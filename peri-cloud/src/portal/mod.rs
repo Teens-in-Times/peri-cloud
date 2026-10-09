@@ -5,6 +5,7 @@ mod browser;
 mod interactions;
 mod native;
 mod security;
+mod workspaces;
 
 use std::sync::Arc;
 
@@ -126,6 +127,8 @@ fn build_router(portal: Portal) -> Router {
         .route("/api/login", post(browser::login))
         .route("/api/logout", post(browser::logout))
         .route("/api/account", get(browser::account))
+        .route("/api/workspaces", get(workspaces::list))
+        .route("/api/workspaces/{id}/switch", post(workspaces::switch))
         .route("/api/interactions", get(interactions::pending))
         .route(
             "/api/interactions/{id}/respond",

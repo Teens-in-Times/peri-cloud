@@ -17,6 +17,9 @@ const errors = {
   stale_request: '这个请求已过期或已经处理，请刷新后查看。',
   rate_limited: '操作过于频繁，请稍后再试。',
   invalid_request: '请检查填写的信息。',
+  invalid_workspace: '请输入设备上的绝对路径，例如 Windows 的 C:\\Projects\\demo 或 Linux 的 /srv/demo。',
+  workspace_busy: '当前任务仍在运行或执行结果未确认，请先等待完成，或在聊天中发送 /取消。',
+  workspace_unavailable: '无法连接这个工作区。请检查执行器与 SSH 连接，并确认该目录存在且可以访问。',
   identity_unavailable: '云服务暂时无法处理请求，请稍后再试。'
 };
 
@@ -157,6 +160,16 @@ async function refresh() {
   refreshInFlight = true;
   try {
     renderAccount(await api('/api/account'));
+    const workspaces = await api('/api/workspaces');
+    list('workspace-selections', workspaces, '还没有选择执行设备的聊天会话。在聊天中发送 /电脑，再发送 /连接 电脑ID [绝对路径]。', selection => {
+      const row = item(selection.device_name + ' · ' + selection.adapter,
+        '会话 ' + shortIdentity(selection.conversation_id), '切换工作区', () => openWorkspace(selection));
+      const path = document.createElement('div'); path.className = 'workspace-path'; path.textContent = selection.workspace;
+      const status = document.createElement('p'); status.className = 'subtle'; status.textContent = selection.busy ? '任务运行中或执行结果待确认，暂时无法切换。' : '当前工作区 · 可以切换';
+      row.querySelector('.item-content').append(path, status);
+      row.querySelector('button').disabled = selection.busy;
+      return row;
+    });
     const cards = await api('/api/interactions');
     byId('pending-count').textContent = cards.length;
     list('interactions', cards, '目前没有等待审批的操作。', card => item(
@@ -174,6 +187,29 @@ async function refresh() {
 
 function shortIdentity(value) {
   const chars = Array.from(value); return chars.length > 18 ? chars.slice(0, 8).join('') + '…' + chars.slice(-6).join('') : value;
+}
+
+function openWorkspace(selection) {
+  const root = document.createElement('div'); root.className = 'workspace-picker';
+  const savedLabel = document.createElement('label'); savedLabel.textContent = '已有工作区';
+  const saved = document.createElement('select'); saved.id = 'workspace-saved';
+  const manual = document.createElement('option'); manual.value = ''; manual.textContent = '指定其他目录…'; saved.append(manual);
+  for (const path of selection.known_workspaces) {
+    const option = document.createElement('option'); option.value = path; option.textContent = path; saved.append(option);
+  }
+  saved.value = selection.workspace; savedLabel.append(saved);
+  const pathLabel = document.createElement('label'); pathLabel.textContent = '设备上的绝对路径';
+  const input = document.createElement('input'); input.id = 'workspace-path-input'; input.value = selection.workspace;
+  input.required = true; input.maxLength = 4096; input.autocomplete = 'off'; input.spellcheck = false;
+  input.placeholder = selection.platform === 'windows' ? 'C:\\Projects\\demo' : '/srv/demo'; pathLabel.append(input);
+  saved.addEventListener('change', () => { if (saved.value) input.value = saved.value; else { input.value = ''; input.focus(); } });
+  input.addEventListener('input', () => { saved.value = selection.known_workspaces.includes(input.value) ? input.value : ''; });
+  root.append(savedLabel, pathLabel);
+  confirm('切换会话工作区', selection.device_name + ' · ' + selection.adapter + ' · ' + shortIdentity(selection.conversation_id) + '。切换后开始新会话，旧历史保留，权限设置保持。', root,
+    async () => {
+      if (!input.reportValidity()) throw new Error('请填写设备上的绝对路径。');
+      await api('/api/workspaces/' + selection.session_id + '/switch', { workspace: input.value.trim() });
+    }, undefined, '确认切换');
 }
 
 const toolLabels = { Read: '读取文件', Write: '写入文件', Edit: '编辑文件', Glob: '查找文件', Grep: '搜索内容', Bash: '运行命令' };

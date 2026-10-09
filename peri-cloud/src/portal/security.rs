@@ -23,6 +23,16 @@ pub enum PortalError {
 impl IntoResponse for PortalError {
     fn into_response(self) -> Response {
         let (status, code) = match self {
+            Self::Interaction(crate::gateway::GatewayError::Invalid) => {
+                (StatusCode::BAD_REQUEST, "invalid_workspace")
+            }
+            Self::Interaction(
+                crate::gateway::GatewayError::Busy
+                | crate::gateway::GatewayError::State(crate::state::StateError::Busy),
+            ) => (StatusCode::CONFLICT, "workspace_busy"),
+            Self::Interaction(crate::gateway::GatewayError::Connection) => {
+                (StatusCode::BAD_GATEWAY, "workspace_unavailable")
+            }
             Self::Interaction(crate::gateway::GatewayError::StaleInteraction) => {
                 (StatusCode::CONFLICT, "stale_request")
             }

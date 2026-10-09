@@ -9,3 +9,4 @@
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}button{transition:none}}
 
 .chat-guide{border-top:1px solid var(--line);margin-top:20px;padding-top:15px;font-size:11px;color:var(--muted)}.chat-guide summary{cursor:pointer}.chat-guide dl{display:grid;grid-template-columns:70px 1fr;gap:8px 12px;margin:16px 0 0}.chat-guide dt,.chat-guide dd{margin:0}.chat-guide dd{color:var(--ink);font-family:ui-monospace,Consolas,monospace;overflow-wrap:anywhere}
+.workspace-path{font:13px/1.7 ui-monospace,Consolas,monospace;margin-top:10px;overflow-wrap:anywhere;color:var(--ink)}#workspace-selections .subtle{margin:6px 0 0}.workspace-picker{white-space:normal;margin-top:22px}.workspace-picker select{display:block;width:100%;margin-top:7px;padding:11px 12px;font:inherit;border:1px solid var(--line);border-radius:2px;background:var(--paper);color:var(--ink)}.workspace-picker input{font-family:ui-monospace,Consolas,monospace}

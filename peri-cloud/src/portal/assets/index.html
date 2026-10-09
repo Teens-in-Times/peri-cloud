@@ -20,8 +20,9 @@
     <a href="#account" class="active"><span class="nav-index">00</span>工作台概览</a>
     <a href="#device-panel"><span class="nav-index">01</span>执行设备</a>
     <a href="#approval-panel"><span class="nav-index">02</span>操作审批</a>
-    <a href="#connections"><span class="nav-index">03</span>聊天与关联</a>
-    <a id="service-nav" href="#service-controls"><span class="nav-index">04</span>服务设置</a>
+    <a href="#workspace-panel"><span class="nav-index">03</span>工作区</a>
+    <a href="#connections"><span class="nav-index">04</span>聊天与关联</a>
+    <a id="service-nav" href="#service-controls"><span class="nav-index">05</span>服务设置</a>
     <p class="nav-note">推理在云端。<br>工作在你选择的设备上。</p>
   </nav>
   <main>
@@ -64,15 +65,17 @@
         <section id="device-panel" class="panel"><div class="section-heading"><h2><span class="section-number">01</span>执行设备</h2><button id="refresh" class="quiet small">刷新</button></div><p class="subtle">在聊天中选择设备与工作区，Agent 就在这里完成任务。添加设备时，请在那台设备的执行器登录入口确认连接。</p><div id="devices" class="items"></div></section>
         <section id="approval-panel" class="panel"><div class="section-heading"><h2><span class="section-number">02</span>操作审批</h2><span class="pill">由你决定</span></div><p class="subtle">先看摘要，再按需展开完整参数。</p><div id="interactions" class="items"></div></section>
       </div>
+      <p class="section-label">CONTEXT &amp; WORKSPACES</p>
+      <section id="workspace-panel" class="panel"><div class="section-heading"><h2><span class="section-number">03</span>会话工作区</h2><span class="pill">设备上的目录</span></div><p class="subtle">选择已有工作区，或指定设备上的绝对路径。切换后开始新会话并保留权限，旧会话历史留存。运行中的任务需要先结束。</p><div id="workspace-selections" class="items"></div></section>
       <p id="connections" class="section-label">CHAT &amp; CONNECTIONS</p>
       <div class="connections-grid">
         <div>
-          <section class="panel"><div class="section-heading"><h2><span class="section-number">03</span>聊天账号</h2></div><p class="subtle">已关联的账号可以与你的 Agent 对话。</p><div id="channels" class="items"></div><details class="chat-guide"><summary>对话中的常用操作</summary><dl><dt>选择设备</dt><dd>/电脑 → /连接 电脑ID</dd><dt>会话权限</dt><dd>/权限 默认 · 编辑 · 全部</dd><dt>任务状态</dt><dd>/状态 · /取消</dd></dl></details></section>
+          <section class="panel"><div class="section-heading"><h2><span class="section-number">04</span>聊天账号</h2></div><p class="subtle">已关联的账号可以与你的 Agent 对话。</p><div id="channels" class="items"></div><details class="chat-guide"><summary>对话中的常用操作</summary><dl><dt>选择设备</dt><dd>/电脑 → /连接 电脑ID [绝对路径]</dd><dt>切换工作区</dt><dd>/工作区 · /工作区 绝对路径</dd><dt>会话权限</dt><dd>/权限 默认 · 编辑 · 全部</dd><dt>任务状态</dt><dd>/状态 · /取消</dd></dl></details></section>
           <section class="panel"><div class="section-heading"><h2>新的关联请求</h2></div><p class="subtle">核对完整账号信息，只确认你刚刚发起的请求。</p><div id="claims" class="items"></div></section>
         </div>
         <section class="panel accent"><p class="eyebrow">CONNECT YOUR CONVERSATION</p><h2 id="pair-title">把聊天接到工作台。</h2><p id="pair-description" class="intro">关联你的 QQ 账号。之后，把想做的事直接告诉 Agent。</p><button id="pair-create" class="primary">生成关联口令</button><div id="pair-result" hidden><output id="pair-code" aria-label="一次性关联口令"></output><p id="pair-expiry" class="subtle"></p><button id="pair-copy" class="quiet small">复制口令</button></div><ol class="connection-steps"><li><span>01</span>在这里生成一次性口令</li><li><span>02</span>发给机器人：/绑定 口令</li><li><span>03</span>回到这里确认账号关联</li></ol></section>
       </div>
-      <details id="service-controls" class="panel service-panel" hidden><summary>04 · 云服务管理</summary><p class="subtle">关闭前会结算当前任务。再次使用时需在服务器启动服务。</p><button id="service-stop" class="quiet danger small">关闭云服务</button></details>
+      <details id="service-controls" class="panel service-panel" hidden><summary>05 · 云服务管理</summary><p class="subtle">关闭前会结算当前任务。再次使用时需在服务器启动服务。</p><button id="service-stop" class="quiet danger small">关闭云服务</button></details>
     </section>
   </main>
   <dialog id="confirmation" aria-labelledby="confirmation-title">

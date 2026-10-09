@@ -20,6 +20,9 @@ use crate::state::{StateError, TurnState};
 use crate::{CloudRuntime, SubmitTurn};
 
 type Origins = HashMap<Uuid, Arc<RwLock<Option<String>>>>;
+#[path = "workspaces.rs"]
+mod workspaces;
+pub use workspaces::WorkspaceSelection;
 struct Ownership {
     closing: bool,
     unconfirmed: bool,
@@ -163,7 +166,7 @@ impl Gateway {
                     GatewayError::Identity(IdentityError::Unauthorized | IdentityError::Forbidden) => "请先在电脑登录并生成关联口令，然后发送 /绑定 口令；也请检查账号或电脑是否已撤销。",
                     GatewayError::Identity(IdentityError::RateLimited) => "请求过于频繁，请稍后重试。",
                     GatewayError::Busy | GatewayError::State(StateError::Busy) => "当前任务仍在运行或执行状态未确认；请先等待完成或发送 /取消。",
-                    GatewayError::Connection => "电脑还没有建立有效连接；请检查执行器和 SSH 连接。",
+                    GatewayError::Connection => "无法建立工作区连接；请检查执行器、SSH 连接，以及路径是否是设备上存在且可访问的目录。",
                     GatewayError::Invalid => "命令参数不正确。发送 /帮助 查看用法。",
                     _ => "这次请求未能完成，请检查云服务状态。没有自动重试执行。",
                 };
@@ -188,7 +191,7 @@ impl Gateway {
             )));
         }
         if text == "/帮助" {
-            return Ok(Some(("/绑定 口令：关联账号\n/电脑：查看已绑定电脑\n/连接 电脑ID：选择执行电脑\n/权限 默认|编辑|全部：设置当前会话权限\n/状态：查看当前会话\n/取消：请求停止当前任务\n选择电脑后直接聊天即可。".into(), None)));
+            return Ok(Some(("/绑定 口令：关联账号\n/电脑：查看已绑定电脑\n/连接 电脑ID [绝对路径]：选择执行电脑和工作区\n/工作区：查看当前及已有工作区\n/工作区 绝对路径：切换工作区，开始新会话\n/权限 默认|编辑|全部：设置当前会话权限\n/状态：查看当前会话\n/取消：请求停止当前任务\n选择电脑后直接聊天即可。".into(), None)));
         }
         let (principal, devices) = self
             .identity
@@ -211,7 +214,7 @@ impl Gateway {
         }
         let selected = self.store.selection(&message.route, principal).await?;
         if let Some(id) = text.strip_prefix("/连接 ") {
-            let id = Uuid::parse_str(id.trim()).map_err(|_| GatewayError::Invalid)?;
+            let (id, workspace) = workspaces::connection_arguments(id)?;
             let device = devices
                 .iter()
                 .find(|device| device.id == id)
@@ -219,6 +222,20 @@ impl Gateway {
             if let Some(old) = selected {
                 let state = self.runtime.journal().session(principal, old).await?;
                 if state.frozen.device_id == id {
+                    if let Some(path) = workspace {
+                        let frozen = self
+                            .change_workspace(&message.route, principal, device, old, path)
+                            .await?;
+                        return Ok(Some((
+                            format!(
+                                "已选择 {}\n工作区：{}\n保留当前权限设置。",
+                                device.name, frozen.binding.workspace
+                            ),
+                            Some(principal),
+                        )));
+                    }
+                }
+                if state.frozen.device_id == id && workspace.is_none() {
                     return Ok(Some((
                         format!("当前已选择 {}。", device.name),
                         Some(principal),
@@ -230,7 +247,12 @@ impl Gateway {
                     return Err(GatewayError::Busy);
                 }
             }
-            let agent = self.connector.open(principal, device, None).await?;
+            let path = workspace.unwrap_or(&device.default_workspace);
+            workspaces::validate_path(&device.platform, path)?;
+            let agent = self
+                .connector
+                .open_workspace(principal, device, path)
+                .await?;
             let frozen = agent.frozen_session(principal);
             self.attach(&message.route, principal, device, agent)
                 .await?;
@@ -239,8 +261,8 @@ impl Gateway {
                 .await?;
             return Ok(Some((
                 format!(
-                    "已连接 {}，当前权限为默认审批。可以直接发送任务。",
-                    device.name
+                    "已连接 {}\n工作区：{}\n当前权限为默认审批。可以直接发送任务。",
+                    device.name, frozen.binding.workspace
                 ),
                 Some(principal),
             )));
@@ -256,6 +278,22 @@ impl Gateway {
             .iter()
             .find(|device| device.id == state.frozen.device_id)
             .ok_or(IdentityError::Forbidden)?;
+        if text == "/工作区" {
+            let paths = self.store.known_workspaces(principal, device.id).await?;
+            return Ok(Some((format!("当前工作区：{}\n\n已有工作区：\n{}\n\n发送 /工作区 绝对路径 切换。路径可以包含空格，不需要加引号。切换后开始新会话，旧历史保留。", state.frozen.binding.workspace, paths.join("\n")), Some(principal))));
+        }
+        if let Some(path) = text.strip_prefix("/工作区 ") {
+            let frozen = self
+                .change_workspace(&message.route, principal, device, session, path.trim())
+                .await?;
+            return Ok(Some((
+                format!(
+                    "已切换工作区：{}\n已开始新会话，保留当前权限设置。旧会话历史已保存。",
+                    frozen.binding.workspace
+                ),
+                Some(principal),
+            )));
+        }
         if text == "/状态" {
             let active = self
                 .runtime

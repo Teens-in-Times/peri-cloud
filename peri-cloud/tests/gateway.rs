@@ -33,6 +33,8 @@ use uuid::Uuid;
 const SETUP: &str = "fixture-cloud-setup-at-least-32-characters";
 const PASSWORD: &str = "fixture-cloud-owner-password-for-argon2";
 const VERIFIER: &str = "fixture-native-pkce-verifier-with-at-least-43-characters";
+#[path = "gateway/workspaces.rs"]
+mod workspace_tests;
 
 struct Clock(AtomicI64);
 impl IdentityClock for Clock {

@@ -155,6 +155,45 @@ impl GatewayStore {
         Ok(())
     }
 
+    pub async fn selections(&self, principal: Uuid) -> GatewayResult<Vec<(ChannelRoute, Uuid)>> {
+        let rows = sqlx::query(
+            "SELECT route_json,session_id FROM gateway_routes WHERE principal=? ORDER BY route_key",
+        )
+        .bind(principal.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    serde_json::from_str(row.get("route_json"))?,
+                    uuid(row.get("session_id"))?,
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn known_workspaces(
+        &self,
+        principal: Uuid,
+        device: Uuid,
+    ) -> GatewayResult<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT state_json FROM cloud_sessions WHERE principal=? ORDER BY rowid DESC",
+        )
+        .bind(principal.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut paths = Vec::new();
+        for row in rows {
+            let state: crate::state::SessionState = serde_json::from_str(row.get("state_json"))?;
+            if state.frozen.device_id == device && !paths.contains(&state.frozen.binding.workspace)
+            {
+                paths.push(state.frozen.binding.workspace);
+            }
+        }
+        Ok(paths)
+    }
+
     pub async fn stage(&self, key: &str, principal: Uuid, session: Uuid) -> GatewayResult<()> {
         sqlx::query("UPDATE gateway_inbox SET principal=?,session_id=? WHERE event_key=? AND state='processing'")
             .bind(principal.to_string()).bind(session.to_string()).bind(key).execute(&self.pool).await?;

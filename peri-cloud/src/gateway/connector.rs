@@ -22,6 +22,19 @@ pub trait SessionConnector: Send + Sync {
         device: &DeviceRecord,
         previous: Option<&FrozenSession>,
     ) -> GatewayResult<Arc<CloudAgent>>;
+
+    /// An account-owned path is a session choice, never a transport setting.
+    /// Reopening an existing session still uses `open` with its frozen binding.
+    async fn open_workspace(
+        &self,
+        principal: Uuid,
+        device: &DeviceRecord,
+        workspace: &str,
+    ) -> GatewayResult<Arc<CloudAgent>> {
+        let mut selected = device.clone();
+        selected.default_workspace = workspace.to_owned();
+        self.open(principal, &selected, None).await
+    }
 }
 
 /// Real native tools on an identity-verified loopback SSH forward. Deployment

@@ -8,7 +8,7 @@ pub(crate) mod store;
 mod types;
 
 pub use connector::{NativeSessionConnector, SessionConnector};
-pub use router::Gateway;
+pub use router::{Gateway, WorkspaceSelection};
 pub use types::{
     ChannelRoute, Delivery, DeliveryBody, DeliveryError, GatewayReceipt, InboundMessage,
     InteractionAction, InteractionCard, MessageAdapter, ReceiptState,
