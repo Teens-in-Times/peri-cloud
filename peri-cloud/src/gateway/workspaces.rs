@@ -46,13 +46,9 @@ impl Gateway {
             let Some(device) = devices.iter().find(|d| d.id == state.frozen.device_id) else {
                 continue;
             };
-            let mut paths = self.store.known_workspaces(principal, device.id).await?;
-            if !paths.iter().any(|path| {
-                path_key(&device.platform, path)
-                    == path_key(&device.platform, &device.default_workspace)
-            }) {
-                paths.push(device.default_workspace.clone());
-            }
+            // Only executor-verified bindings are saved choices. Registration
+            // may use Windows short paths or aliases for the same directory.
+            let paths = self.store.known_workspaces(principal, device.id).await?;
             let busy = !state.execution_settled()
                 || self.runtime.journal().has_unconfirmed_turn(session).await?;
             result.push(WorkspaceSelection {
@@ -220,15 +216,4 @@ pub(super) fn validate_path(platform: &str, path: &str) -> GatewayResult<()> {
         return Err(GatewayError::Invalid);
     }
     Ok(())
-}
-
-fn path_key(platform: &str, path: &str) -> String {
-    if platform != "windows" {
-        return path.to_owned();
-    }
-    let path = path.replace('/', "\\");
-    if let Some(unc) = path.strip_prefix("\\\\?\\UNC\\") {
-        return format!("\\\\{unc}");
-    }
-    path.strip_prefix("\\\\?\\").unwrap_or(&path).to_owned()
 }

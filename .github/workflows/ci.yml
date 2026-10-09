@@ -28,3 +28,14 @@ jobs:
         run: cargo +1.99.0 clippy --locked -p peri-cloud -p peri-executor --all-targets --no-deps -- -D warnings
       - name: Build optimized binaries
         run: cargo +1.99.0 build --release --locked -p peri-cloud --bin peri-cloud-host -p peri-executor --bin peri-executor
+      - name: Preserve verified native binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-${{ matrix.os }}
+          path: |
+            target/release/peri-cloud-host
+            target/release/peri-cloud-host.exe
+            target/release/peri-executor
+            target/release/peri-executor.exe
+          if-no-files-found: error
+          retention-days: 7
