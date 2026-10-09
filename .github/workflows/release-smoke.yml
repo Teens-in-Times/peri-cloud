@@ -1,0 +1,34 @@
+name: Verify release binaries
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: Successful main CI run containing Linux native binaries
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  linux-release:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Validate artifact provenance and matching runtime source
+        shell: bash
+        run: |
+          [[ "$ARTIFACT_RUN_ID" =~ ^[0-9]+$ ]]
+          gh run view "$ARTIFACT_RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion,event,headBranch,headSha > run.json
+          source_commit=$(python3 -c 'import json; r=json.load(open("run.json")); assert r["conclusion"]=="success" and r["event"]=="push" and r["headBranch"]=="main"; print(r["headSha"])')
+          git diff --exit-code "$source_commit" HEAD -- Cargo.toml Cargo.lock 'peri-*' npm-packages
+      - name: Download verified binaries
+        run: gh run download "$ARTIFACT_RUN_ID" --repo "$GITHUB_REPOSITORY" --name native-ubuntu-22.04 --dir native
+      - name: Exercise actual native processes and account APIs
+        run: |
+          chmod +x native/peri-cloud-host native/peri-executor
+          python3 scripts/smoke-release.py native peri-cloud/src/portal/assets
