@@ -1,0 +1,189 @@
+//! SubAgent 继续交互（`resume_thread_id`）：active 发 Info，非 active 恢复执行。
+//!
+//! 语义（issue 决策）：主 agent 凭中断/错误/bg 通知文本携带的 `child_thread_id`
+//! 恢复被中断 subagent——从磁盘 thread 恢复现场继续执行，不创建新 subagent。
+//! - 工具集：`meta.title == "fork"` → 父工具集 clone（execute_fork.rs 同款，无过滤）；
+//!   否则 `load_agent_def(title)` 重新应用 tools/disallowed 过滤（权限漂移防护，
+//!   issue 决策 11）
+//! - skill_names 恒不注入（R-H1：旧 transcript 已含首轮 SkillPreload 内容，
+//!   重复注入会随多次恢复无界增长；`SubagentResumeConfig` 无该字段，结构性禁止）
+//! - 不传 system_prompt（F4：identity System 已在旧 transcript 中，重复注入会重复）
+//! - run mode 由本次调用决定（issue 决策 8）：`run_in_background: true` →
+//!   Background（新 task_id + TaskManager 注册）
+//!
+//! L3：校验/重建/运行/收尾统一经
+//! `peri_agent::session::subagent::resume_subagent`（Agent 层统一入口），
+//! 本文件只组装意图（[`SubagentResumeConfig`](peri_agent::session::subagent::SubagentResumeConfig)）。
+
+use std::sync::Arc;
+
+use peri_agent::session::subagent::{
+    extract_last_ai_text, format_subagent_result, SubagentCancelPolicy, SubagentRunMode,
+};
+use peri_agent::tools::BaseTool;
+
+impl super::SubAgentTool {
+    /// 向本会话 active 后台 subagent 发 Info，或恢复非 active thread。
+    ///
+    /// 前置校验（define.rs 已做）：有效 resume_thread_id 优先于 fork / subagent_type，
+    /// 本方法先经 TaskManager 投递 live 消息；恢复时 load_meta 取 title 决定工具集，
+    /// 组装 [`SubagentResumeConfig`](peri_agent::session::subagent::SubagentResumeConfig) 经 [`SessionFactory::resume_subagent`](peri_agent::session::subagent::SessionFactory::resume_subagent) 执行。
+    ///
+    /// 返回文本与 spawn 路径一致：
+    /// - Background → 启动确认（task_id 文本，execute_bg.rs 同款；thread 恒存在 → 带 thread）
+    /// - interrupted → slice 1 格式（`child_thread_id: {id}` + 恢复提示）
+    /// - 完成 → `child_thread_id: {id}\n{result}`（会话资源门面恒存在）
+    /// - 错误 → 原样 Err（agent 层已带 `resume_subagent:` 前缀）
+    pub(crate) async fn invoke_resume(
+        &self,
+        thread_id: String,
+        prompt: Option<String>,
+        cwd: String,
+        run_in_background: bool,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let host = self.host();
+        // Live 执行是 active 的事实源。投递只做同步查找和入队，不能跨 load_meta
+        // await 后再解析同一 thread，以免把消息投给期间恢复的新执行。
+        if let Some(manager) = &host.task_manager {
+            if let Some(receipt) = manager.send_subagent_message(&thread_id, prompt.as_deref())? {
+                return Ok(format!(
+                    "action: send\nstatus: queued\nchild_thread_id: {thread_id}\ntask_id: {}\n\
+                     Supplemental prompt queued as Info for the active background sub-agent. \
+                     No execution was started or resumed. This does not interrupt the current \
+                     model/tool call or trigger another model call. Queued does not mean read: \
+                     the agent may finish before the model sees this message.",
+                    receipt.task_id,
+                ));
+            }
+        }
+        // 无 live receiver 时才进入磁盘恢复路径。
+        let session_resources = host.session_resources.clone().ok_or(
+            "resume_subagent: session resources required (resume_thread_id needs a persisted thread)",
+        )?;
+
+        // 双保险（review MEDIUM-1）：bg resume 在 agent 层注册失败会回滚 status，
+        // 但无 task_manager 时先在此预检，避免「置 active → 注册失败 → 回滚」的
+        // 无效往返（execute_bg.rs:29-32 同款文本）
+        if run_in_background && host.task_manager.is_none() {
+            return Err("Background tasks not available: no task manager configured".into());
+        }
+
+        // 0. thread_id 格式校验（review low-2）：FilesystemThreadStore 按 id 拼路径，
+        //    非 UUID 在 load_meta 之前统一拒绝（agent 层同文本，双保险）
+        if uuid::Uuid::parse_str(&thread_id).is_err() {
+            return Err(format!("resume_subagent: invalid thread id: {}", thread_id).into());
+        }
+
+        // 1. load_meta 取 title（决定工具集恢复路径，issue 决策 11）
+        let meta = session_resources
+            .load_session_meta(&thread_id)
+            .await
+            .map_err(|_| format!("resume_subagent: thread not found: {}", thread_id))?;
+        if meta.agent_status.is_active() {
+            return Err(format!(
+                "send_subagent: thread {thread_id} is still active, but no live background \
+                 receiver is available in this session. Message was not queued; \
+                 no execution was started or resumed."
+            )
+            .into());
+        }
+        let title = meta.title.clone().unwrap_or_default();
+
+        // 2. 按 title 恢复工具集 / LLM / 迭代上限：
+        //    - "fork" → 父工具集 clone（execute_fork.rs 同款，无过滤）+ 200 迭代
+        //    - 其他 → load_agent_def(title) 重新应用过滤（tools/disallowed，
+        //      权限漂移防护）+ agent_def 声明的 max_turns
+        //    二者均不注入 skill_names / system_prompt（R-H1 / F4）
+        let (llm, tools, tool_filter, max_iterations) = if title == "fork" {
+            let llm = (self.llm_factory)(None);
+            let tools: Vec<Arc<dyn BaseTool>> = self.parent_tools.iter().cloned().collect();
+            (
+                llm,
+                tools,
+                Arc::new(|name: &str| name != "Agent") as Arc<dyn Fn(&str) -> bool + Send + Sync>,
+                200,
+            )
+        } else {
+            let agent_def = if title.starts_with("mcp__") {
+                self.load_and_approve_mcp_agent(&title)
+                    .await
+                    .map_err(|error| format!("resume_subagent: {error}"))?
+            } else {
+                self.load_agent_def_for_resume(&title, &cwd)
+                    .map_err(|error| format!("resume_subagent: {error}"))?
+            };
+            let build_result = self
+                .build_agent_from_def(
+                    &agent_def,
+                    &title,
+                    &cwd,
+                    SubagentCancelPolicy::Cascade,
+                    false,
+                    true,
+                    // 恢复路径不允许 model 覆盖：LLM 按 thread title 选中的
+                    // agent 定义（当前磁盘 frontmatter model）重建，与工具过滤
+                    // 的权限漂移防护同构；调用参数 model 与 subagent_type/fork
+                    // 一样被忽略
+                    None,
+                )
+                .await?;
+            let llm = build_result.llm;
+            let tools: Vec<Arc<dyn BaseTool>> = build_result
+                .tools
+                .into_iter()
+                .map(|t| Arc::from(t) as Arc<dyn BaseTool>)
+                .collect();
+            let tool_filter = build_result.tool_filter;
+            (llm, tools, tool_filter, build_result.max_iterations)
+        };
+
+        // 3. 组装 resume config（通道段与 spawn_config_base 同源；五字段 None 与
+        //    spawn 一致；tool_invocation_resolver 显式设置，R2 补充）
+        let config = self.resume_config_base(
+            thread_id.clone(),
+            prompt,
+            if run_in_background {
+                SubagentRunMode::Background
+            } else {
+                SubagentRunMode::Sync
+            },
+            max_iterations,
+            llm,
+            tools,
+            tool_filter,
+            session_resources,
+            cwd,
+        );
+
+        // 4. 统一恢复入口（Agent 层完成校验 / 重建 / 执行 / 收尾）
+        let spawned = self.resume(config).await?;
+
+        // 5. 返回文本（见方法注释格式约定）
+        if let Some(task_id) = &spawned.task_id {
+            return Ok(format!(
+                "action: resume\nBackground task {} started (thread: {}). You will be notified when it completes. \
+                 You can continue with other tasks in the meantime.",
+                task_id, spawned.child_thread_id
+            ));
+        }
+
+        if spawned.interrupted {
+            return Ok(format!(
+                "child_thread_id: {}\naction: resume\nSub-agent execution was interrupted, resume with Agent(resume_thread_id: {})",
+                spawned.child_thread_id, spawned.child_thread_id
+            ));
+        }
+
+        Ok(format!(
+            "child_thread_id: {}\naction: resume\n{}",
+            spawned.child_thread_id,
+            format_subagent_result(&peri_agent::agent::react::AgentOutput {
+                text: extract_last_ai_text(&spawned.session),
+                steps: 0,
+                tool_calls: Vec::new(),
+                stop_reason: None,
+                block_continue: None,
+            })
+        ))
+    }
+}

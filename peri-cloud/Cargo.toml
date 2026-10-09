@@ -1,0 +1,47 @@
+[package]
+name = "peri-cloud"
+version.workspace = true
+edition.workspace = true
+description = "Personal cloud agent host with native device execution and optional gateways"
+license = "Apache-2.0"
+
+[dependencies]
+peri-agent = { path = "../peri-agent" }
+peri-acp-types = { path = "../peri-acp-types" }
+peri-middlewares = { path = "../peri-middlewares" }
+peri-model = { path = "../peri-model" }
+peri-remote-tools = { path = "../peri-remote-tools" }
+async-trait.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+sqlx.workspace = true
+fs2 = "0.4"
+argon2 = "0.5"
+sha2.workspace = true
+url.workspace = true
+base64 = "0.22"
+axum.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
+ed25519-dalek = "3.0"
+
+[[bin]]
+name = "peri-account-portal"
+path = "src/bin/account_portal.rs"
+
+[[bin]]
+name = "peri-cloud-host"
+path = "src/bin/cloud_host.rs"
+
+[dev-dependencies]
+peri-executor = { path = "../peri-executor" }
+tempfile.workspace = true

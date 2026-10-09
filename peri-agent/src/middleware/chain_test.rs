@@ -1,0 +1,1128 @@
+//! Tests for chain
+
+use crate::middleware::capabilities as hook_state;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+
+use super::*;
+use crate::{
+    agent::state::AgentState,
+    error::{AgentError, AgentResult},
+    messages::{BaseMessage, ContentBlock, MessageId},
+    middleware::{
+        project_enabled_sections,
+        prompt_sections::{PromptSection, PromptSectionZone},
+        r#trait::{Middleware, NoopMiddleware},
+    },
+};
+
+/// 记录调用顺序的中间件
+struct OrderRecorder {
+    name: String,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl OrderRecorder {
+    fn new(name: &str, log: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            name: name.to_string(),
+            log,
+        }
+    }
+}
+
+#[async_trait]
+impl Middleware for OrderRecorder {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn before_agent(&self, _state: &mut dyn hook_state::BeforeAgentState) -> AgentResult<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("{}.before_agent", self.name));
+        Ok(())
+    }
+
+    async fn before_tool(
+        &self,
+        _state: &mut dyn hook_state::BeforeToolState,
+        tool_call: &ToolCall,
+    ) -> AgentResult<ToolCall> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("{}.before_tool", self.name));
+        Ok(tool_call.clone())
+    }
+
+    async fn after_tool(
+        &self,
+        _state: &mut dyn hook_state::AfterToolState,
+        _tool_call: &ToolCall,
+        _result: &ToolResult,
+    ) -> AgentResult<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("{}.after_tool", self.name));
+        Ok(())
+    }
+}
+
+/// 修改 ToolCall 的中间件（用于验证 before_tool 链式传播）
+struct InputModifier {
+    suffix: String,
+}
+
+#[async_trait]
+impl Middleware for InputModifier {
+    fn name(&self) -> &str {
+        "InputModifier"
+    }
+
+    async fn before_tool(
+        &self,
+        _state: &mut dyn hook_state::BeforeToolState,
+        tool_call: &ToolCall,
+    ) -> AgentResult<ToolCall> {
+        let mut modified = tool_call.clone();
+        let new_name = format!("{}{}", tool_call.name, self.suffix);
+        modified.name = new_name;
+        Ok(modified)
+    }
+}
+
+/// 总是返回错误的中间件（用于验证短路行为）
+struct FailMiddleware;
+
+#[async_trait]
+impl Middleware for FailMiddleware {
+    fn name(&self) -> &str {
+        "FailMiddleware"
+    }
+
+    async fn before_agent(&self, _state: &mut dyn hook_state::BeforeAgentState) -> AgentResult<()> {
+        Err(AgentError::MiddlewareError {
+            middleware: "FailMiddleware".to_string(),
+            reason: "intentional failure".to_string(),
+        })
+    }
+}
+
+/// 声明段落的中间件（collect_prompt_sections 测试；默认无段落，契约 4）
+struct SectionProvider {
+    name: String,
+    sections: Vec<PromptSection>,
+}
+
+impl SectionProvider {
+    fn new(name: &str, sections: Vec<PromptSection>) -> Self {
+        Self {
+            name: name.to_string(),
+            sections,
+        }
+    }
+}
+
+#[async_trait]
+impl Middleware for SectionProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn prompt_sections(&self) -> Vec<PromptSection> {
+        self.sections.clone()
+    }
+}
+
+#[test]
+fn test_collect_prompt_sections_empty_chain() {
+    let chain = MiddlewareChain::new();
+    assert!(
+        chain.collect_prompt_sections().is_empty(),
+        "空链收集为空（契约 4：未提供段落不 fail）"
+    );
+}
+
+#[test]
+fn test_collect_prompt_sections_gathers_provided_sections() {
+    let mut chain = MiddlewareChain::new();
+    // 无段落的中间件（默认实现）+ 声明段落的中间件混合
+    chain.add(Box::new(OrderRecorder::new(
+        "NoSections",
+        Arc::new(Mutex::new(Vec::new())),
+    )));
+    chain.add(Box::new(SectionProvider::new(
+        "SectionHolder",
+        vec![
+            PromptSection::builtin("10_hitl", PromptSectionZone::Uncached, 3, "hitl"),
+            PromptSection::dynamic("zz_dyn", PromptSectionZone::Uncached, 8, "dyn".to_string()),
+        ],
+    )));
+    chain.add(Box::new(SectionProvider::new("EmptyHolder", vec![])));
+
+    let collected = chain.collect_prompt_sections();
+    let ids: Vec<&str> = collected.iter().map(|s| s.id).collect();
+    assert_eq!(ids, vec!["10_hitl", "zz_dyn"], "仅收集声明段落的中间件");
+    // 内容与位置属性透传
+    let hitl = collected
+        .iter()
+        .find(|s| s.id == "10_hitl")
+        .expect("10_hitl 在收集结果中");
+    assert_eq!(hitl.zone, PromptSectionZone::Uncached);
+    assert_eq!(hitl.order, 3);
+    assert_eq!(hitl.content.as_str(), "hitl");
+    let dyn_section = collected.iter().find(|s| s.id == "zz_dyn").unwrap();
+    assert_eq!(dyn_section.content.as_str(), "dyn", "动态内容透传");
+}
+
+/// 契约 3 投影：段落 gate = 持有 middleware 是否在链上（映射表驱动）。
+#[test]
+fn test_project_enabled_sections_from_chain_names() {
+    use std::collections::HashSet;
+
+    // 空集合 → 无段落开启
+    assert!(project_enabled_sections(&HashSet::new()).is_empty());
+
+    let names: HashSet<&str> = [
+        "SubAgentMiddleware",
+        "SkillsMiddleware",
+        "UnrelatedMiddleware",
+    ]
+    .into_iter()
+    .collect();
+    let enabled = project_enabled_sections(&names);
+    assert!(
+        enabled.contains("11_subagent"),
+        "SubAgentMiddleware 在链上 → 11_subagent 开启"
+    );
+    assert!(
+        enabled.contains("13_skills"),
+        "SkillsMiddleware 在链上 → 13_skills 开启"
+    );
+    assert!(
+        !enabled.contains("10_hitl"),
+        "PermissionMiddleware 不在链上 → 10_hitl 关闭（2026-08-15 拆分：10_hitl 持有者）"
+    );
+    assert!(
+        !enabled.contains("16_workflow"),
+        "16_workflow 已整段删除（C2，ultracode skill 覆盖），投影恒不含"
+    );
+
+    // 与链收集的一致性：链上持有者提供的段落 = 投影开启的段落
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(SectionProvider::new(
+        "SkillsMiddleware",
+        vec![PromptSection::builtin(
+            "13_skills",
+            PromptSectionZone::Uncached,
+            5,
+            "skills",
+        )],
+    )));
+    let collected_ids: HashSet<&str> = chain
+        .collect_prompt_sections()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    let projected = project_enabled_sections(&chain.names().into_iter().collect::<HashSet<&str>>());
+    assert_eq!(
+        collected_ids, projected,
+        "收集到的段落 = 映射表投影（同一判定，两条路径一致）"
+    );
+}
+
+#[tokio::test]
+async fn test_multiple_middlewares_sequential_order() {
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(OrderRecorder::new("A", Arc::clone(&log))));
+    chain.add(Box::new(OrderRecorder::new("B", Arc::clone(&log))));
+    chain.add(Box::new(OrderRecorder::new("C", Arc::clone(&log))));
+
+    let mut state = AgentState::new("/tmp");
+    chain.run_before_agent(&mut state).await.unwrap();
+
+    let calls = log.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec!["A.before_agent", "B.before_agent", "C.before_agent"]
+    );
+}
+
+#[tokio::test]
+async fn test_error_short_circuits_chain() {
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(OrderRecorder::new("A", Arc::clone(&log))));
+    chain.add(Box::new(FailMiddleware));
+    chain.add(Box::new(OrderRecorder::new("B", Arc::clone(&log))));
+
+    let mut state = AgentState::new("/tmp");
+    let result = chain.run_before_agent(&mut state).await;
+
+    assert!(result.is_err(), "应该返回错误");
+    // B.before_agent 不应被执行
+    let calls = log.lock().unwrap().clone();
+    assert_eq!(calls, vec!["A.before_agent"]);
+}
+
+#[tokio::test]
+async fn test_before_tool_modification_propagates() {
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(InputModifier {
+        suffix: "_modified".to_string(),
+    }));
+
+    let mut state = AgentState::new("/tmp");
+    let original = ToolCall::new("id1", "my_tool", serde_json::json!({}));
+    let result = chain.run_before_tool(&mut state, original).await.unwrap();
+
+    assert_eq!(result.name, "my_tool_modified");
+}
+
+#[tokio::test]
+async fn test_before_tool_chained_modifications() {
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(InputModifier {
+        suffix: "_a".to_string(),
+    }));
+    chain.add(Box::new(InputModifier {
+        suffix: "_b".to_string(),
+    }));
+
+    let mut state = AgentState::new("/tmp");
+    let original = ToolCall::new("id1", "tool", serde_json::json!({}));
+    let result = chain.run_before_tool(&mut state, original).await.unwrap();
+
+    assert_eq!(result.name, "tool_a_b");
+}
+
+#[tokio::test]
+async fn test_empty_chain_runs_ok() {
+    let chain = MiddlewareChain::new();
+    let mut state = AgentState::new("/tmp");
+    chain.run_before_agent(&mut state).await.unwrap();
+
+    let original = ToolCall::new("id", "tool", serde_json::json!({}));
+    let result = chain
+        .run_before_tool(&mut state, original.clone())
+        .await
+        .unwrap();
+    assert_eq!(result.name, original.name);
+}
+
+#[tokio::test]
+async fn test_after_tool_sequential_order() {
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(OrderRecorder::new("A", Arc::clone(&log))));
+    chain.add(Box::new(OrderRecorder::new("B", Arc::clone(&log))));
+
+    let mut state = AgentState::new("/tmp");
+    let call = ToolCall::new("id", "tool", serde_json::json!({}));
+    let result = ToolResult {
+        tool_call_id: "id".to_string(),
+        tool_name: "tool".to_string(),
+        output: "ok".to_string(),
+        is_error: false,
+        execution: None,
+        effective_error_code: None,
+        subagent_failure: None,
+    };
+    chain
+        .run_after_tool(&mut state, &call, &result)
+        .await
+        .unwrap();
+
+    let calls = log.lock().unwrap().clone();
+    assert_eq!(calls, vec!["A.after_tool", "B.after_tool"]);
+}
+
+/// 批量工具调用：一个中间件批准、下一个中间件拒绝（混合结果）
+#[tokio::test]
+async fn test_before_tools_batch_mixed_approval() {
+    // 第一个中间件：所有工具加 _a 后缀
+    struct SuffixA;
+    #[async_trait]
+    impl Middleware for SuffixA {
+        fn name(&self) -> &str {
+            "SuffixA"
+        }
+        async fn before_tool(
+            &self,
+            _state: &mut dyn hook_state::BeforeToolState,
+            tc: &ToolCall,
+        ) -> AgentResult<ToolCall> {
+            let mut m = tc.clone();
+            m.name = format!("{}{}", tc.name, "_a");
+            Ok(m)
+        }
+    }
+
+    // 第二个中间件：第二个工具调用返回 ToolRejected，第一个和第三个放行
+    struct RejectSecond;
+    #[async_trait]
+    impl Middleware for RejectSecond {
+        fn name(&self) -> &str {
+            "RejectSecond"
+        }
+        async fn before_tools_batch(
+            &self,
+            _state: &mut dyn hook_state::BeforeToolState,
+            calls: &[ToolCall],
+        ) -> Vec<AgentResult<ToolCall>> {
+            calls
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i == 1 {
+                        Err(AgentError::ToolRejected {
+                            tool: c.name.clone(),
+                            reason: "拒绝第二个".to_string(),
+                        })
+                    } else {
+                        Ok(c.clone())
+                    }
+                })
+                .collect()
+        }
+    }
+
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(SuffixA));
+    chain.add(Box::new(RejectSecond));
+    let mut state = AgentState::new("/tmp");
+
+    let calls = vec![
+        ToolCall::new("id1", "tool1", serde_json::json!({})),
+        ToolCall::new("id2", "tool2", serde_json::json!({})),
+        ToolCall::new("id3", "tool3", serde_json::json!({})),
+    ];
+    let results = chain.run_before_tools_batch(&mut state, calls).await;
+
+    assert_eq!(results.len(), 3);
+    // 第一个：通过，名称被 SuffixA 修改为 tool1_a
+    assert!(results[0].is_ok());
+    assert_eq!(results[0].as_ref().unwrap().name, "tool1_a");
+    // 第二个：被 RejectSecond 拒绝
+    assert!(matches!(&results[1], Err(AgentError::ToolRejected { tool, .. }) if tool == "tool2_a"));
+    // 第三个：通过
+    assert!(results[2].is_ok());
+    assert_eq!(results[2].as_ref().unwrap().name, "tool3_a");
+}
+
+/// 批量工具调用：所有中间件使用默认逐条实现，结果应与逐个调用一致
+#[tokio::test]
+async fn test_before_tools_batch_equivalent_to_individual() {
+    struct SuffixX;
+    #[async_trait]
+    impl Middleware for SuffixX {
+        fn name(&self) -> &str {
+            "SuffixX"
+        }
+        async fn before_tool(
+            &self,
+            _state: &mut dyn hook_state::BeforeToolState,
+            tc: &ToolCall,
+        ) -> AgentResult<ToolCall> {
+            let mut m = tc.clone();
+            m.name = format!("{}{}", tc.name, "_x");
+            Ok(m)
+        }
+    }
+
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(SuffixX));
+    let mut state = AgentState::new("/tmp");
+
+    let calls = vec![
+        ToolCall::new("id1", "t1", serde_json::json!({})),
+        ToolCall::new("id2", "t2", serde_json::json!({})),
+    ];
+
+    let batch_results = chain
+        .run_before_tools_batch(&mut state, calls.clone())
+        .await;
+    assert_eq!(batch_results.len(), 2);
+    assert_eq!(batch_results[0].as_ref().unwrap().name, "t1_x");
+    assert_eq!(batch_results[1].as_ref().unwrap().name, "t2_x");
+}
+
+// ── before_model / after_model 测试 ──
+
+#[tokio::test]
+async fn test_before_model_sequential_order() {
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut chain = MiddlewareChain::new();
+
+    struct BeforeModelRecorder {
+        name: String,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Middleware for BeforeModelRecorder {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn before_model(
+            &self,
+            _state: &mut dyn hook_state::BeforeModelState,
+        ) -> AgentResult<()> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}.before_model", self.name));
+            Ok(())
+        }
+    }
+
+    chain.add(Box::new(BeforeModelRecorder {
+        name: "A".into(),
+        log: Arc::clone(&log),
+    }));
+    chain.add(Box::new(BeforeModelRecorder {
+        name: "B".into(),
+        log: Arc::clone(&log),
+    }));
+    chain.add(Box::new(BeforeModelRecorder {
+        name: "C".into(),
+        log: Arc::clone(&log),
+    }));
+
+    let mut state = AgentState::new("/tmp");
+    chain.run_before_model(&mut state).await.unwrap();
+
+    assert_eq!(
+        log.lock().unwrap().clone(),
+        vec!["A.before_model", "B.before_model", "C.before_model"]
+    );
+}
+
+#[tokio::test]
+async fn test_before_model_error_short_circuits() {
+    struct FailBeforeModel;
+    #[async_trait]
+    impl Middleware for FailBeforeModel {
+        fn name(&self) -> &str {
+            "FailBeforeModel"
+        }
+        async fn before_model(
+            &self,
+            _state: &mut dyn hook_state::BeforeModelState,
+        ) -> AgentResult<()> {
+            Err(AgentError::MiddlewareError {
+                middleware: "FailBeforeModel".to_string(),
+                reason: "intentional failure".to_string(),
+            })
+        }
+    }
+
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut chain = MiddlewareChain::new();
+
+    struct Recorder {
+        name: String,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Middleware for Recorder {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn before_model(
+            &self,
+            _state: &mut dyn hook_state::BeforeModelState,
+        ) -> AgentResult<()> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}.before_model", self.name));
+            Ok(())
+        }
+    }
+
+    chain.add(Box::new(Recorder {
+        name: "A".into(),
+        log: Arc::clone(&log),
+    }));
+    chain.add(Box::new(FailBeforeModel));
+    chain.add(Box::new(Recorder {
+        name: "B".into(),
+        log: Arc::clone(&log),
+    }));
+
+    let mut state = AgentState::new("/tmp");
+    let result = chain.run_before_model(&mut state).await;
+
+    assert!(result.is_err());
+    assert_eq!(log.lock().unwrap().clone(), vec!["A.before_model"]);
+}
+
+#[tokio::test]
+async fn test_after_model_sequential_order() {
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut chain = MiddlewareChain::new();
+
+    struct AfterModelRecorder {
+        name: String,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Middleware for AfterModelRecorder {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn after_model(
+            &self,
+            _state: &mut dyn hook_state::StateView,
+            _reasoning: &Reasoning,
+        ) -> AgentResult<()> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}.after_model", self.name));
+            Ok(())
+        }
+    }
+
+    chain.add(Box::new(AfterModelRecorder {
+        name: "A".into(),
+        log: Arc::clone(&log),
+    }));
+    chain.add(Box::new(AfterModelRecorder {
+        name: "B".into(),
+        log: Arc::clone(&log),
+    }));
+
+    let mut state = AgentState::new("/tmp");
+    let reasoning = Reasoning {
+        thought: String::new(),
+        final_answer: None,
+        tool_calls: vec![],
+        source_message: None,
+        usage: None,
+        request_id: None,
+        model: String::new(),
+        streamed: false,
+        stream_interruption: None,
+        stop_reason: peri_model::StopReason::EndTurn,
+    };
+    chain.run_after_model(&mut state, &reasoning).await.unwrap();
+
+    assert_eq!(
+        log.lock().unwrap().clone(),
+        vec!["A.after_model", "B.after_model"]
+    );
+}
+
+#[tokio::test]
+async fn test_after_model_error_short_circuits() {
+    struct FailAfterModel;
+    #[async_trait]
+    impl Middleware for FailAfterModel {
+        fn name(&self) -> &str {
+            "FailAfterModel"
+        }
+        async fn after_model(
+            &self,
+            _state: &mut dyn hook_state::StateView,
+            _reasoning: &Reasoning,
+        ) -> AgentResult<()> {
+            Err(AgentError::MiddlewareError {
+                middleware: "FailAfterModel".to_string(),
+                reason: "intentional failure".to_string(),
+            })
+        }
+    }
+
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut chain = MiddlewareChain::new();
+
+    struct Recorder {
+        name: String,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Middleware for Recorder {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn after_model(
+            &self,
+            _state: &mut dyn hook_state::StateView,
+            _reasoning: &Reasoning,
+        ) -> AgentResult<()> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}.after_model", self.name));
+            Ok(())
+        }
+    }
+
+    chain.add(Box::new(Recorder {
+        name: "A".into(),
+        log: Arc::clone(&log),
+    }));
+    chain.add(Box::new(FailAfterModel));
+    chain.add(Box::new(Recorder {
+        name: "B".into(),
+        log: Arc::clone(&log),
+    }));
+
+    let mut state = AgentState::new("/tmp");
+    let reasoning = Reasoning {
+        thought: String::new(),
+        final_answer: None,
+        tool_calls: vec![],
+        source_message: None,
+        usage: None,
+        request_id: None,
+        model: String::new(),
+        streamed: false,
+        stream_interruption: None,
+        stop_reason: peri_model::StopReason::EndTurn,
+    };
+    let result = chain.run_after_model(&mut state, &reasoning).await;
+
+    assert!(result.is_err());
+    assert_eq!(log.lock().unwrap().clone(), vec!["A.after_model"]);
+}
+
+#[tokio::test]
+async fn test_before_model_empty_chain_ok() {
+    let chain = MiddlewareChain::new();
+    let mut state = AgentState::new("/tmp");
+    assert!(chain.run_before_model(&mut state).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_after_model_empty_chain_ok() {
+    let chain = MiddlewareChain::new();
+    let mut state = AgentState::new("/tmp");
+    let reasoning = Reasoning {
+        thought: String::new(),
+        final_answer: None,
+        tool_calls: vec![],
+        source_message: None,
+        usage: None,
+        request_id: None,
+        model: String::new(),
+        streamed: false,
+        stream_interruption: None,
+        stop_reason: peri_model::StopReason::EndTurn,
+    };
+    assert!(chain.run_after_model(&mut state, &reasoning).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_new_hooks_default_noop() {
+    // NoopMiddleware 的 before_model/after_model 默认实现不应报错
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(NoopMiddleware::new("noop")));
+    let mut state = AgentState::new("/tmp");
+
+    chain.run_before_model(&mut state).await.unwrap();
+
+    let reasoning = Reasoning {
+        thought: String::new(),
+        final_answer: None,
+        tool_calls: vec![],
+        source_message: None,
+        usage: None,
+        request_id: None,
+        model: String::new(),
+        streamed: false,
+        stream_interruption: None,
+        stop_reason: peri_model::StopReason::EndTurn,
+    };
+    chain.run_after_model(&mut state, &reasoning).await.unwrap();
+}
+
+/// 验证 before_model 和 after_model 在同一链中独立执行：
+/// A 覆盖两个钩子，B 只覆盖 before_model，C 只覆盖 after_model。
+/// run_before_model 应触发 A+B 但跳过 C；
+/// run_after_model 应触发 A+C 但跳过 B。
+#[tokio::test]
+async fn test_mixed_before_and_after_model_in_same_chain() {
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    // A 覆盖两个钩子
+    struct BothHooks {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Middleware for BothHooks {
+        fn name(&self) -> &str {
+            "A"
+        }
+        async fn before_model(
+            &self,
+            _state: &mut dyn hook_state::BeforeModelState,
+        ) -> AgentResult<()> {
+            self.log.lock().unwrap().push("A.before_model".into());
+            Ok(())
+        }
+        async fn after_model(
+            &self,
+            _state: &mut dyn hook_state::StateView,
+            _r: &Reasoning,
+        ) -> AgentResult<()> {
+            self.log.lock().unwrap().push("A.after_model".into());
+            Ok(())
+        }
+    }
+
+    // B 只覆盖 before_model
+    struct BeforeOnly {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Middleware for BeforeOnly {
+        fn name(&self) -> &str {
+            "B"
+        }
+        async fn before_model(
+            &self,
+            _state: &mut dyn hook_state::BeforeModelState,
+        ) -> AgentResult<()> {
+            self.log.lock().unwrap().push("B.before_model".into());
+            Ok(())
+        }
+    }
+
+    // C 只覆盖 after_model
+    struct AfterOnly {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Middleware for AfterOnly {
+        fn name(&self) -> &str {
+            "C"
+        }
+        async fn after_model(
+            &self,
+            _state: &mut dyn hook_state::StateView,
+            _r: &Reasoning,
+        ) -> AgentResult<()> {
+            self.log.lock().unwrap().push("C.after_model".into());
+            Ok(())
+        }
+    }
+
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(BothHooks {
+        log: Arc::clone(&log),
+    }));
+    chain.add(Box::new(BeforeOnly {
+        log: Arc::clone(&log),
+    }));
+    chain.add(Box::new(AfterOnly {
+        log: Arc::clone(&log),
+    }));
+
+    let mut state = AgentState::new("/tmp");
+
+    // run_before_model: A + B 执行，C 不执行
+    log.lock().unwrap().clear();
+    chain.run_before_model(&mut state).await.unwrap();
+    assert_eq!(
+        log.lock().unwrap().clone(),
+        vec!["A.before_model", "B.before_model"]
+    );
+
+    // run_after_model: A + C 执行，B 不执行
+    log.lock().unwrap().clear();
+    let reasoning = Reasoning {
+        thought: "test".into(),
+        final_answer: None,
+        tool_calls: vec![],
+        source_message: None,
+        usage: None,
+        request_id: None,
+        model: String::new(),
+        streamed: false,
+        stream_interruption: None,
+        stop_reason: peri_model::StopReason::EndTurn,
+    };
+    chain.run_after_model(&mut state, &reasoning).await.unwrap();
+    assert_eq!(
+        log.lock().unwrap().clone(),
+        vec!["A.after_model", "C.after_model"]
+    );
+}
+
+/// before_model 修改 state（如添加消息），随后 after_model 应能读取该修改。
+#[tokio::test]
+async fn test_state_mutation_visible_across_hooks() {
+    let marker_id = Arc::new(Mutex::new(None::<MessageId>));
+
+    struct Writer {
+        marker_id: Arc<Mutex<Option<MessageId>>>,
+    }
+    #[async_trait]
+    impl Middleware for Writer {
+        fn name(&self) -> &str {
+            "Writer"
+        }
+        async fn before_model(
+            &self,
+            state: &mut dyn hook_state::BeforeModelState,
+        ) -> AgentResult<()> {
+            let msg =
+                BaseMessage::system(vec![ContentBlock::text("marker written by before_model")]);
+            let id = msg.id();
+            state.add_message(msg);
+            *self.marker_id.lock().unwrap() = Some(id);
+            Ok(())
+        }
+    }
+
+    struct Reader {
+        marker_id: Arc<Mutex<Option<MessageId>>>,
+    }
+    #[async_trait]
+    impl Middleware for Reader {
+        fn name(&self) -> &str {
+            "Reader"
+        }
+        async fn after_model(
+            &self,
+            state: &mut dyn hook_state::StateView,
+            _r: &Reasoning,
+        ) -> AgentResult<()> {
+            let expected_id = self.marker_id.lock().unwrap().unwrap();
+            let found = state.messages().iter().any(|m| m.id() == expected_id);
+            assert!(found, "after_model 应能看到 before_model 写入的消息");
+            Ok(())
+        }
+    }
+
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(Writer {
+        marker_id: Arc::clone(&marker_id),
+    }));
+    chain.add(Box::new(Reader {
+        marker_id: Arc::clone(&marker_id),
+    }));
+
+    let mut state = AgentState::new("/tmp");
+    chain.run_before_model(&mut state).await.unwrap();
+
+    let reasoning = Reasoning {
+        thought: String::new(),
+        final_answer: None,
+        tool_calls: vec![],
+        source_message: None,
+        usage: None,
+        request_id: None,
+        model: String::new(),
+        streamed: false,
+        stream_interruption: None,
+        stop_reason: peri_model::StopReason::EndTurn,
+    };
+    chain.run_after_model(&mut state, &reasoning).await.unwrap();
+}
+
+/// 验证 after_model 可接收含工具调用的 Reasoning（非空 vec![]）。
+#[tokio::test]
+async fn test_after_model_with_tool_calls() {
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    struct Inspector {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Middleware for Inspector {
+        fn name(&self) -> &str {
+            "Inspector"
+        }
+        async fn after_model(
+            &self,
+            _state: &mut dyn hook_state::StateView,
+            r: &Reasoning,
+        ) -> AgentResult<()> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("tool_count={}", r.tool_calls.len()));
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("has_answer={}", r.final_answer.is_some()));
+            Ok(())
+        }
+    }
+
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(Inspector {
+        log: Arc::clone(&log),
+    }));
+
+    let mut state = AgentState::new("/tmp");
+    let reasoning = Reasoning {
+        thought: "need to search".into(),
+        final_answer: Some("final answer".into()),
+        tool_calls: vec![
+            ToolCall::new("tc1", "test_read".to_string(), serde_json::json!({})),
+            ToolCall::new("tc2", "test_write".to_string(), serde_json::json!({})),
+        ],
+        source_message: None,
+        usage: None,
+        request_id: None,
+        model: "test-model".into(),
+        streamed: false,
+        stream_interruption: None,
+        stop_reason: peri_model::StopReason::ToolUse,
+    };
+    chain.run_after_model(&mut state, &reasoning).await.unwrap();
+
+    let captured = log.lock().unwrap().clone();
+    assert!(captured.contains(&"tool_count=2".to_string()));
+    assert!(captured.contains(&"has_answer=true".to_string()));
+}
+
+/// 验证仅覆盖旧钩子（before_tool、after_tool 等）的中间件
+/// 在新钩子被调用时不报错（默认空实现）。
+#[tokio::test]
+async fn test_unrelated_middleware_ignores_new_hooks() {
+    // OrderRecorder 仅覆盖 name()、before_tool()、after_tool()
+    // 其 before_model/after_model 使用默认空实现
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(OrderRecorder::new("A", Arc::clone(&log))));
+    chain.add(Box::new(OrderRecorder::new("B", Arc::clone(&log))));
+
+    let mut state = AgentState::new("/tmp");
+    // 不应报错
+    chain.run_before_model(&mut state).await.unwrap();
+
+    let reasoning = Reasoning {
+        thought: String::new(),
+        final_answer: None,
+        tool_calls: vec![],
+        source_message: None,
+        usage: None,
+        request_id: None,
+        model: String::new(),
+        streamed: false,
+        stream_interruption: None,
+        stop_reason: peri_model::StopReason::EndTurn,
+    };
+    chain.run_after_model(&mut state, &reasoning).await.unwrap();
+
+    // 确认没有日志写入（OrderRecorder 未覆盖新钩子）
+    assert!(log.lock().unwrap().is_empty());
+}
+
+// ─── first_turn_reminder：首轮一次性通知 ────────────────────────────────────
+
+/// 提供 first_turn_reminder 贡献的中间件（Some/None 均可配置）
+struct ReminderMw {
+    name: String,
+    text: Option<String>,
+}
+
+impl ReminderMw {
+    fn new(name: &str, text: Option<&str>) -> Self {
+        Self {
+            name: name.to_string(),
+            text: text.map(|s| s.to_string()),
+        }
+    }
+}
+
+#[async_trait]
+impl Middleware for ReminderMw {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn first_turn_reminder(
+        &self,
+        _state: &mut dyn hook_state::QueueState,
+    ) -> AgentResult<Option<String>> {
+        Ok(self.text.clone())
+    }
+}
+
+/// 失败中间件：first_turn_reminder 返回错误（验证短路）
+struct ReminderFailMw;
+
+#[async_trait]
+impl Middleware for ReminderFailMw {
+    fn name(&self) -> &str {
+        "ReminderFailMw"
+    }
+
+    async fn first_turn_reminder(
+        &self,
+        _state: &mut dyn hook_state::QueueState,
+    ) -> AgentResult<Option<String>> {
+        Err(AgentError::MiddlewareError {
+            middleware: "ReminderFailMw".to_string(),
+            reason: "intentional failure".to_string(),
+        })
+    }
+}
+
+/// 按链序收集非空贡献；None 与空白串跳过
+#[tokio::test]
+async fn test_first_turn_reminders_collects_in_order() {
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(ReminderMw::new("A", Some("mcp overview"))));
+    chain.add(Box::new(ReminderMw::new("B", None)));
+    chain.add(Box::new(ReminderMw::new("C", Some("   "))));
+    chain.add(Box::new(ReminderMw::new("D", Some("second notice"))));
+
+    let mut state = AgentState::new("/tmp");
+    let reminders = chain.run_first_turn_reminders(&mut state).await.unwrap();
+    assert_eq!(
+        reminders,
+        vec!["mcp overview".to_string(), "second notice".to_string()]
+    );
+}
+
+/// 空链与全部 None：返回空 vec（零噪音）
+#[tokio::test]
+async fn test_first_turn_reminders_none_skipped() {
+    let chain = MiddlewareChain::new();
+    let mut state = AgentState::new("/tmp");
+    let reminders = chain.run_first_turn_reminders(&mut state).await.unwrap();
+    assert!(reminders.is_empty());
+
+    let mut chain2 = MiddlewareChain::new();
+    chain2.add(Box::new(ReminderMw::new("A", None)));
+    chain2.add(Box::new(ReminderMw::new("B", None)));
+    let reminders = chain2.run_first_turn_reminders(&mut state).await.unwrap();
+    assert!(reminders.is_empty());
+}
+
+/// 未覆盖钩子的中间件：默认实现返回 None（不报错）
+#[tokio::test]
+async fn test_first_turn_reminder_default_none() {
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(OrderRecorder::new(
+        "A",
+        Arc::new(Mutex::new(Vec::new())),
+    )));
+    let mut state = AgentState::new("/tmp");
+    let reminders = chain.run_first_turn_reminders(&mut state).await.unwrap();
+    assert!(reminders.is_empty());
+}
+
+/// Err 短路：后续中间件不再执行
+#[tokio::test]
+async fn test_first_turn_reminder_error_short_circuits() {
+    let mut chain = MiddlewareChain::new();
+    chain.add(Box::new(ReminderMw::new("A", Some("ok"))));
+    chain.add(Box::new(ReminderFailMw));
+    chain.add(Box::new(ReminderMw::new("B", Some("never"))));
+    let mut state = AgentState::new("/tmp");
+    let result = chain.run_first_turn_reminders(&mut state).await;
+    assert!(result.is_err(), "应返回错误");
+}

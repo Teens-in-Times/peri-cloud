@@ -1,0 +1,364 @@
+use std::{fs, path::Path};
+
+use crate::{
+    hooks::types::{HookEvent, HookMatchRule, HooksConfig, RegisteredHook},
+    plugin::types::PluginManifest,
+};
+
+/// 宽松解析 hooks JSON 对象。
+///
+/// 逐事件遍历，跳过格式错误或未知的事件 key。
+/// 与 `serde_json::from_value::<HooksConfig>` 的全量反序列化不同：
+/// - 单个事件 key 未知 → 跳过该事件，其余保留
+/// - 单个事件 rules 格式错误（非数组）→ 跳过该事件，其余保留
+///
+/// 返回: Vec<(HookEvent, Vec<HookMatchRule>)>，空 Vec 表示无有效事件。
+fn parse_hooks_value_tolerant(
+    hooks_value: &serde_json::Value,
+    settings_path: &Path,
+) -> Vec<(HookEvent, Vec<HookMatchRule>)> {
+    let obj = match hooks_value.as_object() {
+        Some(obj) => obj,
+        None => return Vec::new(),
+    };
+
+    let mut result = Vec::new();
+    for (event_key, rules_value) in obj {
+        // 逐事件 key 匹配已知事件名，跳过未知事件
+        let event = match HookEvent::parse(event_key) {
+            Some(e) => e,
+            None => {
+                tracing::warn!(
+                    "Unknown hook event '{}' in {}, skipping",
+                    event_key,
+                    settings_path.display()
+                );
+                continue;
+            }
+        };
+
+        // 逐事件解析规则数组
+        match serde_json::from_value::<Vec<HookMatchRule>>(rules_value.clone()) {
+            Ok(rules) => {
+                if !rules.is_empty() {
+                    result.push((event, rules));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse rules for event '{}' in {}: {}, skipping (1 event lost)",
+                    event_key,
+                    settings_path.display(),
+                    e
+                );
+                continue;
+            }
+        }
+    }
+
+    result
+}
+
+///
+/// Priority:
+/// 1. `hooks/hooks.json` file in plugin install directory
+/// 2. `hooks` field in `plugin.json` manifest
+pub(crate) fn extract_hooks(manifest: &PluginManifest, install_path: &Path) -> Option<HooksConfig> {
+    // Priority 1: hooks/hooks.json file
+    let hooks_file = install_path.join("hooks").join("hooks.json");
+    let content = match fs::read_to_string(&hooks_file) {
+        Ok(content) => content,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %hooks_file.display(),
+                    error_kind = ?error.kind(),
+                    "无法读取插件 hooks 文件，回退到 manifest hooks"
+                );
+            }
+            return manifest.hooks.clone();
+        }
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(&content).and_then(|mut value| {
+        // Claude Code 文件带 hooks 包装；保留旧版直接事件映射格式。
+        // 显式但无效的包装字段必须报错，不能回退为旧格式或空配置。
+        let hooks = value
+            .get_mut("hooks")
+            .map(serde_json::Value::take)
+            .unwrap_or(value);
+        serde_json::from_value::<HooksConfig>(hooks)
+    });
+    match parsed {
+        Ok(config) => return Some(config),
+        Err(error) => {
+            // serde 错误文本可能包含命令、URL 或凭据，只记录错误类别与位置。
+            tracing::warn!(
+                path = %hooks_file.display(),
+                category = ?error.classify(),
+                line = error.line(),
+                column = error.column(),
+                "插件 hooks 文件解析失败，回退到 manifest hooks"
+            );
+        }
+    }
+
+    // Priority 2: plugin.json hooks field
+    manifest.hooks.clone()
+}
+
+/// Load hooks from `~/.claude/settings.json` global `hooks` field.
+///
+/// Returns a list of `RegisteredHook` with `plugin_name = "settings.json"`.
+///
+/// 目录经 [`crate::plugin::claude_home`] 解析（HOME 优先的唯一权威），与
+/// [`is_user_settings_path`] 的排除判定同源。
+pub fn load_global_settings_hooks() -> Vec<RegisteredHook> {
+    let claude_dir = crate::plugin::claude_home();
+    let settings_path = claude_dir.join("settings.json");
+    if !settings_path.exists() {
+        tracing::warn!("No settings.json at {}", settings_path.display());
+        return Vec::new();
+    }
+
+    tracing::info!("Reading hooks from {}", settings_path.display());
+
+    let content = match fs::read_to_string(&settings_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to read {}: {}", settings_path.display(), e);
+            return Vec::new();
+        }
+    };
+
+    let value: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Failed to parse {}: {}", settings_path.display(), e);
+            return Vec::new();
+        }
+    };
+
+    let hooks_value = match value.get("hooks") {
+        Some(h) if h.is_object() => h,
+        None => {
+            tracing::warn!("No 'hooks' field in {}", settings_path.display());
+            return Vec::new();
+        }
+        Some(h) => {
+            tracing::warn!(
+                "'hooks' field in {} is not an object (type: {})",
+                settings_path.display(),
+                if h.is_array() {
+                    "array"
+                } else if h.is_string() {
+                    "string"
+                } else if h.is_null() {
+                    "null"
+                } else {
+                    "other"
+                }
+            );
+            return Vec::new();
+        }
+    };
+
+    let event_rules = parse_hooks_value_tolerant(hooks_value, &settings_path);
+    let event_count = event_rules.len();
+
+    let mut hooks = Vec::new();
+    for (event, rules) in event_rules {
+        for rule in rules {
+            for hook_def in rule.hooks {
+                hooks.push(RegisteredHook {
+                    hook: hook_def.clone(),
+                    event: event.clone(),
+                    matcher: rule
+                        .matcher
+                        .clone()
+                        .or_else(|| hook_def.get_matcher().cloned()),
+                    plugin_name: "settings.json".to_string(),
+                    plugin_id: "settings.global".to_string(),
+                    plugin_root: claude_dir.clone(),
+                    plugin_data_dir: claude_dir.clone(),
+                    plugin_options: std::collections::HashMap::new(),
+                });
+            }
+        }
+    }
+
+    tracing::info!(
+        "Loaded {} hooks from ~/.claude/settings.json ({} events)",
+        hooks.len(),
+        event_count
+    );
+
+    hooks
+}
+
+/// Load hooks from `{cwd}/.claude/settings.local.json` `hooks` field.
+///
+/// Returns a list of `RegisteredHook` with `plugin_name = "settings.local.json"`.
+pub fn load_settings_local_hooks(cwd: &str) -> Vec<RegisteredHook> {
+    let settings_path = Path::new(cwd).join(".claude").join("settings.local.json");
+    if !settings_path.exists() {
+        tracing::debug!("No settings.local.json at {}", settings_path.display());
+        return Vec::new();
+    }
+
+    let content = match fs::read_to_string(&settings_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to read {}: {}", settings_path.display(), e);
+            return Vec::new();
+        }
+    };
+
+    // Parse the top-level JSON to extract the `hooks` field
+    let value: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Failed to parse {}: {}", settings_path.display(), e);
+            return Vec::new();
+        }
+    };
+
+    let hooks_value = match value.get("hooks") {
+        Some(h) if h.is_object() => h,
+        _ => return Vec::new(),
+    };
+
+    let event_rules = parse_hooks_value_tolerant(hooks_value, &settings_path);
+    let event_count = event_rules.len();
+
+    let mut hooks = Vec::new();
+    for (event, rules) in event_rules {
+        for rule in rules {
+            for hook_def in rule.hooks {
+                hooks.push(RegisteredHook {
+                    hook: hook_def.clone(),
+                    event: event.clone(),
+                    matcher: rule
+                        .matcher
+                        .clone()
+                        .or_else(|| hook_def.get_matcher().cloned()),
+                    plugin_name: "settings.local.json".to_string(),
+                    plugin_id: "settings.local".to_string(),
+                    plugin_root: Path::new(cwd).to_path_buf(),
+                    plugin_data_dir: Path::new(cwd).join(".claude"),
+                    plugin_options: std::collections::HashMap::new(),
+                });
+            }
+        }
+    }
+
+    tracing::info!(
+        "Loaded {} hooks from settings.local.json ({} events)",
+        hooks.len(),
+        event_count
+    );
+
+    hooks
+}
+
+/// 从 `{cwd}/.claude/settings.json` 加载项目级 hooks 配置。
+///
+/// 返回 `RegisteredHook` 列表，`plugin_name = "project-settings.json"`。
+///
+/// cwd 为用户主目录时（在 `~` 下启动 peri），`{cwd}/.claude/settings.json` 就是
+/// 用户级 `~/.claude/settings.json` 本身：该场景不存在「用户级 + 项目级」两层，
+/// 直接跳过——否则同一份 hooks 会注册成 global 与 project 两组而重复执行。
+pub fn load_settings_project_hooks(cwd: &str) -> Vec<RegisteredHook> {
+    let settings_path = Path::new(cwd).join(".claude").join("settings.json");
+    if is_user_settings_path(&settings_path) {
+        tracing::debug!(
+            "Skipping project hooks: {} is the user-level settings file",
+            settings_path.display()
+        );
+        return Vec::new();
+    }
+    if !settings_path.exists() {
+        tracing::debug!("No settings.json at {}", settings_path.display());
+        return Vec::new();
+    }
+
+    let content = match fs::read_to_string(&settings_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to read {}: {}", settings_path.display(), e);
+            return Vec::new();
+        }
+    };
+
+    // 解析顶层 JSON，提取 `hooks` 字段
+    let value: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Failed to parse {}: {}", settings_path.display(), e);
+            return Vec::new();
+        }
+    };
+
+    let hooks_value = match value.get("hooks") {
+        Some(h) if h.is_object() => h,
+        _ => return Vec::new(),
+    };
+
+    let event_rules = parse_hooks_value_tolerant(hooks_value, &settings_path);
+    let event_count = event_rules.len();
+
+    let mut hooks = Vec::new();
+    for (event, rules) in event_rules {
+        for rule in rules {
+            for hook_def in rule.hooks {
+                hooks.push(RegisteredHook {
+                    hook: hook_def.clone(),
+                    event: event.clone(),
+                    matcher: rule
+                        .matcher
+                        .clone()
+                        .or_else(|| hook_def.get_matcher().cloned()),
+                    plugin_name: "project-settings.json".to_string(),
+                    plugin_id: "settings.project".to_string(),
+                    plugin_root: Path::new(cwd).to_path_buf(),
+                    plugin_data_dir: Path::new(cwd).join(".claude"),
+                    plugin_options: std::collections::HashMap::new(),
+                });
+            }
+        }
+    }
+
+    tracing::info!(
+        "Loaded {} hooks from project settings.json ({} events)",
+        hooks.len(),
+        event_count
+    );
+
+    hooks
+}
+
+/// `path` 是否就是用户级 `~/.claude/settings.json`。无法确定主目录时视为不是。
+///
+/// 主目录解析须与 `load_global_settings_hooks` 同源（[`crate::plugin::user_home`]，
+/// HOME 优先），否则排除会认错文件。
+fn is_user_settings_path(path: &Path) -> bool {
+    is_user_settings_path_under(path, &crate::plugin::user_home())
+}
+
+/// 同上判定，但主目录由调用方给出：字面相同，或经符号链接指向同一文件
+/// （macOS `$HOME` 为链接、`/var` → `/private/var` 等）。
+///
+/// 拆出该入口让排除规则能直接以显式主目录验证，不必依赖进程环境。
+fn is_user_settings_path_under(path: &Path, home: &Path) -> bool {
+    let user_path = home.join(".claude").join("settings.json");
+    if path == user_path {
+        return true;
+    }
+    matches!(
+        (std::fs::canonicalize(path), std::fs::canonicalize(&user_path)),
+        (Ok(path), Ok(user_path)) if path == user_path
+    )
+}
+
+#[cfg(test)]
+#[path = "loader_test.rs"]
+mod tests;

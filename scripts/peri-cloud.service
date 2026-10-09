@@ -1,0 +1,27 @@
+[Unit]
+Description=Peri personal cloud Agent and gateways
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=peri-cloud
+Group=peri-cloud
+WorkingDirectory=/var/lib/peri-cloud
+EnvironmentFile=/etc/peri-cloud/service.env
+ExecStart=/opt/peri-cloud/current/peri-cloud-host --config /etc/peri-cloud/host.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=infinity
+KillSignal=SIGTERM
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/peri-cloud
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

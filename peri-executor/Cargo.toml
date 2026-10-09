@@ -1,0 +1,40 @@
+[package]
+name = "peri-executor"
+version.workspace = true
+edition.workspace = true
+description = "Persistent native tool executor for Windows and Linux devices"
+license = "Apache-2.0"
+
+[dependencies]
+peri-acp-types = { path = "../peri-acp-types" }
+peri-tool-runtime = { path = "../peri-tool-runtime" }
+peri-process = { path = "../peri-process" }
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+fs2 = "0.4"
+subtle = "2"
+reqwest.workspace = true
+url.workspace = true
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "peri-executor"
+path = "src/main.rs"

@@ -1,0 +1,88 @@
+//! [`run_session_loop`] 的 helper 子流程（L5：自 `peri-acp/src/host/exec/executor_helpers.rs`
+//! 物理迁入，ACP 侧保留 re-export 桥）。
+//!
+//! 本文件承载以下四个被 orchestrator 串起来的子流程：
+//!
+//! - [`intercept_immediate_command`]：slash 命令拦截（已注册命令直接返回，不构建 agent）
+//! - [`spawn_event_pump`]：后台事件泵 + Langfuse tracer（经注入闭包）
+//! - [`build_and_execute_agent_v2`]：v2 stages 装配与 ReAct 循环驱动（9 个 phase）
+//! - [`collect_result`]：close channel + 等待 pump drain + recall 提取
+//!
+//! 共享类型（原 ACP `executor.rs` 定义）随本文件迁入：[`ExecOutcome`]。
+//!
+//! # 依赖反转（§0）
+//!
+//! 本模块只依赖 peri-acp-types / peri-model / crate 内部：
+//! - 事件发射经 [`EventPublisher`] 端口（ACP/Controller 适配层实现），
+//!   事件消费经 [`EventSubscriber`] 端口（包装 Controller 订阅）
+//! - 命令拦截经注入的 `command_lookup` 闭包（ACP 协议面注册表）+ 注入的
+//!   `compact_config_loader` 闭包（`load_compact_config` 语义留在 ACP）
+//! - stage 装配经注入的 `StageBuildFn`（ACP 侧从 `SessionContext` 投影
+//!   `StageBuildInput` 并补齐注入面）；Langfuse tracer 由 ACP 闭包捕获，
+//!   本模块不触碰观测实现
+//! - cancel cascade 经注入的 `cancel_cascade` 闭包（ACP 侧 `SessionManager`）
+//!
+//! # Cancel 语义保持
+//!
+//! - `intercept_immediate_command` 显式优先处理 cancel；compact 已确认提交时
+//!   恢复 durable history，提交结果不确定时返回 Internal 并要求冷恢复。
+//!   命令返回路径均发送 `push_done`。
+//! - `build_and_execute_agent_v2` 末尾的 cancel cascade 仍在循环失败后触发，
+//!   且与 failure / `TurnEnded` 共用一次 post-flush cancel 采样的
+//!   单一终态分类；顺序保持 failure 事件 → `TurnEnded` → cascade
+//! - `collect_result` 严格 "close → wait_for_pump(10s timeout) → drain recall"，
+//!   顺序不变（pump 必须先 close sender 才能退出 recv 循环）
+
+use peri_acp_types::command::PromptStopReason;
+use peri_acp_types::session::ExecutionFailure;
+
+use crate::agent::state::AgentState;
+
+mod collect;
+mod event_pump;
+mod intercept;
+mod v2_execute;
+
+pub use collect::{close_channel, collect_result, wait_for_pump, CollectRequest};
+pub use event_pump::{spawn_event_pump, LangfuseEndFn, PumpHandle, SpawnPumpRequest};
+pub use intercept::{
+    emit_command_feedback, intercept_immediate_command, CommandLookupFn, InterceptOutcome,
+    InterceptRequest,
+};
+pub use v2_execute::{
+    build_and_execute_agent_v2, ForwarderLauncherFn, StageBuildFn, StageBuildRequest,
+    V2ExecuteRequest,
+};
+
+// 普通执行与 Immediate 命令共用 done 协议投影，避免响应已取消而通知仍正常完成。
+fn done_stop_reason(reason: PromptStopReason) -> &'static str {
+    match reason {
+        PromptStopReason::EndTurn => "end_turn",
+        PromptStopReason::Cancelled => "cancelled",
+        PromptStopReason::MaxTurnRequests => "max_turn_requests",
+        PromptStopReason::MaxTokens => "max_tokens",
+    }
+}
+
+// ── 共享类型（L5：自 ACP executor.rs 迁入）──────────────────────────────────
+
+/// Agent 执行后的最终输出（state + 停止原因）。
+pub struct ExecOutcome {
+    pub ok: bool,
+    pub stop_reason: PromptStopReason,
+    /// 致命执行失败（None = 正常终止 / 用户取消 / 最大轮数；Some = 真正
+    /// fatal 的 `LoopResult::Error`，见
+    /// spec/issues/2026-08-18-acp-error-handler.md Commit 1）。
+    pub failure: Option<ExecutionFailure>,
+    /// A Full Compact committed during this turn and replaced prior visible history.
+    pub history_replaced_by_compaction: bool,
+    /// Canonical transcript snapshot captured after the persistence barrier.
+    pub persisted_payloads: Vec<peri_acp_types::store::PersistedPayload>,
+    /// Durable state could not be rolled back or verified; host must invalidate the session.
+    pub persistence_inconsistent: bool,
+    pub agent_state: AgentState,
+}
+
+#[cfg(test)]
+#[path = "executor_helpers_test.rs"]
+mod tests;

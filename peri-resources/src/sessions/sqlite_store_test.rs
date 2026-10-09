@@ -1,0 +1,1490 @@
+//! Tests for sqlite_store
+
+use std::collections::BTreeMap;
+use std::error::Error as _;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use sqlx::Connection;
+
+use tempfile::tempdir;
+
+use super::*;
+
+async fn make_store() -> (SqliteThreadStore, tempfile::TempDir) {
+    let dir = tempdir().unwrap();
+    let store = SqliteThreadStore::new(dir.path().join("test.db"))
+        .await
+        .unwrap();
+    (store, dir)
+}
+
+#[tokio::test]
+async fn test_sqlite_store_flush_persistence_makes_messages_and_flags_readable() {
+    let (store, _dir) = make_store().await;
+    let thread_id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    let store: Arc<dyn ThreadStore> = Arc::new(store);
+
+    // 原测试经 MessageTranscript（Agent 层）追加/标记后 flush 落库。
+    // 随迁后 MessageTranscript 不可依赖（peri-resources 不依赖 peri-agent），
+    // 以等价 store API 构造；断言逐字节保留。
+    let message = BaseMessage::human("durable message");
+    let message_id = message.id();
+    store.append_messages(&thread_id, &[message]).await.unwrap();
+    store
+        .update_message_flags(
+            &message_id,
+            &MessageFlags {
+                truncated: true,
+                excluded: true,
+                projection: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let messages = store.load_messages(&thread_id).await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id(), message_id);
+    assert_eq!(messages[0].content(), "durable message");
+
+    let flags = store.load_message_flags(&thread_id).await.unwrap();
+    assert!(flags[&message_id].truncated);
+    assert!(flags[&message_id].excluded);
+}
+
+#[tokio::test]
+async fn test_delete_messages_removes_exact_turn_ids_and_preserves_ancestor() {
+    let (store, _dir) = make_store().await;
+    let id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    let messages = vec![
+        BaseMessage::human("ancestor"),
+        BaseMessage::ai("first durable batch"),
+        BaseMessage::human("later batch"),
+    ];
+    store.append_messages(&id, &messages).await.unwrap();
+
+    store
+        .delete_messages(&id, &[messages[1].id(), messages[2].id()])
+        .await
+        .unwrap();
+
+    let loaded = store.load_messages(&id).await.unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].id(), messages[0].id());
+    assert_eq!(store.load_meta(&id).await.unwrap().message_count, 1);
+}
+
+#[tokio::test]
+async fn test_create_append_load() {
+    let (store, _dir) = make_store().await;
+    let meta = ThreadMeta::new("/tmp");
+    let id = store.create_thread(meta).await.unwrap();
+
+    let msgs = vec![BaseMessage::human("Hello"), BaseMessage::ai("Hi there")];
+    store.append_messages(&id, &msgs).await.unwrap();
+
+    let loaded = store.load_messages(&id).await.unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded[0].content(), "Hello");
+    assert_eq!(loaded[1].content(), "Hi there");
+}
+
+#[tokio::test]
+async fn test_frozen_snapshot_roundtrip_and_legacy_null() {
+    let (store, _dir) = make_store().await;
+    let id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    let snapshot = r#"{"version":1,"marker":"sqlite-frozen-prefix"}"#;
+
+    assert!(store.load_frozen_snapshot(&id).await.unwrap().is_none());
+    assert!(store
+        .store_frozen_snapshot_if_absent(&id, snapshot)
+        .await
+        .unwrap());
+    assert!(
+        !store
+            .store_frozen_snapshot_if_absent(&id, r#"{"version":2}"#)
+            .await
+            .unwrap(),
+        "frozen snapshot is write-once"
+    );
+
+    assert_eq!(
+        store.load_frozen_snapshot(&id).await.unwrap().as_deref(),
+        Some(snapshot)
+    );
+}
+
+#[tokio::test]
+async fn test_frozen_snapshot_concurrent_backfill_has_one_winner() {
+    let (store, _dir) = make_store().await;
+    let id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    let first = r#"{"version":1,"candidate":"first"}"#;
+    let second = r#"{"version":1,"candidate":"second"}"#;
+
+    let (first_won, second_won) = tokio::join!(
+        store.store_frozen_snapshot_if_absent(&id, first),
+        store.store_frozen_snapshot_if_absent(&id, second),
+    );
+    let first_won = first_won.unwrap();
+    let second_won = second_won.unwrap();
+    assert_ne!(first_won, second_won, "exactly one backfill must win");
+    let stored = store.load_frozen_snapshot(&id).await.unwrap().unwrap();
+    assert_eq!(stored, if first_won { first } else { second });
+}
+
+#[tokio::test]
+async fn test_list_threads_order() {
+    let (store, _dir) = make_store().await;
+
+    let m1 = ThreadMeta::new("/a");
+    let id1 = store.create_thread(m1).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let m2 = ThreadMeta::new("/b");
+    let id2 = store.create_thread(m2).await.unwrap();
+
+    // 给 id2 追加消息，更新 updated_at
+    store
+        .append_messages(&id2, &[BaseMessage::human("msg")])
+        .await
+        .unwrap();
+
+    let list = store.list_threads().await.unwrap();
+    assert_eq!(list.len(), 2);
+    // id2 updated_at 更新，应排在第一位
+    assert_eq!(list[0].id, id2);
+    assert_eq!(list[1].id, id1);
+}
+
+#[tokio::test]
+async fn test_list_thread_entries_filters_by_cwd_and_omits_hidden_and_empty_threads() {
+    let (store, _dir) = make_store().await;
+
+    let visible_id = store
+        .create_thread(ThreadMeta::new("/workspace"))
+        .await
+        .unwrap();
+    store
+        .append_messages(&visible_id, &[BaseMessage::human("visible")])
+        .await
+        .unwrap();
+
+    let empty_id = store
+        .create_thread(ThreadMeta::new("/workspace"))
+        .await
+        .unwrap();
+
+    let mut hidden = ThreadMeta::new("/workspace");
+    hidden.hidden = true;
+    let hidden_id = store.create_thread(hidden).await.unwrap();
+    store
+        .append_messages(&hidden_id, &[BaseMessage::human("hidden")])
+        .await
+        .unwrap();
+
+    let other_id = store
+        .create_thread(ThreadMeta::new("/other"))
+        .await
+        .unwrap();
+    store
+        .append_messages(&other_id, &[BaseMessage::human("other")])
+        .await
+        .unwrap();
+
+    let summaries = store.list_thread_entries("/workspace").await.unwrap();
+
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].id, visible_id);
+    assert_eq!(summaries[0].cwd, "/workspace");
+    assert_eq!(summaries[0].message_count, 1);
+    assert_ne!(summaries[0].id, empty_id);
+    assert_ne!(summaries[0].id, hidden_id);
+    assert_ne!(summaries[0].id, other_id);
+}
+
+#[tokio::test]
+async fn test_list_thread_entries_orders_by_updated_at_descending() {
+    let (store, _dir) = make_store().await;
+
+    let first_id = store
+        .create_thread(ThreadMeta::new("/workspace"))
+        .await
+        .unwrap();
+    store
+        .append_messages(&first_id, &[BaseMessage::human("first")])
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let second_id = store
+        .create_thread(ThreadMeta::new("/workspace"))
+        .await
+        .unwrap();
+    store
+        .append_messages(&second_id, &[BaseMessage::human("second")])
+        .await
+        .unwrap();
+
+    let summaries = store.list_thread_entries("/workspace").await.unwrap();
+
+    assert_eq!(summaries.len(), 2);
+    assert_eq!(summaries[0].id, second_id);
+    assert_eq!(summaries[1].id, first_id);
+}
+
+#[tokio::test]
+async fn test_delete_thread_cascade() {
+    let (store, _dir) = make_store().await;
+    let meta = ThreadMeta::new("/tmp");
+    let id = store.create_thread(meta).await.unwrap();
+    store
+        .append_messages(&id, &[BaseMessage::human("msg")])
+        .await
+        .unwrap();
+
+    store.delete_thread(&id).await.unwrap();
+
+    // 消息应该被级联删除
+    let msgs = store.load_messages(&id).await;
+    // 线程不存在时 load_messages 应返回空（因为 SELECT 无结果）
+    assert!(msgs.unwrap().is_empty());
+
+    // 元数据应不存在
+    let meta_result = store.load_meta(&id).await;
+    assert!(meta_result.is_err());
+}
+
+/// [M1] delete_thread 必须级联删除 hidden 子 agent 线程树（孤儿数据防护）。
+#[tokio::test]
+async fn test_delete_thread_cascades_child_thread_tree() {
+    let (store, _dir) = make_store().await;
+
+    // 父 → 子 → 孙 三层线程树（子 agent 链，hidden=true）
+    let parent_id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    let mut child_meta = ThreadMeta::new("/tmp");
+    child_meta.parent_thread_id = Some(parent_id.clone());
+    child_meta.hidden = true;
+    let child_id = store.create_thread(child_meta).await.unwrap();
+    let mut grand_meta = ThreadMeta::new("/tmp");
+    grand_meta.parent_thread_id = Some(child_id.clone());
+    grand_meta.hidden = true;
+    let grand_id = store.create_thread(grand_meta).await.unwrap();
+
+    // 父/子线程各写入消息
+    store
+        .append_messages(&parent_id, &[BaseMessage::human("parent msg")])
+        .await
+        .unwrap();
+    store
+        .append_messages(&child_id, &[BaseMessage::human("child msg")])
+        .await
+        .unwrap();
+
+    store.delete_thread(&parent_id).await.unwrap();
+
+    for tid in [&parent_id, &child_id, &grand_id] {
+        assert!(
+            store.load_meta(tid).await.is_err(),
+            "线程 {tid} 应随父线程级联删除"
+        );
+    }
+    // 消息随 threads 行 FK ON DELETE CASCADE 一并清除
+    assert!(
+        store.load_messages(&child_id).await.unwrap().is_empty(),
+        "子线程消息应级联删除"
+    );
+    // list_threads 不再含任何残留
+    let remaining = store.list_threads().await.unwrap();
+    assert!(
+        !remaining
+            .iter()
+            .any(|m| m.id == parent_id || m.id == child_id || m.id == grand_id),
+        "线程树删除后不应有任何残留"
+    );
+}
+
+#[tokio::test]
+async fn test_message_order_after_multiple_appends() {
+    let (store, _dir) = make_store().await;
+    let meta = ThreadMeta::new("/tmp");
+    let id = store.create_thread(meta).await.unwrap();
+
+    store
+        .append_messages(&id, &[BaseMessage::human("msg1")])
+        .await
+        .unwrap();
+    store
+        .append_messages(&id, &[BaseMessage::ai("reply1")])
+        .await
+        .unwrap();
+    store
+        .append_messages(&id, &[BaseMessage::human("msg2")])
+        .await
+        .unwrap();
+
+    let loaded = store.load_messages(&id).await.unwrap();
+    assert_eq!(loaded.len(), 3);
+    assert_eq!(loaded[0].content(), "msg1");
+    assert_eq!(loaded[1].content(), "reply1");
+    assert_eq!(loaded[2].content(), "msg2");
+}
+
+#[tokio::test]
+async fn test_title_auto_set() {
+    let (store, _dir) = make_store().await;
+    let meta = ThreadMeta::new("/tmp");
+    let id = store.create_thread(meta).await.unwrap();
+
+    store
+        .append_messages(&id, &[BaseMessage::human("这是一条测试消息")])
+        .await
+        .unwrap();
+
+    let loaded_meta = store.load_meta(&id).await.unwrap();
+    assert!(loaded_meta.title.is_some());
+    assert!(loaded_meta.title.unwrap().contains("这是一条测试消息"));
+}
+
+#[tokio::test]
+async fn test_update_title() {
+    let (store, _dir) = make_store().await;
+    let meta = ThreadMeta::new("/tmp");
+    let id = store.create_thread(meta).await.unwrap();
+
+    store.update_title(&id, "new title").await.unwrap();
+    let loaded = store.load_meta(&id).await.unwrap();
+    assert_eq!(loaded.title.as_deref(), Some("new title"));
+}
+
+#[tokio::test]
+async fn test_update_title_updates_timestamp() {
+    let (store, _dir) = make_store().await;
+    let meta = ThreadMeta::new("/tmp");
+    let id = store.create_thread(meta).await.unwrap();
+
+    let before = store.load_meta(&id).await.unwrap().updated_at;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    store.update_title(&id, "updated").await.unwrap();
+    let after = store.load_meta(&id).await.unwrap().updated_at;
+    assert!(
+        after > before,
+        "updated_at should be newer after update_title"
+    );
+}
+
+// ── 新增：子线程创建和列表 ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_child_thread_create_and_list() {
+    let (store, _dir) = make_store().await;
+    // 创建父线程
+    let parent_meta = ThreadMeta::new("/project");
+    let parent_id = store.create_thread(parent_meta).await.unwrap();
+
+    // 创建子线程
+    let mut child_meta = ThreadMeta::new("/project");
+    child_meta.parent_thread_id = Some(parent_id.clone());
+    child_meta.hidden = true;
+    let child_id = store.create_thread(child_meta).await.unwrap();
+
+    // list_child_threads 应返回子线程
+    let children = store.list_child_threads(&parent_id).await.unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].id, child_id);
+    assert_eq!(
+        children[0].parent_thread_id.as_deref(),
+        Some(parent_id.as_str())
+    );
+
+    // 子线程的 meta 应正确读取 parent_thread_id 和 hidden
+    let child_meta_loaded = store.load_meta(&child_id).await.unwrap();
+    assert_eq!(
+        child_meta_loaded.parent_thread_id.as_deref(),
+        Some(parent_id.as_str())
+    );
+    assert!(child_meta_loaded.hidden);
+}
+
+#[tokio::test]
+async fn test_session_threads_recursive() {
+    let (store, _dir) = make_store().await;
+    // L1 根线程
+    let l1_id = store.create_thread(ThreadMeta::new("/root")).await.unwrap();
+    // L2 子线程
+    let mut l2_meta = ThreadMeta::new("/root");
+    l2_meta.parent_thread_id = Some(l1_id.clone());
+    l2_meta.hidden = true;
+    let l2_id = store.create_thread(l2_meta).await.unwrap();
+    // L3 孙线程
+    let mut l3_meta = ThreadMeta::new("/root");
+    l3_meta.parent_thread_id = Some(l2_id.clone());
+    l3_meta.hidden = true;
+    let l3_id = store.create_thread(l3_meta).await.unwrap();
+
+    // 从 L1 根出发应递归获取全部 3 级
+    let session = store.list_session_threads(&l1_id).await.unwrap();
+    assert_eq!(session.len(), 3);
+    let ids: Vec<&str> = session.iter().map(|m| m.id.as_str()).collect();
+    assert!(ids.contains(&l1_id.as_str()));
+    assert!(ids.contains(&l2_id.as_str()));
+    assert!(ids.contains(&l3_id.as_str()));
+}
+
+#[tokio::test]
+async fn test_update_thread_status() {
+    use peri_acp_types::thread::AgentStatus;
+    let (store, _dir) = make_store().await;
+    let id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+
+    // 默认 active
+    let meta = store.load_meta(&id).await.unwrap();
+    assert_eq!(meta.agent_status, AgentStatus::Active);
+
+    // 更新为 done
+    store.update_thread_status(&id, "done").await.unwrap();
+    let meta = store.load_meta(&id).await.unwrap();
+    assert_eq!(meta.agent_status, AgentStatus::Done);
+
+    // 更新为 error
+    store.update_thread_status(&id, "error").await.unwrap();
+    let meta = store.load_meta(&id).await.unwrap();
+    assert_eq!(meta.agent_status, AgentStatus::Error);
+}
+
+#[tokio::test]
+async fn test_update_thread_status_rejects_illegal_string() {
+    // 关键约束：非法状态字符串不应静默 fallback，必须返回错误
+    let (store, _dir) = make_store().await;
+    let id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    let result = store.update_thread_status(&id, "running").await;
+    assert!(result.is_err(), "非法 agent_status 字符串应被拒绝");
+    // 状态保持不变（active）
+    let meta = store.load_meta(&id).await.unwrap();
+    assert_eq!(
+        meta.agent_status,
+        peri_acp_types::thread::AgentStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn test_load_context_without_parent() {
+    let (store, _dir) = make_store().await;
+    let id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+
+    let msgs = vec![
+        BaseMessage::human("hello"),
+        BaseMessage::ai("world"),
+        BaseMessage::human("how are you"),
+    ];
+    store.append_messages(&id, &msgs).await.unwrap();
+
+    // 无父线程，load_context 应返回自身全部消息
+    let ctx = store.load_context(&id).await.unwrap();
+    assert_eq!(ctx.len(), 3);
+    assert_eq!(ctx[0].content(), "hello");
+    assert_eq!(ctx[1].content(), "world");
+    assert_eq!(ctx[2].content(), "how are you");
+
+    // 第二次调用应命中缓存（cached_context 已写入）
+    let ctx2 = store.load_context(&id).await.unwrap();
+    assert_eq!(ctx2.len(), 3);
+}
+
+#[tokio::test]
+async fn test_load_context_with_snapshot() {
+    let (store, _dir) = make_store().await;
+    // 父线程 + 3 条消息
+    let parent_id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    let parent_msgs = vec![
+        BaseMessage::human("p1"),
+        BaseMessage::ai("p2"),
+        BaseMessage::human("p3"),
+    ];
+    store
+        .append_messages(&parent_id, &parent_msgs)
+        .await
+        .unwrap();
+
+    // 快照截止到第 2 条消息（p2）的 message_id
+    let parent_loaded = store.load_messages(&parent_id).await.unwrap();
+    let snapshot_msg_id = parent_loaded[1].id().as_uuid().to_string();
+
+    // 创建子线程
+    let mut child_meta = ThreadMeta::new("/tmp");
+    child_meta.parent_thread_id = Some(parent_id.clone());
+    child_meta.snapshot_at_message_id = Some(snapshot_msg_id);
+    child_meta.hidden = true;
+    let child_id = store.create_thread(child_meta).await.unwrap();
+
+    let child_msgs = vec![BaseMessage::human("c1"), BaseMessage::ai("c2")];
+    store.append_messages(&child_id, &child_msgs).await.unwrap();
+
+    // load_context 应返回：父线程前 2 条 + 子线程全部 2 条 = 4 条
+    let ctx = store.load_context(&child_id).await.unwrap();
+    assert_eq!(ctx.len(), 4, "应包含父线程快照 2 条 + 子线程 2 条");
+    assert_eq!(ctx[0].content(), "p1");
+    assert_eq!(ctx[1].content(), "p2");
+    assert_eq!(ctx[2].content(), "c1");
+    assert_eq!(ctx[3].content(), "c2");
+}
+
+#[tokio::test]
+async fn test_cached_context_invalidation() {
+    let (store, _dir) = make_store().await;
+    let id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    store
+        .append_messages(&id, &[BaseMessage::human("hello")])
+        .await
+        .unwrap();
+
+    // 首次加载产生缓存
+    let ctx = store.load_context(&id).await.unwrap();
+    assert_eq!(ctx.len(), 1);
+
+    // 验证缓存已写入
+    let meta = store.load_meta(&id).await.unwrap();
+    assert!(meta.cached_context.is_some());
+
+    // 清除缓存
+    store.invalidate_context_cache(&id).await.unwrap();
+    let meta = store.load_meta(&id).await.unwrap();
+    assert!(
+        meta.cached_context.is_none(),
+        "清除缓存后 cached_context 应为 None"
+    );
+
+    // 再次加载仍然正常工作（从零重建）
+    let ctx2 = store.load_context(&id).await.unwrap();
+    assert_eq!(ctx2.len(), 1);
+    assert_eq!(ctx2[0].content(), "hello");
+}
+
+#[tokio::test]
+async fn test_list_threads_excludes_hidden() {
+    let (store, _dir) = make_store().await;
+
+    // 创建普通线程
+    let visible_id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+
+    // 创建 hidden 的子 agent 线程
+    let mut hidden_meta = ThreadMeta::new("/tmp");
+    hidden_meta.parent_thread_id = Some(visible_id.clone());
+    hidden_meta.hidden = true;
+    let _hidden_id = store.create_thread(hidden_meta).await.unwrap();
+
+    // list_threads 只返回非 hidden 的线程
+    let list = store.list_threads().await.unwrap();
+    assert_eq!(list.len(), 1, "hidden 线程不应出现在列表中");
+    assert_eq!(list[0].id, visible_id);
+}
+
+#[tokio::test]
+async fn test_load_context_three_level_nesting() {
+    let (store, _dir) = make_store().await;
+
+    // L1 根线程：3 条消息，快照到第 2 条
+    let l1_id = store
+        .create_thread(ThreadMeta::new("/project"))
+        .await
+        .unwrap();
+    let l1_msgs = vec![
+        BaseMessage::human("L1-a"),
+        BaseMessage::ai("L1-b"),
+        BaseMessage::human("L1-c"),
+    ];
+    store.append_messages(&l1_id, &l1_msgs).await.unwrap();
+    let l1_loaded = store.load_messages(&l1_id).await.unwrap();
+    let l1_snap = l1_loaded[1].id().as_uuid().to_string();
+
+    // L2 子线程：2 条消息，快照到第 1 条
+    let mut l2_meta = ThreadMeta::new("/project");
+    l2_meta.parent_thread_id = Some(l1_id.clone());
+    l2_meta.snapshot_at_message_id = Some(l1_snap);
+    l2_meta.hidden = true;
+    let l2_id = store.create_thread(l2_meta).await.unwrap();
+    let l2_msgs = vec![BaseMessage::human("L2-a"), BaseMessage::ai("L2-b")];
+    store.append_messages(&l2_id, &l2_msgs).await.unwrap();
+    let l2_loaded = store.load_messages(&l2_id).await.unwrap();
+    let l2_snap = l2_loaded[0].id().as_uuid().to_string();
+
+    // L3 孙线程：1 条消息，无快照
+    let mut l3_meta = ThreadMeta::new("/project");
+    l3_meta.parent_thread_id = Some(l2_id.clone());
+    l3_meta.snapshot_at_message_id = Some(l2_snap);
+    l3_meta.hidden = true;
+    let l3_id = store.create_thread(l3_meta).await.unwrap();
+    let l3_msgs = vec![BaseMessage::human("L3-a")];
+    store.append_messages(&l3_id, &l3_msgs).await.unwrap();
+
+    // load_context(L3) 应返回：L1 快照 2 条 + L2 快照 1 条 + L3 全部 1 条 = 4 条
+    let ctx = store.load_context(&l3_id).await.unwrap();
+    assert_eq!(
+        ctx.len(),
+        4,
+        "三层嵌套应返回 L1(2) + L2(1) + L3(1) = 4 条消息"
+    );
+    assert_eq!(ctx[0].content(), "L1-a");
+    assert_eq!(ctx[1].content(), "L1-b");
+    assert_eq!(ctx[2].content(), "L2-a");
+    assert_eq!(ctx[3].content(), "L3-a");
+}
+
+#[tokio::test]
+async fn test_update_and_load_message_flags() {
+    let (store, _dir) = make_store().await;
+    let meta = ThreadMeta::new("/tmp");
+    let id = store.create_thread(meta).await.unwrap();
+
+    let msgs = vec![
+        BaseMessage::human("msg1"),
+        BaseMessage::ai("msg2"),
+        BaseMessage::human("msg3"),
+    ];
+    store.append_messages(&id, &msgs).await.unwrap();
+
+    // Set flags: msg1 truncated, msg2 excluded, msg3 no flags
+    store
+        .update_message_flags(
+            &msgs[0].id(),
+            &MessageFlags {
+                truncated: true,
+                excluded: false,
+                projection: None,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .update_message_flags(
+            &msgs[1].id(),
+            &MessageFlags {
+                truncated: false,
+                excluded: true,
+                projection: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let flags = store.load_message_flags(&id).await.unwrap();
+    assert_eq!(flags.len(), 2, "only 2 messages have non-default flags");
+    assert!(flags[&msgs[0].id()].truncated, "msg1 should be truncated");
+    assert!(
+        !flags[&msgs[0].id()].excluded,
+        "msg1 should not be excluded"
+    );
+    assert!(
+        !flags[&msgs[1].id()].truncated,
+        "msg2 should not be truncated"
+    );
+    assert!(flags[&msgs[1].id()].excluded, "msg2 should be excluded");
+}
+
+#[tokio::test]
+async fn test_load_message_flags_empty_when_no_flags() {
+    let (store, _dir) = make_store().await;
+    let meta = ThreadMeta::new("/tmp");
+    let id = store.create_thread(meta).await.unwrap();
+
+    let msgs = vec![BaseMessage::human("hello"), BaseMessage::ai("world")];
+    store.append_messages(&id, &msgs).await.unwrap();
+
+    let flags = store.load_message_flags(&id).await.unwrap();
+    assert!(flags.is_empty(), "no flags set, should return empty map");
+}
+
+// ── 特征化测试：UpdateFlags 持久化后可恢复 ───────────────────────────────
+
+#[tokio::test]
+async fn test_update_message_flags_persists() {
+    // UpdateFlags 写入 DB 后，通过新 store 实例可恢复
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("persist_test.db");
+
+    // 第一步：创建 store，写消息，设 flags
+    let msg_id = {
+        let store = SqliteThreadStore::new(db_path.clone()).await.unwrap();
+        let meta = ThreadMeta::new("/tmp");
+        let tid = store.create_thread(meta).await.unwrap();
+
+        let msgs = vec![
+            BaseMessage::human("hello"),
+            BaseMessage::ai("world"),
+            BaseMessage::human("howdy"),
+        ];
+        store.append_messages(&tid, &msgs).await.unwrap();
+
+        // 标记 msg0 truncated, msg1 excluded
+        store
+            .update_message_flags(
+                &msgs[0].id(),
+                &MessageFlags {
+                    truncated: true,
+                    excluded: false,
+                    projection: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .update_message_flags(
+                &msgs[1].id(),
+                &MessageFlags {
+                    truncated: false,
+                    excluded: true,
+                    projection: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // 记录 msg0 id 和 thread id 用于后续验证
+        let id = msgs[0].id();
+        (id, msgs[1].id(), tid)
+    }; // store dropped here, DB connection closed
+
+    // 第二步：用新 store 重新打开同一 DB，验证 flags 持久化
+    {
+        let store = SqliteThreadStore::new(db_path).await.unwrap();
+        let tid = &msg_id.2;
+
+        let flags = store.load_message_flags(tid).await.unwrap();
+        assert_eq!(flags.len(), 2, "持久化后应有 2 条非默认 flag");
+
+        // msg0: truncated=true, excluded=false
+        assert!(flags[&msg_id.0].truncated, "msg0 应是 truncated");
+        assert!(!flags[&msg_id.0].excluded, "msg0 不应是 excluded");
+
+        // msg1: truncated=false, excluded=true
+        assert!(!flags[&msg_id.1].truncated, "msg1 不应是 truncated");
+        assert!(flags[&msg_id.1].excluded, "msg1 应是 excluded");
+    }
+}
+
+/// 特征化测试：projection JSON 跨 store 实例恢复
+#[tokio::test]
+async fn test_update_message_flags_persists_projection() {
+    use peri_acp_types::projection::{
+        MessageProjectionDirective, ProjectionAction, ProjectionActionEntry, ProjectionTarget,
+    };
+
+    // 构造一个含有 projection directive 的 MessageFlags
+    let directive = MessageProjectionDirective {
+        policy_version: 1,
+        entries: vec![ProjectionActionEntry {
+            message_id: peri_acp_types::messages::MessageId::new(),
+            target: ProjectionTarget::Message,
+            action: ProjectionAction::Exclude,
+        }],
+    };
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("proj_test.db");
+
+    // 第一步：写入 projection flag
+    let (msg_id, tid) = {
+        let store = SqliteThreadStore::new(db_path.clone()).await.unwrap();
+        let meta = ThreadMeta::new("/tmp");
+        let tid = store.create_thread(meta).await.unwrap();
+
+        let msgs = vec![BaseMessage::human("projected message")];
+        store.append_messages(&tid, &msgs).await.unwrap();
+
+        let mid = msgs[0].id();
+        store
+            .update_message_flags(
+                &mid,
+                &MessageFlags {
+                    truncated: true,
+                    excluded: false,
+                    projection: Some(directive.clone()),
+                },
+            )
+            .await
+            .unwrap();
+
+        (mid, tid)
+    }; // store dropped
+
+    // 第二步：新 store 恢复
+    {
+        let store = SqliteThreadStore::new(db_path).await.unwrap();
+        let flags = store.load_message_flags(&tid).await.unwrap();
+        assert_eq!(flags.len(), 1, "应有 1 条非默认 flag");
+        let flag = &flags[&msg_id];
+        assert!(flag.truncated, "truncated 应为 true");
+        assert!(!flag.excluded, "excluded 应为 false");
+        assert!(flag.projection.is_some(), "projection 应不为 None");
+        let restored = flag.projection.as_ref().unwrap();
+        assert_eq!(restored.policy_version, 1);
+        assert_eq!(restored.entries.len(), 1);
+        assert_eq!(restored.entries[0].action, ProjectionAction::Exclude);
+    }
+}
+
+#[tokio::test]
+async fn test_commit_compaction_lifecycle_persists_flags_and_appended_messages_in_order() {
+    let (store, _dir) = make_store().await;
+    let thread_id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    let original_messages = vec![
+        BaseMessage::human("原始用户消息"),
+        BaseMessage::ai("原始助手回复"),
+    ];
+    store
+        .append_messages(&thread_id, &original_messages)
+        .await
+        .unwrap();
+
+    let summary = BaseMessage::human("压缩摘要");
+    let reinject = BaseMessage::human("重新注入的用户上下文");
+    let lifecycle = CompactionChange {
+        flag_updates: vec![
+            (
+                original_messages[0].id(),
+                MessageFlags {
+                    excluded: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                original_messages[1].id(),
+                MessageFlags {
+                    excluded: true,
+                    ..Default::default()
+                },
+            ),
+        ],
+        appended_messages: vec![summary.clone(), reinject.clone()],
+    };
+
+    store
+        .commit_compaction_lifecycle(&thread_id, &lifecycle)
+        .await
+        .unwrap();
+
+    let messages = store.load_messages(&thread_id).await.unwrap();
+    assert_eq!(
+        messages.len(),
+        4,
+        "生命周期提交应持久化原始与追加的全部消息"
+    );
+    assert_eq!(
+        messages[0].id(),
+        original_messages[0].id(),
+        "原始第一条消息顺序不变"
+    );
+    assert_eq!(
+        messages[1].id(),
+        original_messages[1].id(),
+        "原始第二条消息顺序不变"
+    );
+    assert_eq!(messages[2].id(), summary.id(), "摘要应在原始消息之后追加");
+    assert_eq!(
+        messages[3].id(),
+        reinject.id(),
+        "重新注入消息应紧随摘要追加"
+    );
+
+    let flags = store.load_message_flags(&thread_id).await.unwrap();
+    assert_eq!(flags.len(), 2, "两条 excluded 标记都应落库");
+    assert!(
+        flags[&original_messages[0].id()].excluded,
+        "第一条原始消息应被 excluded"
+    );
+    assert!(
+        flags[&original_messages[1].id()].excluded,
+        "第二条原始消息应被 excluded"
+    );
+}
+
+#[tokio::test]
+async fn test_commit_compaction_lifecycle_rolls_back_flags_and_appends_when_message_is_missing() {
+    let (store, _dir) = make_store().await;
+    let thread_id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    let original_messages = vec![
+        BaseMessage::human("回滚前的用户消息"),
+        BaseMessage::ai("回滚前的助手回复"),
+    ];
+    store
+        .append_messages(&thread_id, &original_messages)
+        .await
+        .unwrap();
+
+    let summary = BaseMessage::human("不应落库的压缩摘要");
+    let lifecycle = CompactionChange {
+        flag_updates: vec![
+            (
+                original_messages[0].id(),
+                MessageFlags {
+                    excluded: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                peri_acp_types::messages::MessageId::new(),
+                MessageFlags {
+                    excluded: true,
+                    ..Default::default()
+                },
+            ),
+        ],
+        appended_messages: vec![summary.clone()],
+    };
+
+    let error = store
+        .commit_compaction_lifecycle(&thread_id, &lifecycle)
+        .await
+        .unwrap_err();
+    assert!(
+        !error.to_string().is_empty(),
+        "不存在的 MessageId 必须使整个生命周期提交失败"
+    );
+
+    let flags = store.load_message_flags(&thread_id).await.unwrap();
+    assert!(
+        !flags.contains_key(&original_messages[0].id()),
+        "事务回滚后有效消息必须保持 default flags"
+    );
+    let messages = store.load_messages(&thread_id).await.unwrap();
+    assert_eq!(messages.len(), 2, "事务回滚后不应追加摘要");
+    assert!(
+        messages.iter().all(|message| message.id() != summary.id()),
+        "事务回滚后摘要不得出现"
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DatabaseSnapshot {
+    schema_version: i64,
+    schema: Vec<(String, String, String)>,
+    thread_rows: Vec<String>,
+    message_rows: Vec<String>,
+}
+
+async fn database_snapshot(path: &std::path::Path) -> DatabaseSnapshot {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .create_if_missing(false);
+    let mut connection = sqlx::SqliteConnection::connect_with(&options)
+        .await
+        .unwrap();
+    let schema_version = sqlx::query_scalar("PRAGMA schema_version")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    let schema = sqlx::query_as(
+        "SELECT type, name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name",
+    )
+    .fetch_all(&mut connection)
+    .await
+    .unwrap();
+    let thread_rows = sqlx::query_scalar(
+        "SELECT printf('%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q',
+            id, title, cwd, created_at, updated_at, message_count, parent_thread_id,
+            snapshot_at_message_id, hidden, cancel_policy, config, cached_context,
+            frozen_context, agent_status, context_cache_epoch, typeof(message_count))
+         FROM threads ORDER BY id",
+    )
+    .fetch_all(&mut connection)
+    .await
+    .unwrap_or_default();
+    let message_rows = sqlx::query_scalar(
+        "SELECT printf('%Q|%Q|%Q|%Q|%Q|%Q|%Q', message_id, thread_id, role, content,
+            truncated, excluded, projection) FROM messages ORDER BY message_id",
+    )
+    .fetch_all(&mut connection)
+    .await
+    .unwrap_or_default();
+    connection.close().await.unwrap();
+    DatabaseSnapshot {
+        schema_version,
+        schema,
+        thread_rows,
+        message_rows,
+    }
+}
+
+fn directory_snapshot(path: &std::path::Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
+    std::fs::read_dir(path)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let file_type = entry.file_type().unwrap();
+            assert!(file_type.is_file(), "fixture directory only contains files");
+            let name = entry.file_name();
+            let bytes = if name.to_string_lossy().ends_with("-wal")
+                || name.to_string_lossy().ends_with("-shm")
+            {
+                Vec::new()
+            } else {
+                std::fs::read(entry.path()).unwrap()
+            };
+            (name, bytes)
+        })
+        .collect()
+}
+
+async fn create_schema_without(path: &std::path::Path, omitted_table: &str, omitted_column: &str) {
+    let thread_definitions = [
+        ("id", "id TEXT PRIMARY KEY"),
+        ("title", "title TEXT"),
+        ("cwd", "cwd TEXT NOT NULL DEFAULT ''"),
+        ("created_at", "created_at TEXT NOT NULL"),
+        ("updated_at", "updated_at TEXT NOT NULL"),
+        ("message_count", "message_count INTEGER NOT NULL DEFAULT 0"),
+        ("parent_thread_id", "parent_thread_id TEXT"),
+        ("snapshot_at_message_id", "snapshot_at_message_id TEXT"),
+        ("hidden", "hidden BOOLEAN NOT NULL DEFAULT 0"),
+        (
+            "cancel_policy",
+            "cancel_policy TEXT NOT NULL DEFAULT 'cascade'",
+        ),
+        ("config", "config TEXT"),
+        ("cached_context", "cached_context TEXT"),
+        (
+            "agent_status",
+            "agent_status TEXT NOT NULL DEFAULT 'active'",
+        ),
+    ];
+    let message_definitions = [
+        ("thread_id", "thread_id TEXT NOT NULL"),
+        ("content", "content TEXT NOT NULL"),
+    ];
+    let columns = |table: &str, definitions: &[(&str, &str)]| {
+        definitions
+            .iter()
+            .filter(|(name, _)| !(table == omitted_table && *name == omitted_column))
+            .map(|(_, definition)| *definition)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let schema = format!(
+        "CREATE TABLE threads ({}); CREATE TABLE messages ({})",
+        columns("threads", &thread_definitions),
+        columns("messages", &message_definitions)
+    );
+    let mut connection = sqlx::SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true),
+    )
+    .await
+    .unwrap();
+    sqlx::query(AssertSqlSafe(schema))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+}
+
+async fn readonly_error_kind(path: &std::path::Path) -> ReadOnlyStoreErrorKind {
+    match SqliteThreadStore::open_existing_read_only(path).await {
+        Ok(_) => panic!("只读打开应失败"),
+        Err(error) => error.kind(),
+    }
+}
+
+fn readonly_load_error_kind(error: &anyhow::Error) -> ReadOnlyStoreErrorKind {
+    error
+        .downcast_ref::<ReadOnlyThreadStoreError>()
+        .expect("只读错误应保持可 downcast")
+        .kind()
+}
+
+#[tokio::test]
+async fn test_readonly_open_missing_database_creates_nothing() {
+    let dir = tempdir().unwrap();
+    let parent = dir.path().join("missing-parent");
+    let db_path = parent.join("threads.db");
+    let kind = readonly_error_kind(&db_path).await;
+    assert_eq!(kind, ReadOnlyStoreErrorKind::DatabaseNotFound);
+    assert!(!parent.exists(), "只读打开不得创建父目录");
+}
+
+#[tokio::test]
+async fn test_readonly_open_directory_and_non_sqlite_are_typed() {
+    let dir = tempdir().unwrap();
+    let directory_kind = readonly_error_kind(dir.path()).await;
+    assert_eq!(directory_kind, ReadOnlyStoreErrorKind::DatabaseUnreadable);
+    let file = dir.path().join("not-sqlite.db");
+    std::fs::write(&file, "not a sqlite database").unwrap();
+    let file_kind = readonly_error_kind(&file).await;
+    assert_eq!(file_kind, ReadOnlyStoreErrorKind::SchemaIncompatible);
+}
+
+#[tokio::test]
+async fn test_readonly_open_rejects_missing_table_and_required_column_without_migration() {
+    let dir = tempdir().unwrap();
+    let missing_table = dir.path().join("missing-table.db");
+    let mut connection = sqlx::SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(&missing_table)
+            .create_if_missing(true),
+    )
+    .await
+    .unwrap();
+    sqlx::query("CREATE TABLE unrelated (id TEXT)")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+    let database_before = database_snapshot(&missing_table).await;
+    let before = directory_snapshot(dir.path());
+    assert_eq!(
+        readonly_error_kind(&missing_table).await,
+        ReadOnlyStoreErrorKind::SchemaIncompatible
+    );
+    assert_eq!(database_snapshot(&missing_table).await, database_before);
+    assert_eq!(directory_snapshot(dir.path()), before);
+    let missing_column = dir.path().join("missing-column.db");
+    let mut connection = sqlx::SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(&missing_column)
+            .create_if_missing(true),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE threads (id TEXT); CREATE TABLE messages (thread_id TEXT, content TEXT)",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+    let database_before = database_snapshot(&missing_column).await;
+    let before = directory_snapshot(dir.path());
+    assert_eq!(
+        readonly_error_kind(&missing_column).await,
+        ReadOnlyStoreErrorKind::SchemaIncompatible
+    );
+    assert_eq!(database_snapshot(&missing_column).await, database_before);
+    assert_eq!(directory_snapshot(dir.path()), before);
+}
+
+#[tokio::test]
+async fn test_readonly_open_rejects_every_required_column_without_mutation() {
+    for (table, columns) in [
+        ("threads", REQUIRED_THREAD_COLUMNS),
+        ("messages", REQUIRED_MESSAGE_COLUMNS),
+    ] {
+        for column in columns {
+            let dir = tempdir().unwrap();
+            let db_path = dir.path().join(format!("missing-{table}-{column}.db"));
+            create_schema_without(&db_path, table, column).await;
+            let before = directory_snapshot(dir.path());
+            assert_eq!(
+                readonly_error_kind(&db_path).await,
+                ReadOnlyStoreErrorKind::SchemaIncompatible,
+                "missing {table}.{column} must fail at shape probe"
+            );
+            assert_eq!(directory_snapshot(dir.path()), before);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_readonly_store_loads_exact_meta_and_distinguishes_missing_session() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("threads.db");
+    let writer = SqliteThreadStore::new(&db_path).await.unwrap();
+    let mut expected = ThreadMeta::new("/workspace");
+    expected.title = Some("title".into());
+    expected.agent_status = AgentStatus::Done;
+    let id = writer.create_thread(expected.clone()).await.unwrap();
+    writer.database.pool.close().await;
+    let database_before = database_snapshot(&db_path).await;
+    let directory_before = directory_snapshot(dir.path());
+    let reader = SqliteThreadStore::open_existing_read_only(&db_path)
+        .await
+        .unwrap();
+    let loaded = reader.load_meta(&id).await.unwrap();
+    assert_eq!(loaded.id, expected.id);
+    assert_eq!(loaded.title, expected.title);
+    assert_eq!(loaded.cwd, expected.cwd);
+    assert_eq!(loaded.agent_status, expected.agent_status);
+    let error = reader
+        .load_meta(&"00000000-0000-0000-0000-000000000000".into())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        readonly_load_error_kind(&error),
+        ReadOnlyStoreErrorKind::SessionNotFound
+    );
+    drop(reader);
+    assert_eq!(database_snapshot(&db_path).await, database_before);
+    assert_eq!(directory_snapshot(dir.path()), directory_before);
+}
+
+#[test]
+fn test_meta_decoder_rejects_negative_derived_content_size() {
+    let error = meta_from_row(
+        "550e8400-e29b-41d4-a716-446655440000".into(),
+        None,
+        "/tmp".into(),
+        "2026-09-04T00:00:00Z".into(),
+        "2026-09-04T00:00:00Z".into(),
+        0,
+        -1,
+        None,
+        None,
+        false,
+        "cascade".into(),
+        None,
+        None,
+        "active".into(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("content_size is negative"));
+}
+
+#[tokio::test]
+async fn test_readonly_store_rejects_corrupt_enum_time_type_and_negative_counts_without_values() {
+    for (column, value) in [
+        ("agent_status", "'secret-invalid-status'"),
+        ("cancel_policy", "'secret-invalid-policy'"),
+        ("created_at", "'secret-invalid-time'"),
+        ("updated_at", "'secret-invalid-updated-time'"),
+        ("cwd", "X'80'"),
+        ("title", "X'80'"),
+        ("parent_thread_id", "X'80'"),
+        ("snapshot_at_message_id", "X'80'"),
+        ("hidden", "'secret-invalid-hidden-type'"),
+        ("config", "X'80'"),
+        ("cached_context", "X'80'"),
+        ("message_count", "-1"),
+        ("message_count", "'secret-invalid-type'"),
+    ] {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("threads.db");
+        let writer = SqliteThreadStore::new(&db_path).await.unwrap();
+        let id = writer.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE threads SET {column} = {value} WHERE id = ?1"
+        )))
+        .bind(&id)
+        .execute(&writer.database.pool)
+        .await
+        .unwrap();
+        writer.database.pool.close().await;
+        let database_before = database_snapshot(&db_path).await;
+        let reader = SqliteThreadStore::open_existing_read_only(&db_path)
+            .await
+            .unwrap();
+        let before = directory_snapshot(dir.path());
+        let error = reader.load_meta(&id).await.unwrap_err();
+        assert_eq!(
+            readonly_load_error_kind(&error),
+            ReadOnlyStoreErrorKind::CorruptSessionData
+        );
+        assert!(
+            !error.to_string().contains("secret-invalid"),
+            "稳定错误不得泄露存储原值"
+        );
+        assert!(!format!("{error:#}").contains("secret-invalid"));
+        assert!(!format!("{error:?}").contains("secret-invalid"));
+        let typed = error.downcast_ref::<ReadOnlyThreadStoreError>().unwrap();
+        assert!(typed.source().is_none(), "公开错误 source chain 必须脱敏");
+        drop(reader);
+        assert_eq!(database_snapshot(&db_path).await, database_before);
+        assert_eq!(directory_snapshot(dir.path()), before);
+    }
+}
+
+#[tokio::test]
+async fn test_readonly_backed_trait_rejects_mutation_and_preserves_row() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("threads.db");
+    let writer = SqliteThreadStore::new(&db_path).await.unwrap();
+    let expected = ThreadMeta::new("/before");
+    let id = writer.create_thread(expected.clone()).await.unwrap();
+    writer.database.pool.close().await;
+    let database_before = database_snapshot(&db_path).await;
+    let reader: Arc<dyn ThreadStore> = Arc::new(
+        SqliteThreadStore::open_existing_read_only(&db_path)
+            .await
+            .unwrap(),
+    );
+    let before = directory_snapshot(dir.path());
+    let mut changed = expected.clone();
+    changed.cwd = "/after".into();
+    assert!(
+        reader.update_meta(&id, changed).await.is_err(),
+        "SQLite read-only capability 必须拒绝写入"
+    );
+    let loaded = reader.load_meta(&id).await.unwrap();
+    assert_eq!(loaded.id, expected.id);
+    assert_eq!(loaded.cwd, expected.cwd);
+    assert_eq!(loaded.created_at, expected.created_at);
+    assert_eq!(loaded.updated_at, expected.updated_at);
+    assert_eq!(loaded.message_count, expected.message_count);
+    assert_eq!(loaded.agent_status, expected.agent_status);
+    drop(reader);
+    assert_eq!(database_snapshot(&db_path).await, database_before);
+    assert_eq!(directory_snapshot(dir.path()), before);
+}
+
+#[tokio::test]
+async fn test_readonly_store_observes_wal_commit_but_not_uncommitted_update() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("threads.db");
+    let writer = SqliteThreadStore::new(&db_path).await.unwrap();
+    let id = writer
+        .create_thread(ThreadMeta::new("/baseline"))
+        .await
+        .unwrap();
+    let mut transaction = writer.database.pool.begin().await.unwrap();
+    sqlx::query("UPDATE threads SET cwd = '/pending' WHERE id = ?1")
+        .bind(&id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let sidecars_before_open = directory_snapshot(dir.path());
+    let reader = SqliteThreadStore::open_existing_read_only(&db_path)
+        .await
+        .unwrap();
+    let sidecars_after_open = directory_snapshot(dir.path());
+    assert_eq!(sidecars_after_open, sidecars_before_open);
+    assert_eq!(reader.load_meta(&id).await.unwrap().cwd, "/baseline");
+    let sidecars_after_load = directory_snapshot(dir.path());
+    assert_eq!(sidecars_after_load, sidecars_before_open);
+    drop(reader);
+    assert_eq!(directory_snapshot(dir.path()), sidecars_before_open);
+    transaction.commit().await.unwrap();
+    let sidecars_before_committed_open = directory_snapshot(dir.path());
+    let reader = SqliteThreadStore::open_existing_read_only(&db_path)
+        .await
+        .unwrap();
+    assert_eq!(
+        directory_snapshot(dir.path()),
+        sidecars_before_committed_open
+    );
+    assert_eq!(reader.load_meta(&id).await.unwrap().cwd, "/pending");
+    assert_eq!(
+        directory_snapshot(dir.path()),
+        sidecars_before_committed_open
+    );
+    drop(reader);
+    assert_eq!(
+        directory_snapshot(dir.path()),
+        sidecars_before_committed_open
+    );
+}
+
+/// 确定性 test double：只用于覆盖 probe 失败的分类分支，不经过真实 SQLite。
+#[derive(Debug)]
+struct ShapeProbeError {
+    code: Option<&'static str>,
+    message: &'static str,
+}
+
+impl std::fmt::Display for ShapeProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for ShapeProbeError {}
+
+impl sqlx::error::DatabaseError for ShapeProbeError {
+    fn message(&self) -> &str {
+        self.message
+    }
+
+    fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.code.map(std::borrow::Cow::Borrowed)
+    }
+
+    fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+
+    fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+
+    fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+        self
+    }
+
+    fn kind(&self) -> sqlx::error::ErrorKind {
+        sqlx::error::ErrorKind::Other
+    }
+}
+
+#[test]
+fn test_shape_probe_failure_classification_never_fakes_schema_verdict() {
+    // 只有确定性损坏/非数据库镜像才可判定 schema 不兼容。
+    for code in ["11", "26"] {
+        let error = sqlx::Error::Database(Box::new(ShapeProbeError {
+            code: Some(code),
+            message: "shape probe failed",
+        }));
+        assert_eq!(
+            classify_shape_probe_failure(&error).kind(),
+            ReadOnlyStoreErrorKind::SchemaIncompatible,
+            "SQLite primary result code {code} 是确定性 schema/镜像判定"
+        );
+    }
+
+    // 瞬时或环境故障（锁竞争、IO、连接池超时等）必须保持可诊断。
+    let transient_codes = [
+        Some("5"),   // SQLITE_BUSY：并发 checkpoint / lock 未释放
+        Some("6"),   // SQLITE_LOCKED：共享缓存表锁
+        Some("10"),  // SQLITE_IOERR
+        Some("14"),  // SQLITE_CANTOPEN：-wal/-shm 不可用
+        Some("266"), // SQLITE_IOERR_READ 扩展码
+        None,
+    ];
+    for code in transient_codes {
+        let error = sqlx::Error::Database(Box::new(ShapeProbeError {
+            code,
+            message: "shape probe failed",
+        }));
+        assert_eq!(
+            classify_shape_probe_failure(&error).kind(),
+            ReadOnlyStoreErrorKind::DatabaseUnreadable,
+            "code {code:?} 不得伪装成 schema 判定"
+        );
+    }
+    for error in [sqlx::Error::PoolTimedOut, sqlx::Error::RowNotFound] {
+        assert_eq!(
+            classify_shape_probe_failure(&error).kind(),
+            ReadOnlyStoreErrorKind::DatabaseUnreadable
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_readonly_open_lock_contention_is_bounded() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("threads.db");
+    let writer = SqliteThreadStore::new(&db_path).await.unwrap();
+    drop(writer);
+    let mut lock =
+        sqlx::SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&db_path))
+            .await
+            .unwrap();
+    sqlx::query("PRAGMA locking_mode=EXCLUSIVE")
+        .execute(&mut lock)
+        .await
+        .unwrap();
+    sqlx::query("BEGIN EXCLUSIVE")
+        .execute(&mut lock)
+        .await
+        .unwrap();
+    let started = Instant::now();
+    let kind = readonly_error_kind(&db_path).await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        kind,
+        ReadOnlyStoreErrorKind::DatabaseUnreadable,
+        "锁竞争必须报成不可读，不得伪装成 schema 判定: {kind:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "锁等待必须有界: {elapsed:?}"
+    );
+    sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
+}

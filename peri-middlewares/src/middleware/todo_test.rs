@@ -1,0 +1,345 @@
+use peri_acp_types::system_reminder::{
+    ReminderAudience, ReminderCategory, ReminderDelivery, ReminderSeverity,
+};
+use peri_agent::agent::react::AgentOutput;
+use peri_agent::agent::state::AgentState;
+use peri_agent::middleware::r#trait::Middleware;
+use peri_agent::session::MessageKind;
+use tokio::sync::mpsc;
+
+use super::*;
+
+async fn make_mw_with_items(
+    items: Vec<TodoItem>,
+    require_completion: bool,
+) -> (TodoMiddleware, Arc<Mutex<TodoState>>) {
+    let (tx, _rx) = mpsc::channel(8);
+    let mw = TodoMiddleware::new(tx);
+    let state = Arc::clone(&mw.state);
+    {
+        let mut guard = state.lock().await;
+        guard.items = items;
+        guard.require_completion = require_completion;
+    }
+    (mw, state)
+}
+
+/// [回归测试] 旧 requireCompletion 在后台任务活跃时仍注入提醒并强制续跑。
+#[tokio::test]
+async fn test_after_agent_background_tasks_suppress_and_resume_todo() {
+    use peri_acp_types::tasks::{BgTaskKind, BgTaskRegistration, TaskManager as _};
+    use peri_agent::agent::{
+        agent_context::AgentContext, async_tasks::TaskManager, events::BackgroundTaskResult,
+        stages::StageContext,
+    };
+    use peri_agent::session::{FrozenContext, Session};
+    for kind in [BgTaskKind::Agent, BgTaskKind::Workflow, BgTaskKind::Shell] {
+        for success in [true, false] {
+            let manager = Arc::new(TaskManager::new());
+            manager
+                .register(BgTaskRegistration {
+                    task_id: "background".into(),
+                    kind,
+                    summary: "后台边界替身".into(),
+                    pid: None,
+                    kill: Some(Box::new(|| {})),
+                })
+                .unwrap();
+            let session = Session::new(
+                Arc::from("/tmp/todo-reminder"),
+                FrozenContext::builder().build(),
+                None,
+            );
+            let ctx = StageContext::builder(
+                session.start_turn(),
+                session.transcript(),
+                session.queue().clone(),
+            )
+            .with_idle_should_wait({
+                let manager = manager.clone();
+                Arc::new(move || manager.active_count() > 0)
+            })
+            .build();
+            let mut state = AgentContext::from_stage(&ctx);
+            let (mw, todo) = make_mw_with_items(
+                vec![TodoItem {
+                    content: "等待交付".into(),
+                    active_form: None,
+                    status: TodoStatus::InProgress,
+                }],
+                true,
+            )
+            .await;
+            let output = AgentOutput::new("等待后台完成", 1);
+            for _ in 0..2 {
+                let result = Middleware::after_agent(&mw, &mut state, &output)
+                    .await
+                    .unwrap();
+                assert!(result.block_continue.is_none(), "{kind:?} 活跃时不应续跑");
+                assert!(session.queue().drain_all().is_empty(), "后台期间不应注入");
+                let todo = todo.lock().await;
+                assert!(todo.require_completion);
+                assert_eq!(todo.items[0].status, TodoStatus::InProgress);
+            }
+            assert!(manager.complete(
+                "background",
+                BackgroundTaskResult {
+                    task_id: "background".into(),
+                    agent_name: "边界替身".into(),
+                    prompt_summary: String::new(),
+                    success,
+                    output: "终态".into(),
+                    tool_calls_count: 0,
+                    duration_ms: 0,
+                    child_thread_id: None,
+                    timed_out: false,
+                    subagent_failure: None,
+                    shell_output: None,
+                }
+            ));
+            let result = Middleware::after_agent(&mw, &mut state, &output)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.block_continue.as_deref(),
+                Some("todo_require_completion")
+            );
+            let messages = session.queue().drain_all();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].kind, MessageKind::Defer);
+            assert_eq!(messages[0].source, MessageSource::TodoSteering);
+            let peri_agent::session::QueuedPayload::SystemReminder(reminder) = &messages[0].payload
+            else {
+                panic!("必须使用 canonical reminder");
+            };
+            assert_eq!(reminder.as_reminder().metadata["pending_count"], 1);
+            assert!(reminder
+                .as_reminder()
+                .body
+                .contains("[0] [in_progress] 等待交付"));
+        }
+    }
+}
+
+#[test]
+fn test_render_steering_包含当前todo状态() {
+    let items = vec![
+        TodoItem {
+            content: "重构模块".into(),
+            active_form: None,
+            status: TodoStatus::Pending,
+        },
+        TodoItem {
+            content: "跑测试".into(),
+            active_form: None,
+            status: TodoStatus::InProgress,
+        },
+    ];
+    let text = TodoMiddleware::render_steering(&items);
+    assert!(text.contains("[0] [pending] 重构模块"));
+    assert!(text.contains("[1] [in_progress] 跑测试"));
+    assert!(text.contains("completed"), "应提醒标记为 completed");
+    assert!(
+        text.contains("requireCompletion=false"),
+        "应提供显式解除的出口"
+    );
+}
+
+#[tokio::test]
+async fn test_after_agent_未完成_注入_steering_并设_block_continue() {
+    let (mw, _state) = make_mw_with_items(
+        vec![TodoItem {
+            content: "A".into(),
+            active_form: None,
+            status: TodoStatus::Pending,
+        }],
+        true,
+    )
+    .await;
+    let mut state = AgentState::new("/tmp");
+    let output = AgentOutput::new("我完成了", 1);
+
+    let result = Middleware::after_agent(&mw, &mut state, &output)
+        .await
+        .unwrap();
+
+    // 设 block_continue 触发 executor 续跑
+    assert_eq!(
+        result.block_continue.as_deref(),
+        Some("todo_require_completion")
+    );
+
+    // 注入路径：v2 MessageQueue 应收到 1 条 Defer（TodoSteering），内容含 todo 状态
+    let drained = state.v2_queue().drain_all();
+    assert_eq!(drained.len(), 1, "应 push 1 条 todo steering Defer 消息");
+    assert_eq!(drained[0].kind, MessageKind::Defer);
+    assert_eq!(
+        drained[0].source,
+        MessageSource::TodoSteering,
+        "来源应为 TodoSteering"
+    );
+    let reminder = match &drained[0].payload {
+        peri_agent::session::QueuedPayload::SystemReminder(reminder) => reminder.as_reminder(),
+        other => panic!("expected canonical reminder, got {other:?}"),
+    };
+    assert_eq!(reminder.category, ReminderCategory::Guidance);
+    assert_eq!(reminder.source.0, "todo");
+    assert_eq!(reminder.kind, "require_completion");
+    assert_eq!(reminder.severity, ReminderSeverity::Warning);
+    assert_eq!(reminder.delivery, ReminderDelivery::Required);
+    assert!(reminder.audiences.contains(ReminderAudience::Model));
+    assert!(reminder.audiences.contains(ReminderAudience::Automation));
+    assert!(
+        reminder.body.contains("[0] [pending] A"),
+        "注入内容应含当前 todo 状态: {}",
+        reminder.body
+    );
+}
+
+#[tokio::test]
+async fn test_after_agent_全部completed_放行() {
+    let (mw, _state) = make_mw_with_items(
+        vec![TodoItem {
+            content: "A".into(),
+            active_form: None,
+            status: TodoStatus::Completed,
+        }],
+        true,
+    )
+    .await;
+    let mut state = AgentState::new("/tmp");
+    let output = AgentOutput::new("完成", 1);
+
+    let result = Middleware::after_agent(&mw, &mut state, &output)
+        .await
+        .unwrap();
+
+    assert!(result.block_continue.is_none(), "全部 completed 不应拦截");
+    let drained = state.v2_queue().drain_all();
+    assert!(drained.is_empty(), "不应注入任何消息");
+}
+
+#[tokio::test]
+async fn test_after_agent_未开启标记_放行() {
+    let (mw, _state) = make_mw_with_items(
+        vec![TodoItem {
+            content: "A".into(),
+            active_form: None,
+            status: TodoStatus::Pending,
+        }],
+        false,
+    )
+    .await;
+    let mut state = AgentState::new("/tmp");
+    let output = AgentOutput::new("普通回答", 1);
+
+    let result = Middleware::after_agent(&mw, &mut state, &output)
+        .await
+        .unwrap();
+
+    assert!(
+        result.block_continue.is_none(),
+        "未开启 requireCompletion 不应拦截"
+    );
+    let drained = state.v2_queue().drain_all();
+    assert!(drained.is_empty(), "不应注入任何消息");
+}
+
+#[tokio::test]
+async fn test_after_agent_空列表_放行() {
+    let (mw, _state) = make_mw_with_items(vec![], true).await;
+    let mut state = AgentState::new("/tmp");
+    let output = AgentOutput::new("回答", 1);
+
+    let result = Middleware::after_agent(&mw, &mut state, &output)
+        .await
+        .unwrap();
+
+    assert!(result.block_continue.is_none(), "空列表不应拦截");
+    let drained = state.v2_queue().drain_all();
+    assert!(drained.is_empty(), "不应注入任何消息");
+}
+
+#[tokio::test]
+async fn test_after_agent_已有block_continue_不干预() {
+    let (mw, _state) = make_mw_with_items(
+        vec![TodoItem {
+            content: "A".into(),
+            active_form: None,
+            status: TodoStatus::Pending,
+        }],
+        true,
+    )
+    .await;
+    let mut state = AgentState::new("/tmp");
+    let mut output = AgentOutput::new("回答", 1);
+    output.block_continue = Some("stop_hook_block".to_string());
+
+    let result = Middleware::after_agent(&mw, &mut state, &output)
+        .await
+        .unwrap();
+
+    // 尊重前置中间件的优先级：保留原 block_continue，不覆盖也不重复注入
+    assert_eq!(result.block_continue.as_deref(), Some("stop_hook_block"));
+    let drained = state.v2_queue().drain_all();
+    assert!(drained.is_empty(), "已有 block_continue 时不应注入");
+}
+
+#[tokio::test]
+async fn test_after_agent_steering_解除后_不再拦截() {
+    // 模拟完整生命周期：创建（标记开启）→ 全部标记完成 → 停止轮放行
+    let (tx, _rx) = mpsc::channel(8);
+    let mw = TodoMiddleware::new(tx);
+    let mut state = AgentState::new("/tmp");
+
+    // 经 TodoWrite 创建并开启标记（按名取工具，不依赖链序）
+    let tool = mw
+        .collect_tools("/tmp")
+        .into_iter()
+        .find(|t| t.name() == "TodoWrite")
+        .expect("TodoMiddleware 应提供 TodoWrite 工具");
+    tool.invoke(
+        serde_json::json!({
+            "requireCompletion": true,
+            "todos": [
+                { "content": "A", "status": "in_progress" },
+                { "content": "B", "status": "pending" }
+            ]
+        }),
+        peri_agent::tools::ToolContext::new(&[], "."),
+    )
+    .await
+    .unwrap();
+
+    // 停止轮 → 拦截
+    let output = AgentOutput::new("先停一下", 1);
+    let result = Middleware::after_agent(&mw, &mut state, &output)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.block_continue.as_deref(),
+        Some("todo_require_completion"),
+        "未完成时应拦截续跑"
+    );
+    state.v2_queue().drain_all();
+
+    // 全部标记 completed → 停止轮放行
+    tool.invoke(
+        serde_json::json!({
+            "todos": [
+                { "content": "A", "status": "completed" },
+                { "content": "B", "status": "completed" }
+            ]
+        }),
+        peri_agent::tools::ToolContext::new(&[], "."),
+    )
+    .await
+    .unwrap();
+    let output = AgentOutput::new("全部完成", 1);
+    let result = Middleware::after_agent(&mw, &mut state, &output)
+        .await
+        .unwrap();
+    assert!(result.block_continue.is_none(), "全部完成应放行");
+    let drained = state.v2_queue().drain_all();
+    assert!(drained.is_empty(), "不应再注入");
+}

@@ -1,0 +1,30 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  cloud-executor:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      NO_PROXY: 127.0.0.1,localhost
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install tested Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+      - name: Format
+        run: cargo +1.99.0 fmt --all -- --check
+      - name: Cloud and executor regression tests
+        run: cargo +1.99.0 test --locked -p peri-cloud -p peri-executor -p peri-remote-tools -p peri-tool-runtime -p peri-process
+      - name: Clippy
+        run: cargo +1.99.0 clippy --locked -p peri-cloud -p peri-executor --all-targets --no-deps -- -D warnings
+      - name: Build optimized binaries
+        run: cargo +1.99.0 build --release --locked -p peri-cloud --bin peri-cloud-host -p peri-executor --bin peri-executor

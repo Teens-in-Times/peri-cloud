@@ -1,0 +1,363 @@
+use std::sync::Arc;
+
+use super::{
+    auth_store::FileCredentialStore,
+    client::{
+        build_authed_transport, ClientStatus, McpClientHandle, McpClientPool, McpPoolError,
+        McpServiceWrapper, OAuthStartDisposition, OAuthStatus, HTTP_CONNECT_TIMEOUT,
+        SHUTDOWN_TIMEOUT,
+    },
+    initialize::{
+        commit_discovery_failure, commit_discovery_success, downgrade_resource_listing,
+        fail_tool_discovery, list_discovered_tools,
+    },
+    oauth_flow::{OAuthFailureKind, OAuthFlowEvent, OAuthFlowManager},
+};
+
+impl McpClientPool {
+    /// 异步触发 OAuth 授权流程（不阻塞调用方）。
+    ///
+    /// 授权任务独立 spawn：服务器先标记 `NeedsAuthorization`，`run_oauth_flow`
+    /// 期间的事件（`AuthorizationNeeded` / `Completed` / `Failed`）经装配面
+    /// 注入的 `oauth_event_callback` 转发给 TUI；授权成功后自动用
+    /// `AuthorizationManager` 重建认证传输层并连接。
+    ///
+    /// 无 `oauth_event_callback`（TUI 面板池，UI 无法弹 popup）时降级为
+    /// 快速路径：仅尝试恢复磁盘凭证连接，不启动完整授权（不弹窗、不阻塞）；
+    /// 凭据缺失/失效时保持 `NeedsAuthorization`，由 host pool 授权完成后
+    /// 各 pool 经共享 `FileCredentialStore` 恢复。
+    pub fn spawn_oauth_flow(self: &Arc<Self>, server_name: &str) {
+        let flow_id = uuid::Uuid::now_v7().to_string();
+        let _ = self.spawn_oauth_flow_with_id(server_name, &flow_id);
+    }
+
+    /// 以稳定 identity 启动授权。reservation 在 spawn 前完成，保证同一
+    /// server 不会因 Ack 重试并发启动两个 provider flow。
+    pub fn spawn_oauth_flow_with_id(
+        self: &Arc<Self>,
+        server_name: &str,
+        flow_id: &str,
+    ) -> OAuthStartDisposition {
+        let disposition = self.reserve_oauth_flow(server_name, flow_id);
+        if disposition != OAuthStartDisposition::Started {
+            return disposition;
+        }
+        let _admission = self.lifecycle_registration.lock();
+        if !self.is_open() {
+            self.release_oauth_flow(server_name, flow_id);
+            return OAuthStartDisposition::Conflict {
+                active_flow_id: "pool-closing".to_string(),
+            };
+        }
+        let pool = self.clone();
+        let server_name = server_name.to_string();
+        let flow_id = flow_id.to_string();
+        let rollback_server = server_name.clone();
+        let rollback_flow = flow_id.clone();
+        let key = super::task_scope::McpTaskKey::OAuth(flow_id.clone());
+        let spawn = self.task_spawner.spawn(key, async move {
+            if pool.oauth_event_callback().is_none() {
+                let _ = pool.start_oauth_flow(&flow_id, &server_name, true).await;
+                pool.release_oauth_flow(&server_name, &flow_id);
+                return;
+            }
+            Self::insert_needs_auth(&pool, &server_name, "OAuth 授权进行中".to_string());
+            let _ = pool.start_oauth_flow(&flow_id, &server_name, false).await;
+            pool.release_oauth_flow(&server_name, &flow_id);
+        });
+        if spawn.is_err() {
+            self.release_oauth_flow(&rollback_server, &rollback_flow);
+            return OAuthStartDisposition::Conflict {
+                active_flow_id: "task-owner-closing".to_string(),
+            };
+        }
+        disposition
+    }
+
+    /// 执行 OAuth 授权流程（异步，两轮尝试）。
+    ///
+    /// `quick_only=true`（面板池路径）：只跑第一轮「恢复磁盘凭证 → 连接」，
+    /// 凭据失效时不清除、不启动完整授权，直接返回错误（保持 NeedsAuthorization）。
+    /// `quick_only=false`（host pool 路径）：第一轮恢复失败/凭据失效时清除
+    /// 失效凭证，第二轮走完整授权（DCR + PKCE + AuthorizationNeeded 弹 popup）。
+    pub async fn start_oauth_flow(
+        self: &Arc<Self>,
+        flow_id: &str,
+        server_name: &str,
+        quick_only: bool,
+    ) -> Result<(), McpPoolError> {
+        let cfg = match self.configs.read().get(server_name).cloned() {
+            Some(config) => config,
+            None => {
+                let error = McpPoolError::NotConnected {
+                    server: server_name.to_string(),
+                    status: ClientStatus::Disconnected,
+                };
+                self.emit_oauth_failure(flow_id, server_name, OAuthFailureKind::Internal, &error);
+                return Err(error);
+            }
+        };
+        let url = cfg.url.as_deref().unwrap_or("").to_string();
+        // 使用显式 OAuth 配置，或对 HTTP 服务器回退到默认配置（启用 DCR 自动发现）
+        let oauth_cfg = match cfg.oauth.as_ref().filter(|o| o.is_enabled()) {
+            Some(explicit) => explicit.clone(),
+            None => {
+                if cfg.url.is_none() {
+                    let error = McpPoolError::ConnectionFailed {
+                        server: server_name.to_string(),
+                        reason: "仅 HTTP 传输支持 OAuth".to_string(),
+                    };
+                    self.emit_oauth_failure(
+                        flow_id,
+                        server_name,
+                        OAuthFailureKind::Internal,
+                        &error,
+                    );
+                    return Err(error);
+                }
+                super::config::OAuthConfig::default()
+            }
+        };
+        let ts = Arc::new(FileCredentialStore::new());
+        let event_cb = self
+            .oauth_event_callback()
+            .unwrap_or_else(|| Arc::new(|_| {}) as Arc<dyn Fn(OAuthFlowEvent) + Send + Sync>);
+
+        // 两轮尝试：第一轮优先恢复磁盘凭证（可能已过期/被 revoke）；恢复后
+        // 连接仍要求授权（401）时清除失效凭证，第二轮走完整授权流程（弹
+        // popup 让用户重新授权）。第二轮再失败直接返回错误。
+        // quick_only（面板池路径）只跑第一轮：401 时不清除凭据、不完整授权。
+        let rounds: u8 = if quick_only { 1 } else { 2 };
+        for attempt in 0..rounds {
+            let mut mgr = OAuthFlowManager::new_with_arc(ts.clone(), event_cb.clone());
+            mgr.run_oauth_flow_with_id(flow_id, server_name, &url, &oauth_cfg)
+                .await
+                .map_err(|e| McpPoolError::ConnectionFailed {
+                    server: server_name.to_string(),
+                    reason: format!("OAuth 授权失败: {e}"),
+                })?;
+
+            // 从 OAuth 流程中提取 AuthorizationManager，用于构建认证传输层
+            let auth_manager = match mgr.get_authorization_manager(server_name) {
+                Some(manager) => manager,
+                None => {
+                    let error = McpPoolError::ConnectionFailed {
+                        server: server_name.to_string(),
+                        reason: "OAuth 授权完成但无法提取 AuthorizationManager".to_string(),
+                    };
+                    self.emit_oauth_failure(
+                        flow_id,
+                        server_name,
+                        OAuthFailureKind::Internal,
+                        &error,
+                    );
+                    return Err(error);
+                }
+            };
+
+            // 关闭旧连接
+            let previous_service = { self.services.lock().remove(server_name) };
+            if let Some(mut svc) = previous_service {
+                let _ = svc.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+            }
+            let old_status = self
+                .clients
+                .read()
+                .get(server_name)
+                .map(|c| c.status.clone());
+            self.clients.write().remove(server_name);
+            // 本次发现尝试开始：旧代证据立即作废，等待方按「仍在进行」重新判定。
+            self.clear_discovery_evidence(server_name);
+
+            // 使用认证传输层重新连接
+            let headers = cfg.headers.clone().unwrap_or_default();
+            let result = tokio::time::timeout(
+                HTTP_CONNECT_TIMEOUT,
+                rmcp::service::serve_client(
+                    super::client::mcpp_client_info_for_profile(&self.capability_profile),
+                    build_authed_transport(&url, &headers, auth_manager),
+                ),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(rs)) => {
+                    let service = self.retain_service(McpServiceWrapper::Default(rs));
+                    let rs = &service;
+                    let peer = rs.peer().clone();
+                    let cache_version = self.install_peer_cache_version(server_name, &peer);
+                    // 严格发现：`tools/list` 的 `Err` 不是「没有工具」。System MCP 走
+                    // 本次 live round-trip（不用历史缓存代替健康证据），失败即
+                    // ToolDiscoveryFailed，不提交 Connected。
+                    let tools = match list_discovered_tools(self, server_name, &peer, &cfg).await {
+                        Ok(tools) => tools,
+                        Err(source) => {
+                            // 授权成功但 live `tools/list` 失败：不留下「无句柄」的
+                            // 模糊状态，显式记为 Failed + 本代 tools_list_ok = false，
+                            // System 等待方据此立即判定，而不是等满 deadline。
+                            fail_tool_discovery(self, server_name, &source.to_string());
+                            let error = McpPoolError::ToolDiscoveryFailed {
+                                server: server_name.to_string(),
+                                reason: source.to_string(),
+                            };
+                            self.emit_oauth_failure(
+                                flow_id,
+                                server_name,
+                                OAuthFailureKind::ConnectionFailed,
+                                &error,
+                            );
+                            return Err(error);
+                        }
+                    };
+                    let resources = match self.list_all_resources_cached(server_name, &peer).await {
+                        Ok(resources) => resources,
+                        Err(error) => {
+                            downgrade_resource_listing(server_name, &error.to_string());
+                            Vec::new()
+                        }
+                    };
+                    let skills_capable = super::client::peer_declares_skills(&peer);
+                    let handle = Arc::new(McpClientHandle {
+                        name: server_name.to_string(),
+                        version: peer.peer_info().and_then(|info| {
+                            info.server_info.as_ref().map(|si| si.version.clone())
+                        }),
+                        cache_version: cache_version.clone(),
+                        peer: Some(peer),
+                        tools,
+                        resources,
+                        status: ClientStatus::Connected,
+                        oauth_status: OAuthStatus::Authorized,
+                        source: cfg.source.clone(),
+                        url: cfg.url.clone(),
+                        channel_capable: false,
+                        skills_capable,
+                    });
+                    let committed = Arc::clone(&handle);
+                    if let Err(mut service) =
+                        self.try_commit_connection(server_name.to_string(), handle, service)
+                    {
+                        let _ = service.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+                        // 提交被拒（pool 关闭）：不留任何可被读成成功的证据。
+                        self.clear_discovery_evidence(server_name);
+                        return Err(McpPoolError::ConnectionFailed {
+                            server: server_name.to_string(),
+                            reason: "MCP pool is closing".to_string(),
+                        });
+                    }
+                    self.record_status_change(server_name, old_status.as_ref());
+                    // 唯一能提交本代发现证据的位置：live `tools/list` 已成功且句柄已登记代际。
+                    commit_discovery_success(self, server_name, &committed);
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    let err_str = e.to_string();
+                    if Self::is_auth_required_error(&err_str, true) {
+                        if attempt == 0 && !quick_only {
+                            // 磁盘凭证已失效（过期/被服务端 revoke）：清除后
+                            // 第二轮走完整授权（弹 popup），保证用户可重新授权。
+                            tracing::info!(server = %server_name, "恢复的 OAuth 凭证已失效，清除并重新授权");
+                            let _ = ts.clear_server(server_name).await;
+                            continue;
+                        }
+                        Self::insert_needs_auth(self, server_name, err_str.clone());
+                    } else {
+                        Self::insert_failed(self, server_name, err_str.clone());
+                    }
+                    commit_discovery_failure(self, server_name, false);
+                    let error = McpPoolError::ConnectionFailed {
+                        server: server_name.to_string(),
+                        reason: err_str,
+                    };
+                    self.emit_oauth_failure(
+                        flow_id,
+                        server_name,
+                        OAuthFailureKind::ConnectionFailed,
+                        &error,
+                    );
+                    return Err(error);
+                }
+                Err(_) => {
+                    let msg = "连接超时".to_string();
+                    Self::insert_failed(self, server_name, msg.clone());
+                    commit_discovery_failure(self, server_name, false);
+                    let error = McpPoolError::ConnectionFailed {
+                        server: server_name.to_string(),
+                        reason: msg,
+                    };
+                    self.emit_oauth_failure(
+                        flow_id,
+                        server_name,
+                        OAuthFailureKind::ConnectionFailed,
+                        &error,
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        unreachable!("start_oauth_flow 循环内必返回")
+    }
+
+    fn emit_oauth_failure(
+        &self,
+        flow_id: &str,
+        server_name: &str,
+        failure_kind: OAuthFailureKind,
+        error: &McpPoolError,
+    ) {
+        if let Some(callback) = self.oauth_event_callback() {
+            callback(OAuthFlowEvent::AuthorizationFailed {
+                flow_id: flow_id.to_string(),
+                server_name: server_name.to_string(),
+                failure_kind,
+                error: error.to_string(),
+            });
+        }
+    }
+
+    /// 清除指定服务器的 OAuth 凭证并断开连接
+    pub async fn clear_oauth(self: &Arc<Self>, server_name: &str) -> Result<(), McpPoolError> {
+        // 1. 清除 token 文件中的凭证
+        let store = FileCredentialStore::new();
+        let _ = store.clear_server(server_name).await;
+
+        // 2. 关闭连接
+        let service = { self.services.lock().remove(server_name) };
+        if let Some(mut svc) = service {
+            let _ = svc.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+        }
+
+        // 3. 更新 handle 为 NeedsAuthorization
+        let old_status = self
+            .clients
+            .read()
+            .get(server_name)
+            .map(|c| c.status.clone());
+        let (source, url) = self
+            .configs
+            .read()
+            .get(server_name)
+            .map(|c| (c.source.clone(), c.url.clone()))
+            .unwrap_or((None, None));
+        self.clients.write().insert(
+            server_name.to_string(),
+            Arc::new(McpClientHandle {
+                name: server_name.to_string(),
+                version: None,
+                cache_version: None,
+                peer: None,
+                tools: vec![],
+                resources: vec![],
+                status: ClientStatus::Failed("OAuth credentials cleared".to_string()),
+                oauth_status: OAuthStatus::NeedsAuthorization,
+                source,
+                url,
+                skills_capable: false,
+                channel_capable: false,
+            }),
+        );
+        self.record_status_change(server_name, old_status.as_ref());
+
+        Ok(())
+    }
+}

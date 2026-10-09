@@ -1,0 +1,8 @@
+{
+  "device_name": "Workstation",
+  "listen": "127.0.0.1:42371",
+  "ssh_host": "agent-cloud",
+  "ssh_reverse_listen": "127.0.0.1:44371",
+  "cloud_listen": "127.0.0.1:47671",
+  "cloud_remote": "127.0.0.1:47671"
+}

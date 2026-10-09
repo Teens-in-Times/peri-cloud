@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Peri · 个人云 Agent</title>
+  <link rel="stylesheet" href="/portal.css">
+  <script src="/portal.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <a class="brand" href="/" aria-label="Peri 首页">
+      <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><circle cx="16" cy="16" r="5" stroke="currentColor" stroke-width="1.8"/><path d="M16 1v7m0 16v7M1 16h7m16 0h7M5.4 5.4l5 5m11.2 11.2 5 5m0-21.2-5 5M10.4 21.6l-5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></span>
+      Peri<span class="brand-detail">个人云 Agent</span>
+    </a>
+    <button id="logout" class="quiet" hidden>退出登录</button>
+  </header>
+  <nav id="workspace-nav" class="workspace-nav" aria-label="工作台导航" hidden>
+    <p class="nav-caption">WORKSPACE</p>
+    <a href="#account" class="active"><span class="nav-index">00</span>工作台概览</a>
+    <a href="#device-panel"><span class="nav-index">01</span>执行设备</a>
+    <a href="#approval-panel"><span class="nav-index">02</span>操作审批</a>
+    <a href="#connections"><span class="nav-index">03</span>聊天与关联</a>
+    <a id="service-nav" href="#service-controls"><span class="nav-index">04</span>服务设置</a>
+    <p class="nav-note">推理在云端。<br>工作在你选择的设备上。</p>
+  </nav>
+  <main>
+    <div id="notice" role="status" aria-live="polite" hidden></div>
+    <section id="loading" class="entry"><div class="entry-symbol" aria-hidden="true">✳</div><p class="eyebrow">A QUIET PLACE TO WORK</p><h1>正在连接你的工作台</h1></section>
+    <section id="entry" class="entry" hidden>
+      <div class="entry-symbol" aria-hidden="true">✳</div>
+      <p class="eyebrow">YOUR PERSONAL AGENT</p>
+      <h1 id="entry-title">登录你的云 Agent</h1>
+      <p class="intro">一个账号，连接你的设备与聊天。<br>让工作从一句话开始。</p>
+      <form id="login-form" class="panel">
+        <label>用户名<input name="login" autocomplete="username" required maxlength="64" placeholder="你的用户名"></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required maxlength="1024" placeholder="输入你的密码"></label>
+        <button type="submit" class="primary">进入工作台</button>
+      </form>
+      <form id="setup-form" class="panel" hidden>
+        <label>初始化口令<input name="bootstrap_token" type="password" autocomplete="off" required minlength="32" placeholder="设备安装时生成的口令"></label>
+        <label>用户名<input name="login" autocomplete="username" required maxlength="64" pattern="[A-Za-z0-9_.-]+" placeholder="例如 my-agent"><span class="label-note">使用英文字母、数字、下划线、连字符或点。</span></label>
+        <label>显示名称<input name="display_name" autocomplete="nickname" required maxlength="128" placeholder="希望怎样称呼你"></label>
+        <label>密码<input name="password" type="password" autocomplete="new-password" required minlength="12" maxlength="1024" placeholder="至少 12 个字符"></label>
+        <button type="submit" class="primary">创建我的工作台</button>
+      </form>
+    </section>
+    <section id="consent" class="entry" hidden>
+      <div class="entry-symbol" aria-hidden="true">✳</div>
+      <p class="eyebrow">MAKE YOURSELF AT HOME</p><h1>连接这台设备</h1>
+      <p class="intro">让你的 Agent 在这里完成工作。</p>
+      <div class="panel">
+        <h2 id="consent-device"></h2>
+        <p class="consent-account">关联账号 <strong id="consent-owner"></strong></p>
+        <p class="subtle">连接后，可以从聊天选择这台设备。每次工具操作遵循当前会话的权限设置。</p>
+        <div class="actions"><button id="consent-deny" class="quiet">暂不连接</button><button id="consent-allow" class="primary">确认连接</button></div>
+      </div>
+    </section>
+    <section id="account" hidden>
+      <div class="page-heading"><div><p class="eyebrow">YOUR PERSONAL WORKSPACE</p><h1 id="greeting">你的工作台</h1><p class="intro">连接你的设备，留下专注工作的空间。</p></div><span class="pill">私人空间</span></div>
+      <div class="overview" aria-label="工作台概况"><span><strong id="device-count">0</strong>台设备</span><span><strong id="channel-count">0</strong>个聊天账号</span><span><strong id="pending-count">0</strong>项待审批</span></div>
+      <p class="section-label">EXECUTION &amp; DECISIONS</p>
+      <div class="workspace-grid">
+        <section id="device-panel" class="panel"><div class="section-heading"><h2><span class="section-number">01</span>执行设备</h2><button id="refresh" class="quiet small">刷新</button></div><p class="subtle">在聊天中选择设备与工作区，Agent 就在这里完成任务。添加设备时，请在那台设备的执行器登录入口确认连接。</p><div id="devices" class="items"></div></section>
+        <section id="approval-panel" class="panel"><div class="section-heading"><h2><span class="section-number">02</span>操作审批</h2><span class="pill">由你决定</span></div><p class="subtle">先看摘要，再按需展开完整参数。</p><div id="interactions" class="items"></div></section>
+      </div>
+      <p id="connections" class="section-label">CHAT &amp; CONNECTIONS</p>
+      <div class="connections-grid">
+        <div>
+          <section class="panel"><div class="section-heading"><h2><span class="section-number">03</span>聊天账号</h2></div><p class="subtle">已关联的账号可以与你的 Agent 对话。</p><div id="channels" class="items"></div><details class="chat-guide"><summary>对话中的常用操作</summary><dl><dt>选择设备</dt><dd>/电脑 → /连接 电脑ID</dd><dt>会话权限</dt><dd>/权限 默认 · 编辑 · 全部</dd><dt>任务状态</dt><dd>/状态 · /取消</dd></dl></details></section>
+          <section class="panel"><div class="section-heading"><h2>新的关联请求</h2></div><p class="subtle">核对完整账号信息，只确认你刚刚发起的请求。</p><div id="claims" class="items"></div></section>
+        </div>
+        <section class="panel accent"><p class="eyebrow">CONNECT YOUR CONVERSATION</p><h2 id="pair-title">把聊天接到工作台。</h2><p id="pair-description" class="intro">关联你的 QQ 账号。之后，把想做的事直接告诉 Agent。</p><button id="pair-create" class="primary">生成关联口令</button><div id="pair-result" hidden><output id="pair-code" aria-label="一次性关联口令"></output><p id="pair-expiry" class="subtle"></p><button id="pair-copy" class="quiet small">复制口令</button></div><ol class="connection-steps"><li><span>01</span>在这里生成一次性口令</li><li><span>02</span>发给机器人：/绑定 口令</li><li><span>03</span>回到这里确认账号关联</li></ol></section>
+      </div>
+      <details id="service-controls" class="panel service-panel" hidden><summary>04 · 云服务管理</summary><p class="subtle">关闭前会结算当前任务。再次使用时需在服务器启动服务。</p><button id="service-stop" class="quiet danger small">关闭云服务</button></details>
+    </section>
+  </main>
+  <dialog id="confirmation" aria-labelledby="confirmation-title">
+    <p class="eyebrow">A MOMENT TO CONFIRM</p><h2 id="confirmation-title"></h2><p id="confirmation-text"></p><div id="confirmation-details" class="details"></div>
+    <p id="confirmation-error" role="status" hidden></p>
+    <div class="actions"><button id="confirmation-deny" class="quiet">取消</button><button id="confirmation-allow" class="primary">确认</button></div>
+  </dialog>
+  <footer><span class="footer-brand">Peri · 为专注留一点空间</span><span>推理在云端，工作在你的设备上。</span></footer>
+</body>
+</html>

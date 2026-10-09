@@ -1,0 +1,21 @@
+Peri Cloud
+Copyright 2026 Peri Cloud contributors.
+
+This product includes software developed by the Peri project:
+https://github.com/KonghaYao/peri
+Base revision: d7ee444efe7a461b0696bd6c27c6c91f946fdec1
+Peri is distributed under the Apache License, Version 2.0.
+Existing source notices are retained.
+
+Modifications in this distribution include a personal cloud host, account portal,
+OAuth device enrollment, optional message gateways, a Windows/Linux executor,
+remote execution protocol, shared filesystem/shell runtime and approval UI.
+This is a separate distribution and is not an official upstream Peri release.
+
+The QQ adapter was independently implemented in Rust with protocol guidance from
+Prism and behavior reference from Hermes Agent (https://github.com/NousResearch/hermes-agent).
+No Hermes or Prism checkout, configuration, credentials or runtime data is included.
+Third-party dependencies remain subject to their respective licenses.
+The embedded workflow engine is @claude-code-best/workflow-engine 0.1.0,
+Copyright (c) 2026 claude-code-best, MIT License.
+The complete notice is included in licenses/workflow-engine-MIT.txt.

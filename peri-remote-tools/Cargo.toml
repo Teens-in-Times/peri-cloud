@@ -1,0 +1,24 @@
+[package]
+name = "peri-remote-tools"
+version.workspace = true
+edition.workspace = true
+description = "Native Peri tool adapters for a frozen device executor session"
+license = "Apache-2.0"
+
+[dependencies]
+peri-acp-types = { path = "../peri-acp-types" }
+peri-tool-runtime = { path = "../peri-tool-runtime" }
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+peri-executor = { path = "../peri-executor" }
+axum.workspace = true
+tempfile.workspace = true

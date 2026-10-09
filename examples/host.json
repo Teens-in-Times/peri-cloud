@@ -1,0 +1,24 @@
+{
+  "state_dir": "/var/lib/peri-cloud",
+  "listen": "127.0.0.1:47671",
+  "public_origin": "http://127.0.0.1:47671",
+  "bootstrap_env": "PERI_BOOTSTRAP_TOKEN",
+  "model": {
+    "api_base": "https://api.example.com/v1",
+    "api_key_env": "PERI_MODEL_API_KEY",
+    "model": "your-model-name",
+    "context_window": 131072,
+    "max_tokens": 8192,
+    "thinking_enabled": false,
+    "supports_thinking_content": false
+  },
+  "devices": [],
+  "qq": {
+    "instance_id": "qq-main",
+    "app_id_env": "PERI_QQ_APP_ID",
+    "client_secret_env": "PERI_QQ_CLIENT_SECRET",
+    "transport": "websocket",
+    "interaction": { "kind": "native" }
+  },
+  "max_iterations": 32
+}

@@ -1,0 +1,65 @@
+pub mod acp;
+pub mod agent_registry;
+pub mod apps;
+pub mod apps_invoke;
+pub mod apps_relay;
+pub mod auth_store;
+pub mod callback_server;
+pub mod channel_handler;
+pub mod client;
+pub mod client_oauth;
+pub mod config;
+pub mod discover_tool;
+pub mod dynamic;
+// ClientInitializeError 来自 rmcp crate（504 bytes），无法修改其定义
+#[allow(clippy::result_large_err)]
+pub mod initialize;
+pub mod mcp_notify;
+pub mod middleware;
+pub mod oauth_flow;
+pub mod reconnect;
+pub mod resource_cache;
+pub mod resource_tool;
+pub(crate) mod skill_discovery;
+pub(crate) mod system_tools;
+pub mod task_scope;
+pub mod tool_bridge;
+pub mod transport;
+
+pub use acp::AcpMcpService;
+pub use agent_registry::{ActivatedMcpAgent, McpAgentMetadata, McpAgentRegistry};
+pub use apps::{
+    canonical_resource_uri, raw_resource, raw_tool, tool_resource_uri, tool_visibility,
+    McpAppsInvocationError, McpAppsInvocationSeam, McpAppsInvoker, McpCapabilityProfile,
+    RawCallToolResult, RawMcpResource, RawMcpTool, ToolVisibility, MCP_APPS_VERSION,
+    MCP_APP_MIME_TYPE, MCP_UI_EXTENSION,
+};
+pub use auth_store::{AuthStoreError, FileCredentialStore, PerServerCredentialStore};
+pub use callback_server::{parse_code_from_url, CallbackError, OAuthCallbackServer};
+pub use channel_handler::ChannelHandler;
+pub use client::{
+    redact_mcp_error, ClientStatus, McpClientHandle, McpClientPool, McpInitStatus, McpPoolError,
+    OAuthStartDisposition, OAuthStatus, ServerInfo,
+};
+pub(crate) use config::load_merged_config_full;
+pub use config::{
+    load_merged_config, remove_server_from_config, set_server_disabled, ConfigSource,
+    McpConfigError, McpConfigFile, McpServerConfig, OAuthConfig,
+};
+pub use middleware::McpMiddleware;
+pub use oauth_flow::{
+    OAuthCallbackResult, OAuthFailureKind, OAuthFlowError, OAuthFlowEvent, OAuthFlowManager,
+};
+pub use resource_tool::McpResourceTool;
+pub use rmcp::model::{Resource, Tool};
+pub use task_scope::{
+    DynamicMcpTaskKind, McpTaskKey, McpTaskOwner, McpTaskShutdownReport, McpTaskSpawner,
+    TaskAdmissionError,
+};
+pub use tool_bridge::{build_tool_bridges, McpToolBridge, ToolCallError};
+
+// D-02：crate 内 seam 测试（主 plan §6 W5）。模块名参与 `cargo test` 过滤，
+// 故不沿用 `mod tests`（过滤 `mcp::mcp_v4_seam` 必须命中本模块）。
+#[cfg(test)]
+#[path = "mcp_v4_seam_test.rs"]
+mod mcp_v4_seam_tests;
