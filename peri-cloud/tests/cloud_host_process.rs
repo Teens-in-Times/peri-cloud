@@ -25,6 +25,8 @@ const PASSWORD: &str = "fixture-host-owner-password";
 const VERIFIER: &str = "fixture-host-native-verifier-at-least-43-characters";
 const QQ_SECRET: &str = "fixture-host-qq-secret-32-characters";
 const MODEL_KEY: &str = "fixture-host-model-private-key";
+#[path = "cloud_host_process/local_instance.rs"]
+mod local_instance_tests;
 
 #[derive(Default)]
 struct Wire {
@@ -472,7 +474,7 @@ async fn actual_host_qq_buttons_execute_then_restart_restores_session_and_shutdo
     assert!(selected["content"]
         .as_str()
         .unwrap()
-        .contains("已连接 Host PC"));
+        .contains("已连接实例：Host PC"));
     first.message(&client, "write", "创建文件").await;
     let card = wait_message(&wire, "write", true).await;
     assert_eq!(card["msg_type"], 2);

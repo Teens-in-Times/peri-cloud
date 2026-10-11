@@ -4,6 +4,7 @@
 mod channel;
 mod clock;
 mod crypto;
+mod instances;
 mod oauth;
 mod pairing;
 mod service;

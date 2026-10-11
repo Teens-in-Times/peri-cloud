@@ -3,6 +3,7 @@
 
 mod broker;
 mod connector;
+mod menu_store;
 mod router;
 pub(crate) mod store;
 mod types;
@@ -11,7 +12,8 @@ pub use connector::{NativeSessionConnector, SessionConnector};
 pub use router::{Gateway, WorkspaceSelection};
 pub use types::{
     ChannelRoute, Delivery, DeliveryBody, DeliveryError, GatewayReceipt, InboundMessage,
-    InteractionAction, InteractionCard, MessageAdapter, ReceiptState,
+    InteractionAction, InteractionCard, MenuButton, MenuCard, MessageAdapter, ReceiptState,
+    ReplyKind,
 };
 
 #[derive(Debug, thiserror::Error)]

@@ -20,6 +20,8 @@ use crate::state::{StateError, TurnState};
 use crate::{CloudRuntime, SubmitTurn};
 
 type Origins = HashMap<Uuid, Arc<RwLock<Option<String>>>>;
+#[path = "menus.rs"]
+mod menus;
 #[path = "workspaces.rs"]
 mod workspaces;
 pub use workspaces::WorkspaceSelection;
@@ -138,7 +140,7 @@ impl Gateway {
         receipt.await.map_err(|_| GatewayError::RecoveryRequired)?
     }
 
-    async fn process(&self, message: InboundMessage) -> GatewayResult<GatewayReceipt> {
+    async fn process(&self, mut message: InboundMessage) -> GatewayResult<GatewayReceipt> {
         // Personal cloud deployments have few channels. This gate serializes
         // routing/control operations; long-running model/tool work is elsewhere.
         let _gate = self.receive_gate.lock().await;
@@ -153,7 +155,26 @@ impl Gateway {
             }
             return Ok(receipt);
         }
-        match self.route(&message).await {
+        let routed = async {
+            if let Some(index) = message.text.trim().strip_prefix("/选 ") {
+                let principal = self
+                    .identity
+                    .resolve_channel(&message.route.identity)
+                    .await?;
+                let token = self
+                    .store
+                    .menu_number(
+                        &message.route,
+                        principal,
+                        index.parse().map_err(|_| GatewayError::Invalid)?,
+                    )
+                    .await?;
+                message.text = format!("/卡片 {token}");
+            }
+            self.route(&message).await
+        }
+        .await;
+        match routed {
             Ok(Some((text, principal))) => self.store.notice(&message, text, principal).await?,
             Ok(None) => (),
             Err(error) => {
@@ -163,11 +184,12 @@ impl Gateway {
                     return self.store.receipt(&receipt.event_key).await;
                 }
                 let text = match error {
-                    GatewayError::Identity(IdentityError::Unauthorized | IdentityError::Forbidden) => "请先在电脑登录并生成关联口令，然后发送 /绑定 口令；也请检查账号或电脑是否已撤销。",
+                    GatewayError::Identity(IdentityError::Unauthorized | IdentityError::Forbidden) => "请先在电脑登录并生成关联口令，然后发送 /绑定 口令；也请检查账号或实例是否已撤销。",
                     GatewayError::Identity(IdentityError::RateLimited) => "请求过于频繁，请稍后重试。",
                     GatewayError::Busy | GatewayError::State(StateError::Busy) => "当前任务仍在运行或执行状态未确认；请先等待完成或发送 /取消。",
-                    GatewayError::Connection => "无法建立工作区连接；请检查执行器、SSH 连接，以及路径是否是设备上存在且可访问的目录。",
-                    GatewayError::Invalid => "命令参数不正确。发送 /帮助 查看用法。",
+                    GatewayError::Connection => "无法建立工作区连接；请检查执行器、SSH 连接，以及路径是否是实例上存在且可访问的目录。",
+                    GatewayError::Invalid => "参数不正确。发送“菜单”打开操作卡片。",
+                    GatewayError::StaleInteraction => "卡片已过期、已使用或会话已改变。请发送“菜单”重新打开。",
                     _ => "这次请求未能完成，请检查云服务状态。没有自动重试执行。",
                 };
                 self.store.notice(&message, text.into(), None).await?;
@@ -179,97 +201,93 @@ impl Gateway {
     async fn route(
         &self,
         message: &InboundMessage,
-    ) -> GatewayResult<Option<(String, Option<Uuid>)>> {
+    ) -> GatewayResult<Option<(DeliveryBody, Option<Uuid>)>> {
         let text = message.text.trim();
         if let Some(code) = text.strip_prefix("/绑定 ") {
             self.identity
                 .claim_pair_code(message.route.identity.clone(), code.trim())
                 .await?;
             return Ok(Some((
-                "关联请求已发到电脑登录页面，请在电脑确认这次 QQ 身份。确认后发送 /电脑。".into(),
+                "关联请求已发到登录页面，请确认这次 QQ 身份。确认后发送“菜单”选择实例。".into(),
                 None,
             )));
         }
-        if text == "/帮助" {
-            return Ok(Some(("/绑定 口令：关联账号\n/电脑：查看已绑定电脑\n/连接 电脑ID [绝对路径]：选择执行电脑和工作区\n/工作区：查看当前及已有工作区\n/工作区 绝对路径：切换工作区，开始新会话\n/权限 默认|编辑|全部：设置当前会话权限\n/状态：查看当前会话\n/取消：请求停止当前任务\n选择电脑后直接聊天即可。".into(), None)));
+        if matches!(text, "/帮助" | "菜单" | "/菜单")
+            && self
+                .identity
+                .resolve_channel(&message.route.identity)
+                .await
+                .is_err()
+        {
+            return Ok(Some(("先在个人电脑的登录入口生成关联口令，再发送 /绑定 口令，回到网页确认账号。关联后发送“菜单”，即可选择实例、工作区和权限；选好后直接聊天。".into(), None)));
         }
         let (principal, devices) = self
             .identity
             .channel_devices(&message.route.identity)
             .await?;
-        if text == "/电脑" {
-            let listing = devices
-                .iter()
-                .map(|device| format!("{} ({})\n{}", device.name, device.platform, device.id))
-                .collect::<Vec<_>>()
-                .join("\n\n");
+        let selected = self.store.selection(&message.route, principal).await?;
+        let action = match text {
+            "/菜单" | "菜单" | "/帮助" => Some(super::menu_store::MenuAction::Home),
+            "/实例" | "实例" | "/电脑" => {
+                Some(super::menu_store::MenuAction::Instances { offset: 0 })
+            }
+            "/工作区" | "工作区" => Some(super::menu_store::MenuAction::Workspaces),
+            "/权限" => Some(super::menu_store::MenuAction::Permissions),
+            _ => None,
+        };
+        if let Some(action) = action {
             return Ok(Some((
-                if listing.is_empty() {
-                    "账号还没有可用电脑，请先在执行器登录。".into()
-                } else {
-                    format!("可用电脑：\n{listing}\n\n发送 /连接 电脑ID 选择。")
-                },
+                self.menu_route(message, principal, &devices, selected, action)
+                    .await?,
                 Some(principal),
             )));
         }
-        let selected = self.store.selection(&message.route, principal).await?;
-        if let Some(id) = text.strip_prefix("/连接 ") {
-            let (id, workspace) = workspaces::connection_arguments(id)?;
+        if let Some(token) = text.strip_prefix("/卡片 ") {
+            let token = Uuid::parse_str(token).map_err(|_| GatewayError::Invalid)?;
+            let record = self
+                .store
+                .menu_action(&message.route, principal, token, self.identity.now())
+                .await?;
+            if record.action.mutates() && record.expected_session != selected {
+                return Err(GatewayError::StaleInteraction);
+            }
+            self.store
+                .consume_menu_action(token, &message.event_id)
+                .await?;
+            return Ok(Some((
+                self.menu_route(message, principal, &devices, selected, record.action)
+                    .await?,
+                Some(principal),
+            )));
+        }
+        if let Some(input) = text.strip_prefix("/连接 ") {
+            let (id, workspace) = workspaces::connection_arguments(input)?;
             let device = devices
                 .iter()
-                .find(|device| device.id == id)
+                .find(|d| d.id == id)
                 .ok_or(IdentityError::Forbidden)?;
-            if let Some(old) = selected {
-                let state = self.runtime.journal().session(principal, old).await?;
-                if state.frozen.device_id == id {
-                    if let Some(path) = workspace {
-                        let frozen = self
-                            .change_workspace(&message.route, principal, device, old, path)
-                            .await?;
-                        return Ok(Some((
-                            format!(
-                                "已选择 {}\n工作区：{}\n保留当前权限设置。",
-                                device.name, frozen.binding.workspace
-                            ),
-                            Some(principal),
-                        )));
-                    }
-                }
-                if state.frozen.device_id == id && workspace.is_none() {
-                    return Ok(Some((
-                        format!("当前已选择 {}。", device.name),
-                        Some(principal),
-                    )));
-                }
-                if !state.execution_settled()
-                    || self.runtime.journal().has_unconfirmed_turn(old).await?
-                {
-                    return Err(GatewayError::Busy);
-                }
-            }
-            let path = workspace.unwrap_or(&device.default_workspace);
-            workspaces::validate_path(&device.platform, path)?;
-            let agent = self
-                .connector
-                .open_workspace(principal, device, path)
-                .await?;
-            let frozen = agent.frozen_session(principal);
-            self.attach(&message.route, principal, device, agent)
-                .await?;
-            self.store
-                .select(&message.route, principal, frozen.session_id)
+            let frozen = self
+                .select_instance(&message.route, principal, device, selected, workspace)
                 .await?;
             return Ok(Some((
                 format!(
-                    "已连接 {}\n工作区：{}\n当前权限为默认审批。可以直接发送任务。",
+                    "已连接实例：{}\n工作区：{}\n可直接发送任务，或发送“菜单”选择目录与权限。",
                     device.name, frozen.binding.workspace
-                ),
+                )
+                .into(),
                 Some(principal),
             )));
         }
         let Some(session) = selected else {
             return Ok(Some((
-                "请先发送 /电脑，再用 /连接 电脑ID 选择执行电脑。".into(),
+                self.menu_route(
+                    message,
+                    principal,
+                    &devices,
+                    None,
+                    super::menu_store::MenuAction::Instances { offset: 0 },
+                )
+                .await?,
                 Some(principal),
             )));
         };
@@ -278,10 +296,6 @@ impl Gateway {
             .iter()
             .find(|device| device.id == state.frozen.device_id)
             .ok_or(IdentityError::Forbidden)?;
-        if text == "/工作区" {
-            let paths = self.store.known_workspaces(principal, device.id).await?;
-            return Ok(Some((format!("当前工作区：{}\n\n已有工作区：\n{}\n\n发送 /工作区 绝对路径 切换。路径可以包含空格，不需要加引号。切换后开始新会话，旧历史保留。", state.frozen.binding.workspace, paths.join("\n")), Some(principal))));
-        }
         if let Some(path) = text.strip_prefix("/工作区 ") {
             let frozen = self
                 .change_workspace(&message.route, principal, device, session, path.trim())
@@ -290,7 +304,8 @@ impl Gateway {
                 format!(
                     "已切换工作区：{}\n已开始新会话，保留当前权限设置。旧会话历史已保存。",
                     frozen.binding.workspace
-                ),
+                )
+                .into(),
                 Some(principal),
             )));
         }
@@ -303,16 +318,17 @@ impl Gateway {
             let status = match active.map(|turn| turn.state) {
                 Some(TurnState::RecoveryRequired) => "执行状态待恢复确认",
                 Some(_) => "任务运行中",
-                None if !state.execution_settled() => "电脑任务尚未确认全部结束",
+                None if !state.execution_settled() => "实例任务尚未确认全部结束",
                 None => "空闲",
             };
             return Ok(Some((
                 format!(
-                    "电脑：{}\n工作区：{}\n权限：{}\n状态：{status}",
+                    "实例：{}\n工作区：{}\n权限：{}\n状态：{status}",
                     device.name,
                     state.frozen.binding.workspace,
                     permission_label(state.permissions()?)
-                ),
+                )
+                .into(),
                 Some(principal),
             )));
         }
@@ -332,7 +348,7 @@ impl Gateway {
                 )));
             }
             return Ok(Some((
-                "没有正在运行的云端任务。电脑后台执行状态仍以执行器为准。".into(),
+                "没有正在运行的云端任务。实例后台执行状态仍以执行器为准。".into(),
                 Some(principal),
             )));
         }
@@ -348,7 +364,7 @@ impl Gateway {
                 .set_permissions(principal, session, mode)
                 .await?;
             return Ok(Some((
-                format!("当前会话权限已设为{}。", permission_label(mode)),
+                format!("当前会话权限已设为{}。", permission_label(mode)).into(),
                 Some(principal),
             )));
         }

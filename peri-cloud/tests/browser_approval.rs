@@ -136,6 +136,7 @@ async fn browser_cookie_and_csrf_approve_the_existing_channel_request_once() {
                 platform: executor.info().platform.clone(),
                 default_workspace: workspace.path().to_str().unwrap().into(),
                 connection_id: None,
+                is_local: false,
                 revoked: false,
             },
         )
@@ -195,6 +196,7 @@ async fn browser_cookie_and_csrf_approve_the_existing_channel_request_once() {
         .receive(InboundMessage {
             route: route.clone(),
             event_id: "select".into(),
+            reply_kind: peri_cloud::gateway::ReplyKind::Message,
             text: format!("/连接 {}", executor.info().device_id),
         })
         .await
@@ -203,6 +205,7 @@ async fn browser_cookie_and_csrf_approve_the_existing_channel_request_once() {
         .receive(InboundMessage {
             route,
             event_id: "write".into(),
+            reply_kind: peri_cloud::gateway::ReplyKind::Message,
             text: "创建文件".into(),
         })
         .await

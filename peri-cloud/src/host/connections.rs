@@ -94,6 +94,21 @@ impl Connections {
 
 #[async_trait]
 impl SessionConnector for Connections {
+    async fn directories(
+        &self,
+        _principal: Uuid,
+        device: &DeviceRecord,
+        query: peri_acp_types::device_executor::DirectoryQuery,
+    ) -> GatewayResult<peri_acp_types::device_executor::DirectoryListing> {
+        if device.revoked {
+            return Err(GatewayError::Connection);
+        }
+        self.client(device.id)
+            .await?
+            .directories(query)
+            .await
+            .map_err(|_| GatewayError::Connection)
+    }
     async fn open(
         &self,
         principal: Uuid,

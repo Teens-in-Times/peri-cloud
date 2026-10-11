@@ -14,6 +14,7 @@ use crate::state::CloudJournal;
 const BROWSER_LIFETIME: i64 = 12 * 60 * 60;
 
 pub struct IdentityService {
+    pub(crate) local_instance: parking_lot::RwLock<Option<DeviceRecord>>,
     pub(crate) pool: SqlitePool,
     bootstrap_hash: String,
     dummy_password: String,
@@ -37,6 +38,7 @@ impl IdentityService {
             return Err(IdentityError::Invalid);
         }
         Ok(Arc::new(Self {
+            local_instance: parking_lot::RwLock::new(None),
             pool: journal.identity_pool(),
             bootstrap_hash: hash("bootstrap", bootstrap_token),
             dummy_password: password_hash(secret(), None).await?,
@@ -93,6 +95,7 @@ impl IdentityService {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        self.ensure_local_instance().await?;
         Ok(principal)
     }
 
@@ -202,6 +205,7 @@ impl IdentityService {
             || device.default_workspace.len() > 4096
             || device.default_workspace.contains('\0')
             || device.connection_id.is_some()
+            || device.is_local
         {
             return Err(IdentityError::Invalid);
         }
@@ -219,6 +223,9 @@ impl IdentityService {
             // The native grant can update its metadata. Connection configuration
             // is deployment-owned and cannot be replaced through registration.
             let existing: DeviceRecord = serde_json::from_str(row.get("record_json"))?;
+            if existing.is_local {
+                return Err(IdentityError::Forbidden);
+            }
             device.connection_id = existing.connection_id;
         }
         sqlx::query("INSERT INTO identity_devices(id,principal,record_json) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET record_json=excluded.record_json")
@@ -232,14 +239,19 @@ impl IdentityService {
 
     pub async fn devices(&self, actor: &Authenticated) -> IdentityResult<Vec<DeviceRecord>> {
         self.browser_scope(actor).await?;
+        self.ensure_local_instance().await?;
         let rows =
             sqlx::query("SELECT record_json FROM identity_devices WHERE principal=? ORDER BY id")
                 .bind(actor.principal.id.to_string())
                 .fetch_all(&self.pool)
                 .await?;
-        rows.into_iter()
+        let mut devices: Vec<DeviceRecord> = rows
+            .into_iter()
             .map(|row| serde_json::from_str(row.get("record_json")).map_err(IdentityError::from))
-            .collect()
+            .collect::<IdentityResult<_>>()?;
+        self.apply_instance_defaults(actor.principal.id, &mut devices)
+            .await?;
+        Ok(devices)
     }
 
     pub async fn revoke_device(&self, actor: &Authenticated, device: Uuid) -> IdentityResult<()> {

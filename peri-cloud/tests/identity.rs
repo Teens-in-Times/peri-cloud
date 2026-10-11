@@ -215,6 +215,7 @@ async fn native_pkce_exact_redirect_single_use_and_device_bound_scope() {
         platform: "windows".into(),
         default_workspace: "G:\\Project".into(),
         connection_id: None,
+        is_local: false,
         revoked: false,
     };
     f.identity
@@ -303,6 +304,7 @@ async fn refresh_rotation_replay_revokes_family_and_device_revocation_invalidate
                 platform: "linux".into(),
                 default_workspace: "/srv/project".into(),
                 connection_id: None,
+                is_local: false,
                 revoked: false,
             },
         )

@@ -7,6 +7,11 @@ use crate::gateway::{ChannelRoute, Gateway, InboundMessage, InteractionAction};
 use crate::identity::ChannelIdentity;
 
 pub enum QqInput {
+    Menu {
+        route: ChannelRoute,
+        event_id: String,
+        action: Uuid,
+    },
     Message(InboundMessage),
     Interaction {
         route: ChannelRoute,
@@ -55,6 +60,7 @@ pub fn normalize(instance: &str, event_type: &str, data: Value) -> QqResult<Opti
                 route: route(instance, user, conversation),
                 event_id: message.id,
                 text: message.content,
+                reply_kind: crate::gateway::ReplyKind::Message,
             })))
         }
         "INTERACTION_CREATE" => {
@@ -107,6 +113,13 @@ pub fn normalize(instance: &str, event_type: &str, data: Value) -> QqResult<Opti
                 return Err(QqError::Event);
             }
             let request = Uuid::parse_str(parts[2]).map_err(|_| QqError::Event)?;
+            if parts[1] == "menu" {
+                return Ok(Some(QqInput::Menu {
+                    route: route(instance, user, conversation),
+                    event_id: id,
+                    action: request,
+                }));
+            }
             let action = match parts[1] {
                 "allow" => InteractionAction::AllowOnce {},
                 "reject" => InteractionAction::Reject {},
@@ -164,6 +177,18 @@ impl QqAdapter {
             );
         }
         match normalize(&self.instance, kind, data)? {
+            Some(QqInput::Menu {
+                route,
+                event_id,
+                action,
+            }) => {
+                let accepted = gateway
+                    .receive_menu(route, event_id.clone(), action)
+                    .await
+                    .is_ok();
+                self.acknowledge_interaction(&event_id, if accepted { 0 } else { 4 })
+                    .await?;
+            }
             Some(QqInput::Message(message)) => {
                 gateway
                     .receive(message)

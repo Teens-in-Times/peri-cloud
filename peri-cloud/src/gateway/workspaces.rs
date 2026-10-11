@@ -19,11 +19,95 @@ pub struct WorkspaceSelection {
     pub adapter: String,
     pub conversation_id: String,
     pub workspace: String,
+    pub default_workspace: String,
+    pub instance_kind: String,
     pub known_workspaces: Vec<String>,
     pub busy: bool,
 }
 
 impl Gateway {
+    pub async fn browse_browser_instance(
+        &self,
+        actor: &Authenticated,
+        id: Uuid,
+        path: Option<String>,
+        offset: usize,
+    ) -> GatewayResult<peri_acp_types::device_executor::DirectoryListing> {
+        self.identity.browser_scope(actor).await?;
+        let devices = self.identity.devices(actor).await?;
+        let device = devices
+            .iter()
+            .find(|d| d.id == id && !d.revoked)
+            .ok_or(IdentityError::Forbidden)?;
+        let path = path.unwrap_or_else(|| device.default_workspace.clone());
+        if !path.is_empty() {
+            validate_path(&device.platform, &path)?;
+        }
+        self.connector
+            .directories(
+                actor.principal().id,
+                device,
+                peri_acp_types::device_executor::DirectoryQuery {
+                    path,
+                    offset,
+                    limit: 50,
+                },
+            )
+            .await
+    }
+
+    pub async fn set_browser_instance_default(
+        &self,
+        actor: &Authenticated,
+        id: Uuid,
+        path: String,
+    ) -> GatewayResult<String> {
+        if path.is_empty() {
+            return Err(GatewayError::Invalid);
+        }
+        let listing = self
+            .browse_browser_instance(actor, id, Some(path), 0)
+            .await?;
+        self.identity.browser_scope(actor).await?;
+        self.identity
+            .set_instance_default(actor.principal().id, id, &listing.path)
+            .await?;
+        Ok(listing.path)
+    }
+    pub(super) async fn select_instance(
+        &self,
+        route: &ChannelRoute,
+        principal: Uuid,
+        device: &DeviceRecord,
+        selected: Option<Uuid>,
+        workspace: Option<&str>,
+    ) -> GatewayResult<FrozenSession> {
+        let path = workspace.unwrap_or(&device.default_workspace);
+        validate_path(&device.platform, path)?;
+        if let Some(old) = selected {
+            let state = self.runtime.journal().session(principal, old).await?;
+            if state.frozen.device_id == device.id {
+                return self
+                    .change_workspace(route, principal, device, old, path)
+                    .await;
+            }
+            if !state.execution_settled()
+                || self.runtime.journal().has_unconfirmed_turn(old).await?
+            {
+                return Err(GatewayError::Busy);
+            }
+        }
+        let agent = self
+            .connector
+            .open_workspace(principal, device, path)
+            .await?;
+        let frozen = agent.frozen_session(principal);
+        self.attach(route, principal, device, agent).await?;
+        self.store
+            .select(route, principal, frozen.session_id)
+            .await?;
+        Ok(frozen)
+    }
     /// Only current, still-linked chat contexts belonging to the browser account.
     pub async fn browser_workspaces(
         &self,
@@ -59,6 +143,13 @@ impl Gateway {
                 adapter: route.identity.adapter_instance_id,
                 conversation_id: route.conversation_id,
                 workspace: state.frozen.binding.workspace,
+                default_workspace: device.default_workspace.clone(),
+                instance_kind: if device.is_local {
+                    "local"
+                } else {
+                    "connected"
+                }
+                .into(),
                 known_workspaces: paths,
                 busy,
             });
@@ -133,6 +224,11 @@ impl Gateway {
             .iter()
             .find(|d| d.id == state.frozen.device_id)
             .ok_or(IdentityError::Forbidden)?;
+        let workspace = if workspace.is_empty() {
+            &device.default_workspace
+        } else {
+            workspace
+        };
         Ok(self
             .change_workspace(&route, principal, device, expected, workspace)
             .await?

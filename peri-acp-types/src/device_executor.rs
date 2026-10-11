@@ -22,6 +22,31 @@ pub struct OpenSession {
     pub workspace: String,
 }
 
+/// Account UI directory discovery; never a model tool or an execution request.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryQuery {
+    pub path: String,
+    #[serde(default)]
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirectoryListing {
+    pub path: String,
+    pub parent: Option<String>,
+    pub roots: Vec<String>,
+    pub directories: Vec<DirectoryEntry>,
+    pub next_offset: Option<usize>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionBinding {
     pub session_id: Uuid,

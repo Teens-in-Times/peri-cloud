@@ -194,6 +194,7 @@ impl LoginClient {
             platform: self.device.platform.clone(),
             default_workspace: self.workspace.clone(),
             connection_id: None,
+            is_local: false,
             revoked: false,
         };
         let response = self

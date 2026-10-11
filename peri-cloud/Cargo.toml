@@ -11,6 +11,7 @@ peri-acp-types = { path = "../peri-acp-types" }
 peri-middlewares = { path = "../peri-middlewares" }
 peri-model = { path = "../peri-model" }
 peri-remote-tools = { path = "../peri-remote-tools" }
+peri-executor = { path = "../peri-executor" }
 async-trait.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
@@ -43,5 +44,4 @@ name = "peri-cloud-host"
 path = "src/bin/cloud_host.rs"
 
 [dev-dependencies]
-peri-executor = { path = "../peri-executor" }
 tempfile.workspace = true

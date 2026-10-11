@@ -72,7 +72,14 @@ pub struct DeviceRecord {
     pub default_workspace: String,
     /// Set only by deployment-owned connection configuration.
     pub connection_id: Option<Uuid>,
+    /// Only the cloud deployment may register a same-host executor.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_local: bool,
     pub revoked: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

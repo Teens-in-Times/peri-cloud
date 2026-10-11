@@ -5,7 +5,7 @@ use uuid::Uuid;
 use super::types::digest;
 use super::{
     ChannelRoute, Delivery, DeliveryBody, GatewayError, GatewayReceipt, GatewayResult,
-    InboundMessage, ReceiptState,
+    InboundMessage, ReceiptState, ReplyKind,
 };
 use crate::state::{CloudJournal, TurnRecord, TurnState};
 
@@ -24,13 +24,22 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             .execute(&mut *tx)
             .await?;
     }
+    if matches!(version, 2 | 3) {
+        for statement in [
+            "CREATE TABLE instance_defaults (principal TEXT NOT NULL REFERENCES principals(id), device_id TEXT NOT NULL REFERENCES identity_devices(id), workspace TEXT NOT NULL, PRIMARY KEY(principal,device_id))",
+            "CREATE TABLE gateway_menu_actions (id TEXT PRIMARY KEY, route_key TEXT NOT NULL, principal TEXT NOT NULL REFERENCES principals(id), record_json TEXT NOT NULL, expires_at INTEGER NOT NULL, used_event TEXT)",
+        ] { sqlx::query(statement).execute(&mut *tx).await?; }
+        sqlx::query("PRAGMA user_version = 4")
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok(())
 }
 
 #[derive(Clone)]
 pub(crate) struct GatewayStore {
-    pool: SqlitePool,
+    pub(super) pool: SqlitePool,
 }
 
 pub(crate) struct PendingTurn {
@@ -220,7 +229,7 @@ impl GatewayStore {
     pub async fn notice(
         &self,
         message: &InboundMessage,
-        text: String,
+        body: DeliveryBody,
         principal: Option<Uuid>,
     ) -> GatewayResult<()> {
         let mut tx = self.pool.begin().await?;
@@ -228,8 +237,8 @@ impl GatewayStore {
             &mut tx,
             &format!("notice:{}", message.key()?),
             &message.route,
-            &message.event_id,
-            DeliveryBody::Notice { text },
+            (&message.event_id, message.reply_kind),
+            body,
             principal,
             None,
         )
@@ -256,7 +265,7 @@ impl GatewayStore {
             &mut tx,
             &format!("interaction:{}", card.request_id),
             route,
-            parent,
+            (parent, ReplyKind::Message),
             DeliveryBody::Interaction { card: card.clone() },
             Some(principal),
             Some(card.device_id),
@@ -299,7 +308,7 @@ impl GatewayStore {
                 &mut tx,
                 &format!("reply:{}:{}", turn.turn_id, reply.message_id),
                 &pending.route,
-                &pending.event_id,
+                (&pending.event_id, ReplyKind::Message),
                 DeliveryBody::Reply {
                     reply: reply.clone(),
                 },
@@ -323,7 +332,7 @@ impl GatewayStore {
                 &mut tx,
                 &format!("turn-status:{}", turn.turn_id),
                 &pending.route,
-                &pending.event_id,
+                (&pending.event_id, ReplyKind::Message),
                 DeliveryBody::Notice { text: text.into() },
                 Some(pending.principal),
                 Some(device),
@@ -375,11 +384,12 @@ async fn enqueue(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     key: &str,
     route: &ChannelRoute,
-    parent: &str,
+    parent: (&str, ReplyKind),
     body: DeliveryBody,
     principal: Option<Uuid>,
     device: Option<Uuid>,
 ) -> GatewayResult<()> {
+    let (parent, reply_kind) = parent;
     let (exists,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM gateway_outbox WHERE semantic_key=?")
             .bind(key)
@@ -388,7 +398,11 @@ async fn enqueue(
     if exists != 0 {
         return Ok(());
     }
-    let reply_key = digest(&serde_json::to_vec(&(route, parent))?);
+    let reply_key = if reply_kind == ReplyKind::Event {
+        digest(&serde_json::to_vec(&(route, parent, "event"))?)
+    } else {
+        digest(&serde_json::to_vec(&(route, parent))?)
+    };
     let (last,): (i64,) =
         sqlx::query_as("SELECT COALESCE(MAX(sequence),0) FROM gateway_outbox WHERE reply_key=?")
             .bind(&reply_key)
@@ -399,6 +413,7 @@ async fn enqueue(
         delivery_id: Uuid::new_v4(),
         route: route.clone(),
         in_reply_to: parent.into(),
+        reply_kind,
         message_sequence: sequence,
         body,
     };

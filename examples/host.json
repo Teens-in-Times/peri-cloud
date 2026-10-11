@@ -13,6 +13,10 @@
     "supports_thinking_content": false
   },
   "devices": [],
+  "local_instance": {
+    "name": "服务器本地",
+    "workspace": "/var/lib/peri-cloud/workspace"
+  },
   "qq": {
     "instance_id": "qq-main",
     "app_id_env": "PERI_QQ_APP_ID",

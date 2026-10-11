@@ -1,6 +1,7 @@
 //! Device execution without an agent loop or a second approval layer.
 
 mod config;
+mod directories;
 mod error;
 pub mod login;
 mod native;

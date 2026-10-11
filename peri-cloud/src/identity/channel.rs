@@ -11,6 +11,7 @@ impl IdentityService {
         identity: &ChannelIdentity,
     ) -> IdentityResult<(Uuid, Vec<DeviceRecord>)> {
         let principal = self.resolve_channel(identity).await?;
+        self.ensure_local_instance().await?;
         let rows =
             sqlx::query("SELECT record_json FROM identity_devices WHERE principal=? ORDER BY id")
                 .bind(principal.to_string())
@@ -23,6 +24,8 @@ impl IdentityService {
                 devices.push(device);
             }
         }
+        self.apply_instance_defaults(principal, &mut devices)
+            .await?;
         Ok((principal, devices))
     }
 

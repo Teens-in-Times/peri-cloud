@@ -68,6 +68,12 @@ impl DeviceClient {
         &self.device
     }
 
+    pub async fn directories(&self, query: DirectoryQuery) -> Result<DirectoryListing> {
+        let body = serde_json::to_value(query).map_err(|_| Error::Protocol)?;
+        self.request(Method::POST, "/v1/directories", Some(body))
+            .await
+    }
+
     /// A new SSH forwarding port is published only after checking device identity.
     pub async fn reconnect(&self, endpoint: SocketAddr) -> Result<()> {
         let _gate = self.reconnect_gate.lock().await;

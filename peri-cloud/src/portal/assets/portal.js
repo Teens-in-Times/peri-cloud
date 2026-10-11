@@ -13,11 +13,11 @@ const errors = {
   unauthorized: '登录信息无效或已过期，请重新登录。',
   forbidden: '当前账户无法完成这项操作。',
   origin_rejected: '访问地址与云服务配置不一致，请使用正确的登录地址。',
-  identity_conflict: '账户已初始化，或这台设备已经属于其他账户。',
+  identity_conflict: '账户已初始化，或这个实例已经属于其他账户。',
   stale_request: '这个请求已过期或已经处理，请刷新后查看。',
   rate_limited: '操作过于频繁，请稍后再试。',
   invalid_request: '请检查填写的信息。',
-  invalid_workspace: '请输入设备上的绝对路径，例如 Windows 的 C:\\Projects\\demo 或 Linux 的 /srv/demo。',
+  invalid_workspace: '请输入实例上的绝对路径，例如 Windows 的 C:\\Projects\\demo 或 Linux 的 /srv/demo。',
   workspace_busy: '当前任务仍在运行或执行结果未确认，请先等待完成，或在聊天中发送 /取消。',
   workspace_unavailable: '无法连接这个工作区。请检查执行器与 SSH 连接，并确认该目录存在且可以访问。',
   identity_unavailable: '云服务暂时无法处理请求，请稍后再试。'
@@ -137,18 +137,14 @@ function renderAccount(data) {
   byId('pair-title').textContent = data.channels.length ? '让对话继续。' : '把聊天，接到工作台。';
   byId('pair-description').textContent = data.channels.length ? '聊天已经连接。你也可以关联其他账号，共用这个工作台。' : '关联你的 QQ 账号。之后，把想做的事直接告诉 Agent。';
   byId('pair-create').textContent = data.channels.length ? '关联其他账号' : '生成关联口令';
-  list('devices', data.devices, '还没有关联的执行设备。', device => item(
-    device.name + (device.revoked ? ' · 已撤销' : ''),
-    (device.platform === 'windows' ? 'Windows' : 'Linux') + ' · ' + device.default_workspace,
-    device.revoked ? '' : '撤销', () => confirm('撤销设备连接？', '撤销后，该执行器需要重新登录。', device.name, () => api('/api/devices/' + device.id + '/revoke', {})), true
-  ));
+  list('devices', data.devices, '还没有登记的执行实例。', instanceItem);
   list('channels', data.channels, '还没有关联的聊天账号。', channel => item(
     channel.adapter_instance_id, shortIdentity(channel.external_user_id), '移除',
     () => confirm('移除聊天账号？', '这个聊天账号将无法再使用你的 Agent。电脑登录仍然保留。', channel.adapter_instance_id + '\n' + channel.external_user_id, () => api('/api/channels/revoke', channel)), true
   ));
   list('claims', data.pending_pair_claims, '目前没有等待确认的请求。', claim => item(
     '新的聊天账号关联', claim.identity.adapter_instance_id + ' · ' + shortIdentity(claim.identity.external_user_id), '查看并确认',
-    () => confirm('确认关联这个聊天账号？', '关联后，这个账号可以选择并使用你的执行设备。请核对是不是你刚刚发送口令的账号。', claim.identity.adapter_instance_id + '\n' + claim.identity.external_user_id,
+    () => confirm('确认关联这个聊天账号？', '关联后，这个账号可以选择并使用你的执行实例。请核对是不是你刚刚发送口令的账号。', claim.identity.adapter_instance_id + '\n' + claim.identity.external_user_id,
       () => api('/api/pairing/' + claim.claim_id + '/confirm', { allow: true }),
       () => api('/api/pairing/' + claim.claim_id + '/confirm', { allow: false }), '确认关联', '拒绝关联')
   ));
@@ -161,7 +157,7 @@ async function refresh() {
   try {
     renderAccount(await api('/api/account'));
     const workspaces = await api('/api/workspaces');
-    list('workspace-selections', workspaces, '还没有选择执行设备的聊天会话。在聊天中发送 /电脑，再发送 /连接 电脑ID [绝对路径]。', selection => {
+    list('workspace-selections', workspaces, '还没有选择实例的聊天会话。在 QQ 发送“菜单”，点击选择实例即可。', selection => {
       const row = item(selection.device_name + ' · ' + selection.adapter,
         '会话 ' + shortIdentity(selection.conversation_id), '切换工作区', () => openWorkspace(selection));
       const path = document.createElement('div'); path.className = 'workspace-path'; path.textContent = selection.workspace;
@@ -189,27 +185,102 @@ function shortIdentity(value) {
   const chars = Array.from(value); return chars.length > 18 ? chars.slice(0, 8).join('') + '…' + chars.slice(-6).join('') : value;
 }
 
-function openWorkspace(selection) {
+function directoryPicker(instance, initial, history = []) {
   const root = document.createElement('div'); root.className = 'workspace-picker';
-  const savedLabel = document.createElement('label'); savedLabel.textContent = '已有工作区';
+  const element = (tag, className, text) => {
+    const node = document.createElement(tag); node.className = className; node.textContent = text; return node;
+  };
+  const button = (label, task) => {
+    const node = element('button', 'quiet small', label); node.type = 'button';
+    node.addEventListener('click', () => action(node, task)); return node;
+  };
+  const label = element('label', '', '工作区目录');
   const saved = document.createElement('select'); saved.id = 'workspace-saved';
-  const manual = document.createElement('option'); manual.value = ''; manual.textContent = '指定其他目录…'; saved.append(manual);
-  for (const path of selection.known_workspaces) {
-    const option = document.createElement('option'); option.value = path; option.textContent = path; saved.append(option);
+  for (const [value,text] of [['', '默认（全局）：' + instance.default_workspace], ...history.map(p=>[p,p]), ['__manual__','指定其他目录…']]) {
+    const option = document.createElement('option'); option.value = value; option.textContent = text; saved.append(option);
   }
-  saved.value = selection.workspace; savedLabel.append(saved);
-  const pathLabel = document.createElement('label'); pathLabel.textContent = '设备上的绝对路径';
-  const input = document.createElement('input'); input.id = 'workspace-path-input'; input.value = selection.workspace;
-  input.required = true; input.maxLength = 4096; input.autocomplete = 'off'; input.spellcheck = false;
-  input.placeholder = selection.platform === 'windows' ? 'C:\\Projects\\demo' : '/srv/demo'; pathLabel.append(input);
-  saved.addEventListener('change', () => { if (saved.value) input.value = saved.value; else { input.value = ''; input.focus(); } });
-  input.addEventListener('input', () => { saved.value = selection.known_workspaces.includes(input.value) ? input.value : ''; });
-  root.append(savedLabel, pathLabel);
-  confirm('切换会话工作区', selection.device_name + ' · ' + selection.adapter + ' · ' + shortIdentity(selection.conversation_id) + '。切换后开始新会话，旧历史保留，权限设置保持。', root,
-    async () => {
-      if (!input.reportValidity()) throw new Error('请填写设备上的绝对路径。');
-      await api('/api/workspaces/' + selection.session_id + '/switch', { workspace: input.value.trim() });
-    }, undefined, '确认切换');
+  saved.value = history.includes(initial) ? initial : initial ? '__manual__' : '';
+  const input = document.createElement('input'); input.id = 'workspace-path-input';
+  input.value = initial || ''; input.maxLength = 4096; input.autocomplete = 'off'; input.spellcheck = false;
+  input.placeholder = '留空使用默认工作区';
+  saved.addEventListener('change', () => {
+    input.value = saved.value === '__manual__' ? '' : saved.value;
+    if (saved.value === '__manual__') input.focus();
+    else browse(input.value || null);
+  });
+  input.addEventListener('input', () => { saved.value = input.value ? '__manual__' : ''; });
+  label.append(saved, input);
+  const hint = element('p', 'subtle', '留空使用实例默认目录；也可以从下面浏览文件夹。');
+  const browser = element('div', 'directory-browser', '');
+  const heading = element('div', 'directory-heading', '浏览目录');
+  const nav = element('div', 'directory-nav', '');
+  const path = element('p', 'workspace-path', '');
+  const status = element('p', 'subtle', '正在读取目录…');
+  const folders = element('div', 'directory-folders', '');
+  const commands = element('div', 'directory-nav', '');
+  const browsePath = button('浏览填写的路径', () => browse(input.value.trim() || null));
+  browser.append(heading, nav, path, status, folders, commands); root.append(label, hint, browsePath, browser);
+  let request = 0;
+  async function browse(directory, offset = 0) {
+    const version = ++request; status.textContent = '正在读取目录…';
+    folders.replaceChildren(); commands.replaceChildren();
+    try {
+      const listing = await api('/api/instances/' + instance.id + '/browse', { path: directory, offset });
+      if (version !== request || !root.isConnected) return;
+      nav.replaceChildren(...listing.roots.map(p => button(p, () => browse(p))), button('默认目录', () => browse(null)));
+      if (listing.parent) nav.prepend(button('上一级', () => browse(listing.parent)));
+      path.textContent = listing.path;
+      status.textContent = listing.directories.length ? '点击文件夹进入；选择目录后，再确认切换。' : '此目录没有子文件夹。可以直接使用当前目录。';
+      for (const child of listing.directories) folders.append(button(child.name + ' /', () => browse(child.path)));
+      commands.append(button('选择此目录', async () => {
+        input.value = listing.path; saved.value = '__manual__'; hint.textContent = '已选择：' + listing.path;
+      }));
+      commands.append(button('设为全局默认', async () => {
+        const result = await api('/api/instances/' + instance.id + '/default-workspace', { workspace: listing.path });
+        instance.default_workspace = result.workspace;
+        saved.options[0].textContent = '默认（全局）：' + result.workspace;
+        hint.textContent = '默认目录已保存，当前聊天会话不变。';
+      }));
+      if (listing.next_offset !== null) commands.append(button('下一页目录', () => browse(listing.path, listing.next_offset)));
+      if (offset) commands.append(button('第一页', () => browse(listing.path)));
+    } catch (error) {
+      if (version === request && root.isConnected) {
+        status.textContent = error.message; path.textContent = directory || instance.default_workspace;
+        try {
+          const listing = await api('/api/instances/' + instance.id + '/browse', {path:'',offset:0});
+          if (version === request && root.isConnected) nav.replaceChildren(...listing.roots.map(p => button(p, () => browse(p))));
+        } catch { /* Retain the directory error and allow a manual path. */ }
+      }
+    }
+  }
+  return { root, value: () => input.value.trim() || null, load: () => browse(initial || null) };
+}
+
+function openWorkspace(selection) {
+  const instance = {id: selection.device_id, default_workspace: selection.default_workspace};
+  const picker = directoryPicker(instance, selection.workspace, selection.known_workspaces);
+  confirm('切换会话工作区', selection.device_name + ' · ' + selection.adapter + '。切换后开始新会话，保留权限与旧历史。', picker.root,
+    () => api('/api/workspaces/' + selection.session_id + '/switch', { workspace: picker.value() }), undefined, '确认切换');
+  picker.load();
+}
+
+function openInstanceWorkspace(instance) {
+  const picker = directoryPicker(instance, null);
+  confirm('实例默认工作区', instance.name + '。默认目录用于以后未指定路径的新会话，当前会话不变。', picker.root,
+    () => api('/api/instances/' + instance.id + '/default-workspace', { workspace: picker.value() || instance.default_workspace }), undefined, '保存默认目录');
+  picker.load();
+}
+
+function instanceItem(instance) {
+  const row = item(instance.name + (instance.revoked ? ' · 已撤销' : ''),
+    (instance.platform === 'windows' ? 'Windows' : 'Linux') + (instance.is_local ? ' · 服务器本地' : ' · 已登记执行器') + '\n默认（全局）：' + instance.default_workspace,
+    instance.revoked ? '' : '浏览 / 默认目录', () => openInstanceWorkspace(instance));
+  if (!instance.revoked && !instance.is_local) {
+    const revoke = document.createElement('button'); revoke.className = 'quiet danger small'; revoke.textContent = '撤销';
+    revoke.addEventListener('click', () => confirm('撤销实例连接？', '撤销后，该执行器需要重新登录。', instance.name, () => api('/api/devices/' + instance.id + '/revoke', {})));
+    row.querySelector('.item-title').append(revoke);
+  }
+  return row;
 }
 
 const toolLabels = { Read: '读取文件', Write: '写入文件', Edit: '编辑文件', Glob: '查找文件', Grep: '搜索内容', Bash: '运行命令' };

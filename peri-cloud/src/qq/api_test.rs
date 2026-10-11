@@ -16,6 +16,7 @@ fn delivery() -> Delivery {
             conversation_id: "c2c:owner-openid".into(),
         },
         in_reply_to: "message-id".into(),
+        reply_kind: crate::gateway::ReplyKind::Message,
         message_sequence: 2,
         body: DeliveryBody::Interaction {
             card: InteractionCard {
@@ -100,6 +101,48 @@ fn interaction_modes_reject_unused_template_and_extra_fields() {
         serde_json::from_value::<QqInteractionMode>(json!({"kind":"native"})).unwrap(),
         QqInteractionMode::Native {}
     ));
+}
+
+#[test]
+fn menu_payload_has_unique_button_ids_opaque_callbacks_and_plain_fallback() {
+    let adapter = adapter(QqEndpoints::default());
+    let mut delivery = delivery();
+    delivery.body = DeliveryBody::Menu {
+        card: crate::gateway::MenuCard {
+            title: "Choose [instance]".into(),
+            text: "folder <name>".into(),
+            buttons: (0..15)
+                .map(|index| crate::gateway::MenuButton {
+                    label: format!("instance {index}"),
+                    action_id: Uuid::new_v4(),
+                })
+                .collect(),
+        },
+    };
+    let body = adapter.body(&delivery).unwrap();
+    let rows = body["keyboard"]["content"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+    let mut ids = std::collections::HashSet::new();
+    for row in rows {
+        for button in row["buttons"].as_array().unwrap() {
+            assert!(ids.insert(button["id"].as_str().unwrap()));
+            assert_eq!(button["action"]["permission"], json!({"type":2}));
+            assert!(button["action"]["data"]
+                .as_str()
+                .unwrap()
+                .starts_with("peri:menu:"));
+        }
+    }
+    assert!(body["markdown"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("\\<name\\>"));
+    let fallback = adapter.payload(&delivery, false).unwrap();
+    assert!(fallback.get("keyboard").is_none());
+    assert!(fallback["content"]
+        .as_str()
+        .unwrap()
+        .contains("/选 1 · instance 0"));
 }
 
 #[derive(Default)]

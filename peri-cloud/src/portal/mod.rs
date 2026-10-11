@@ -128,6 +128,11 @@ fn build_router(portal: Portal) -> Router {
         .route("/api/logout", post(browser::logout))
         .route("/api/account", get(browser::account))
         .route("/api/workspaces", get(workspaces::list))
+        .route("/api/instances/{id}/browse", post(workspaces::browse))
+        .route(
+            "/api/instances/{id}/default-workspace",
+            post(workspaces::set_default),
+        )
         .route("/api/workspaces/{id}/switch", post(workspaces::switch))
         .route("/api/interactions", get(interactions::pending))
         .route(

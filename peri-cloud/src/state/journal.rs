@@ -44,7 +44,7 @@ impl CloudJournal {
         let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
-        if !matches!(version, 0..=3) {
+        if !matches!(version, 0..=4) {
             return Err(StateError::Version);
         }
         if version == 0 {

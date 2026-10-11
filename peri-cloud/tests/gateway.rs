@@ -33,6 +33,8 @@ use uuid::Uuid;
 const SETUP: &str = "fixture-cloud-setup-at-least-32-characters";
 const PASSWORD: &str = "fixture-cloud-owner-password-for-argon2";
 const VERIFIER: &str = "fixture-native-pkce-verifier-with-at-least-43-characters";
+#[path = "gateway/menus.rs"]
+mod menu_tests;
 #[path = "gateway/workspaces.rs"]
 mod workspace_tests;
 
@@ -249,6 +251,7 @@ impl Fixture {
         InboundMessage {
             route: self.route.clone(),
             event_id: event.into(),
+            reply_kind: peri_cloud::gateway::ReplyKind::Message,
             text: text.into(),
         }
     }
@@ -321,6 +324,7 @@ impl Fixture {
             platform: executor.info().platform.clone(),
             default_workspace: workspace.path().to_str().unwrap().into(),
             connection_id: None,
+            is_local: false,
             revoked: false,
         };
         self.c()

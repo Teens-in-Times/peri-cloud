@@ -34,7 +34,7 @@ executor=subprocess.Popen([str(binary/'peri-executor'),'--state-dir',str(state),
 try:
     uri=f'http://127.0.0.1:{q}/v1/info';assert ready(uri).status==401
     token=(state/'transport-token').read_text().strip()
-    data=json.load(ready(uri,{'Authorization':'Bearer '+token}));assert data['platform']=='linux' and data['version']=='0.2.0'
+    data=json.load(ready(uri,{'Authorization':'Bearer '+token}));assert data['platform']=='linux' and data['version']=='0.3.0'
 finally:
     executor.terminate();assert executor.wait(timeout=10)==0
 print(json.dumps({'linux_release_smoke':'pass','cloud_account_login':True,'embedded_assets_match':True,'authenticated_shutdown':True,'executor_authentication':True}))

@@ -2275,7 +2275,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "peri-acp-types"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2297,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "peri-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2329,7 +2329,7 @@ dependencies = [
 
 [[package]]
 name = "peri-cloud"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2364,7 +2364,7 @@ dependencies = [
 
 [[package]]
 name = "peri-executor"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2394,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "peri-js-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -2414,7 +2414,7 @@ dependencies = [
 
 [[package]]
 name = "peri-lsp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "lsp-types",
@@ -2431,7 +2431,7 @@ dependencies = [
 
 [[package]]
 name = "peri-middlewares"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2482,7 +2482,7 @@ dependencies = [
 
 [[package]]
 name = "peri-model"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -2498,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "peri-process"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "tempfile",
@@ -2508,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "peri-remote-tools"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2528,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "peri-resources"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "peri-tool-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2576,7 +2576,7 @@ dependencies = [
 
 [[package]]
 name = "peri-workflow"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",

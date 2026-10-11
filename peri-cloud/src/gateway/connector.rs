@@ -16,6 +16,14 @@ use crate::CloudAgent;
 /// SSH login or bearer tokens. Existing frozen sessions must reopen unchanged.
 #[async_trait]
 pub trait SessionConnector: Send + Sync {
+    async fn directories(
+        &self,
+        _principal: Uuid,
+        _device: &DeviceRecord,
+        _query: peri_acp_types::device_executor::DirectoryQuery,
+    ) -> GatewayResult<peri_acp_types::device_executor::DirectoryListing> {
+        Err(GatewayError::Connection)
+    }
     async fn open(
         &self,
         principal: Uuid,
@@ -70,6 +78,29 @@ impl NativeSessionConnector {
 
 #[async_trait]
 impl SessionConnector for NativeSessionConnector {
+    async fn directories(
+        &self,
+        _principal: Uuid,
+        device: &DeviceRecord,
+        query: peri_acp_types::device_executor::DirectoryQuery,
+    ) -> GatewayResult<peri_acp_types::device_executor::DirectoryListing> {
+        if device.revoked {
+            return Err(GatewayError::Connection);
+        }
+        let client = self
+            .clients
+            .read()
+            .get(&device.id)
+            .cloned()
+            .ok_or(GatewayError::Connection)?;
+        if client.info().platform != device.platform {
+            return Err(GatewayError::Connection);
+        }
+        client
+            .directories(query)
+            .await
+            .map_err(|_| GatewayError::Connection)
+    }
     async fn open(
         &self,
         principal: Uuid,

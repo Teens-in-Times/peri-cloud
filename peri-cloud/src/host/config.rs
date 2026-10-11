@@ -21,11 +21,20 @@ pub struct HostConfig {
     pub model: ModelConfig,
     #[serde(default)]
     pub devices: Vec<DeviceConnection>,
+    #[serde(default)]
+    pub local_instance: Option<LocalInstanceConfig>,
     pub qq: Option<QqConfig>,
     #[serde(default = "max_iterations")]
     pub max_iterations: usize,
     #[serde(default = "system_prompt")]
     pub system_prompt: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalInstanceConfig {
+    pub name: String,
+    pub workspace: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -117,11 +126,24 @@ impl HostConfig {
                 device.token_file = directory.join(&device.token_file);
             }
         }
+        if let Some(local) = &mut config.local_instance {
+            if local.workspace.is_relative() {
+                local.workspace = directory.join(&local.workspace);
+            }
+        }
         config.validate()?;
         Ok(config)
     }
 
     pub fn validate(&self) -> HostResult<()> {
+        if self.local_instance.as_ref().is_some_and(|local| {
+            local.name.trim().is_empty()
+                || local.name.len() > 128
+                || local.name.chars().any(char::is_control)
+                || !local.workspace.is_absolute()
+        }) {
+            return Err(HostError::Configuration);
+        }
         if !self.listen.ip().is_loopback()
             || self.state_dir.as_os_str().is_empty()
             || !(1..=1024).contains(&self.max_iterations)

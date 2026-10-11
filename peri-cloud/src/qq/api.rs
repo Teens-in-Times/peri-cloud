@@ -234,6 +234,10 @@ impl QqAdapter {
         let text = match &delivery.body {
             DeliveryBody::Reply { reply } => reply.text.clone(),
             DeliveryBody::Notice { text } => text.clone(),
+            DeliveryBody::Menu { card } => menu_text(
+                card,
+                native && matches!(self.interaction, QqInteractionMode::Native {}),
+            ),
             DeliveryBody::Interaction { card } => super::card::text(
                 card,
                 &self.web_origin,
@@ -251,14 +255,47 @@ impl QqAdapter {
                 button("reject", "拒绝", &format!("peri:reject:{}",card.request_id))
             ]}]}}});
         }
+        if let (true, DeliveryBody::Menu { card }, QqInteractionMode::Native {}) =
+            (native, &delivery.body, &self.interaction)
+        {
+            let rows:Vec<_>=card.buttons.chunks(3).enumerate().map(|(row_index,row)|json!({"buttons":row.iter().enumerate().map(|(index,item)|button(&format!("menu-{}",row_index*3+index),&super::card::excerpt(&item.label,20,false),&format!("peri:menu:{}",item.action_id))).collect::<Vec<_>>() })).collect();
+            body = json!({"msg_type":2,"msg_id":delivery.in_reply_to,"msg_seq":delivery.message_sequence,"markdown":{"content":text},"keyboard":{"content":{"rows":rows}}});
+        }
+        if delivery.reply_kind == crate::gateway::ReplyKind::Event {
+            body.as_object_mut().unwrap().remove("msg_id");
+            body["event_id"] = json!(delivery.in_reply_to);
+        }
         Ok(body)
+    }
+}
+
+fn menu_text(card: &crate::gateway::MenuCard, markdown: bool) -> String {
+    let title = super::card::excerpt(&card.title, 60, markdown);
+    let text = card
+        .text
+        .lines()
+        .take(50)
+        .map(|line| super::card::excerpt(line, 240, markdown))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if markdown {
+        format!("**{title}**\n{text}")
+    } else {
+        let options = card
+            .buttons
+            .iter()
+            .enumerate()
+            .map(|(index, button)| format!("/选 {} · {}", index + 1, button.label))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{title}\n{text}\n\n{options}\n按钮不可用时发送上面的 /选 序号。")
     }
 }
 
 fn button(id: &str, label: &str, data: &str) -> Value {
     // Match Hermes: let clicks reach the gateway, which authenticates the
     // observed sender against the exact pending route before consuming approval.
-    json!({"id":id,"group_id":"approval","render_data":{"label":label,"visited_label":"已选择","style":if id == "reject" { 0 } else { 1 }},"action":{"type":1,"permission":{"type":2},"data":data,"unsupport_tips":"请打开电脑登录页面审批"}})
+    json!({"id":id,"group_id":if id.starts_with("menu-"){"menu"}else{"approval"},"render_data":{"label":label,"visited_label":"已选择","style":if id == "reject" { 0 } else { 1 }},"action":{"type":1,"permission":{"type":2},"data":data,"unsupport_tips":"请发送“菜单”或打开网页登录入口"}})
 }
 
 #[async_trait]

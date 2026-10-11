@@ -3,9 +3,11 @@
 
 mod config;
 mod connections;
+mod local;
 
 pub use config::{
-    DeviceConnection, HostConfig, ModelConfig, QqConfig, QqRelay, QqTransport, SshConnection,
+    DeviceConnection, HostConfig, LocalInstanceConfig, ModelConfig, QqConfig, QqRelay, QqTransport,
+    SshConnection,
 };
 
 use std::sync::Arc;
@@ -60,12 +62,6 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
     if let Some(effort) = &config.model.reasoning_effort {
         model = model.with_reasoning_effort(effort);
     }
-    let connector = connections::Connections::new(
-        config.devices,
-        Arc::new(OpenAiModel::new(model)),
-        config.system_prompt,
-        config.model.context_window,
-    )?;
     let qq = match &config.qq {
         Some(qq) => Some(
             QqAdapter::new(
@@ -93,6 +89,24 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
         .await
         .map_err(|_| HostError::State)?;
     drop(bootstrap);
+    let local = match &config.local_instance {
+        Some(value) => Some(local::LocalExecutor::start(&config.state_dir, value).await?),
+        None => None,
+    };
+    let mut devices = config.devices;
+    if let Some(local) = &local {
+        identity
+            .configure_local_instance(local.record.clone())
+            .await
+            .map_err(|_| HostError::State)?;
+        devices.push(local.connection.clone());
+    }
+    let connector = connections::Connections::new(
+        devices,
+        Arc::new(OpenAiModel::new(model)),
+        config.system_prompt,
+        config.model.context_window,
+    )?;
     let runtime = CloudRuntime::new(journal);
     let adapters = qq
         .iter()
@@ -197,6 +211,9 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
         if tunnel.await.is_err() {
             failed = true;
         }
+    }
+    if let Some(local) = local {
+        local.shutdown().await?;
     }
     tracing::info!(
         component = "cloud_host",

@@ -75,7 +75,7 @@ fn summary(item: &ApprovalItem, markdown: bool) -> String {
     )
 }
 
-fn excerpt(value: &str, limit: usize, markdown: bool) -> String {
+pub(super) fn excerpt(value: &str, limit: usize, markdown: bool) -> String {
     let mut result = String::new();
     for (index, ch) in value.chars().enumerate() {
         if index == limit {

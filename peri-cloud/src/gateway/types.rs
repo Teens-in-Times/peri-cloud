@@ -38,6 +38,24 @@ pub struct InboundMessage {
     pub route: ChannelRoute,
     pub event_id: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "ReplyKind::is_message")]
+    pub reply_kind: ReplyKind,
+}
+
+/// Adapters translate this platform-independent reply source into their own
+/// message/event reference. Old persisted deliveries default to message replies.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyKind {
+    #[default]
+    Message,
+    Event,
+}
+
+impl ReplyKind {
+    fn is_message(value: &Self) -> bool {
+        *value == Self::Message
+    }
 }
 
 impl InboundMessage {
@@ -52,6 +70,13 @@ impl InboundMessage {
             return Err(GatewayError::Invalid);
         }
         // Adapter-global event deduplication survives changing selected devices.
+        if self.reply_kind == ReplyKind::Event {
+            return Ok(digest(&serde_json::to_vec(&(
+                &self.route.identity.adapter_instance_id,
+                &self.event_id,
+                "event",
+            ))?));
+        }
         Ok(digest(&serde_json::to_vec(&(
             &self.route.identity.adapter_instance_id,
             &self.event_id,
@@ -66,6 +91,10 @@ impl InboundMessage {
 pub(crate) fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+
+#[cfg(test)]
+#[path = "types_test.rs"]
+mod tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,6 +132,32 @@ pub enum DeliveryBody {
     Reply { reply: ChatReply },
     Notice { text: String },
     Interaction { card: InteractionCard },
+    Menu { card: MenuCard },
+}
+
+impl From<String> for DeliveryBody {
+    fn from(text: String) -> Self {
+        Self::Notice { text }
+    }
+}
+
+impl From<&str> for DeliveryBody {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MenuCard {
+    pub title: String,
+    pub text: String,
+    pub buttons: Vec<MenuButton>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MenuButton {
+    pub label: String,
+    pub action_id: Uuid,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,6 +165,8 @@ pub struct Delivery {
     pub delivery_id: Uuid,
     pub route: ChannelRoute,
     pub in_reply_to: String,
+    #[serde(default)]
+    pub reply_kind: ReplyKind,
     /// Persisted before sending. QQ uses this with msg_id for deduplication.
     pub message_sequence: u32,
     pub body: DeliveryBody,
