@@ -54,6 +54,7 @@ def main():
     parser.add_argument('--port', type=int, default=52371)
     parser.add_argument('--memory-mib', type=int, default=512)
     parser.add_argument('--cpus', type=float, default=1)
+    parser.add_argument('--image-loaded', action='store_true', help='Use an already loaded, verified peri-owner-executor:local image')
     parser.add_argument('--apply', action='store_true', help='Create container and output config snippet')
     args = parser.parse_args()
     image = 'peri-owner-executor:local'
@@ -88,10 +89,13 @@ def main():
         path = root / name
         path.mkdir(mode=0o700)
         os.chown(path, 10001, 10001)
-    with tempfile.TemporaryDirectory(prefix='peri-executor-image-') as context:
-        shutil.copy2(binary, Path(context) / 'peri-executor')
-        shutil.copy2(Path(__file__).with_name('executor.Dockerfile'), Path(context) / 'Dockerfile')
-        run(['docker', 'build', '--tag', image, context])
+    if args.image_loaded:
+        run(['docker', 'image', 'inspect', '--format', '{{.Id}}', image])
+    else:
+        with tempfile.TemporaryDirectory(prefix='peri-executor-image-') as context:
+            shutil.copy2(binary, Path(context) / 'peri-executor')
+            shutil.copy2(Path(__file__).with_name('executor.Dockerfile'), Path(context) / 'Dockerfile')
+            run(['docker', 'build', '--tag', image, context])
     run(command)
     token_file = root / 'state' / 'transport-token'
     identity_file = root / 'state' / 'device.json'
@@ -109,6 +113,8 @@ def main():
         except (OSError, ValueError, KeyError):
             time.sleep(0.25)
     else:
+        # Startup logs contain lifecycle categories only, never transport tokens.
+        subprocess.run(['docker', 'logs', '--tail', '20', 'peri-owner-executor'], check=False)
         raise SystemExit('Executor did not pass authenticated startup; inspect its container logs')
     write_private(token_path, token, cloud.pw_uid, cloud.pw_gid)
     snippet = {'isolated_instance': {'name': '服务器本地（隔离）', 'workspace': '/workspace', 'connection': {'device_id': device['id'], 'endpoint': f'127.0.0.1:{args.port}', 'token_file': str(token_path)}}}
