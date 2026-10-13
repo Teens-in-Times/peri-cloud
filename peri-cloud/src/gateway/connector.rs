@@ -52,6 +52,7 @@ pub struct NativeSessionConnector {
     model: Arc<dyn Model>,
     system_prompt: String,
     context_window: u32,
+    account_models: RwLock<Option<Arc<crate::models::AccountModels>>>,
 }
 
 impl NativeSessionConnector {
@@ -68,11 +69,15 @@ impl NativeSessionConnector {
             model,
             system_prompt,
             context_window,
+            account_models: RwLock::new(None),
         }))
     }
 
     pub fn register_client(&self, client: Arc<DeviceClient>) {
         self.clients.write().insert(client.info().device_id, client);
+    }
+    pub fn set_account_models(&self, models: Arc<crate::models::AccountModels>) {
+        *self.account_models.write() = Some(models);
     }
 }
 
@@ -139,8 +144,11 @@ impl SessionConnector for NativeSessionConnector {
         let remote = RemoteSession::open(client, executor_id, session_id.to_string(), &workspace)
             .await
             .map_err(|_| GatewayError::Connection)?;
-        let agent = CloudAgent::new(session_id, remote, self.model.clone(), prompt, window)
+        let mut agent = CloudAgent::new(session_id, remote, self.model.clone(), prompt, window)
             .map_err(|_| GatewayError::Connection)?;
+        if let Some(models) = self.account_models.read().clone() {
+            agent = agent.with_account_models(models);
+        }
         if previous.is_some_and(|frozen| *frozen != agent.frozen_session(principal)) {
             return Err(GatewayError::Connection);
         }

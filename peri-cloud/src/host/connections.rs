@@ -21,10 +21,13 @@ use crate::CloudAgent;
 pub(crate) struct Connections {
     native: Arc<NativeSessionConnector>,
     configured: HashMap<Uuid, DeviceConnection>,
-    clients: tokio::sync::Mutex<HashMap<Uuid, Arc<DeviceClient>>>,
+    clients: HashMap<Uuid, tokio::sync::Mutex<Option<Arc<DeviceClient>>>>,
 }
 
 impl Connections {
+    pub fn set_account_models(&self, models: Arc<crate::models::AccountModels>) {
+        self.native.set_account_models(models);
+    }
     pub fn new(
         devices: Vec<DeviceConnection>,
         model: Arc<dyn Model>,
@@ -35,11 +38,14 @@ impl Connections {
             .map_err(|_| HostError::Configuration)?;
         Ok(Arc::new(Self {
             native,
+            clients: devices
+                .iter()
+                .map(|device| (device.device_id, tokio::sync::Mutex::new(None)))
+                .collect(),
             configured: devices
                 .into_iter()
                 .map(|device| (device.device_id, device))
                 .collect(),
-            clients: tokio::sync::Mutex::new(HashMap::new()),
         }))
     }
 
@@ -47,8 +53,13 @@ impl Connections {
     /// identity-verified again when selecting/restoring a frozen session.
     async fn client(&self, id: Uuid) -> GatewayResult<Arc<DeviceClient>> {
         let config = self.configured.get(&id).ok_or(GatewayError::Connection)?;
-        let mut clients = self.clients.lock().await;
-        if let Some(client) = clients.get(&id) {
+        let mut cached = self
+            .clients
+            .get(&id)
+            .ok_or(GatewayError::Connection)?
+            .lock()
+            .await;
+        if let Some(client) = cached.as_ref() {
             client
                 .reconnect(config.endpoint)
                 .await
@@ -72,7 +83,7 @@ impl Connections {
             .await
             .map_err(|_| GatewayError::Connection)?;
         self.native.register_client(client.clone());
-        clients.insert(id, client.clone());
+        *cached = Some(client.clone());
         Ok(client)
     }
 

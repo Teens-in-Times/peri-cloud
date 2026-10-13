@@ -48,6 +48,7 @@ struct LiveSession {
 }
 
 struct OwnedTask {
+    principal_id: Uuid,
     session_id: Uuid,
     turn_id: Option<Uuid>,
     cancellation: CancellationToken,
@@ -79,6 +80,7 @@ pub struct RuntimeStatus {
 /// not drop the loop or the journal transaction; shutdown has a bounded report
 /// and retains live handles so a later attempt can observe actual completion.
 pub struct CloudRuntime {
+    limits: crate::limits::RuntimeLimits,
     journal: Arc<CloudJournal>,
     sessions: RwLock<HashMap<Uuid, Arc<LiveSession>>>,
     ownership: Mutex<Ownership>,
@@ -87,12 +89,27 @@ pub struct CloudRuntime {
 
 impl CloudRuntime {
     pub fn new(journal: Arc<CloudJournal>) -> Arc<Self> {
-        Arc::new(Self {
+        Self::with_limits(journal, crate::limits::RuntimeLimits::default()).expect("valid defaults")
+    }
+
+    pub fn with_limits(
+        journal: Arc<CloudJournal>,
+        limits: crate::limits::RuntimeLimits,
+    ) -> Result<Arc<Self>, RuntimeError> {
+        if !limits.valid() {
+            return Err(StateError::Limit.into());
+        }
+        Ok(Arc::new(Self {
+            limits,
             journal,
             sessions: RwLock::new(HashMap::new()),
             ownership: Mutex::new(Ownership::default()),
             shutdown_gate: tokio::sync::Mutex::new(()),
-        })
+        }))
+    }
+
+    pub fn limits(&self) -> &crate::limits::RuntimeLimits {
+        &self.limits
     }
 
     pub async fn attach(
@@ -160,14 +177,49 @@ impl CloudRuntime {
         if live.principal_id != request.principal_id {
             return Err(StateError::Forbidden.into());
         }
+        if serde_json::to_vec(&request.prompt)
+            .map_err(StateError::from)?
+            .len()
+            > self.limits.max_prompt_bytes
+        {
+            return Err(StateError::Limit.into());
+        }
+        // A repeat receipt never starts or charges a second task.
+        if let Some(turn) = self
+            .journal
+            .existing_request(
+                request.principal_id,
+                request.session_id,
+                &request.request_key,
+                &request.prompt,
+            )
+            .await?
+        {
+            return Ok(turn);
+        }
         let task_id = Uuid::new_v4();
         let session_id = request.session_id;
+        let principal_id = request.principal_id;
         let cancellation = CancellationToken::new();
         let (sender, receiver) = oneshot::channel();
         {
             let mut owner = self.ownership.lock();
             if owner.closing {
                 return Err(RuntimeError::Closing);
+            }
+            let active: Vec<_> = owner
+                .tasks
+                .values()
+                .filter(|t| !t.handle.is_finished())
+                .collect();
+            if active.len() >= self.limits.max_active_turns
+                || active
+                    .iter()
+                    .filter(|t| t.principal_id == principal_id)
+                    .count()
+                    >= self.limits.max_active_per_user
+            {
+                return Err(StateError::Limit.into());
             }
             let runtime = self.clone();
             let cancel = cancellation.clone();
@@ -181,6 +233,7 @@ impl CloudRuntime {
             owner.tasks.insert(
                 task_id,
                 OwnedTask {
+                    principal_id,
                     session_id,
                     turn_id: None,
                     cancellation,
@@ -227,11 +280,12 @@ impl CloudRuntime {
     ) -> Result<(), RuntimeError> {
         let admission = match self
             .journal
-            .admit(
+            .admit_limited(
                 request.principal_id,
                 request.session_id,
                 request.request_key,
                 request.prompt,
+                self.limits.daily_turns,
             )
             .await
         {
@@ -265,6 +319,12 @@ impl CloudRuntime {
         {
             cancellation.cancel();
         }
+        let personal = self.journal.user_data(request.principal_id).await?;
+        let timer_cancel = cancellation.clone();
+        let seconds = self.limits.max_turn_seconds;
+        let timer = tokio::spawn(async move {
+            tokio::select! { _ = timer_cancel.cancelled() => (), _ = tokio::time::sleep(Duration::from_secs(seconds)) => timer_cancel.cancel() }
+        });
         let run = CloudTurnRequest {
             turn_id: admission.turn.turn_id,
             prompt: admission.turn.prompt,
@@ -278,7 +338,18 @@ impl CloudRuntime {
             cancellation,
             max_iterations: request.max_iterations,
         };
-        match live.agent.run_turn(run).await {
+        let result = live
+            .agent
+            .run_personal_turn(
+                run,
+                personal,
+                self.journal.clone(),
+                request.principal_id,
+                &self.limits,
+            )
+            .await;
+        timer.abort();
+        match result {
             Ok(result) => {
                 self.journal.settle(admission.turn.turn_id, &result).await?;
                 Ok(())
@@ -340,6 +411,7 @@ impl CloudRuntime {
         for (session_id, live) in self.sessions.read().iter() {
             let id = *session_id;
             let live = live.clone();
+            let principal_id = live.principal_id;
             let journal = self.journal.clone();
             let handle = tokio::spawn(async move {
                 let revision = journal.session(live.principal_id, id).await?.revision;
@@ -364,6 +436,7 @@ impl CloudRuntime {
             owner.tasks.insert(
                 Uuid::new_v4(),
                 OwnedTask {
+                    principal_id,
                     session_id: id,
                     turn_id: None,
                     cancellation: CancellationToken::new(),

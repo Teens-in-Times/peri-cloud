@@ -4,12 +4,19 @@ const byId = id => document.getElementById(id);
 const views = ['loading', 'entry', 'consent', 'account'];
 let csrfCookie = 'peri_csrf';
 let activeAccount = null;
-let refreshInFlight = false;
+let authEpoch = 0;
+let refreshInFlight = null;
 let pendingDecision = null;
 let authorization = null;
 let visibleView = 'loading';
 let canStopService = false;
+let personalOwner = null;
+let personalRevision = 0;
+let inviteId = null;
 const errors = {
+  account_limit: '个人数据超过服务限制，请缩短内容后再保存。',
+  data_conflict: '记忆已由另一页面或 Agent 修改，请重新载入后合并你的修改。',
+  invalid_model: '请检查模型名称；首次配置或切换供应商需要填写 API 密钥。',
   unauthorized: '登录信息无效或已过期，请重新登录。',
   forbidden: '当前账户无法完成这项操作。',
   origin_rejected: '访问地址与云服务配置不一致，请使用正确的登录地址。',
@@ -40,6 +47,7 @@ function csrf() {
 }
 
 async function api(path, body) {
+  const epoch = authEpoch;
   const options = { credentials: 'same-origin', cache: 'no-store', headers: {} };
   if (body !== undefined) {
     options.method = 'POST';
@@ -51,9 +59,11 @@ async function api(path, body) {
   try { response = await fetch(path, options); }
   catch { throw new Error('暂时无法连接云服务，请检查网络。'); }
   const result = await response.json().catch(() => ({}));
+  if (epoch !== authEpoch) throw new Error('登录账号已变更，请重新操作。');
   if (!response.ok) {
-    if (response.status === 401 && !['/api/login', '/api/setup'].includes(path)) {
-      activeAccount = null;
+    if (response.status === 401 && !['/api/login', '/api/setup', '/api/register'].includes(path)) {
+      authEpoch += 1;
+      clearPersonal(); activeAccount = null;
       byId('logout').hidden = true;
       show('entry');
     }
@@ -124,8 +134,11 @@ for (const link of byId('workspace-nav').querySelectorAll('a')) {
 function renderAccount(data) {
   activeAccount = data;
   byId('logout').hidden = false;
-  byId('service-controls').hidden = !canStopService;
-  byId('service-nav').hidden = !canStopService;
+  byId('service-controls').hidden = !canStopService || !data.is_admin;
+  byId('service-nav').hidden = !canStopService || !data.is_admin;
+  byId('members-panel').hidden = !data.is_admin;
+  byId('members-nav').hidden = !data.is_admin;
+  byId('personal-panel').hidden = !data.personal_data;
   if (authorization) {
     byId('consent-device').textContent = authorization.device_name;
     byId('consent-owner').textContent = data.principal.display_name;
@@ -152,10 +165,21 @@ function renderAccount(data) {
 }
 
 async function refresh() {
-  if (refreshInFlight) return;
-  refreshInFlight = true;
+  const epoch = authEpoch;
+  if (refreshInFlight === epoch) return;
+  refreshInFlight = epoch;
   try {
     renderAccount(await api('/api/account'));
+    if (activeAccount.personal_data) {
+      const personal = await api('/api/user-data');
+      byId('usage-summary').textContent = '今日（UTC）：对话 ' + personal.usage.turns + ' / ' + personal.limits.daily_turns + '；模型请求 ' + personal.usage.model_requests + ' / ' + personal.limits.daily_model_requests + '。每人最多并行 ' + personal.limits.max_active_per_user + ' 个任务。';
+      byId('personal-budget').textContent = '偏好与记忆合计最多 ' + personal.limits.max_user_data_bytes + ' 字节';
+      if (personalOwner !== activeAccount.principal.id) {
+        setPersonal(personal.data);
+        await loadModel();
+        personalOwner = activeAccount.principal.id;
+      }
+    }
     const workspaces = await api('/api/workspaces');
     list('workspace-selections', workspaces, '还没有选择实例的聊天会话。在 QQ 发送“菜单”，点击选择实例即可。', selection => {
       const row = item(selection.device_name + ' · ' + selection.adapter,
@@ -178,7 +202,7 @@ async function refresh() {
       window.history.replaceState(null, '', '/'); openInteraction(card);
     }
   }
-  finally { refreshInFlight = false; }
+  finally { if (refreshInFlight === epoch) refreshInFlight = null; }
 }
 
 function shortIdentity(value) {
@@ -315,10 +339,82 @@ function openInteraction(card) {
 }
 
 async function signIn(login, password) {
+  authEpoch += 1; clearPersonal();
   await api('/api/login', { login, password });
-  for (const form of [byId('login-form'), byId('setup-form')]) form.reset();
+  personalOwner = null;
+  for (const form of [byId('login-form'), byId('setup-form'), byId('register-form')]) form.reset();
   await refresh();
 }
+
+function clearPersonal() {
+  personalOwner = null; personalRevision = 0; inviteId = null;
+  byId('personal-form').reset(); byId('model-form').reset();
+  byId('invite-result').hidden = true; byId('invite-link').value = '';
+  byId('pair-result').hidden = true; byId('pair-code').textContent = '';
+  pendingDecision = null;
+  if (byId('confirmation').open) byId('confirmation').close();
+}
+
+function setPersonal(data) {
+  personalRevision = data.revision;
+  byId('personal-form').elements.instructions.value = data.instructions;
+  byId('personal-form').elements.memory.value = data.memory;
+}
+async function loadModel() {
+  const state = await api('/api/model');
+  byId('model-panel').hidden = !state.enabled;
+  if (!state.enabled) return;
+  const form = byId('model-form');
+  form.elements.provider.replaceChildren(...state.providers.map(provider => {
+    const option = document.createElement('option'); option.value = provider.id;
+    option.textContent = provider.name; return option;
+  }));
+  form.elements.provider.value = state.choice ? state.choice.provider : state.providers[0].id;
+  form.elements.model.value = state.choice ? state.choice.model : state.default_model;
+  form.elements.api_key.value = '';
+  byId('model-current').textContent = state.choice ? state.choice.model + ' · 自有密钥' : state.default_model + ' · 服务默认';
+}
+byId('personal-form').addEventListener('submit', event => {
+  event.preventDefault(); const form = event.currentTarget;
+  action(form.querySelector('button'), async () => {
+    const result = await api('/api/user-data', {revision:personalRevision, instructions:form.elements.instructions.value, memory:form.elements.memory.value});
+    setPersonal(result); notice('个人上下文已保存，下轮对话生效。');
+  });
+});
+byId('personal-reload').addEventListener('click', () => action(byId('personal-reload'), async () => {
+  setPersonal((await api('/api/user-data')).data); notice('已载入最新记忆。');
+}));
+byId('model-form').addEventListener('submit', event => {
+  event.preventDefault(); const form = event.currentTarget;
+  action(form.querySelector('button.primary'), async () => {
+    await api('/api/model', Object.fromEntries(new FormData(form)));
+    form.elements.api_key.value = ''; await loadModel(); notice('模型配置已保存，下轮对话生效。');
+  });
+});
+byId('model-reset').addEventListener('click', () => action(byId('model-reset'), async () => {
+  await api('/api/model/reset', {}); await loadModel(); notice('已恢复服务默认模型。');
+}));
+byId('register-form').addEventListener('submit', event => {
+  event.preventDefault(); const form = event.currentTarget;
+  const fields = Object.fromEntries(new FormData(form));
+  action(form.querySelector('button'), async () => {
+    await api('/api/register', fields); window.history.replaceState(null, '', '/');
+    await signIn(fields.login, fields.password);
+  });
+});
+byId('invite-create').addEventListener('click', () => action(byId('invite-create'), async () => {
+  const invite = await api('/api/admin/invites', {}); inviteId = invite.id;
+  byId('invite-link').value = window.location.origin + '/#invite=' + invite.code;
+  byId('invite-result').hidden = false;
+}));
+byId('invite-copy').addEventListener('click', () => action(byId('invite-copy'), async () => {
+  if (!navigator.clipboard) throw new Error('请选中并复制上方链接。');
+  await navigator.clipboard.writeText(byId('invite-link').value); notice('邀请链接已复制。');
+}));
+byId('invite-revoke').addEventListener('click', () => action(byId('invite-revoke'), async () => {
+  await api('/api/admin/invites/' + inviteId + '/revoke', {});
+  byId('invite-result').hidden = true; byId('invite-link').value = ''; inviteId = null;
+}));
 
 byId('login-form').addEventListener('submit', event => {
   event.preventDefault(); const form = event.currentTarget;
@@ -336,8 +432,9 @@ byId('setup-form').addEventListener('submit', event => {
   });
 });
 byId('logout').addEventListener('click', () => action(byId('logout'), async () => {
+  authEpoch += 1;
   await api('/api/logout', {}); activeAccount = null;
-  byId('pair-result').hidden = true; byId('pair-code').textContent = '';
+  clearPersonal();
   byId('logout').hidden = true; show('entry');
 }));
 byId('refresh').addEventListener('click', () => action(byId('refresh'), refresh));
@@ -368,6 +465,13 @@ async function start() {
   canStopService = state.service_control === true;
   byId('setup-form').hidden = state.initialized;
   byId('login-form').hidden = !state.initialized;
+  byId('register-entry').hidden = !state.initialized;
+  const invite = new URLSearchParams(window.location.hash.slice(1)).get('invite');
+  if (invite && /^[a-f0-9]{64}$/.test(invite)) {
+    byId('register-entry').open = true;
+    byId('register-form').elements.invite_code.value = invite;
+    window.history.replaceState(null, '', '/');
+  }
   byId('entry-title').textContent = state.initialized ? '登录你的云 Agent' : '创建你的私人账户';
   if (window.location.pathname === '/oauth/authorize') {
     const params = Object.fromEntries(new URLSearchParams(window.location.search));

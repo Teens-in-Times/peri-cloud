@@ -25,6 +25,9 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[path = "cloud_loop/personal.rs"]
+mod personal_tests;
+
 #[derive(Default)]
 struct Script {
     replies: Mutex<VecDeque<String>>,

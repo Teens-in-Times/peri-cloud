@@ -2,12 +2,16 @@
 
 mod journal;
 mod types;
+pub(crate) mod userdata;
 
 pub use journal::CloudJournal;
 pub use types::{Admission, FrozenSession, SessionState, TurnRecord, TurnState};
+pub use userdata::{UserData, UserUsage};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
+    #[error("account resource limit reached")]
+    Limit,
     #[error("cloud state is unavailable")]
     Database(#[from] sqlx::Error),
     #[error("cloud state cannot be opened")]

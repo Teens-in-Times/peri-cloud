@@ -263,7 +263,12 @@ async fn native_menu_queue_is_owned_and_revoked_instances_cannot_be_selected() {
         .receive_menu(
             f.route.clone(),
             "revoked".into(),
-            instances.buttons[0].action_id,
+            instances
+                .buttons
+                .iter()
+                .find(|b| b.label.ends_with(&format!(" · {}", f.devices[0].name)))
+                .unwrap()
+                .action_id,
         )
         .await
         .unwrap();

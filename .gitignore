@@ -24,3 +24,5 @@ native-credentials*
 !examples/host.json
 !examples/executor.json
 node_modules/
+__pycache__/
+*.pyc

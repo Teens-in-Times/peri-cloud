@@ -117,10 +117,22 @@ impl OpenAiModel {
     pub fn new(config: OpenAiConfig) -> Self {
         // Some compatible gateways reject or stall anonymous HTTP clients.
         // Identify Peri without including model, device or account metadata.
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("Peri/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("model HTTP client initialization failed");
+        let builder =
+            reqwest::Client::builder().user_agent(concat!("Peri/", env!("CARGO_PKG_VERSION")));
+        // A loopback provider is local to this process's host. Never route its
+        // credentials through an environment or system proxy.
+        let loopback = match config.endpoint.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        };
+        let client = if loopback {
+            builder.no_proxy()
+        } else {
+            builder
+        }
+        .build()
+        .expect("model HTTP client initialization failed");
         Self {
             config,
             transport: Arc::new(ReqwestTransport::new(client.clone())),

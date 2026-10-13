@@ -18,6 +18,9 @@ struct Args {
     state_dir: PathBuf,
     #[arg(long, default_value = "127.0.0.1:42371")]
     listen: SocketAddr,
+    /// Permit a container-internal listener; publish it only on host loopback.
+    #[arg(long)]
+    container_listen: bool,
     #[arg(long, global = true)]
     device_name: Option<String>,
     #[command(flatten)]
@@ -68,7 +71,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     anyhow::ensure!(
-        args.listen.ip().is_loopback(),
+        args.listen.ip().is_loopback()
+            || (args.container_listen
+                && cfg!(target_os = "linux")
+                && std::path::Path::new("/.dockerenv").is_file()),
         "Executor must listen on a loopback address; use SSH forwarding for remote access"
     );
     let name = args.device_name.unwrap_or_else(|| {

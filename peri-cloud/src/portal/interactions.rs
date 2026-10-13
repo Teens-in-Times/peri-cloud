@@ -35,7 +35,8 @@ pub(super) async fn shutdown(
     State(portal): State<Portal>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, PortalError> {
-    security::browser(&portal, &headers, true).await?;
+    let actor = security::browser(&portal, &headers, true).await?;
+    portal.identity.require_admin(&actor).await?;
     let shutdown = portal.shutdown.as_ref().ok_or(PortalError::Invalid)?;
     shutdown.cancel();
     Ok(Json(json!({"status":"shutdown_requested"})))

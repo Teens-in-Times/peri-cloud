@@ -1,6 +1,7 @@
-import json,os,pathlib,socket,subprocess,tempfile,time,urllib.request,urllib.error,http.cookiejar,sys
+import json,os,pathlib,socket,subprocess,tempfile,time,urllib.request,urllib.error,http.cookiejar,sys,tomllib
 binary=pathlib.Path(sys.argv[1]).resolve()
 assets=pathlib.Path(sys.argv[2]).resolve()
+expected_version=tomllib.loads((assets.parents[3]/'Cargo.toml').read_text())['workspace']['package']['version']
 root=pathlib.Path(tempfile.mkdtemp(prefix='peri-cloud-release-smoke-'))
 def port():
     with socket.socket() as s: s.bind(('127.0.0.1',0));return s.getsockname()[1]
@@ -34,7 +35,7 @@ executor=subprocess.Popen([str(binary/'peri-executor'),'--state-dir',str(state),
 try:
     uri=f'http://127.0.0.1:{q}/v1/info';assert ready(uri).status==401
     token=(state/'transport-token').read_text().strip()
-    data=json.load(ready(uri,{'Authorization':'Bearer '+token}));assert data['platform']=='linux' and data['version']=='0.3.0'
+    data=json.load(ready(uri,{'Authorization':'Bearer '+token}));assert data['platform']=='linux' and data['version']==expected_version
 finally:
     executor.terminate();assert executor.wait(timeout=10)==0
 print(json.dumps({'linux_release_smoke':'pass','cloud_account_login':True,'embedded_assets_match':True,'authenticated_shutdown':True,'executor_authentication':True}))

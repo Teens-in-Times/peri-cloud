@@ -39,3 +39,9 @@ jobs:
             target/release/peri-executor.exe
           if-no-files-found: error
           retention-days: 7
+      - name: Linux release process smoke
+        if: runner.os == 'Linux'
+        run: python3 scripts/smoke-release.py target/release peri-cloud/src/portal/assets
+      - name: Linux isolated executor smoke
+        if: runner.os == 'Linux'
+        run: sudo env GITHUB_ACTIONS=true RUNNER_OS=Linux python3 scripts/smoke-isolated-executor.py target/release/peri-executor

@@ -43,12 +43,28 @@ pub struct Gateway {
     hub: Arc<InteractionHub>,
     origins: RwLock<Origins>,
     owner: Mutex<Ownership>,
-    receive_gate: tokio::sync::Mutex<()>,
+    receive_gates: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     dispatch_gate: tokio::sync::Mutex<()>,
     max_iterations: usize,
 }
 
 impl Gateway {
+    pub(super) fn account_gate(&self, key: String) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.receive_gates.lock();
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
+    }
+    pub fn journal(&self) -> &Arc<crate::state::CloudJournal> {
+        self.runtime.journal()
+    }
+    pub fn limits(&self) -> &crate::limits::RuntimeLimits {
+        self.runtime.limits()
+    }
     pub async fn new(
         runtime: Arc<CloudRuntime>,
         identity: Arc<IdentityService>,
@@ -91,7 +107,7 @@ impl Gateway {
                 unconfirmed: false,
                 tasks: Vec::new(),
             }),
-            receive_gate: tokio::sync::Mutex::new(()),
+            receive_gates: Mutex::new(HashMap::new()),
             dispatch_gate: tokio::sync::Mutex::new(()),
             max_iterations,
         }))
@@ -141,9 +157,15 @@ impl Gateway {
     }
 
     async fn process(&self, mut message: InboundMessage) -> GatewayResult<GatewayReceipt> {
-        // Personal cloud deployments have few channels. This gate serializes
-        // routing/control operations; long-running model/tool work is elsewhere.
-        let _gate = self.receive_gate.lock().await;
+        // Serialize controls for one account; offline devices must not block
+        // unrelated users. Unbound senders retain an independent route scope.
+        let key = match self.identity.resolve_channel(&message.route.identity).await {
+            Ok(principal) => principal.to_string(),
+            Err(IdentityError::Unauthorized | IdentityError::Forbidden) => message.route.key()?,
+            Err(error) => return Err(error.into()),
+        };
+        let gate = self.account_gate(key);
+        let _guard = gate.lock().await;
         let (receipt, created) = self.store.admit(&message).await?;
         if !created {
             if let Some(session) = receipt.session_id {
@@ -184,6 +206,7 @@ impl Gateway {
                     return self.store.receipt(&receipt.event_key).await;
                 }
                 let text = match error {
+                    GatewayError::State(StateError::Limit) | GatewayError::Runtime(crate::RuntimeError::State(StateError::Limit)) => "当前并发或今日额度已达上限，请稍后重试；可在网页查看自己的用量。",
                     GatewayError::Identity(IdentityError::Unauthorized | IdentityError::Forbidden) => "请先在电脑登录并生成关联口令，然后发送 /绑定 口令；也请检查账号或实例是否已撤销。",
                     GatewayError::Identity(IdentityError::RateLimited) => "请求过于频繁，请稍后重试。",
                     GatewayError::Busy | GatewayError::State(StateError::Busy) => "当前任务仍在运行或执行状态未确认；请先等待完成或发送 /取消。",

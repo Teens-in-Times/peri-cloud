@@ -20,9 +20,16 @@ pub struct HostConfig {
     pub bootstrap_env: String,
     pub model: ModelConfig,
     #[serde(default)]
+    pub model_providers: Vec<crate::models::ModelProvider>,
+    #[serde(default)]
+    pub limits: crate::limits::RuntimeLimits,
+    #[serde(default)]
     pub devices: Vec<DeviceConnection>,
     #[serde(default)]
     pub local_instance: Option<LocalInstanceConfig>,
+    /// Administrator-only server instance with a separately owned executor.
+    #[serde(default)]
+    pub isolated_instance: Option<IsolatedInstanceConfig>,
     pub qq: Option<QqConfig>,
     #[serde(default = "max_iterations")]
     pub max_iterations: usize,
@@ -35,6 +42,14 @@ pub struct HostConfig {
 pub struct LocalInstanceConfig {
     pub name: String,
     pub workspace: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolatedInstanceConfig {
+    pub name: String,
+    pub workspace: String,
+    pub connection: DeviceConnection,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +141,11 @@ impl HostConfig {
                 device.token_file = directory.join(&device.token_file);
             }
         }
+        if let Some(local) = &mut config.isolated_instance {
+            if local.connection.token_file.is_relative() {
+                local.connection.token_file = directory.join(&local.connection.token_file);
+            }
+        }
         if let Some(local) = &mut config.local_instance {
             if local.workspace.is_relative() {
                 local.workspace = directory.join(&local.workspace);
@@ -136,6 +156,30 @@ impl HostConfig {
     }
 
     pub fn validate(&self) -> HostResult<()> {
+        if self.local_instance.is_some() && self.isolated_instance.is_some() {
+            return Err(HostError::Configuration);
+        }
+        if self.isolated_instance.as_ref().is_some_and(|local| {
+            local.name.trim().is_empty()
+                || local.name.len() > 128
+                || local.name.chars().any(char::is_control)
+                || !local.workspace.starts_with('/')
+                || local.workspace.len() > 4096
+                || local.workspace.chars().any(char::is_control)
+        }) {
+            return Err(HostError::Configuration);
+        }
+        if !self.limits.valid() {
+            return Err(HostError::Configuration);
+        }
+        let mut providers = HashSet::new();
+        if self.model_providers.len() > 31
+            || self.model_providers.iter().any(|p| {
+                p.id == "default" || !crate::models::valid_provider(p) || !providers.insert(&p.id)
+            })
+        {
+            return Err(HostError::Configuration);
+        }
         if self.local_instance.as_ref().is_some_and(|local| {
             local.name.trim().is_empty()
                 || local.name.len() > 128
@@ -184,7 +228,11 @@ impl HostConfig {
         }
         let mut devices = HashSet::new();
         let mut endpoints = HashSet::new();
-        for device in &self.devices {
+        for device in self
+            .devices
+            .iter()
+            .chain(self.isolated_instance.iter().map(|local| &local.connection))
+        {
             if !devices.insert(device.device_id)
                 || !endpoints.insert(device.endpoint)
                 || !device.endpoint.ip().is_loopback()

@@ -77,3 +77,78 @@ async fn relative_paths_resolve_from_config_file_instead_of_process_cwd() {
     assert_eq!(config.state_dir, root.join("state"));
     assert_eq!(config.devices[0].token_file, root.join("device-token"));
 }
+
+#[tokio::test]
+async fn isolated_instance_uses_a_unique_loopback_connection_and_excludes_legacy_local() {
+    let mut input = config();
+    input["isolated_instance"] = json!({"name":"Owner only","workspace":"/workspace","connection":{
+        "device_id":"00000000-0000-0000-0000-000000000042","endpoint":"127.0.0.1:52371","token_file":"owner-token"
+    }});
+    serde_json::from_value::<HostConfig>(input.clone())
+        .unwrap()
+        .validate()
+        .unwrap();
+    for change in [
+        json!({"local_instance":{"name":"Legacy","workspace":std::env::temp_dir()}}),
+        json!({"devices":[input["isolated_instance"]["connection"].clone()]}),
+    ] {
+        let mut changed = input.clone();
+        for (key, value) in change.as_object().unwrap() {
+            changed[key] = value.clone();
+        }
+        assert!(serde_json::from_value::<HostConfig>(changed)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+    let mut changed = input.clone();
+    changed["isolated_instance"]["connection"]["endpoint"] = json!("0.0.0.0:52371");
+    assert!(serde_json::from_value::<HostConfig>(changed)
+        .unwrap()
+        .validate()
+        .is_err());
+    let mut changed = input.clone();
+    changed["isolated_instance"]["workspace"] = json!("relative/workspace");
+    assert!(serde_json::from_value::<HostConfig>(changed)
+        .unwrap()
+        .validate()
+        .is_err());
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("host.json");
+    std::fs::write(&path, serde_json::to_vec(&input).unwrap()).unwrap();
+    let read = HostConfig::read(&path).await.unwrap();
+    assert_eq!(
+        read.isolated_instance.unwrap().connection.token_file,
+        tokio::fs::canonicalize(root.path())
+            .await
+            .unwrap()
+            .join("owner-token")
+    );
+}
+
+#[test]
+fn account_limits_and_provider_ids_cannot_bypass_operator_boundaries() {
+    for limits in [
+        json!({"max_active_turns":0}),
+        json!({"max_active_turns":1,"max_active_per_user":2}),
+    ] {
+        let mut input = config();
+        input["limits"] = limits;
+        assert!(serde_json::from_value::<HostConfig>(input)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+    for provider in [
+        json!({"id":"default","name":"Duplicate","api_base":"https://model.example.test/v1"}),
+        json!({"id":"fixture","name":"Unsafe","api_base":"http://public.example.test/v1"}),
+        json!({"id":"fixture","name":"Credentials","api_base":"https://user:password@model.example.test/v1"}),
+    ] {
+        let mut input = config();
+        input["model_providers"] = json!([provider]);
+        assert!(serde_json::from_value::<HostConfig>(input)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+}

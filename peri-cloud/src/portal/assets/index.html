@@ -22,7 +22,9 @@
     <a href="#approval-panel"><span class="nav-index">02</span>操作审批</a>
     <a href="#workspace-panel"><span class="nav-index">03</span>工作区</a>
     <a href="#connections"><span class="nav-index">04</span>聊天与关联</a>
-    <a id="service-nav" href="#service-controls"><span class="nav-index">05</span>服务设置</a>
+    <a href="#personal-panel"><span class="nav-index">05</span>记忆与模型</a>
+    <a id="members-nav" href="#members-panel" hidden><span class="nav-index">06</span>邀请成员</a>
+    <a id="service-nav" href="#service-controls"><span class="nav-index">07</span>服务设置</a>
     <p class="nav-note">推理在云端。<br>工作在你选择的实例上。</p>
   </nav>
   <main>
@@ -38,6 +40,15 @@
         <label>密码<input name="password" type="password" autocomplete="current-password" required maxlength="1024" placeholder="输入你的密码"></label>
         <button type="submit" class="primary">进入工作台</button>
       </form>
+      <details id="register-entry" class="panel" hidden><summary>持有邀请口令？创建自己的账号</summary>
+        <form id="register-form">
+          <label>邀请口令<input name="invite_code" type="password" autocomplete="off" required minlength="64" maxlength="64"></label>
+          <label>用户名<input name="login" autocomplete="username" required maxlength="64" pattern="[A-Za-z0-9_.-]+"></label>
+          <label>显示名称<input name="display_name" autocomplete="nickname" required maxlength="128"></label>
+          <label>密码<input name="password" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
+          <button type="submit" class="primary">创建独立工作台</button>
+        </form>
+      </details>
       <form id="setup-form" class="panel" hidden>
         <label>初始化口令<input name="bootstrap_token" type="password" autocomplete="off" required minlength="32" placeholder="设备安装时生成的口令"></label>
         <label>用户名<input name="login" autocomplete="username" required maxlength="64" pattern="[A-Za-z0-9_.-]+" placeholder="例如 my-agent"><span class="label-note">使用英文字母、数字、下划线、连字符或点。</span></label>
@@ -75,7 +86,34 @@
         </div>
         <section class="panel accent"><p class="eyebrow">CONNECT YOUR CONVERSATION</p><h2 id="pair-title">把聊天接到工作台。</h2><p id="pair-description" class="intro">关联你的 QQ 账号。之后，把想做的事直接告诉 Agent。</p><button id="pair-create" class="primary">生成关联口令</button><div id="pair-result" hidden><output id="pair-code" aria-label="一次性关联口令"></output><p id="pair-expiry" class="subtle"></p><button id="pair-copy" class="quiet small">复制口令</button></div><ol class="connection-steps"><li><span>01</span>在这里生成一次性口令</li><li><span>02</span>发给机器人：/绑定 口令</li><li><span>03</span>回到这里确认账号关联</li></ol></section>
       </div>
-      <details id="service-controls" class="panel service-panel" hidden><summary>05 · 云服务管理</summary><p class="subtle">关闭前会结算当前任务。再次使用时需在服务器启动服务。</p><button id="service-stop" class="quiet danger small">关闭云服务</button></details>
+      <p class="section-label">PERSONAL CONTEXT &amp; MODEL</p>
+      <section id="personal-panel" class="panel" hidden>
+        <div class="section-heading"><h2>个人记忆与偏好</h2><button id="personal-reload" class="quiet small">重新载入</button></div>
+        <p class="subtle">只供你的 Agent 使用，切换实例时仍然保留。修改后从下一轮对话生效。</p>
+        <form id="personal-form">
+          <label>回复偏好<textarea name="instructions" rows="3" maxlength="8192" placeholder="例如：用中文回复，先给结论。"></textarea></label>
+          <label>长期记忆<textarea name="memory" rows="6" maxlength="8192" placeholder="希望 Agent 记住的事实。也可以在聊天中让它记住或忘记。"></textarea></label>
+          <div class="actions"><span id="personal-budget" class="subtle"></span><button type="submit" class="primary">保存个人上下文</button></div>
+        </form>
+        <p id="usage-summary" class="subtle"></p>
+      </section>
+      <section id="model-panel" class="panel" hidden>
+        <div class="section-heading"><h2>我的模型</h2><span id="model-current" class="pill"></span></div>
+        <p class="subtle">可使用服务默认模型，也可填写自己的供应商密钥与模型名称。密钥保存后不会回显；正在执行的任务保持原配置。</p>
+        <form id="model-form">
+          <label>供应商<select name="provider" required></select></label>
+          <label>模型名称<input name="model" required maxlength="256" placeholder="供应商提供的模型 ID"></label>
+          <label>API 密钥<input name="api_key" type="password" autocomplete="new-password" maxlength="8192" placeholder="首次配置或切换供应商时填写，留空保留已有密钥"></label>
+          <div class="actions"><button id="model-reset" type="button" class="quiet">使用服务默认</button><button type="submit" class="primary">保存我的模型</button></div>
+        </form>
+      </section>
+      <section id="members-panel" class="panel" hidden>
+        <div class="section-heading"><h2>邀请新成员</h2><span class="pill">管理员</span></div>
+        <p class="subtle">新成员拥有独立账号、聊天关联、设备池、记忆和模型配置。服务器本地实例只属于你的账号。</p>
+        <button id="invite-create" class="primary">生成一次性邀请</button>
+        <div id="invite-result" hidden><label>注册链接<input id="invite-link" readonly></label><p class="subtle">24 小时有效，注册成功后失效。</p><div class="actions"><button id="invite-copy" class="quiet small">复制链接</button><button id="invite-revoke" class="quiet danger small">撤销这次邀请</button></div></div>
+      </section>
+      <details id="service-controls" class="panel service-panel" hidden><summary>07 · 云服务管理</summary><p class="subtle">关闭前会结算当前任务。再次使用时需在服务器启动服务。</p><button id="service-stop" class="quiet danger small">关闭云服务</button></details>
     </section>
   </main>
   <dialog id="confirmation" aria-labelledby="confirmation-title">

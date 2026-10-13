@@ -110,6 +110,124 @@ fn external(adapter: &str) -> ChannelIdentity {
 }
 
 #[tokio::test]
+async fn invites_are_one_time_expiring_admin_only_and_accounts_keep_separate_channels() {
+    let f = Fixture::new().await;
+    assert!(f.identity.is_admin(&f.browser).await.unwrap());
+    let invite = f.identity.create_invite(&f.browser).await.unwrap();
+    let guest = f
+        .identity
+        .register_invited(&invite.code, "guest", PASSWORD.into(), "Guest")
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.identity
+            .register_invited(&invite.code, "replay", PASSWORD.into(), "Replay")
+            .await,
+        Err(IdentityError::Unauthorized)
+    ));
+    let login = f.identity.login("guest", PASSWORD.into()).await.unwrap();
+    let guest_actor = f
+        .identity
+        .authenticate_browser(&login.session_token)
+        .await
+        .unwrap();
+    assert!(!f.identity.is_admin(&guest_actor).await.unwrap());
+    assert!(matches!(
+        f.identity.create_invite(&guest_actor).await,
+        Err(IdentityError::Forbidden)
+    ));
+    assert!(f.identity.devices(&guest_actor).await.unwrap().is_empty());
+    for adapter in ["qq:first", "qq:second", "future:wechat"] {
+        let pair = f.identity.create_pair_code(&guest_actor).await.unwrap();
+        let claim = f
+            .identity
+            .claim_pair_code(external(adapter), &pair.code)
+            .await
+            .unwrap();
+        assert!(matches!(
+            f.identity
+                .confirm_pair_claim(&f.browser, claim.claim_id, true)
+                .await,
+            Err(IdentityError::Stale)
+        ));
+        f.identity
+            .confirm_pair_claim(&guest_actor, claim.claim_id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.identity
+                .resolve_channel(&external(adapter))
+                .await
+                .unwrap(),
+            guest.id
+        );
+    }
+    assert_eq!(f.identity.channels(&guest_actor).await.unwrap().len(), 3);
+    assert!(f.identity.channels(&f.browser).await.unwrap().is_empty());
+    let expired = f.identity.create_invite(&f.browser).await.unwrap();
+    f.clock.advance(86400);
+    assert!(matches!(
+        f.identity
+            .register_invited(&expired.code, "late", PASSWORD.into(), "Late")
+            .await,
+        Err(IdentityError::Unauthorized)
+    ));
+    f.journal.close().await;
+}
+
+#[tokio::test]
+async fn personal_context_is_account_scoped_and_concurrent_edits_do_not_overwrite() {
+    use peri_cloud::state::{StateError, UserData};
+    let f = Fixture::new().await;
+    let invite = f.identity.create_invite(&f.browser).await.unwrap();
+    let guest = f
+        .identity
+        .register_invited(&invite.code, "guest", PASSWORD.into(), "Guest")
+        .await
+        .unwrap();
+    let owner = f.browser.principal().id;
+    let data = f
+        .journal
+        .save_user_data(
+            owner,
+            UserData {
+                revision: 0,
+                instructions: "OWNER_PREFERENCES".into(),
+                memory: "OWNER_MEMORY".into(),
+            },
+            8192,
+        )
+        .await
+        .unwrap();
+    assert_eq!(data.revision, 1);
+    assert_eq!(
+        f.journal.user_data(guest.id).await.unwrap(),
+        UserData::default()
+    );
+    assert!(matches!(
+        f.journal
+            .save_user_data(owner, UserData::default(), 8192)
+            .await,
+        Err(StateError::InvocationConflict)
+    ));
+    assert!(matches!(
+        f.journal
+            .save_user_data(
+                guest.id,
+                UserData {
+                    memory: "x".repeat(8193),
+                    ..Default::default()
+                },
+                8192
+            )
+            .await,
+        Err(StateError::Limit)
+    ));
+    assert_eq!(f.journal.user_data(owner).await.unwrap(), data);
+    f.journal.close().await;
+}
+
+#[tokio::test]
 async fn private_setup_password_login_csrf_logout_and_hash_only_storage() {
     let f = Fixture::new().await;
     assert!(matches!(

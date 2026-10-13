@@ -18,13 +18,13 @@ pub struct IdentityService {
     pub(crate) pool: SqlitePool,
     bootstrap_hash: String,
     dummy_password: String,
-    password_gate: Arc<tokio::sync::Semaphore>,
+    pub(crate) password_gate: Arc<tokio::sync::Semaphore>,
     clock: Arc<dyn IdentityClock>,
 }
 
 impl IdentityService {
     /// Setup credential is deployment configuration, used once to initialize
-    /// the private cloud account. Public registration is never enabled.
+    /// the administrator account. Additional accounts require its invitation.
     pub async fn new(journal: &CloudJournal, bootstrap_token: &str) -> IdentityResult<Arc<Self>> {
         Self::with_clock(journal, bootstrap_token, Arc::new(WallClock)).await
     }
@@ -92,6 +92,10 @@ impl IdentityService {
             .bind(&principal.login)
             .bind(&principal.display_name)
             .bind(encoded)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO account_roles(principal,admin) VALUES(?,1)")
+            .bind(principal.id.to_string())
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -324,7 +328,7 @@ pub(crate) fn principal_from_row(row: &sqlx::sqlite::SqliteRow) -> IdentityResul
     })
 }
 
-fn normalized_login(login: &str) -> IdentityResult<String> {
+pub(crate) fn normalized_login(login: &str) -> IdentityResult<String> {
     let login = login.trim().to_ascii_lowercase();
     if login.is_empty()
         || login.len() > 64

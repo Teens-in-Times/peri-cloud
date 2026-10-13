@@ -104,6 +104,114 @@ async fn local_instance_works_without_native_oauth_and_uses_same_approval_and_re
     assert_eq!(data["devices"].as_array().unwrap().len(), 1);
     assert_eq!(data["devices"][0]["is_local"], true);
     let device = data["devices"][0]["id"].as_str().unwrap().to_owned();
+    // Invited users inherit neither server execution nor service administration.
+    let invite = first
+        .post(&client, &account, "/api/admin/invites", json!({}))
+        .await;
+    client.post(format!("{base}/api/register")).header("Origin",&base)
+        .json(&json!({"invite_code":invite["code"],"login":"guest","password":PASSWORD,"display_name":"Guest"}))
+        .send().await.unwrap().error_for_status().unwrap();
+    let response = client
+        .post(format!("{base}/api/login"))
+        .header("Origin", &base)
+        .json(&json!({"login":"guest","password":PASSWORD}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let cookies: Vec<_> = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|h| h.to_str().unwrap().split(';').next().unwrap().to_owned())
+        .collect();
+    let guest_cookie = cookies.join("; ");
+    let guest_csrf = cookies
+        .iter()
+        .find(|s| s.starts_with("peri_csrf="))
+        .unwrap()
+        .split_once('=')
+        .unwrap()
+        .1;
+    let guest_account: Value = client
+        .get(format!("{base}/api/account"))
+        .header("Cookie", &guest_cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(guest_account["is_admin"], false);
+    assert!(guest_account["devices"].as_array().unwrap().is_empty());
+    for (path, body) in [
+        (
+            format!("/api/instances/{device}/browse"),
+            json!({"path":null,"offset":0}),
+        ),
+        ("/api/service/shutdown".into(), json!({})),
+        ("/api/admin/invites".into(), json!({})),
+    ] {
+        assert_eq!(
+            client
+                .post(format!("{base}{path}"))
+                .header("Origin", &base)
+                .header("Cookie", &guest_cookie)
+                .header("X-Peri-CSRF", guest_csrf)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let memory:Value = client.post(format!("{base}/api/user-data")).header("Origin",&base).header("Cookie",&guest_cookie).header("X-Peri-CSRF",guest_csrf).json(&json!({"revision":0,"instructions":"GUEST_ONLY_PREFERENCE","memory":"GUEST_ONLY_MEMORY"})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(memory["memory"], "GUEST_ONLY_MEMORY");
+    // JSON escaping can exceed the ordinary 16 KiB request cap even when the
+    // decoded personal context is within its 8 KiB account quota.
+    let escaped = json!({"revision":1,"instructions":"","memory":"\n".repeat(8192)});
+    assert!(serde_json::to_vec(&escaped).unwrap().len() > 16 * 1024);
+    client
+        .post(format!("{base}/api/user-data"))
+        .header("Origin", &base)
+        .header("Cookie", &guest_cookie)
+        .header("X-Peri-CSRF", guest_csrf)
+        .json(&escaped)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        first.get(&client, &account, "/api/user-data").await["data"]["memory"],
+        ""
+    );
+    let model_body =
+        json!({"provider":"default","model":"guest-model","api_key":"GUEST_WRITE_ONLY_KEY"});
+    client
+        .post(format!("{base}/api/model"))
+        .header("Origin", &base)
+        .header("Cookie", &guest_cookie)
+        .header("X-Peri-CSRF", guest_csrf)
+        .json(&model_body)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let model_view = client
+        .get(format!("{base}/api/model"))
+        .header("Cookie", &guest_cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!model_view.contains("GUEST_WRITE_ONLY_KEY"));
+    assert!(first.get(&client, &account, "/api/model").await["choice"].is_null());
     let original_default = data["devices"][0]["default_workspace"]
         .as_str()
         .unwrap()

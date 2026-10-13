@@ -114,7 +114,8 @@ impl Gateway {
         actor: &Authenticated,
     ) -> GatewayResult<Vec<WorkspaceSelection>> {
         self.identity.browser_scope(actor).await?;
-        let _gate = self.receive_gate.lock().await;
+        let gate = self.account_gate(actor.principal().id.to_string());
+        let _guard = gate.lock().await;
         let principal = actor.principal().id;
         let mut result = Vec::new();
         for (route, session) in self.store.selections(principal).await? {
@@ -205,7 +206,8 @@ impl Gateway {
         expected: Uuid,
         workspace: &str,
     ) -> GatewayResult<Uuid> {
-        let _gate = self.receive_gate.lock().await;
+        let gate = self.account_gate(actor.principal().id.to_string());
+        let _guard = gate.lock().await;
         self.identity.browser_scope(actor).await?;
         let principal = actor.principal().id;
         let (route, _) = self

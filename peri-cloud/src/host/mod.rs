@@ -6,8 +6,8 @@ mod connections;
 mod local;
 
 pub use config::{
-    DeviceConnection, HostConfig, LocalInstanceConfig, ModelConfig, QqConfig, QqRelay, QqTransport,
-    SshConnection,
+    DeviceConnection, HostConfig, IsolatedInstanceConfig, LocalInstanceConfig, ModelConfig,
+    QqConfig, QqRelay, QqTransport, SshConnection,
 };
 
 use std::sync::Arc;
@@ -89,11 +89,42 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
         .await
         .map_err(|_| HostError::State)?;
     drop(bootstrap);
+    let mut providers = config.model_providers;
+    providers.insert(
+        0,
+        crate::models::ModelProvider {
+            id: "default".into(),
+            name: "默认供应商（自有密钥）".into(),
+            api_base: config.model.api_base.clone(),
+        },
+    );
+    let account_models = crate::models::AccountModels::new(
+        journal.clone(),
+        providers,
+        config.model.model.clone(),
+        config.model.max_tokens,
+    )
+    .map_err(|_| HostError::Configuration)?;
     let local = match &config.local_instance {
         Some(value) => Some(local::LocalExecutor::start(&config.state_dir, value).await?),
         None => None,
     };
     let mut devices = config.devices;
+    if let Some(instance) = config.isolated_instance {
+        identity
+            .configure_local_instance(crate::identity::DeviceRecord {
+                id: instance.connection.device_id,
+                name: instance.name,
+                platform: "linux".into(),
+                default_workspace: instance.workspace,
+                connection_id: None,
+                is_local: true,
+                revoked: false,
+            })
+            .await
+            .map_err(|_| HostError::State)?;
+        devices.push(instance.connection);
+    }
     if let Some(local) = &local {
         identity
             .configure_local_instance(local.record.clone())
@@ -107,7 +138,9 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
         config.system_prompt,
         config.model.context_window,
     )?;
-    let runtime = CloudRuntime::new(journal);
+    connector.set_account_models(account_models.clone());
+    let runtime =
+        CloudRuntime::with_limits(journal, config.limits).map_err(|_| HostError::Configuration)?;
     let adapters = qq
         .iter()
         .map(|adapter| adapter.clone() as Arc<dyn MessageAdapter>)
@@ -121,8 +154,13 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
     )
     .await
     .map_err(|_| HostError::State)?;
-    let mut router =
-        portal::router_for_host(identity, portal_config, gateway.clone(), stop.clone());
+    let mut router = portal::router_for_host_with_models(
+        identity,
+        portal_config,
+        gateway.clone(),
+        stop.clone(),
+        account_models,
+    );
     if let (Some(adapter), Some(qq)) = (&qq, &config.qq) {
         if qq.transport == QqTransport::Webhook {
             router = router.merge(webhook_router(adapter.clone(), gateway.clone()));

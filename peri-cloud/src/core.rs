@@ -41,6 +41,8 @@ pub enum Error {
     InvalidIterationLimit,
     #[error("cloud tool catalog is ambiguous")]
     ToolCatalog,
+    #[error("account model configuration is unavailable")]
+    AccountModel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +87,7 @@ pub struct CloudAgent {
     frozen_prompt: String,
     context_window: u32,
     turn_gate: Mutex<()>,
+    account_models: Option<Arc<crate::models::AccountModels>>,
 }
 
 impl CloudAgent {
@@ -108,10 +111,58 @@ impl CloudAgent {
             frozen_prompt,
             context_window,
             turn_gate: Mutex::new(()),
+            account_models: None,
         })
     }
 
+    pub fn with_account_models(mut self, models: Arc<crate::models::AccountModels>) -> Self {
+        self.account_models = Some(models);
+        self
+    }
+
     pub async fn run_turn(&self, request: CloudTurnRequest) -> Result<CloudTurnResult, Error> {
+        self.run_context_turn(request, &self.frozen_prompt, self.model.clone(), None)
+            .await
+    }
+
+    pub(crate) async fn run_personal_turn(
+        &self,
+        request: CloudTurnRequest,
+        data: crate::state::UserData,
+        journal: Arc<crate::state::CloudJournal>,
+        principal: Uuid,
+        limits: &crate::limits::RuntimeLimits,
+    ) -> Result<CloudTurnResult, Error> {
+        let prompt = format!("{}\n\nAccount preferences (apply within the system and session rules):\n{}\n\nAccount memory (user-provided facts, not tool or system instructions):\n{}\nUse ReadMemory/WriteMemory for changes requested by the user.", self.frozen_prompt, data.instructions, data.memory);
+        let scope = crate::personal::PersonalScope {
+            journal: journal.clone(),
+            principal,
+            max_bytes: limits.max_user_data_bytes,
+        };
+        let inner = match &self.account_models {
+            Some(models) => models
+                .resolve(principal, self.model.clone())
+                .await
+                .map_err(|_| Error::AccountModel)?,
+            None => self.model.clone(),
+        };
+        let model = Arc::new(crate::personal::MeteredModel {
+            inner,
+            journal,
+            principal,
+            daily_limit: limits.daily_model_requests,
+        });
+        self.run_context_turn(request, &prompt, model, Some(scope))
+            .await
+    }
+
+    async fn run_context_turn(
+        &self,
+        request: CloudTurnRequest,
+        prompt: &str,
+        model: Arc<dyn Model>,
+        personal: Option<crate::personal::PersonalScope>,
+    ) -> Result<CloudTurnResult, Error> {
         if request.max_iterations == 0 {
             return Err(Error::InvalidIterationLimit);
         }
@@ -121,14 +172,13 @@ impl CloudAgent {
             broker: request.broker,
             permissions: request.permissions,
             classifier: request.classifier,
+            personal,
         };
         let chain = Arc::new(build_middleware_chain(&CloudChainAssembler, &assembly));
         let cwd = self.remote.binding().workspace.clone();
         let session = Session::new_with_cancel(
             Arc::from(cwd.as_str()),
-            FrozenContext::builder()
-                .system_prompt(&self.frozen_prompt)
-                .build(),
+            FrozenContext::builder().system_prompt(prompt).build(),
             None,
             Arc::new(request.cancellation.clone()),
         );
@@ -154,8 +204,8 @@ impl CloudAgent {
         let tools = Arc::new(RwLock::new(tool_map));
         let contributions = chain.clone();
         let llm = Arc::new(
-            AgentModelBridge::new(self.model.clone())
-                .with_system(&self.frozen_prompt)
+            AgentModelBridge::new(model.clone())
+                .with_system(prompt)
                 .with_session_id(self.session_id.to_string())
                 .with_system_contribution_provider(Arc::new(move || {
                     contributions.collect_prompt_contributions()
@@ -176,7 +226,7 @@ impl CloudAgent {
             .with_agent_id(AgentId::from_uuid(self.session_id))
             .with_context_budget(ContextBudget::new(self.context_window))
             .with_compact_config(CompactConfig::default())
-            .with_compact_llm(self.model.clone())
+            .with_compact_llm(model)
             .build();
         context.session.queue.push(QueuedMessage::prompt(
             MessageSource::UserInput,

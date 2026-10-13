@@ -1,6 +1,7 @@
 //! Cloud accounts, native OAuth grants and independently revocable channels.
 //! Credentials never enter Agent/tool parameters or Debug representations.
 
+mod accounts;
 mod channel;
 mod clock;
 mod crypto;

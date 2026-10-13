@@ -44,7 +44,7 @@ impl CloudJournal {
         let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
-        if !matches!(version, 0..=4) {
+        if !matches!(version, 0..=6) {
             return Err(StateError::Version);
         }
         if version == 0 {
@@ -61,6 +61,7 @@ impl CloudJournal {
         }
         crate::identity::store::migrate(&pool).await?;
         crate::gateway::store::migrate(&pool).await?;
+        super::userdata::migrate(&pool).await?;
         let journal = Self {
             pool,
             _owner: owner,
@@ -129,12 +130,49 @@ impl CloudJournal {
     }
 
     /// The exact request and turn identity are committed before any execution.
+    pub(crate) async fn existing_request(
+        &self,
+        principal: Uuid,
+        session: Uuid,
+        key: &str,
+        prompt: &MessageContent,
+    ) -> StateResult<Option<TurnRecord>> {
+        self.session(principal, session).await?;
+        let row =
+            sqlx::query("SELECT record_json FROM cloud_turns WHERE session_id=? AND request_key=?")
+                .bind(session.to_string())
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
+        let turn: Option<TurnRecord> = row
+            .map(|r| serde_json::from_str(r.get("record_json")))
+            .transpose()?;
+        if turn.as_ref().is_some_and(|t| {
+            serde_json::to_value(&t.prompt).ok() != serde_json::to_value(prompt).ok()
+        }) {
+            return Err(StateError::InvocationConflict);
+        }
+        Ok(turn)
+    }
+
     pub async fn admit(
         &self,
         principal: Uuid,
         session_id: Uuid,
         request_key: String,
         prompt: MessageContent,
+    ) -> StateResult<Admission> {
+        self.admit_limited(principal, session_id, request_key, prompt, u32::MAX)
+            .await
+    }
+
+    pub(crate) async fn admit_limited(
+        &self,
+        principal: Uuid,
+        session_id: Uuid,
+        request_key: String,
+        prompt: MessageContent,
+        daily_limit: u32,
     ) -> StateResult<Admission> {
         if request_key.is_empty() || request_key.len() > 512 {
             return Err(StateError::InvocationConflict);
@@ -173,6 +211,24 @@ impl CloudJournal {
             return Err(StateError::Busy);
         }
         session.permissions()?;
+        let day = super::userdata::usage_day();
+        sqlx::query("INSERT OR IGNORE INTO user_usage(principal,day) VALUES(?,?)")
+            .bind(principal.to_string())
+            .bind(day)
+            .execute(&mut *tx)
+            .await?;
+        let charged = sqlx::query(
+            "UPDATE user_usage SET turns=turns+1 WHERE principal=? AND day=? AND turns<?",
+        )
+        .bind(principal.to_string())
+        .bind(day)
+        .bind(i64::from(daily_limit))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if charged == 0 {
+            return Err(StateError::Limit);
+        }
         let turn = TurnRecord {
             turn_id: Uuid::new_v4(),
             session_id,

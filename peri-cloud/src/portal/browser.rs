@@ -104,6 +104,8 @@ pub(super) async fn account(
     let actor = security::browser(&portal, &headers, false).await?;
     Ok(Json(json!({
         "principal": actor.principal(),
+        "is_admin": portal.identity.is_admin(&actor).await?,
+        "personal_data": portal.gateway.is_some(),
         "devices": portal.identity.devices(&actor).await?,
         "channels": portal.identity.channels(&actor).await?,
         "pending_pair_claims": portal.identity.pending_pair_claims(&actor).await?,

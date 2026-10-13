@@ -18,11 +18,24 @@ pub enum PortalError {
     Identity(#[from] IdentityError),
     #[error("portal interaction request failed")]
     Interaction(#[from] crate::gateway::GatewayError),
+    #[error("personal data request failed")]
+    State(#[from] crate::state::StateError),
+    #[error("personal model request failed")]
+    Model(#[from] crate::models::ModelConfigError),
 }
 
 impl IntoResponse for PortalError {
     fn into_response(self) -> Response {
         let (status, code) = match self {
+            Self::Model(crate::models::ModelConfigError::Invalid) => {
+                (StatusCode::BAD_REQUEST, "invalid_model")
+            }
+            Self::State(crate::state::StateError::Limit) => {
+                (StatusCode::TOO_MANY_REQUESTS, "account_limit")
+            }
+            Self::State(crate::state::StateError::InvocationConflict) => {
+                (StatusCode::CONFLICT, "data_conflict")
+            }
             Self::Interaction(crate::gateway::GatewayError::Invalid) => {
                 (StatusCode::BAD_REQUEST, "invalid_workspace")
             }

@@ -18,6 +18,7 @@ pub(crate) struct CloudAssemblyContext {
     pub broker: Arc<dyn UserInteractionBroker>,
     pub permissions: Arc<SharedPermissionMode>,
     pub classifier: Option<Arc<dyn AutoClassifier>>,
+    pub personal: Option<crate::personal::PersonalScope>,
 }
 
 /// Only installed cloud capabilities are enabled. Slot order remains Peri-owned.
@@ -42,7 +43,7 @@ impl MiddlewareChainAssembler for CloudChainAssembler {
                 ChainSlot::Permission => {
                     chain.add(Box::new(PermissionMiddleware::with_shared_mode(
                         ctx.broker.clone(),
-                        default_requires_approval,
+                        |name| name == "WriteMemory" || default_requires_approval(name),
                         ctx.permissions.clone(),
                         ctx.classifier.clone(),
                     )))
@@ -55,6 +56,9 @@ impl MiddlewareChainAssembler for CloudChainAssembler {
                 // enabled against the cloud server's filesystem.
                 _ => {}
             }
+        }
+        if let Some(scope) = &ctx.personal {
+            chain.add(Box::new(crate::personal::PersonalTools(scope.clone())));
         }
         chain
     }

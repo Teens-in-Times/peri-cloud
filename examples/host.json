@@ -12,6 +12,16 @@
     "thinking_enabled": false,
     "supports_thinking_content": false
   },
+  "model_providers": [],
+  "limits": {
+    "max_active_turns": 4,
+    "max_active_per_user": 1,
+    "daily_turns": 200,
+    "daily_model_requests": 1000,
+    "max_turn_seconds": 600,
+    "max_prompt_bytes": 65536,
+    "max_user_data_bytes": 8192
+  },
   "devices": [],
   "local_instance": {
     "name": "服务器本地",

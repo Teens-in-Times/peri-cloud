@@ -4,6 +4,7 @@
 mod browser;
 mod interactions;
 mod native;
+mod personal;
 mod security;
 mod workspaces;
 
@@ -73,6 +74,7 @@ pub(crate) struct Portal {
     config: PortalConfig,
     gateway: Option<Arc<crate::gateway::Gateway>>,
     shutdown: Option<tokio_util::sync::CancellationToken>,
+    models: Option<Arc<crate::models::AccountModels>>,
 }
 
 /// Serve embedded assets and identity APIs. Mount behind a proxy that preserves
@@ -83,6 +85,7 @@ pub fn router(identity: Arc<IdentityService>, config: PortalConfig) -> Router {
         config,
         gateway: None,
         shutdown: None,
+        models: None,
     })
 }
 
@@ -98,6 +101,7 @@ pub fn router_with_gateway(
         config,
         gateway: Some(gateway),
         shutdown: None,
+        models: None,
     })
 }
 
@@ -113,6 +117,23 @@ pub fn router_for_host(
         config,
         gateway: Some(gateway),
         shutdown: Some(shutdown),
+        models: None,
+    })
+}
+
+pub fn router_for_host_with_models(
+    identity: Arc<IdentityService>,
+    config: PortalConfig,
+    gateway: Arc<crate::gateway::Gateway>,
+    shutdown: tokio_util::sync::CancellationToken,
+    models: Arc<crate::models::AccountModels>,
+) -> Router {
+    build_router(Portal {
+        identity,
+        config,
+        gateway: Some(gateway),
+        shutdown: Some(shutdown),
+        models: Some(models),
     })
 }
 
@@ -125,6 +146,23 @@ fn build_router(portal: Portal) -> Router {
         .route("/api/service/shutdown", post(interactions::shutdown))
         .route("/api/setup", post(browser::setup))
         .route("/api/login", post(browser::login))
+        .route("/api/register", post(personal::register))
+        .route("/api/admin/invites", post(personal::invite))
+        .route(
+            "/api/admin/invites/{id}/revoke",
+            post(personal::revoke_invite),
+        )
+        .route(
+            "/api/user-data",
+            get(personal::read)
+                .post(personal::save)
+                .layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/api/model",
+            get(personal::model).post(personal::save_model),
+        )
+        .route("/api/model/reset", post(personal::reset_model))
         .route("/api/logout", post(browser::logout))
         .route("/api/account", get(browser::account))
         .route("/api/workspaces", get(workspaces::list))
