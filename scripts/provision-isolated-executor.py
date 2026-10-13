@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Provision the administrator's server executor; build binaries off-server."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,7 +27,7 @@ def plan(root, image, port, memory, cpus):
         '--user', '10001:10001', '--cap-drop', 'ALL',
         '--security-opt', 'no-new-privileges:true', '--pids-limit', '128',
         '--memory', f'{memory}m', '--memory-swap', f'{memory}m', '--cpus', str(cpus),
-        '--network', 'peri-owner-internal', '--publish', f'127.0.0.1:{port}:42371',
+        '--network', 'peri-owner-network', '--publish', f'127.0.0.1:{port}:42371',
         '--mount', f'type=bind,src={root}/workspace,dst=/workspace',
         '--mount', f'type=bind,src={root}/state,dst=/state',
         '--tmpfs', '/tmp:rw,nosuid,nodev,size=64m,mode=1777',
@@ -82,8 +83,15 @@ def main():
     snippet_path = config_dir / 'isolated-instance.json'
     if root.exists() or token_path.exists() or snippet_path.exists():
         raise SystemExit('Instance already exists; preserve its data and review it manually')
-    # Separate internal bridge and only two explicitly writable mounts.
-    run(['docker', 'network', 'create', '--internal', 'peri-owner-internal'])
+    if args.image_loaded:
+        output = subprocess.check_output(['docker','run','--rm','--read-only','--cap-drop','ALL',
+            '--security-opt','no-new-privileges:true','--network','none','--entrypoint','sha256sum',
+            image,'/usr/local/bin/peri-executor'], text=True)
+        if output.split()[0] != hashlib.sha256(binary.read_bytes()).hexdigest():
+            raise SystemExit('Loaded image binary does not match --binary')
+    # Dedicated bridge, no inter-container traffic, and only two writable mounts.
+    run(['docker', 'network', 'create', '--driver', 'bridge', '--opt',
+         'com.docker.network.bridge.enable_icc=false', 'peri-owner-network'])
     root.mkdir(parents=True, mode=0o700)
     for name in ('workspace', 'state'):
         path = root / name

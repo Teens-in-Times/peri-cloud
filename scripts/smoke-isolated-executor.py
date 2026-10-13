@@ -71,11 +71,11 @@ try:
     mounts = {m['Destination'] for m in inspect['Mounts'] if m['Type'] == 'bind'}
     assert mounts == {'/workspace', '/state'}
     assert all(binding['HostIp'] == '127.0.0.1' for bindings in cfg['PortBindings'].values() for binding in bindings)
-    network = json.loads(subprocess.check_output(['docker', 'network', 'inspect', 'peri-owner-internal']))[0]
-    assert network['Internal']
+    network = json.loads(subprocess.check_output(['docker', 'network', 'inspect', 'peri-owner-network']))[0]
+    assert network['Options']['com.docker.network.bridge.enable_icc'] == 'false'
     print(json.dumps({'isolated_executor': 'pass', 'real_shell_execution': True, 'credentials_not_mounted': True,
-                      'readonly_root': True, 'internal_network': True, 'resource_limits': True}))
+                      'readonly_root': True, 'dedicated_network': True, 'resource_limits': True}))
 finally:
     subprocess.run(['docker', 'stop', '--time', '30', 'peri-owner-executor'], check=True)
     subprocess.run(['docker', 'rm', 'peri-owner-executor'], check=True)
-    subprocess.run(['docker', 'network', 'rm', 'peri-owner-internal'], check=True)
+    subprocess.run(['docker', 'network', 'rm', 'peri-owner-network'], check=True)

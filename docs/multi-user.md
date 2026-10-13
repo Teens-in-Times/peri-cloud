@@ -59,7 +59,9 @@ sudo python3 scripts/provision-isolated-executor.py --binary ./peri-executor --a
 
 脚本要求已有 `/etc/peri-cloud` 和 `peri-cloud` 系统账号，拒绝覆盖既有实例。完成运输认证后，把 `/etc/peri-cloud/isolated-instance.json` 的字段合并进 `host.json`，移除 `local_instance`，校验再重启。脚本不改写宿主配置或自动重启它。
 
-容器以 UID 10001 运行，根文件系统只读，只挂载 `/var/lib/peri-instances/owner/workspace` 和 `state`。默认 512 MiB 内存、1 CPU、128 个进程、64 MiB 临时目录，仅回环发布认证端口。内部网络不提供互联网访问，需要联网的管理任务可选择自己的外部实例。
+容器以 UID 10001 运行，根文件系统只读，只挂载 `/var/lib/peri-instances/owner/workspace` 和 `state`。默认 512 MiB 内存、1 CPU、128 个进程、64 MiB 临时目录，仅回环发布认证端口。使用专用 Docker bridge，禁用同网内容器互访，工具可以联网下载依赖。它不是网络出口沙箱。
+
+服务器无法访问 Docker Hub 时，可从 GitHub 的“Build isolated executor image”任务下载经过验收的 `peri-owner-executor.tar.gz`，校验下载文件后用 `docker load --input peri-owner-executor.tar.gz` 加载，再给安装命令加 `--image-loaded`。脚本核对镜像里的执行器与 `--binary` 的 SHA256 是否一致，再写入运输凭据。
 
 容器的 `/` 是容器文件系统，只有 `/workspace` 对应宿主专用目录，不提供访问整个服务器的能力。云服务配置、模型密钥和历史不挂载。目录容量仍需文件系统配额或磁盘监控。
 
