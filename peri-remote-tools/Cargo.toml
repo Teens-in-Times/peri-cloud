@@ -3,7 +3,7 @@ name = "peri-remote-tools"
 version.workspace = true
 edition.workspace = true
 description = "Native Peri tool adapters for a frozen device executor session"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 
 [dependencies]
 peri-acp-types = { path = "../peri-acp-types" }

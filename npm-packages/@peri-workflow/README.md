@@ -320,4 +320,4 @@ npm publish
 
 ## 许可
 
-Apache-2.0
+GNU Affero General Public License version 3 only (AGPL-3.0-only). See [LICENSE](LICENSE); upstream notices are preserved in the repository [NOTICE](../../NOTICE).

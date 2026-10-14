@@ -19,3 +19,8 @@ Third-party dependencies remain subject to their respective licenses.
 The embedded workflow engine is @claude-code-best/workflow-engine 0.1.0,
 Copyright (c) 2026 claude-code-best, MIT License.
 The complete notice is included in licenses/workflow-engine-MIT.txt.
+
+This distribution as a whole is licensed under GNU AGPL version 3 only
+(SPDX: AGPL-3.0-only); see LICENSE. The retained Apache-2.0 license
+for upstream Peri portions is in licenses/Apache-2.0.txt. Upstream and
+third-party copyright and license notices remain applicable.

@@ -3,7 +3,7 @@ name = "peri-cloud"
 version.workspace = true
 edition.workspace = true
 description = "Personal cloud agent host with native device execution and optional gateways"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 
 [dependencies]
 peri-agent = { path = "../peri-agent" }

@@ -3,7 +3,7 @@ name = "peri-model"
 version.workspace = true
 edition.workspace = true
 description = "Model-neutral protocol types and stream-first model interface for Peri"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 
 [dependencies]
 async-trait.workspace = true
