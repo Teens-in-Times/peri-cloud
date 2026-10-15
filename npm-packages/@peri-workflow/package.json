@@ -15,7 +15,9 @@
     "dist",
     "src",
     "README.md",
-    "DESIGN.md"
+    "DESIGN.md",
+    "NOTICE",
+    "LICENSES"
   ],
   "scripts": {
     "build": "bun build src/index.ts --outfile=dist/peri-workflow.js --target=node --format=esm --banner:js='#!/usr/bin/env node'",
