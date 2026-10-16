@@ -59,11 +59,37 @@ impl LockedTarget<'_> {
             let _ = metadata;
         }
 
-        if std::fs::rename(&tmp_path, self.path).is_err() {
+        if rename_committed_file(&tmp_path, self.path).is_err() {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(CommitError::Io);
         }
         Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_committed_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, target)
+}
+
+#[cfg(windows)]
+fn rename_committed_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    // A scanner or another path lookup can briefly hold a non-delete-shared
+    // handle. Windows can report this as ACCESS_DENIED as well as a sharing or
+    // lock violation. Retry these definite failures only, with the target lock
+    // still held and the already-computed contents unchanged (including append).
+    let mut delay_ms = 5;
+    loop {
+        match std::fs::rename(source, target) {
+            Err(error)
+                if delay_ms <= 80
+                    && matches!(error.raw_os_error(), Some(5) | Some(32) | Some(33)) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms *= 2;
+            }
+            result => return result,
+        }
     }
 }
 
@@ -152,4 +178,49 @@ fn target_lock(path: &Path) -> Arc<TargetMutex<()>> {
     let lock = Arc::new(TargetMutex::new(()));
     entries.insert(key, Arc::downgrade(&lock));
     lock
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn commit_tolerates_a_brief_windows_sharing_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.txt");
+        std::fs::write(&path, b"before").unwrap();
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3) // FILE_SHARE_READ | FILE_SHARE_WRITE, without DELETE.
+            .open(&path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            drop(handle);
+        });
+        let result = with_target_lock(&path, |locked| locked.guard_and_commit(b"before", b"after"));
+        release.join().unwrap();
+        result.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"after");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn persistent_sharing_lock_preserves_original_and_cleans_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.txt");
+        std::fs::write(&path, b"before").unwrap();
+        let _handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            with_target_lock(&path, |locked| locked.guard_and_commit(b"before", b"after")),
+            Err(CommitError::Io)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 }

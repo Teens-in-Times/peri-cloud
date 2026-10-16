@@ -28,12 +28,11 @@ prefix = f'peri-cloud-v{version}'
 output = args.output.resolve()
 output.mkdir(parents=True, exist_ok=False)
 shared = {}
-for name in ['README.md', 'LICENSE', 'NOTICE', 'AGENTS.md']:
+tracked = subprocess.check_output([
+    'git', 'ls-files', '-z', '--', 'README.md', 'LICENSE', 'NOTICE', 'AGENTS.md',
+    'docs', 'examples', 'licenses'], cwd=root).decode('utf-8').split('\0')
+for name in filter(None, tracked):
     shared[name] = (root / name).read_bytes()
-for folder in ['docs', 'examples', 'licenses']:
-    for path in (root / folder).rglob('*'):
-        if path.is_file():
-            shared[path.relative_to(root).as_posix()] = path.read_bytes()
 
 provenance = {'version': version, 'commit': head,
               'ci_run': f'https://github.com/Teens-in-Times/peri-cloud/actions/runs/{args.ci_run}',
