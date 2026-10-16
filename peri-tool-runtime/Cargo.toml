@@ -3,7 +3,7 @@ name = "peri-tool-runtime"
 version.workspace = true
 edition.workspace = true
 description = "Shared native tools for in-process agents and SSH executors"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 
 [dependencies]
 peri-acp-types = { path = "../peri-acp-types" }

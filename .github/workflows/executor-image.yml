@@ -1,0 +1,43 @@
+name: Build isolated executor image
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: Main CI run with successful Linux tests, Clippy and binary build
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  executor-image:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Verify binary provenance
+        shell: bash
+        run: |
+          [[ "$ARTIFACT_RUN_ID" =~ ^[0-9]+$ ]]
+          gh run view "$ARTIFACT_RUN_ID" --repo "$GITHUB_REPOSITORY" --json event,headBranch,headSha,jobs > run.json
+          source_commit=$(python3 -c 'import json; r=json.load(open("run.json")); assert r["event"]=="push" and r["headBranch"]=="main"; j=next(j for j in r["jobs"] if j["name"]=="cloud-executor (ubuntu-22.04)"); required={"Cloud and executor regression tests","Clippy","Build optimized binaries"}; assert required <= {s["name"] for s in j["steps"] if s["conclusion"]=="success"}; print(r["headSha"])')
+          git diff --exit-code "$source_commit" HEAD -- Cargo.toml Cargo.lock 'peri-*/src' npm-packages
+      - name: Download verified native binary
+        run: gh run download "$ARTIFACT_RUN_ID" --repo "$GITHUB_REPOSITORY" --name native-ubuntu-22.04 --dir native
+      - name: Exercise actual isolated executor
+        run: sudo env GITHUB_ACTIONS=true RUNNER_OS=Linux python3 scripts/smoke-isolated-executor.py native/peri-executor
+      - name: Export image for offline installation
+        if: always()
+        run: docker save peri-owner-executor:local | gzip > peri-owner-executor.tar.gz
+      - name: Preserve image
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: isolated-executor-image
+          path: peri-owner-executor.tar.gz
+          if-no-files-found: error
+          retention-days: 7

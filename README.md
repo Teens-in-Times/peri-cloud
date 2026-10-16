@@ -102,7 +102,7 @@ cargo clippy --locked -p peri-cloud -p peri-executor --all-targets --no-deps -- 
 
 ## 来源与许可
 
-Apache-2.0。源代码基于 Peri 提交 `d7ee444efe7a461b0696bd6c27c6c91f946fdec1`，新增云端、执行器、远程工具协议和共享工具运行库，并修改必要的依赖模块。QQ 官方网关实现参考独立项目 Prism 的适配协议；按钮行为参考 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的网关实现。
+本发行版整体采用 AGPL-3.0-only。来自 Peri 的上游代码保留原 Apache-2.0 声明和[完整许可文本](licenses/Apache-2.0.txt)。源代码基于 Peri 提交 `d7ee444efe7a461b0696bd6c27c6c91f946fdec1`，新增云端、执行器、远程工具协议和共享工具运行库，并修改必要的依赖模块。QQ 官方网关实现参考独立项目 Prism 的适配协议；按钮行为参考 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的网关实现。
 
 参见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。第三方依赖保留各自许可证。公开仓库采用新的源码快照，未包含原开发目录的 Git 历史、个人配置、聊天记录、凭据或运行数据库。
 

@@ -1,6 +1,7 @@
 {
   "name": "@peri-code/workflow",
   "version": "0.2.0",
+  "license": "AGPL-3.0-only",
   "description": "Workflow runner for the Perihelion agent — JSON-RPC 2.0 stdio bridge. Host-language-agnostic: any language that can spawn a Node child process and speak JSON-RPC over stdin/stdout can integrate. Built-in CLI subcommands (read/list) for inspecting run results.",
   "bin": {
     "peri-workflow": "dist/peri-workflow.js"
@@ -14,7 +15,9 @@
     "dist",
     "src",
     "README.md",
-    "DESIGN.md"
+    "DESIGN.md",
+    "NOTICE",
+    "LICENSES"
   ],
   "scripts": {
     "build": "bun build src/index.ts --outfile=dist/peri-workflow.js --target=node --format=esm --banner:js='#!/usr/bin/env node'",

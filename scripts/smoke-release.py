@@ -1,7 +1,8 @@
-import json,os,pathlib,socket,subprocess,tempfile,time,urllib.request,urllib.error,http.cookiejar,sys,tomllib
+import json,os,pathlib,socket,subprocess,tempfile,time,urllib.request,urllib.error,http.cookiejar,sys,re
 binary=pathlib.Path(sys.argv[1]).resolve()
 assets=pathlib.Path(sys.argv[2]).resolve()
-expected_version=tomllib.loads((assets.parents[3]/'Cargo.toml').read_text())['workspace']['package']['version']
+manifest=(assets.parents[3]/'Cargo.toml').read_text()
+expected_version=re.search(r'\[workspace\.package\]\s+version\s*=\s*"([^"]+)"',manifest).group(1)
 root=pathlib.Path(tempfile.mkdtemp(prefix='peri-cloud-release-smoke-'))
 def port():
     with socket.socket() as s: s.bind(('127.0.0.1',0));return s.getsockname()[1]

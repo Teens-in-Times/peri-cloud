@@ -316,7 +316,13 @@ async fn shell_alias_uses_canonical_bash_approval_and_returns_real_exit_evidence
     let command = "printf shell-result";
     let h = Harness::new(
         vec![
-            tool_call("shell-call", "Shell", json!({"command":command})),
+            // This checks exit evidence, not the default foreground deadline.
+            // Cold PowerShell startup can exceed 15s on a shared Windows runner.
+            tool_call(
+                "shell-call",
+                "Shell",
+                json!({"command":command,"timeout":60000}),
+            ),
             answer("命令执行完成。"),
         ],
         true,

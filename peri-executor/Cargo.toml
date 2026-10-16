@@ -3,7 +3,7 @@ name = "peri-executor"
 version.workspace = true
 edition.workspace = true
 description = "Persistent native tool executor for Windows and Linux devices"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 
 [dependencies]
 peri-acp-types = { path = "../peri-acp-types" }
