@@ -1,7 +1,7 @@
 use super::*;
 use peri_cloud::gateway::MenuCard;
 
-async fn menu(f: &Fixture, event: &str, command: &str) -> (MenuCard, String) {
+pub(super) async fn menu(f: &Fixture, event: &str, command: &str) -> (MenuCard, String) {
     f.c()
         .gateway
         .receive(f.message(event, command))
@@ -15,7 +15,7 @@ async fn menu(f: &Fixture, event: &str, command: &str) -> (MenuCard, String) {
     (card, delivery.in_reply_to)
 }
 
-fn choice(card: &MenuCard, label: &str) -> Uuid {
+pub(super) fn choice(card: &MenuCard, label: &str) -> Uuid {
     card.buttons
         .iter()
         .find(|b| b.label == label)

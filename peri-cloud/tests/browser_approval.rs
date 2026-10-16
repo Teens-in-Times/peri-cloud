@@ -33,6 +33,9 @@ const VERIFIER: &str = "fixture-browser-native-verifier-at-least-43-characters";
 struct Adapter(Mutex<Vec<Delivery>>);
 #[async_trait]
 impl MessageAdapter for Adapter {
+    fn initial_access_policy(&self) -> peri_cloud::gateway::access::AccessPolicy {
+        peri_cloud::gateway::access::AccessPolicy::open()
+    }
     fn instance_id(&self) -> &str {
         "fixture-qq"
     }

@@ -1,6 +1,7 @@
 //! Optional message adapters feed one account/session router. No tool policy or
 //! reasoning loop lives in the adapter; structured interactions use Peri's broker.
 
+pub mod access;
 mod broker;
 mod connector;
 mod menu_store;

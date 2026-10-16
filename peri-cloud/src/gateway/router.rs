@@ -43,15 +43,16 @@ struct Ownership {
 /// CloudRuntime shutdown closes the shared journal.
 pub struct Gateway {
     runtime: Arc<CloudRuntime>,
-    identity: Arc<IdentityService>,
+    pub(super) identity: Arc<IdentityService>,
     connector: Arc<dyn SessionConnector>,
-    adapters: HashMap<String, Arc<dyn MessageAdapter>>,
-    store: GatewayStore,
+    pub(super) adapters: HashMap<String, Arc<dyn MessageAdapter>>,
+    pub(super) store: GatewayStore,
     hub: Arc<InteractionHub>,
     origins: RwLock<Origins>,
     owner: Mutex<Ownership>,
     receive_gates: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     dispatch_gate: tokio::sync::Mutex<()>,
+    pub(super) access_gate: tokio::sync::RwLock<()>,
     max_iterations: usize,
 }
 
@@ -95,6 +96,11 @@ impl Gateway {
         }
         let store = GatewayStore::new(runtime.journal());
         store.recover().await?;
+        for (id, adapter) in &mapped {
+            store
+                .seed_access(id, adapter.initial_access_policy())
+                .await?;
+        }
         let hub = InteractionHub::new(
             identity.clone(),
             runtime.journal().clone(),
@@ -116,6 +122,7 @@ impl Gateway {
             }),
             receive_gates: Mutex::new(HashMap::new()),
             dispatch_gate: tokio::sync::Mutex::new(()),
+            access_gate: tokio::sync::RwLock::new(()),
             max_iterations,
         }))
     }
@@ -125,6 +132,9 @@ impl Gateway {
         message: InboundMessage,
     ) -> GatewayResult<GatewayReceipt> {
         message.key()?;
+        if !self.route_allowed(&message.route).await? {
+            return Err(IdentityError::Forbidden.into());
+        }
         if !self
             .adapters
             .contains_key(&message.route.identity.adapter_instance_id)
@@ -173,6 +183,9 @@ impl Gateway {
         };
         let gate = self.account_gate(key);
         let _guard = gate.lock().await;
+        if !self.route_allowed(&message.route).await? {
+            return Err(IdentityError::Forbidden.into());
+        }
         let (receipt, created) = self.store.admit(&message).await?;
         if !created {
             if let Some(session) = receipt.session_id {
@@ -279,6 +292,9 @@ impl Gateway {
             .channel_devices(&message.route.identity)
             .await?;
         let selected = self.store.selection(&message.route, principal).await?;
+        if let Some(body) = self.access_command(message, principal).await? {
+            return Ok(Some((body, Some(principal))));
+        }
         if text == "/菜单详情" || text.starts_with("/菜单详情 ") {
             let arguments: Vec<_> = text
                 .strip_prefix("/菜单详情")
@@ -580,6 +596,9 @@ impl Gateway {
         request: Uuid,
         action: InteractionAction,
     ) -> GatewayResult<()> {
+        if !self.route_allowed(route).await? {
+            return Err(IdentityError::Forbidden.into());
+        }
         if self.owner.lock().closing {
             return Err(GatewayError::Closing);
         }
@@ -656,6 +675,7 @@ impl Gateway {
                 .await?;
         }
         for pending in self.store.ready().await? {
+            let _policy_read = self.access_gate.read().await;
             let Some(adapter) = self
                 .adapters
                 .get(&pending.delivery.route.identity.adapter_instance_id)
@@ -695,7 +715,7 @@ impl Gateway {
                 },
                 _ => true,
             };
-            if !authorized || !live {
+            if !authorized || !live || !self.route_allowed(&pending.delivery.route).await? {
                 if let DeliveryBody::Interaction { card } = &pending.delivery.body {
                     self.hub.invalidate(card.request_id);
                 }

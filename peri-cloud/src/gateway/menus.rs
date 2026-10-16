@@ -19,6 +19,9 @@ impl Gateway {
         event: String,
         action: Uuid,
     ) -> GatewayResult<()> {
+        if !self.route_allowed(&route).await? {
+            return Err(IdentityError::Forbidden.into());
+        }
         let principal = self.identity.resolve_channel(&route.identity).await?;
         self.store
             .menu_action(&route, principal, action, self.identity.now())
@@ -75,6 +78,33 @@ impl Gateway {
             .as_ref()
             .and_then(|s| devices.iter().find(|d| d.id == s.frozen.device_id));
         match action {
+            MenuAction::Access {
+                adapter,
+                section,
+                page,
+            } => {
+                return self
+                    .access_menu(message, principal, adapter.as_deref(), &section, page)
+                    .await
+            }
+            MenuAction::AccessChange {
+                adapter,
+                revision,
+                change,
+            } => {
+                return self
+                    .access_change(message, principal, &adapter, revision, &change)
+                    .await
+            }
+            MenuAction::AccessInput {
+                adapter,
+                revision,
+                list,
+            } => {
+                return self
+                    .access_prompt(message, principal, &adapter, revision, list)
+                    .await
+            }
             MenuAction::Personal { section, page } => {
                 return Ok(DeliveryBody::Menu {
                     card: self
@@ -139,6 +169,27 @@ impl Gateway {
                         page: 1,
                     },
                 ));
+                if self
+                    .adapters
+                    .get(&message.route.identity.adapter_instance_id)
+                    .is_some_and(|a| {
+                        a.conversation_scope(&message.route)
+                            == crate::gateway::access::ConversationScope::Private
+                    })
+                    && self
+                        .identity
+                        .channel_is_admin(&message.route.identity)
+                        .await?
+                {
+                    choices.push((
+                        "网关与访问控制".into(),
+                        MenuAction::Access {
+                            adapter: None,
+                            section: "home".into(),
+                            page: 1,
+                        },
+                    ));
+                }
             }
             MenuAction::Instances { offset } => {
                 title = "选择执行设备".into();
@@ -573,7 +624,7 @@ impl Gateway {
         Box::pin(self.menu_route(message, principal, devices, selected, action))
     }
 
-    async fn build_menu(
+    pub(in crate::gateway) async fn build_menu(
         &self,
         message: &InboundMessage,
         principal: Uuid,

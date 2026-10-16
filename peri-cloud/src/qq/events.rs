@@ -205,6 +205,13 @@ impl QqAdapter {
                     .await?;
             }
             Some(QqInput::Message(message)) => {
+                if !gateway
+                    .route_allowed(&message.route)
+                    .await
+                    .map_err(|_| QqError::Admission)?
+                {
+                    return Ok(());
+                }
                 gateway
                     .receive(message)
                     .await

@@ -114,6 +114,7 @@
         <button id="invite-create" class="primary">生成一次性邀请</button>
         <div id="invite-result" hidden><label>注册链接<input id="invite-link" readonly></label><p class="subtle">24 小时有效，注册成功后失效。</p><div class="actions"><button id="invite-copy" class="quiet small">复制链接</button><button id="invite-revoke" class="quiet danger small">撤销这次邀请</button></div></div>
       </section>
+      <details id="gateway-panel" class="panel" hidden><summary>入口访问控制</summary><p class="subtle">QQ 私聊发送 /网关 可日常管理。这里也可恢复被关闭的聊天入口。黑名单优先；群聊在白名单模式下须同时允许用户和群。</p><button id="gateway-refresh" class="quiet small">载入名单</button><div id="gateway-policies"></div></details>
       <details id="service-controls" class="panel service-panel" hidden><summary>07 · 云服务管理</summary><p class="subtle">关闭前会结算当前任务。再次使用时需在服务器启动服务。</p><button id="service-stop" class="quiet danger small">关闭云服务</button></details>
     </section>
   </main>

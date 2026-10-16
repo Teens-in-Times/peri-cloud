@@ -36,6 +36,9 @@ impl IntoResponse for PortalError {
             Self::State(crate::state::StateError::InvocationConflict) => {
                 (StatusCode::CONFLICT, "data_conflict")
             }
+            Self::Interaction(crate::gateway::GatewayError::State(
+                crate::state::StateError::InvocationConflict,
+            )) => (StatusCode::CONFLICT, "access_conflict"),
             Self::Interaction(crate::gateway::GatewayError::Invalid) => {
                 (StatusCode::BAD_REQUEST, "invalid_workspace")
             }

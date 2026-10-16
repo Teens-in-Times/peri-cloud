@@ -375,6 +375,22 @@ fn button(id: &str, label: &str, data: &str) -> Value {
 
 #[async_trait]
 impl MessageAdapter for QqAdapter {
+    fn initial_access_policy(&self) -> crate::gateway::access::AccessPolicy {
+        crate::gateway::access::AccessPolicy::open()
+    }
+    fn conversation_scope(
+        &self,
+        route: &crate::gateway::ChannelRoute,
+    ) -> crate::gateway::access::ConversationScope {
+        use crate::gateway::access::ConversationScope;
+        if let Some(group) = route.conversation_id.strip_prefix("group:") {
+            ConversationScope::Group(group.into())
+        } else if route.conversation_id == format!("c2c:{}", route.identity.external_user_id) {
+            ConversationScope::Private
+        } else {
+            ConversationScope::Unknown
+        }
+    }
     fn instance_id(&self) -> &str {
         &self.instance
     }

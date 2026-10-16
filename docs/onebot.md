@@ -23,10 +23,14 @@ Peri 的官方 QQBot 和个人 QQ 是同一个云助手的两个入口。官方�
     "instance_id": "qq-personal-main",
     "self_id": "123456789",
     "listen": "127.0.0.1:47672",
-    "access_token_env": "PERI_ONEBOT_TOKEN"
+    "access_token_env": "PERI_ONEBOT_TOKEN",
+    "allowed_users": ["1234567890"],
+    "allowed_groups": []
   }
 }
 ```
+
+新入口默认拒绝所有来源。`allowed_users` 与 `allowed_groups` 是首次创建策略的引导名单；上例只允许一个用户私聊，不响应任何群。已有策略在重启时不会被配置文件覆盖，日常在管理员私聊发送 `/网关` 管理白名单与黑名单，见 [网关访问控制](gateway-access.md)。
 
 `instance_id` 必须与官方 QQBot 不同，绑定后保持稳定。`self_id` 是登录的机器人 QQ 号，必须是十进制字符串。令牌至少 32 个可见 ASCII 字符，由部署环境持有，不能放进模型工具参数。云服务先运行 `--check-config`，检查成功后再启动。
 

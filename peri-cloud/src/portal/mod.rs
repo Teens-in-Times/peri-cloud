@@ -1,6 +1,7 @@
 //! Browser account/device entry point. No Agent loop, channel credentials or
 //! tool policy is owned by HTTP requests; deployment retains those lifecycles.
 
+mod access;
 mod browser;
 mod conversations;
 mod interactions;
@@ -149,6 +150,10 @@ fn build_router(portal: Portal) -> Router {
         .route("/api/login", post(browser::login))
         .route("/api/register", post(personal::register))
         .route("/api/admin/invites", post(personal::invite))
+        .route(
+            "/api/admin/gateway-access",
+            get(access::list).post(access::change),
+        )
         .route(
             "/api/admin/invites/{id}/revoke",
             post(personal::revoke_invite),

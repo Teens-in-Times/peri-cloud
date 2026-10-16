@@ -21,6 +21,7 @@ pub struct OneBotAdapter {
     instance: String,
     self_id: String,
     token: String,
+    initial_access: crate::gateway::access::AccessPolicy,
     connection: Mutex<Option<Connection>>,
 }
 
@@ -44,7 +45,15 @@ pub enum OneBotError {
 }
 
 impl OneBotAdapter {
-    pub fn new(instance: String, self_id: String, token: String) -> Result<Arc<Self>, OneBotError> {
+    pub fn new(
+        instance: String,
+        self_id: String,
+        token: String,
+        initial_access: crate::gateway::access::AccessPolicy,
+    ) -> Result<Arc<Self>, OneBotError> {
+        initial_access
+            .validate()
+            .map_err(|_| OneBotError::Configuration)?;
         if instance.is_empty()
             || instance.len() > 128
             || instance.chars().any(char::is_control)
@@ -58,6 +67,7 @@ impl OneBotAdapter {
             instance,
             self_id,
             token,
+            initial_access,
             connection: Mutex::new(None),
         }))
     }
@@ -88,6 +98,10 @@ impl OneBotAdapter {
         let Some(mut input) = events::parse(&self.instance, &self.self_id, &value) else {
             return;
         };
+        // Deny before API lookups, Gateway admission, pairing or any model call.
+        if !matches!(gateway.route_allowed(&input.message.route).await, Ok(true)) {
+            return;
+        }
         if let Some(reply) = input.quoted.as_ref() {
             // Read the original from the authenticated protocol endpoint rather
             // than trusting reply text embedded in a user-controlled event.
@@ -120,6 +134,25 @@ impl OneBotAdapter {
 impl MessageAdapter for OneBotAdapter {
     fn instance_id(&self) -> &str {
         &self.instance
+    }
+    fn initial_access_policy(&self) -> crate::gateway::access::AccessPolicy {
+        self.initial_access.clone()
+    }
+    fn conversation_scope(
+        &self,
+        route: &crate::gateway::ChannelRoute,
+    ) -> crate::gateway::access::ConversationScope {
+        use crate::gateway::access::ConversationScope;
+        if let Some(group) = route.conversation_id.strip_prefix("group:") {
+            ConversationScope::Group(group.into())
+        } else if route.conversation_id == format!("private:{}", route.identity.external_user_id) {
+            ConversationScope::Private
+        } else {
+            ConversationScope::Unknown
+        }
+    }
+    fn valid_access_id(&self, _list: crate::gateway::access::AccessList, id: &str) -> bool {
+        events::valid_id(id)
     }
 
     async fn deliver(&self, delivery: &Delivery) -> Result<(), DeliveryError> {

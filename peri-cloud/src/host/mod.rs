@@ -84,6 +84,7 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
                 value.instance_id.clone(),
                 value.self_id.clone(),
                 config::credential(&value.access_token_env)?,
+                value.access_policy()?,
             )
             .map_err(|_| HostError::Configuration)?,
         ),

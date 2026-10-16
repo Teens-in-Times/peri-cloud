@@ -8,6 +8,21 @@ use uuid::Uuid;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum MenuAction {
+    Access {
+        adapter: Option<String>,
+        section: String,
+        page: usize,
+    },
+    AccessChange {
+        adapter: String,
+        revision: u64,
+        change: super::access::AccessChange,
+    },
+    AccessInput {
+        adapter: String,
+        revision: u64,
+        list: super::access::AccessList,
+    },
     Home,
     Personal {
         section: String,
@@ -75,7 +90,9 @@ impl MenuAction {
     pub fn mutates(&self) -> bool {
         matches!(
             self,
-            Self::Select { .. }
+            Self::AccessChange { .. }
+                | Self::AccessInput { .. }
+                | Self::Select { .. }
                 | Self::ClearPersonal { .. }
                 | Self::SetDefault { .. }
                 | Self::SetPermission { .. }

@@ -141,6 +141,10 @@ pub struct OneBotConfig {
     /// A separate loopback listener, optionally carried through SSH/WSS.
     pub listen: SocketAddr,
     pub access_token_env: String,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
 }
 
 impl HostConfig {
@@ -302,6 +306,7 @@ impl HostConfig {
         }
         if let Some(onebot) = &self.onebot {
             environment_name(&onebot.access_token_env)?;
+            onebot.access_policy()?;
             if !onebot.listen.ip().is_loopback()
                 || onebot.listen.port() == 0
                 || onebot.listen == self.listen
@@ -370,3 +375,32 @@ fn system_prompt() -> String {
 #[cfg(test)]
 #[path = "config_test.rs"]
 mod tests;
+
+impl OneBotConfig {
+    pub(crate) fn access_policy(&self) -> HostResult<crate::gateway::access::AccessPolicy> {
+        let valid = |id: &String| {
+            id.parse::<i64>()
+                .is_ok_and(|n| n > 0 && n.to_string() == *id)
+        };
+        if self
+            .allowed_users
+            .iter()
+            .chain(&self.allowed_groups)
+            .any(|id| !valid(id))
+        {
+            return Err(HostError::Configuration);
+        }
+        let policy = crate::gateway::access::AccessPolicy {
+            allowed_users: self.allowed_users.iter().cloned().collect(),
+            allowed_groups: self.allowed_groups.iter().cloned().collect(),
+            ..Default::default()
+        };
+        if policy.allowed_users.len() != self.allowed_users.len()
+            || policy.allowed_groups.len() != self.allowed_groups.len()
+        {
+            return Err(HostError::Configuration);
+        }
+        policy.validate().map_err(|_| HostError::Configuration)?;
+        Ok(policy)
+    }
+}

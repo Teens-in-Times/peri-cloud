@@ -44,7 +44,7 @@ impl CloudJournal {
         let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
-        if !matches!(version, 0..=6) {
+        if !matches!(version, 0..=7) {
             return Err(StateError::Version);
         }
         if version == 0 {
@@ -62,6 +62,7 @@ impl CloudJournal {
         crate::identity::store::migrate(&pool).await?;
         crate::gateway::store::migrate(&pool).await?;
         super::userdata::migrate(&pool).await?;
+        crate::gateway::access::migrate(&pool).await?;
         let journal = Self {
             pool,
             _owner: owner,

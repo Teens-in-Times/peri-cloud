@@ -22,6 +22,7 @@ const errors = {
   origin_rejected: '访问地址与云服务配置不一致，请使用正确的登录地址。',
   identity_conflict: '账户已初始化，或这个实例已经属于其他账户。',
   stale_request: '这个请求已过期或已经处理，请刷新后查看。',
+  access_conflict: '名单已被另一处修改，请载入最新名单后重试。',
   rate_limited: '操作过于频繁，请稍后再试。',
   invalid_request: '请检查填写的信息。',
   invalid_workspace: '请输入实例上的绝对路径，例如 Windows 的 C:\\Projects\\demo 或 Linux 的 /srv/demo。',
@@ -138,6 +139,8 @@ function renderAccount(data) {
   byId('service-nav').hidden = !canStopService || !data.is_admin;
   byId('members-panel').hidden = !data.is_admin;
   byId('members-nav').hidden = !data.is_admin;
+  byId('gateway-panel').hidden = !canStopService || !data.is_admin;
+  if (!data.is_admin) byId('gateway-policies').replaceChildren();
   byId('personal-panel').hidden = !data.personal_data;
   if (authorization) {
     byId('consent-device').textContent = authorization.device_name;
@@ -407,6 +410,7 @@ async function signIn(login, password) {
 }
 
 function clearPersonal() {
+  byId('gateway-policies').replaceChildren(); byId('gateway-panel').hidden = true;
   personalOwner = null; personalRevision = 0; inviteId = null;
   byId('personal-form').reset(); byId('model-form').reset();
   byId('invite-result').hidden = true; byId('invite-link').value = '';
@@ -548,3 +552,44 @@ start().catch(error => { show('entry'); notice(error.message); });
 setInterval(() => {
   if (activeAccount && !document.hidden) refresh().catch(error => notice(error.message));
 }, 5000);
+
+
+async function loadGatewayPolicies() {
+  const policies = await api('/api/admin/gateway-access');
+  const root = byId('gateway-policies'); root.replaceChildren();
+  const fields = [['allowed_users', '允许的用户'], ['allowed_groups', '允许的群'], ['blocked_users', '屏蔽的用户'], ['blocked_groups', '屏蔽的群']];
+  for (const { adapter, record } of policies) {
+    const panel = document.createElement('section'); panel.className = 'panel';
+    const title = document.createElement('h3'); title.textContent = adapter;
+    const state = document.createElement('p');
+    state.textContent = (record.policy.mode === 'allowlist' ? '白名单模式' : '黑名单模式') + ' · 版本 ' + record.revision;
+    const change = (title, detail, value) => confirm(title, detail, '入口：' + adapter, async () => {
+      await api('/api/admin/gateway-access', { adapter, revision: record.revision, change: value });
+      await loadGatewayPolicies();
+    }, null, '确认修改', '取消', false);
+    const mode = document.createElement('button'); mode.type = 'button'; mode.className = 'quiet small';
+    mode.textContent = record.policy.mode === 'allowlist' ? '改用黑名单模式' : '改用白名单模式';
+    mode.addEventListener('click', () => change('切换来源模式？', record.policy.mode === 'allowlist'
+      ? '切换后所有未屏蔽的来源均可发消息；仍须账号关联和工具审批。'
+      : '切换后只接受名单用户，群聊还须允许该群。网页管理员入口仍可恢复设置。',
+      { kind: 'mode', mode: record.policy.mode === 'allowlist' ? 'blocklist' : 'allowlist' }));
+    panel.append(title, state, mode);
+    for (const [field, label] of fields) {
+      const detail = document.createElement('details');
+      const summary = document.createElement('summary'); summary.textContent = label + '（' + record.policy[field].length + '）'; detail.append(summary);
+      for (const id of record.policy[field]) {
+        detail.append(item(id, label, '移除', () => change('移除这条规则？', label + '：' + id, { kind: 'remove', list: field, id }), true));
+      }
+      const form = document.createElement('form'); form.className = 'actions';
+      const input = document.createElement('input'); input.type = 'text'; input.required = true; input.maxLength = 256;
+      input.setAttribute('aria-label', label + '的完整标识'); input.placeholder = '用户标识或群标识'; input.autocomplete = 'off';
+      const add = document.createElement('button'); add.type = 'submit'; add.className = 'quiet small'; add.textContent = '添加';
+      form.append(input, add); form.addEventListener('submit', event => {
+        event.preventDefault(); if (input.reportValidity()) change('添加这条规则？', label + '：' + input.value.trim(), { kind: 'add', list: field, id: input.value.trim() });
+      });
+      detail.append(form); panel.append(detail);
+    }
+    root.append(panel);
+  }
+}
+byId('gateway-refresh').addEventListener('click', () => action(byId('gateway-refresh'), loadGatewayPolicies));

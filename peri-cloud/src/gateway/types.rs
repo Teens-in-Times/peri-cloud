@@ -186,6 +186,15 @@ pub enum DeliveryError {
 #[async_trait]
 pub trait MessageAdapter: Send + Sync {
     fn instance_id(&self) -> &str;
+    fn initial_access_policy(&self) -> super::access::AccessPolicy {
+        super::access::AccessPolicy::default()
+    }
+    fn conversation_scope(&self, _route: &ChannelRoute) -> super::access::ConversationScope {
+        super::access::ConversationScope::Unknown
+    }
+    fn valid_access_id(&self, _list: super::access::AccessList, id: &str) -> bool {
+        super::access::valid_subject(id)
+    }
     async fn deliver(&self, delivery: &Delivery) -> Result<(), DeliveryError>;
 }
 

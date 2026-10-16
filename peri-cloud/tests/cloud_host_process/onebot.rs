@@ -184,7 +184,7 @@ impl Fixture {
         drop(reservation);
         let mut conf: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         conf["local_instance"] = json!({"name":"Cloud local","workspace":workspace});
-        conf["onebot"] = json!({"instance_id":"personal","self_id":"12345","listen":address,"access_token_env":"FIXTURE_ONEBOT_TOKEN"});
+        conf["onebot"] = json!({"instance_id":"personal","self_id":"12345","listen":address,"access_token_env":"FIXTURE_ONEBOT_TOKEN","allowed_users":["67890"],"allowed_groups":["11111","22222"]});
         std::fs::write(&path, serde_json::to_vec(&conf).unwrap()).unwrap();
         let client = Client::builder()
             .no_proxy()

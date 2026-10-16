@@ -4,6 +4,17 @@ use uuid::Uuid;
 use super::{ChannelIdentity, DeviceRecord, IdentityError, IdentityResult, IdentityService};
 
 impl IdentityService {
+    pub(crate) async fn channel_is_admin(
+        &self,
+        identity: &ChannelIdentity,
+    ) -> IdentityResult<bool> {
+        let principal = self.resolve_channel(identity).await?;
+        let row = sqlx::query("SELECT admin,disabled FROM account_roles WHERE principal=?")
+            .bind(principal.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some_and(|r| r.get::<i64, _>("admin") == 1 && r.get::<i64, _>("disabled") == 0))
+    }
     /// A gateway supplies only the sender observed by its authenticated adapter.
     /// Resolve account membership on every use, including interaction responses.
     pub async fn channel_devices(

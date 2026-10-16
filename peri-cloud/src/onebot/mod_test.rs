@@ -34,8 +34,13 @@ async fn ack_requires_confirmed_message_id_and_never_retries_unknown_outcomes() 
         (json!({"status":"ok","retcode":0,"data":{}}), "unknown"),
         (Value::Null, "unknown"),
     ] {
-        let adapter =
-            OneBotAdapter::new("personal".into(), "12345".into(), "a".repeat(32)).unwrap();
+        let adapter = OneBotAdapter::new(
+            "personal".into(),
+            "12345".into(),
+            "a".repeat(32),
+            crate::gateway::access::AccessPolicy::open(),
+        )
+        .unwrap();
         let (requests, mut calls) = mpsc::channel(32);
         *adapter.connection.lock() = Some(Connection {
             id: Uuid::new_v4(),
@@ -82,6 +87,12 @@ fn credential_validation_does_not_accept_empty_or_injectable_tokens() {
         "a".repeat(31),
         format!("{}\nsecret", "a".repeat(32)),
     ] {
-        assert!(OneBotAdapter::new("personal".into(), "12345".into(), token).is_err());
+        assert!(OneBotAdapter::new(
+            "personal".into(),
+            "12345".into(),
+            token,
+            crate::gateway::access::AccessPolicy::open()
+        )
+        .is_err());
     }
 }

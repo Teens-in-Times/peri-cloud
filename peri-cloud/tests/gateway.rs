@@ -33,6 +33,8 @@ use uuid::Uuid;
 const SETUP: &str = "fixture-cloud-setup-at-least-32-characters";
 const PASSWORD: &str = "fixture-cloud-owner-password-for-argon2";
 const VERIFIER: &str = "fixture-native-pkce-verifier-with-at-least-43-characters";
+#[path = "gateway/access.rs"]
+mod access_tests;
 #[path = "gateway/experience.rs"]
 mod experience_tests;
 #[path = "gateway/menu_details.rs"]
@@ -86,6 +88,22 @@ struct Adapter {
 
 #[async_trait]
 impl MessageAdapter for Adapter {
+    fn conversation_scope(
+        &self,
+        route: &ChannelRoute,
+    ) -> peri_cloud::gateway::access::ConversationScope {
+        use peri_cloud::gateway::access::ConversationScope;
+        if route.conversation_id == "c2c-owner" {
+            ConversationScope::Private
+        } else if let Some(group) = route.conversation_id.strip_prefix("group:") {
+            ConversationScope::Group(group.into())
+        } else {
+            ConversationScope::Unknown
+        }
+    }
+    fn initial_access_policy(&self) -> peri_cloud::gateway::access::AccessPolicy {
+        peri_cloud::gateway::access::AccessPolicy::open()
+    }
     fn instance_id(&self) -> &str {
         "fixture-qq"
     }
