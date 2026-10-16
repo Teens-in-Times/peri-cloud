@@ -181,6 +181,14 @@ async function refresh() {
       }
     }
     const workspaces = await api('/api/workspaces');
+    const conversations = await api('/api/conversations');
+    list('conversation-activity', conversations, '还没有选定设备的聊天。先在 QQ 发送“菜单”选择设备。', conversation => {
+      const row = item(conversation.device_name + ' · ' + conversation.label,
+        shortIdentity(conversation.conversation_id) + '\n' + conversation.workspace + '\n权限：' + conversation.permission,
+        conversation.has_result ? '查看结果' : '', button => action(button, () => openSavedResult(conversation.session_id)));
+      row.dataset.phase = conversation.phase;
+      return row;
+    });
     list('workspace-selections', workspaces, '还没有选择实例的聊天会话。在 QQ 发送“菜单”，点击选择实例即可。', selection => {
       const row = item(selection.device_name + ' · ' + selection.adapter,
         '会话 ' + shortIdentity(selection.conversation_id), '切换工作区', () => openWorkspace(selection));
@@ -192,7 +200,7 @@ async function refresh() {
     });
     const cards = await api('/api/interactions');
     byId('pending-count').textContent = cards.length;
-    list('interactions', cards, '目前没有等待审批的操作。', card => item(
+    list('interactions', cards, '目前没有等待你处理的审批或问题。', card => item(
       card.context.kind === 'Approval' ? '确认 ' + card.context.items.length + ' 项操作' : 'Agent 需要你的回答',
       card.device_name + ' · ' + card.workspace, '查看', () => openInteraction(card)
     ));
@@ -297,7 +305,7 @@ function openInstanceWorkspace(instance) {
 
 function instanceItem(instance) {
   const row = item(instance.name + (instance.revoked ? ' · 已撤销' : ''),
-    (instance.platform === 'windows' ? 'Windows' : 'Linux') + (instance.is_local ? ' · 服务器本地' : ' · 已登记执行器') + '\n默认（全局）：' + instance.default_workspace,
+    (instance.platform === 'windows' ? 'Windows' : 'Linux') + (instance.is_local ? ' · 管理员专用' : ' · 已登记执行器') + '\n默认（全局）：' + instance.default_workspace,
     instance.revoked ? '' : '浏览 / 默认目录', () => openInstanceWorkspace(instance));
   if (!instance.revoked && !instance.is_local) {
     const revoke = document.createElement('button'); revoke.className = 'quiet danger small'; revoke.textContent = '撤销';
@@ -331,11 +339,63 @@ function operationDetails(items) {
 }
 
 function openInteraction(card) {
-  if (card.context.kind !== 'Approval') { notice('这项交互暂不支持网页作答。'); return; }
+  if (card.context.kind === 'Questions') { openQuestions(card); return; }
   const details = operationDetails(card.context.items);
   const respond = kind => api('/api/interactions/' + card.request_id + '/respond', { kind });
   confirm('允许这 ' + card.context.items.length + ' 项操作？', card.device_name + ' · ' + card.workspace, details,
     () => respond('allow_once'), () => respond('reject'), '允许一次', '拒绝');
+}
+
+function openQuestions(card) {
+  const form = document.createElement('form'); form.className = 'question-form';
+  const controls = card.context.requests.map((question, questionIndex) => {
+    const fieldset = document.createElement('fieldset');
+    const legend = document.createElement('legend'); legend.textContent = question.question;
+    fieldset.append(legend);
+    const options = question.options.map((option, index) => {
+      const label = document.createElement('label'); label.className = 'question-option';
+      const input = document.createElement('input'); input.type = question.multi_select ? 'checkbox' : 'radio';
+      input.name = 'question-' + questionIndex; input.value = String(index);
+      const description = document.createElement('span'); description.textContent = option.label + (option.description ? ' — ' + option.description : '');
+      label.append(input, description); fieldset.append(label); return input;
+    });
+    const label = document.createElement('label'); label.textContent = question.options.length ? '补充或自行填写' : '你的回答';
+    const text = document.createElement('textarea'); text.rows = 3; text.maxLength = 4096; text.autocomplete = 'off';
+    label.append(text); fieldset.append(label); form.append(fieldset);
+    return { question, options, text };
+  });
+  const deadline = document.createElement('p'); deadline.className = 'subtle';
+  deadline.textContent = '有效至 ' + new Date(card.expires_at * 1000).toLocaleTimeString() + '；关掉窗口会保留问题，点击“暂不回答”才会拒绝。';
+  form.append(deadline);
+  const send = async () => {
+    const answers = controls.map(({ question, options, text }) => {
+      const selected = options.flatMap((input, index) => input.checked ? [question.options[index].label] : []);
+      if (!selected.length && !text.value.trim()) throw new Error('请回答每个问题，再提交。');
+      if (new TextEncoder().encode(text.value).length > 4096) throw new Error('文字答案过长，请缩短后提交。');
+      return { id: question.id, selected, text: text.value.trim() || null };
+    });
+    await api('/api/interactions/' + card.request_id + '/respond', { kind: 'answers', answers });
+  };
+  form.addEventListener('submit', event => { event.preventDefault(); byId('confirmation-allow').click(); });
+  confirm('回答 Agent 的问题', card.device_name + ' · ' + card.workspace, form, send,
+    () => api('/api/interactions/' + card.request_id + '/respond', { kind: 'reject' }), '提交回答', '暂不回答');
+}
+
+async function openSavedResult(session, page = 1, turn = null) {
+  const query = '?page=' + page + (turn ? '&turn=' + encodeURIComponent(turn) : '');
+  const result = await api('/api/conversations/' + encodeURIComponent(session) + '/result' + query);
+  if (!result) { notice('这个聊天还没有已保存的任务结果。'); return; }
+  const details = document.createElement('div');
+  const body = document.createElement('pre'); body.className = 'saved-result'; body.textContent = result.text;
+  const pager = document.createElement('div'); pager.className = 'actions';
+  for (const [label, target] of [['上一页', page - 1], ['下一页', page + 1]]) {
+    const button = document.createElement('button'); button.type = 'button'; button.className = 'quiet small'; button.textContent = label;
+    button.disabled = target < 1 || target > result.page_count;
+    button.addEventListener('click', () => action(button, () => openSavedResult(session, target, result.turn_id))); pager.append(button);
+  }
+  details.append(body, pager);
+  confirm('已保存结果 · ' + result.page + ' / ' + result.page_count + ' 页',
+    result.device_name + ' · ' + result.workspace + '。这里只查看已有结果。', details, undefined, undefined, '关闭', '返回', false);
 }
 
 async function signIn(login, password) {
@@ -352,6 +412,10 @@ function clearPersonal() {
   byId('invite-result').hidden = true; byId('invite-link').value = '';
   byId('pair-result').hidden = true; byId('pair-code').textContent = '';
   pendingDecision = null;
+  byId('confirmation-details').replaceChildren();
+  byId('confirmation-title').textContent = '';
+  byId('confirmation-text').textContent = '';
+  byId('conversation-activity').replaceChildren();
   if (byId('confirmation').open) byId('confirmation').close();
 }
 

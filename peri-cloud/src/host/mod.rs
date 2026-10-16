@@ -7,7 +7,7 @@ mod local;
 
 pub use config::{
     DeviceConnection, HostConfig, IsolatedInstanceConfig, LocalInstanceConfig, ModelConfig,
-    QqConfig, QqRelay, QqTransport, SshConnection,
+    OneBotConfig, QqConfig, QqRelay, QqTransport, SshConnection,
 };
 
 use std::sync::Arc;
@@ -42,6 +42,8 @@ pub enum HostError {
     Io,
     #[error("cloud service owned worker failed")]
     Worker,
+    #[error("configured executor could not authenticate; check its transport and token")]
+    Connection,
 }
 pub type HostResult<T> = Result<T, HostError>;
 
@@ -73,6 +75,25 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
                 qq.endpoints()?,
             )
             .map_err(|_| HostError::Configuration)?,
+        ),
+        None => None,
+    };
+    let onebot = match &config.onebot {
+        Some(value) => Some(
+            crate::onebot::OneBotAdapter::new(
+                value.instance_id.clone(),
+                value.self_id.clone(),
+                config::credential(&value.access_token_env)?,
+            )
+            .map_err(|_| HostError::Configuration)?,
+        ),
+        None => None,
+    };
+    let onebot_listener = match &config.onebot {
+        Some(value) => Some(
+            tokio::net::TcpListener::bind(value.listen)
+                .await
+                .map_err(|_| HostError::Io)?,
         ),
         None => None,
     };
@@ -141,10 +162,13 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
     connector.set_account_models(account_models.clone());
     let runtime =
         CloudRuntime::with_limits(journal, config.limits).map_err(|_| HostError::Configuration)?;
-    let adapters = qq
+    let mut adapters: Vec<Arc<dyn MessageAdapter>> = qq
         .iter()
         .map(|adapter| adapter.clone() as Arc<dyn MessageAdapter>)
         .collect();
+    if let Some(adapter) = &onebot {
+        adapters.push(adapter.clone());
+    }
     let gateway = Gateway::new(
         runtime.clone(),
         identity.clone(),
@@ -175,6 +199,19 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
     let tunnel_stop = CancellationToken::new();
     let tunnels = connector.tunnels(tunnel_stop.clone());
     let mut workers = JoinSet::new();
+    if let (Some(adapter), Some(listener)) = (onebot, onebot_listener) {
+        let gateway = gateway.clone();
+        let cancelled = stop.clone();
+        workers.spawn(async move {
+            (
+                "onebot",
+                adapter
+                    .run(listener, gateway, cancelled)
+                    .await
+                    .map_err(|_| HostError::Worker),
+            )
+        });
+    }
     let cancelled = stop.clone();
     workers.spawn(async move {
         (

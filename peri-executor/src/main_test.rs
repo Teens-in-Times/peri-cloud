@@ -1,6 +1,26 @@
 use super::*;
 
 #[test]
+fn wireguard_requires_an_explicit_adapter_and_keeps_loopback_listener() {
+    let prefix = ["peri-executor", "--state-dir", "fixture"];
+    assert!(Args::try_parse_from(
+        prefix
+            .into_iter()
+            .chain(["--wireguard-listen", "10.77.0.3:42371"])
+    )
+    .is_err());
+    let args = Args::try_parse_from(prefix.into_iter().chain([
+        "--wireguard-listen",
+        "10.77.0.3:42371",
+        "--wireguard-interface",
+        "wg77",
+    ]))
+    .unwrap();
+    assert!(args.listen.ip().is_loopback());
+    assert_eq!(args.wireguard_interface.as_deref(), Some("wg77"));
+}
+
+#[test]
 fn test_cli_preserves_executor_start_and_adds_native_login_entry() {
     let serve = Args::try_parse_from([
         "peri-executor",

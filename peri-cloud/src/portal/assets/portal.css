@@ -15,3 +15,10 @@
 #confirmation .actions{position:sticky;bottom:-30px;background:var(--surface);padding:14px 0;margin-top:12px;border-top:1px solid var(--line);z-index:1}@media(max-width:600px){#confirmation .actions{bottom:-24px}}
 textarea,select{display:block;width:100%;margin-top:8px;padding:11px 12px;font:inherit;color:var(--ink);background:var(--paper);border:1px solid var(--line);border-radius:2px}textarea{resize:vertical}#register-entry summary{cursor:pointer;margin-bottom:18px}#invite-result{margin-top:20px}#model-current{overflow-wrap:anywhere}
 #model-current{white-space:normal;max-width:60%;min-width:0}#personal-panel,#model-panel,#members-panel{scroll-margin-top:100px}
+:root { --question-border: #d9ddd6; }
+.question-form fieldset { margin: 0 0 1rem; padding: 1rem; border: 1px solid var(--question-border); border-radius: 12px; }
+.question-form legend { max-width: 100%; overflow-wrap: anywhere; font-weight: 600; }
+.question-form .question-option { display: flex; align-items: flex-start; gap: .7rem; margin: .7rem 0; }
+.question-option input { width: auto; margin-top: .25rem; flex: none; }
+.question-form textarea { width: 100%; }
+.saved-result { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 55vh; overflow-y: auto; }

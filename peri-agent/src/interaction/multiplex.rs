@@ -87,6 +87,7 @@ fn tag_source(response: InteractionResponse, source: &str) -> InteractionRespons
         }
         InteractionResponse::Answers(answers) => InteractionResponse::Answers(answers),
         InteractionResponse::Rejected => InteractionResponse::Rejected,
+        InteractionResponse::Cancelled => InteractionResponse::Cancelled,
         InteractionResponse::Unanswered { cause } => InteractionResponse::Unanswered { cause },
     }
 }

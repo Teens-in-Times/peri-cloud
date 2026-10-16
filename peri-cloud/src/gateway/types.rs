@@ -152,6 +152,8 @@ pub struct MenuCard {
     pub title: String,
     pub text: String,
     pub buttons: Vec<MenuButton>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_request: Option<(Uuid, u32)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -192,5 +194,11 @@ pub trait MessageAdapter: Send + Sync {
 pub enum InteractionAction {
     AllowOnce {},
     Reject {},
-    Answers { answers: Vec<QuestionAnswer> },
+    Answers {
+        answers: Vec<QuestionAnswer>,
+    },
+    /// Select by index; the broker resolves the actual option in its owned card.
+    Choose {
+        option: usize,
+    },
 }

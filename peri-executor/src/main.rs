@@ -10,9 +10,13 @@ use peri_executor::login::LoginClient;
 use peri_executor::{web, Executor};
 
 mod tunnel;
+mod wireguard;
 
 #[derive(Parser)]
-#[command(version, about = "Native device executor, connected through SSH")]
+#[command(
+    version,
+    about = "Native device executor, connected through SSH or WireGuard"
+)]
 struct Args {
     #[arg(long)]
     state_dir: PathBuf,
@@ -21,6 +25,11 @@ struct Args {
     /// Permit a container-internal listener; publish it only on host loopback.
     #[arg(long)]
     container_listen: bool,
+    /// Additional private listener on an OS-verified WireGuard adapter.
+    #[arg(long, requires = "wireguard_interface")]
+    wireguard_listen: Option<SocketAddr>,
+    #[arg(long, requires = "wireguard_listen")]
+    wireguard_interface: Option<String>,
     #[arg(long, global = true)]
     device_name: Option<String>,
     #[command(flatten)]
@@ -86,17 +95,45 @@ async fn main() -> anyhow::Result<()> {
         return account_command(&args.state_dir, &name, command).await;
     }
     args.tunnel.validate()?;
+    let wireguard =
+        args.wireguard_listen
+            .zip(args.wireguard_interface)
+            .map(
+                |(endpoint, interface)| peri_process::wireguard::WireGuardEndpoint {
+                    endpoint,
+                    interface,
+                },
+            );
+    if let Some(config) = &wireguard {
+        config.validate()?;
+    }
     let executor = Arc::new(Executor::open(&args.state_dir, &name).await?);
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     let tunnel_stop = tokio_util::sync::CancellationToken::new();
+    let server_stop = tokio_util::sync::CancellationToken::new();
+    let wireguard_server = wireguard.map(|config| {
+        tokio::spawn(wireguard::supervise(
+            config,
+            executor.clone(),
+            server_stop.clone(),
+        ))
+    });
     let connection = tokio::spawn(
         args.tunnel
             .supervise(listener.local_addr()?, tunnel_stop.clone()),
     );
     tracing::info!(device_id = %executor.info().device_id, listen = %listener.local_addr()?, state_dir = %args.state_dir.display(), "Executor started");
+    let shutdown_stop = server_stop.clone();
     let server_result = axum::serve(listener, web::router(executor.clone()))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_stop.cancel();
+        })
         .await;
+    server_stop.cancel();
+    if let Some(server) = wireguard_server {
+        server.await.context("WireGuard listener owner failed")?;
+    }
     while executor.shutdown().await.is_err() {
         tracing::error!(
             component = "executor",

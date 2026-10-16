@@ -6,6 +6,8 @@ description = "Local subprocess tree ownership and cleanup evidence"
 
 [dependencies]
 tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

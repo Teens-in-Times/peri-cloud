@@ -33,6 +33,10 @@ use uuid::Uuid;
 const SETUP: &str = "fixture-cloud-setup-at-least-32-characters";
 const PASSWORD: &str = "fixture-cloud-owner-password-for-argon2";
 const VERIFIER: &str = "fixture-native-pkce-verifier-with-at-least-43-characters";
+#[path = "gateway/experience.rs"]
+mod experience_tests;
+#[path = "gateway/menu_details.rs"]
+mod menu_detail_tests;
 #[path = "gateway/menus.rs"]
 mod menu_tests;
 #[path = "gateway/workspaces.rs"]
@@ -388,6 +392,22 @@ impl Fixture {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 self.c().gateway.dispatch().await.unwrap();
+                if let Some(card) = self
+                    .c()
+                    .gateway
+                    .browser_interactions(&self.c().browser)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|c| {
+                        matches!(
+                            c.context,
+                            peri_acp_types::interaction::InteractionContext::Questions { .. }
+                        )
+                    })
+                {
+                    break card;
+                }
                 if let Some(card) =
                     self.adapter
                         .attempts

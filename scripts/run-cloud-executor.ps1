@@ -9,6 +9,10 @@ if (-not (Test-Path -LiteralPath $taskBinary)) { throw 'Installed executor is mi
 $env:RUST_LOG = 'info'
 $env:NO_PROXY = '127.0.0.1,localhost'
 $taskArguments = @('--state-dir', ('"' + $taskState + '"'), '--device-name', ('"' + $taskConfig.device_name + '"'), '--listen', $taskConfig.listen, '--ssh-host', $taskConfig.ssh_host, '--ssh-reverse-listen', $taskConfig.ssh_reverse_listen, '--cloud-listen', $taskConfig.cloud_listen, '--cloud-remote', $taskConfig.cloud_remote)
+if ($taskConfig.wireguard_listen -or $taskConfig.wireguard_interface) {
+    if (-not $taskConfig.wireguard_listen -or $taskConfig.wireguard_interface -notmatch '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}$') { throw 'Invalid WireGuard configuration' }
+    $taskArguments += @('--wireguard-listen', $taskConfig.wireguard_listen, '--wireguard-interface', $taskConfig.wireguard_interface)
+}
 while ($true) {
     # The executor owns durable tasks and the SSH child. This launcher only
     # restarts an exited executor; it never resubmits an operation.

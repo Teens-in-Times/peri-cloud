@@ -1,4 +1,4 @@
-//! Loopback HTTP adapter carried through SSH forwarding.
+//! Authenticated HTTP adapter on loopback/SSH or an explicitly verified WireGuard address.
 
 use std::sync::Arc;
 

@@ -16,7 +16,7 @@ use super::{
     InboundMessage, InteractionAction, MessageAdapter, SessionConnector,
 };
 use crate::identity::{DeviceRecord, IdentityError, IdentityService};
-use crate::state::{StateError, TurnState};
+use crate::state::StateError;
 use crate::{CloudRuntime, SubmitTurn};
 
 type Origins = HashMap<Uuid, Arc<RwLock<Option<String>>>>;
@@ -25,6 +25,13 @@ mod menus;
 #[path = "workspaces.rs"]
 mod workspaces;
 pub use workspaces::WorkspaceSelection;
+#[path = "activity.rs"]
+pub(super) mod activity;
+pub use activity::{ConversationActivity, SavedResultPage};
+#[path = "controls.rs"]
+mod controls;
+#[path = "personal.rs"]
+mod personal;
 struct Ownership {
     closing: bool,
     unconfirmed: bool,
@@ -178,19 +185,34 @@ impl Gateway {
             return Ok(receipt);
         }
         let routed = async {
-            if let Some(index) = message.text.trim().strip_prefix("/选 ") {
+            if let Some(arguments) = message.text.trim().strip_prefix("/选 ") {
                 let principal = self
                     .identity
                     .resolve_channel(&message.route.identity)
                     .await?;
-                let token = self
-                    .store
-                    .menu_number(
-                        &message.route,
-                        principal,
-                        index.parse().map_err(|_| GatewayError::Invalid)?,
-                    )
-                    .await?;
+                let arguments: Vec<_> = arguments.split_whitespace().collect();
+                let token = match arguments.as_slice() {
+                    [index] => {
+                        self.store
+                            .menu_number(
+                                &message.route,
+                                principal,
+                                index.parse().map_err(|_| GatewayError::Invalid)?,
+                            )
+                            .await?
+                    }
+                    [snapshot, index] => {
+                        self.store
+                            .snapshot_number(
+                                &message.route,
+                                principal,
+                                Uuid::parse_str(snapshot).map_err(|_| GatewayError::Invalid)?,
+                                index.parse().map_err(|_| GatewayError::Invalid)?,
+                            )
+                            .await?
+                    }
+                    _ => return Err(GatewayError::Invalid),
+                };
                 message.text = format!("/卡片 {token}");
             }
             self.route(&message).await
@@ -212,7 +234,8 @@ impl Gateway {
                     GatewayError::Busy | GatewayError::State(StateError::Busy) => "当前任务仍在运行或执行状态未确认；请先等待完成或发送 /取消。",
                     GatewayError::Connection => "无法建立工作区连接；请检查执行器、SSH 连接，以及路径是否是实例上存在且可访问的目录。",
                     GatewayError::Invalid => "参数不正确。发送“菜单”打开操作卡片。",
-                    GatewayError::StaleInteraction => "卡片已过期、已使用或会话已改变。请发送“菜单”重新打开。",
+                    GatewayError::StaleInteraction => "卡片已过期、已使用或会话已改变。提问可发送 /问题 重开，其他操作发送“菜单”。",
+                    GatewayError::State(StateError::InvocationConflict) => "内容已被另一处修改，本次确认未生效。请查看最新内容后重新操作。",
                     _ => "这次请求未能完成，请检查云服务状态。没有自动重试执行。",
                 };
                 self.store.notice(&message, text.into(), None).await?;
@@ -226,6 +249,13 @@ impl Gateway {
         message: &InboundMessage,
     ) -> GatewayResult<Option<(DeliveryBody, Option<Uuid>)>> {
         let text = message.text.trim();
+        let text = match text {
+            "/help" => "/帮助",
+            "/status" => "/状态",
+            "/stop" | "/停止" => "/取消",
+            "/result" => "/结果",
+            other => other,
+        };
         if let Some(code) = text.strip_prefix("/绑定 ") {
             self.identity
                 .claim_pair_code(message.route.identity.clone(), code.trim())
@@ -249,9 +279,79 @@ impl Gateway {
             .channel_devices(&message.route.identity)
             .await?;
         let selected = self.store.selection(&message.route, principal).await?;
+        if text == "/菜单详情" || text.starts_with("/菜单详情 ") {
+            let arguments: Vec<_> = text
+                .strip_prefix("/菜单详情")
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect();
+            let (snapshot, page) = match arguments.as_slice() {
+                [] => (None, 1),
+                [page] => (
+                    None,
+                    page.parse::<usize>().map_err(|_| GatewayError::Invalid)?,
+                ),
+                [snapshot, page] => (
+                    Some(Uuid::parse_str(snapshot).map_err(|_| GatewayError::Invalid)?),
+                    page.parse::<usize>().map_err(|_| GatewayError::Invalid)?,
+                ),
+                _ => return Err(GatewayError::Invalid),
+            };
+            let body = match self
+                .store
+                .menu_snapshot(&message.route, principal, snapshot)
+                .await?
+            {
+                Some(delivery) => {
+                    let DeliveryBody::Menu { card } = delivery.body else {
+                        return Err(GatewayError::Invalid);
+                    };
+                    let text = super::menu_view::page(&card, delivery.delivery_id, page)?.render();
+                    format!("{text}\n\n操作这份菜单：/选 {} 编号\n直接 /选 编号 操作当前最新菜单。过期或已使用的选项需重开菜单。", delivery.delivery_id)
+                }
+                None => "这个聊天没有可查看的菜单。发送“菜单”重新打开。".into(),
+            };
+            return Ok(Some((body.into(), Some(principal))));
+        }
+        if let Some(body) = self.interaction_command(message, text, principal).await? {
+            return Ok(Some((body, Some(principal))));
+        }
+        if let Some(body) = self
+            .personal_command(message, text, principal, selected)
+            .await?
+        {
+            return Ok(Some((body, Some(principal))));
+        }
+        if text == "/结果" || text.starts_with("/结果 ") {
+            let arguments: Vec<_> = text
+                .strip_prefix("/结果")
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect();
+            let (turn, page) = match arguments.as_slice() {
+                [] => (None, 1),
+                [page] => (
+                    None,
+                    page.parse::<usize>().map_err(|_| GatewayError::Invalid)?,
+                ),
+                [turn, page] => (
+                    Some(Uuid::parse_str(turn).map_err(|_| GatewayError::Invalid)?),
+                    page.parse::<usize>().map_err(|_| GatewayError::Invalid)?,
+                ),
+                _ => return Err(GatewayError::Invalid),
+            };
+            let body = match self
+                .saved_result(&message.route, principal, page, turn)
+                .await?
+            {
+                Some(result) => result.text(),
+                None => "这个聊天还没有已保存的任务结果。任务完成后可发送 /结果 查看。".into(),
+            };
+            return Ok(Some((body.into(), Some(principal))));
+        }
         let action = match text {
             "/菜单" | "菜单" | "/帮助" => Some(super::menu_store::MenuAction::Home),
-            "/实例" | "实例" | "/电脑" => {
+            "/设备" | "设备" | "/实例" | "实例" | "/电脑" => {
                 Some(super::menu_store::MenuAction::Instances { offset: 0 })
             }
             "/工作区" | "工作区" => Some(super::menu_store::MenuAction::Workspaces),
@@ -294,7 +394,7 @@ impl Gateway {
                 .await?;
             return Ok(Some((
                 format!(
-                    "已连接实例：{}\n工作区：{}\n可直接发送任务，或发送“菜单”选择目录与权限。",
+                    "已连接设备：{}\n工作区：{}\n可直接发送任务，或发送“菜单”选择目录与权限。",
                     device.name, frozen.binding.workspace
                 )
                 .into(),
@@ -333,25 +433,11 @@ impl Gateway {
             )));
         }
         if text == "/状态" {
-            let active = self
-                .runtime
-                .journal()
-                .active_turn(principal, session)
-                .await?;
-            let status = match active.map(|turn| turn.state) {
-                Some(TurnState::RecoveryRequired) => "执行状态待恢复确认",
-                Some(_) => "任务运行中",
-                None if !state.execution_settled() => "实例任务尚未确认全部结束",
-                None => "空闲",
-            };
             return Ok(Some((
-                format!(
-                    "实例：{}\n工作区：{}\n权限：{}\n状态：{status}",
-                    device.name,
-                    state.frozen.binding.workspace,
-                    permission_label(state.permissions()?)
-                )
-                .into(),
+                self.activity(&message.route, principal, device, &state)
+                    .await?
+                    .text()
+                    .into(),
                 Some(principal),
             )));
         }
@@ -390,6 +476,35 @@ impl Gateway {
                 format!("当前会话权限已设为{}。", permission_label(mode)).into(),
                 Some(principal),
             )));
+        }
+        if text == "/问题"
+            || text == "/回答"
+            || text.starts_with("/回答 ")
+            || !text.starts_with('/')
+        {
+            if let Some(request) = self.hub.current_question(&message.route).await? {
+                let card = if matches!(text, "/问题" | "/回答") {
+                    self.hub.question_menu(&message.route, request).await?
+                } else {
+                    if let Some(origin) = self.origins.read().get(&session) {
+                        *origin.write() = Some(message.event_id.clone());
+                    }
+                    self.hub
+                        .question_text(
+                            &message.route,
+                            request,
+                            text.strip_prefix("/回答 ").unwrap_or(text),
+                        )
+                        .await?
+                };
+                return Ok(Some((DeliveryBody::Menu { card }, Some(principal))));
+            }
+            if text.starts_with("/回答") || text == "/问题" {
+                return Ok(Some((
+                    "当前没有等待回答的问题。可直接发送任务，或用 /状态 查看进度。".into(),
+                    Some(principal),
+                )));
+            }
         }
         if text.starts_with('/') {
             return Err(GatewayError::Invalid);
@@ -570,6 +685,14 @@ impl Gateway {
             };
             let live = match &pending.delivery.body {
                 DeliveryBody::Interaction { card } => self.hub.is_live(card.request_id),
+                DeliveryBody::Menu { card } => match card.question_request {
+                    Some((request, revision)) => {
+                        self.hub
+                            .question_delivery_current(&pending.delivery.route, request, revision)
+                            .await?
+                    }
+                    None => true,
+                },
                 _ => true,
             };
             if !authorized || !live {

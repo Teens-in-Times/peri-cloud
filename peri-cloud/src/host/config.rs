@@ -31,6 +31,8 @@ pub struct HostConfig {
     #[serde(default)]
     pub isolated_instance: Option<IsolatedInstanceConfig>,
     pub qq: Option<QqConfig>,
+    /// Additional personal-account gateway; never replaces the official bot.
+    pub onebot: Option<OneBotConfig>,
     #[serde(default = "max_iterations")]
     pub max_iterations: usize,
     #[serde(default = "system_prompt")]
@@ -79,6 +81,8 @@ pub struct DeviceConnection {
     /// Optional direct SSH tunnel managed by this cloud host. Reverse tunnels
     /// originate at the device; omit this when using a device-owned reverse SSH.
     pub ssh: Option<SshConnection>,
+    /// Optional OS-verified WireGuard route, preferred over the loopback/SSH route.
+    pub wireguard: Option<peri_remote_tools::WireGuardEndpoint>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -87,6 +91,18 @@ pub struct SshConnection {
     /// Existing SSH config alias; known-host and key selection belong to SSH.
     pub host_alias: String,
     pub remote_executor: SocketAddr,
+}
+
+impl DeviceConnection {
+    pub fn routes(&self) -> Vec<peri_remote_tools::ExecutorEndpoint> {
+        use peri_remote_tools::ExecutorEndpoint;
+        let mut routes = Vec::new();
+        if let Some(wg) = &self.wireguard {
+            routes.push(ExecutorEndpoint::WireGuard(wg.clone()));
+        }
+        routes.push(ExecutorEndpoint::Loopback(self.endpoint));
+        routes
+    }
 }
 
 #[derive(Deserialize)]
@@ -114,6 +130,17 @@ pub enum QqTransport {
 pub struct QqRelay {
     pub api: Url,
     pub token: Url,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OneBotConfig {
+    pub instance_id: String,
+    /// Expected personal bot QQ number, represented as a decimal string.
+    pub self_id: String,
+    /// A separate loopback listener, optionally carried through SSH/WSS.
+    pub listen: SocketAddr,
+    pub access_token_env: String,
 }
 
 impl HostConfig {
@@ -233,6 +260,12 @@ impl HostConfig {
             .iter()
             .chain(self.isolated_instance.iter().map(|local| &local.connection))
         {
+            if let Some(wg) = &device.wireguard {
+                wg.validate().map_err(|_| HostError::Configuration)?;
+                if !endpoints.insert(wg.endpoint) {
+                    return Err(HostError::Configuration);
+                }
+            }
             if !devices.insert(device.device_id)
                 || !endpoints.insert(device.endpoint)
                 || !device.endpoint.ip().is_loopback()
@@ -266,6 +299,27 @@ impl HostConfig {
                 return Err(HostError::Configuration);
             }
             qq.endpoints()?;
+        }
+        if let Some(onebot) = &self.onebot {
+            environment_name(&onebot.access_token_env)?;
+            if !onebot.listen.ip().is_loopback()
+                || onebot.listen.port() == 0
+                || onebot.listen == self.listen
+                || endpoints.contains(&onebot.listen)
+                || onebot.instance_id.is_empty()
+                || onebot.instance_id.len() > 128
+                || onebot.instance_id.chars().any(char::is_control)
+                || !onebot
+                    .self_id
+                    .parse::<i64>()
+                    .is_ok_and(|id| id > 0 && id.to_string() == onebot.self_id)
+                || self
+                    .qq
+                    .as_ref()
+                    .is_some_and(|qq| qq.instance_id == onebot.instance_id)
+            {
+                return Err(HostError::Configuration);
+            }
         }
         Ok(())
     }

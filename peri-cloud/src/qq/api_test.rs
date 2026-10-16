@@ -109,6 +109,7 @@ fn menu_payload_has_unique_button_ids_opaque_callbacks_and_plain_fallback() {
     let mut delivery = delivery();
     delivery.body = DeliveryBody::Menu {
         card: crate::gateway::MenuCard {
+            question_request: None,
             title: "Choose [instance]".into(),
             text: "folder <name>".into(),
             buttons: (0..15)
@@ -143,6 +144,67 @@ fn menu_payload_has_unique_button_ids_opaque_callbacks_and_plain_fallback() {
         .as_str()
         .unwrap()
         .contains("/选 1 · instance 0"));
+}
+
+#[test]
+fn long_similar_names_remain_distinguishable_in_native_and_plain_menus() {
+    let adapter = adapter(QqEndpoints::default());
+    let mut delivery = delivery();
+    let prefix = "东京生产环境的相同目录前缀".repeat(3);
+    let labels = [format!("{prefix}服务器甲"), format!("{prefix}服务器乙")];
+    delivery.body = DeliveryBody::Menu {
+        card: crate::gateway::MenuCard {
+            title: "选择目录".into(),
+            text: "完整说明".into(),
+            question_request: None,
+            buttons: labels
+                .iter()
+                .map(|label| crate::gateway::MenuButton {
+                    label: label.clone(),
+                    action_id: Uuid::new_v4(),
+                })
+                .collect(),
+        },
+    };
+    let native = adapter.payload(&delivery, true).unwrap();
+    let rows = native["keyboard"]["content"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "long names get one column");
+    for (index, row) in rows.iter().enumerate() {
+        let data = &row["buttons"][0]["render_data"];
+        assert_eq!(data["label"], format!("选 {}", index + 1));
+        assert_eq!(data["label"], data["visited_label"]);
+        assert!(!data["label"].as_str().unwrap().contains('…'));
+    }
+    for native_mode in [false, true] {
+        let body = adapter.payload(&delivery, native_mode).unwrap();
+        let text = if native_mode {
+            &body["markdown"]["content"]
+        } else {
+            &body["content"]
+        }
+        .as_str()
+        .unwrap();
+        for label in &labels {
+            assert!(text.contains(label));
+        }
+    }
+    let DeliveryBody::Menu { card } = &mut delivery.body else {
+        unreachable!()
+    };
+    card.text = format!("{}结束", "长正文".repeat(1000));
+    for native_mode in [false, true] {
+        let body = adapter.payload(&delivery, native_mode).unwrap();
+        let text = if native_mode {
+            &body["markdown"]["content"]
+        } else {
+            &body["content"]
+        }
+        .as_str()
+        .unwrap();
+        assert!(text.contains(&format!("/菜单详情 {} 2", delivery.delivery_id)));
+        assert!(!text.contains('…'));
+        assert!(!text.contains("结束"));
+    }
 }
 
 #[derive(Default)]
@@ -233,4 +295,40 @@ async fn unknown_native_delivery_does_not_send_a_fallback_duplicate() {
     assert_eq!(script.requests.lock().len(), 1);
     stop.cancel();
     server.await.unwrap();
+}
+
+#[test]
+fn question_payload_never_offers_permission_approval_buttons() {
+    use peri_acp_types::interaction::{QuestionItem, QuestionOption};
+    let adapter = adapter(QqEndpoints::default());
+    let mut delivery = delivery();
+    let DeliveryBody::Interaction { card } = &mut delivery.body else {
+        unreachable!()
+    };
+    card.context = InteractionContext::Questions {
+        requests: vec![QuestionItem {
+            id: "q".into(),
+            header: "服务".into(),
+            question: "选哪个？".into(),
+            multi_select: false,
+            options: vec![
+                QuestionOption {
+                    label: "A".into(),
+                    description: None,
+                },
+                QuestionOption {
+                    label: "B".into(),
+                    description: None,
+                },
+            ],
+        }],
+    };
+    let body = adapter.body(&delivery).unwrap();
+    let payload = body["keyboard"].to_string();
+    assert!(payload.contains("peri:answer:"));
+    assert!(!payload.contains("peri:allow:"));
+    assert!(body["markdown"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("/回答"));
 }

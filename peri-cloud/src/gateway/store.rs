@@ -275,6 +275,30 @@ impl GatewayStore {
         Ok(())
     }
 
+    pub async fn question(
+        &self,
+        route: &ChannelRoute,
+        parent: &str,
+        principal: Uuid,
+        request: Uuid,
+        device: Uuid,
+        card: super::MenuCard,
+    ) -> GatewayResult<()> {
+        let mut tx = self.pool.begin().await?;
+        enqueue(
+            &mut tx,
+            &format!("interaction:{request}"),
+            route,
+            (parent, ReplyKind::Message),
+            DeliveryBody::Menu { card },
+            Some(principal),
+            Some(device),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn pending_turns(&self) -> GatewayResult<Vec<PendingTurn>> {
         let rows = sqlx::query("SELECT * FROM gateway_inbox WHERE state='submitted' LIMIT 128")
             .fetch_all(&self.pool)
@@ -304,14 +328,14 @@ impl GatewayStore {
         }
         let mut tx = self.pool.begin().await?;
         for reply in &turn.replies {
+            let mut preview = reply.clone();
+            preview.text = super::router::activity::reply_preview(&reply.text, turn.turn_id);
             enqueue(
                 &mut tx,
                 &format!("reply:{}:{}", turn.turn_id, reply.message_id),
                 &pending.route,
                 (&pending.event_id, ReplyKind::Message),
-                DeliveryBody::Reply {
-                    reply: reply.clone(),
-                },
+                DeliveryBody::Reply { reply: preview },
                 Some(pending.principal),
                 Some(device),
             )

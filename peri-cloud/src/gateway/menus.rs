@@ -64,7 +64,8 @@ impl Gateway {
         action: MenuAction,
     ) -> GatewayResult<DeliveryBody> {
         let mut title = "云 Agent 菜单".to_owned();
-        let mut text = "选择实例后直接发送任务；未指定目录时使用实例的默认工作区。".to_owned();
+        let mut text =
+            "选择一台执行设备后直接发送任务；未指定目录时使用该设备的默认工作区。".to_owned();
         let mut choices = Vec::new();
         let state = match selected {
             Some(id) => Some(self.runtime.journal().session(principal, id).await?),
@@ -74,37 +75,73 @@ impl Gateway {
             .as_ref()
             .and_then(|s| devices.iter().find(|d| d.id == s.frozen.device_id));
         match action {
+            MenuAction::Personal { section, page } => {
+                return Ok(DeliveryBody::Menu {
+                    card: self
+                        .personal_menu(message, principal, selected, &section, page)
+                        .await?,
+                })
+            }
+            MenuAction::ClearPersonal { field, revision } => {
+                return Ok(self
+                    .clear_personal(principal, &field, revision)
+                    .await?
+                    .into())
+            }
+            MenuAction::QuestionPage {
+                request,
+                revision,
+                question,
+                offset,
+            } => {
+                return Ok(DeliveryBody::Menu {
+                    card: self
+                        .hub
+                        .question_page(&message.route, request, revision, question, offset)
+                        .await?,
+                })
+            }
+            MenuAction::QuestionDecline { request, revision } => {
+                return Ok(DeliveryBody::Menu {
+                    card: self
+                        .hub
+                        .question_decline(&message.route, request, revision)
+                        .await?,
+                })
+            }
             MenuAction::Home | MenuAction::Status => {
                 if let (Some(state), Some(device)) = (&state, current) {
-                    let busy = !state.execution_settled()
-                        || self
-                            .runtime
-                            .journal()
-                            .has_unconfirmed_turn(state.frozen.session_id)
-                            .await?;
-                    text = format!(
-                        "实例：{}\n工作区：{}\n默认工作区：{}\n权限：{}\n状态：{}",
-                        device.name,
-                        state.frozen.binding.workspace,
-                        device.default_workspace,
-                        permission_label(state.permissions()?),
-                        if busy {
-                            "运行中或待确认"
-                        } else {
-                            "空闲"
-                        }
-                    );
+                    let activity = self
+                        .activity(&message.route, principal, device, state)
+                        .await?;
+                    text = activity.text();
                     choices.extend([
                         ("工作区".into(), MenuAction::Workspaces),
                         ("工具权限".into(), MenuAction::Permissions),
                         ("状态".into(), MenuAction::Status),
                         ("取消任务".into(), MenuAction::Cancel),
                     ]);
+                    if activity.has_result {
+                        choices.push((
+                            "查看结果".into(),
+                            MenuAction::Results {
+                                turn: None,
+                                page: 1,
+                            },
+                        ));
+                    }
                 }
-                choices.insert(0, ("选择实例".into(), MenuAction::Instances { offset: 0 }));
+                choices.insert(0, ("选择设备".into(), MenuAction::Instances { offset: 0 }));
+                choices.push((
+                    "个人设置".into(),
+                    MenuAction::Personal {
+                        section: "home".into(),
+                        page: 1,
+                    },
+                ));
             }
             MenuAction::Instances { offset } => {
-                title = "选择执行实例".into();
+                title = "选择执行设备".into();
                 text = devices
                     .iter()
                     .skip(offset)
@@ -117,7 +154,7 @@ impl Gateway {
                             device.name,
                             device.platform,
                             if device.is_local {
-                                " · 服务器本地"
+                                " · 管理员专用"
                             } else {
                                 " · 已登记"
                             },
@@ -127,15 +164,21 @@ impl Gateway {
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 if text.is_empty() {
-                    text = "尚未登记执行实例，请在执行器的登录入口关联账号。".into();
+                    text = "尚未登记执行设备，请在执行器的登录入口关联账号。".into();
                 }
-                for (index, device) in devices.iter().skip(offset).take(6).enumerate() {
+                for device in devices.iter().skip(offset).take(6) {
                     choices.push((
-                        format!("{} · {}", offset + index + 1, device.name),
+                        device.name.clone(),
                         MenuAction::Select {
                             device: device.id,
                             workspace: None,
                         },
+                    ));
+                }
+                if offset >= 6 {
+                    choices.push((
+                        "上一页".into(),
+                        MenuAction::Instances { offset: offset - 6 },
                     ));
                 }
                 if offset + 6 < devices.len() {
@@ -147,6 +190,17 @@ impl Gateway {
                 choices.push(("返回菜单".into(), MenuAction::Home));
             }
             MenuAction::Workspaces => {
+                return self
+                    .menu_route_boxed(
+                        message,
+                        principal,
+                        devices,
+                        selected,
+                        MenuAction::WorkspacesPage { offset: 0 },
+                    )
+                    .await;
+            }
+            MenuAction::WorkspacesPage { offset } => {
                 let (Some(state), Some(device)) = (&state, current) else {
                     return self
                         .menu_route_boxed(
@@ -159,8 +213,16 @@ impl Gateway {
                         .await;
                 };
                 title = "选择工作区".into();
-                let paths = self.store.known_workspaces(principal, device.id).await?;
-                text = format!("实例：{}\n当前：{}\n默认（全局）：{}\n\n已有工作区：\n{}\n\n可直接使用默认目录，或浏览实例上的文件夹。切换后开始新会话，保留当前权限与旧历史。",device.name,state.frozen.binding.workspace,device.default_workspace,paths.iter().take(8).cloned().collect::<Vec<_>>().join("\n"));
+                let paths: Vec<_> = self
+                    .store
+                    .known_workspaces(principal, device.id)
+                    .await?
+                    .into_iter()
+                    .filter(|p| {
+                        *p != state.frozen.binding.workspace && *p != device.default_workspace
+                    })
+                    .collect();
+                text = format!("设备：{}\n当前：{}\n默认（全局）：{}\n\n历史工作区第 {}/{} 页，共 {} 个。\n可直接使用默认目录，或浏览实例上的文件夹。切换后开始新会话，保留当前权限与旧历史。",device.name,state.frozen.binding.workspace,device.default_workspace,offset / 6 + 1, paths.len().div_ceil(6).max(1),paths.len());
                 choices.push((
                     "使用默认工作区".into(),
                     MenuAction::Select {
@@ -184,22 +246,91 @@ impl Gateway {
                         offset: 0,
                     },
                 ));
-                for path in paths
-                    .iter()
-                    .filter(|p| {
-                        **p != state.frozen.binding.workspace && **p != device.default_workspace
-                    })
-                    .take(7)
-                {
+                for path in paths.iter().skip(offset).take(6) {
                     choices.push((
-                        folder_label(path),
+                        path.clone(),
                         MenuAction::Select {
                             device: device.id,
                             workspace: Some(path.clone()),
                         },
                     ));
                 }
+                if offset >= 6 {
+                    choices.push((
+                        "上一页工作区".into(),
+                        MenuAction::WorkspacesPage { offset: offset - 6 },
+                    ));
+                }
+                if offset + 6 < paths.len() {
+                    choices.push((
+                        "下一页工作区".into(),
+                        MenuAction::WorkspacesPage { offset: offset + 6 },
+                    ));
+                }
                 choices.push(("返回菜单".into(), MenuAction::Home));
+            }
+            MenuAction::Results { turn, page } => {
+                title = "已保存的任务结果".into();
+                if let Some(result) = self
+                    .saved_result(&message.route, principal, page, turn)
+                    .await?
+                {
+                    text = result.text();
+                    if page > 1 {
+                        choices.push((
+                            "上一页".into(),
+                            MenuAction::Results {
+                                turn: Some(result.turn_id),
+                                page: page - 1,
+                            },
+                        ));
+                    }
+                    if page < result.page_count {
+                        choices.push((
+                            "下一页".into(),
+                            MenuAction::Results {
+                                turn: Some(result.turn_id),
+                                page: page + 1,
+                            },
+                        ));
+                    }
+                } else {
+                    text = "这个聊天还没有已保存的任务结果。".into();
+                }
+                choices.push(("返回菜单".into(), MenuAction::Home));
+            }
+            MenuAction::QuestionOption {
+                request,
+                revision,
+                question,
+                option,
+                selected,
+            } => {
+                return Ok(DeliveryBody::Menu {
+                    card: self
+                        .hub
+                        .question_option(
+                            &message.route,
+                            request,
+                            revision,
+                            question,
+                            option,
+                            selected,
+                        )
+                        .await?,
+                });
+            }
+            MenuAction::QuestionNext {
+                request,
+                revision,
+                question,
+            } => {
+                return Ok(DeliveryBody::Menu {
+                    card: self
+                        .hub
+                        .question_next(&message.route, request, revision, question)
+                        .await?,
+                });
             }
             MenuAction::Browse {
                 device: id,
@@ -224,7 +355,7 @@ impl Gateway {
                     .await?;
                 title = "浏览实例目录".into();
                 if path.is_none() {
-                    text = format!("实例：{}\n选择系统根目录或磁盘。", device.name);
+                    text = format!("设备：{}\n选择系统根目录或磁盘。", device.name);
                     for root in listing.roots.iter().skip(offset).take(8) {
                         choices.push((
                             root.clone(),
@@ -255,7 +386,7 @@ impl Gateway {
                     ));
                 } else {
                     text = format!(
-                        "实例：{}\n目录：{}\n\n{}",
+                        "设备：{}\n目录：{}\n\n{}",
                         device.name,
                         listing.path,
                         if listing.directories.is_empty() {
@@ -333,9 +464,9 @@ impl Gateway {
                         workspace.as_deref(),
                     )
                     .await?;
-                title = "实例与工作区已就绪".into();
+                title = "设备与工作区已就绪".into();
                 text = format!(
-                    "实例：{}\n工作区：{}\n现在直接发送任务即可。",
+                    "设备：{}\n工作区：{}\n现在直接发送任务即可。",
                     device.name, frozen.binding.workspace
                 );
                 choices.extend([
@@ -364,7 +495,7 @@ impl Gateway {
                     .set_instance_default(principal, device.id, &listing.path)
                     .await?;
                 title = "默认工作区已更新".into();
-                text=format!("实例：{}\n默认（全局）：{}\n以后选择此实例且不指定路径时使用这个目录。当前会话不变。",device.name,listing.path);
+                text=format!("设备：{}\n默认（全局）：{}\n以后选择此实例且不指定路径时使用这个目录。当前会话不变。",device.name,listing.path);
                 choices.extend([
                     (
                         "使用默认工作区".into(),
@@ -452,8 +583,11 @@ impl Gateway {
     ) -> GatewayResult<DeliveryBody> {
         let expected_session = self.store.selection(&message.route, principal).await?;
         let expires_at = self.identity.now() + 240;
+        if choices.len() > 15 {
+            return Err(GatewayError::Invalid);
+        }
         let mut buttons = Vec::new();
-        for (label, action) in choices.into_iter().take(15) {
+        for (label, action) in choices {
             let action_id = self
                 .store
                 .save_menu_action(
@@ -470,19 +604,11 @@ impl Gateway {
         }
         Ok(DeliveryBody::Menu {
             card: MenuCard {
+                question_request: None,
                 title,
                 text,
                 buttons,
             },
         })
     }
-}
-
-fn folder_label(path: &str) -> String {
-    path.trim_end_matches(['/', '\\'])
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(path)
-        .into()
 }

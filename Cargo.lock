@@ -2501,6 +2501,8 @@ name = "peri-process"
 version = "0.4.0"
 dependencies = [
  "libc",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "windows-sys 0.61.2",
@@ -2514,6 +2516,7 @@ dependencies = [
  "axum",
  "peri-acp-types",
  "peri-executor",
+ "peri-process",
  "peri-tool-runtime",
  "reqwest",
  "serde",

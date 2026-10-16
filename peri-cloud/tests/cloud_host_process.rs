@@ -27,6 +27,8 @@ const QQ_SECRET: &str = "fixture-host-qq-secret-32-characters";
 const MODEL_KEY: &str = "fixture-host-model-private-key";
 #[path = "cloud_host_process/local_instance.rs"]
 mod local_instance_tests;
+#[path = "cloud_host_process/onebot.rs"]
+mod onebot_tests;
 
 #[derive(Default)]
 struct Wire {
@@ -109,6 +111,7 @@ impl Process {
             .env("FIXTURE_MODEL_KEY", MODEL_KEY)
             .env("FIXTURE_QQ_APP", "123")
             .env("FIXTURE_QQ_SECRET", QQ_SECRET)
+            .env("FIXTURE_ONEBOT_TOKEN", onebot_tests::TOKEN)
             .env("RUST_LOG", "info")
             .env("NO_PROXY", "127.0.0.1,localhost")
             .env("TEMP", path.parent().unwrap())
@@ -335,6 +338,7 @@ impl Process {
             VERIFIER,
             QQ_SECRET,
             MODEL_KEY,
+            onebot_tests::TOKEN,
             &account.access,
             &account.csrf,
         ] {
@@ -474,7 +478,7 @@ async fn actual_host_qq_buttons_execute_then_restart_restores_session_and_shutdo
     assert!(selected["content"]
         .as_str()
         .unwrap()
-        .contains("已连接实例：Host PC"));
+        .contains("已连接设备：Host PC"));
     first.message(&client, "write", "创建文件").await;
     let card = wait_message(&wire, "write", true).await;
     assert_eq!(card["msg_type"], 2);

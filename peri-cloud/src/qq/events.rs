@@ -109,10 +109,25 @@ pub fn normalize(instance: &str, event_type: &str, data: Value) -> QqResult<Opti
                 .as_str()
                 .ok_or(QqError::Event)?;
             let parts: Vec<_> = payload.split(':').collect();
-            if parts.len() != 3 || parts[0] != "peri" {
+            if !matches!(parts.len(), 3 | 4) || parts[0] != "peri" {
                 return Err(QqError::Event);
             }
             let request = Uuid::parse_str(parts[2]).map_err(|_| QqError::Event)?;
+            if parts.len() == 4 {
+                if parts[1] != "answer" {
+                    return Err(QqError::Event);
+                }
+                let option = parts[3].parse::<usize>().map_err(|_| QqError::Event)?;
+                if option >= 6 {
+                    return Err(QqError::Event);
+                }
+                return Ok(Some(QqInput::Interaction {
+                    route: route(instance, user, conversation),
+                    event_id: id,
+                    request,
+                    action: InteractionAction::Choose { option },
+                }));
+            }
             if parts[1] == "menu" {
                 return Ok(Some(QqInput::Menu {
                     route: route(instance, user, conversation),

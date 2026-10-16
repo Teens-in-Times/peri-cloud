@@ -15,11 +15,15 @@ use super::{ChannelRoute, GatewayError, GatewayResult, InteractionAction, Intera
 use crate::identity::IdentityService;
 use crate::state::{CloudJournal, TurnState};
 
+#[path = "questions.rs"]
+mod questions;
+
 struct Pending {
     route: ChannelRoute,
     principal: Uuid,
     card: InteractionCard,
     response: oneshot::Sender<InteractionResponse>,
+    draft: Option<questions::QuestionDraft>,
 }
 
 pub(crate) struct InteractionHub {
@@ -31,6 +35,36 @@ pub(crate) struct InteractionHub {
 }
 
 impl InteractionHub {
+    pub(crate) async fn card_by_code(
+        &self,
+        route: &ChannelRoute,
+        code: &str,
+    ) -> GatewayResult<InteractionCard> {
+        if !(8..=32).contains(&code.len()) || !code.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(GatewayError::Invalid);
+        }
+        let candidates: Vec<_> = self
+            .pending
+            .lock()
+            .values()
+            .filter(|p| {
+                p.route == *route
+                    && p.card
+                        .request_id
+                        .simple()
+                        .to_string()
+                        .starts_with(&code.to_ascii_lowercase())
+                    && p.card.expires_at > self.identity.now()
+                    && !p.response.is_closed()
+            })
+            .map(|p| (p.principal, p.card.clone()))
+            .collect();
+        let [(principal, card)] = candidates.as_slice() else {
+            return Err(GatewayError::StaleInteraction);
+        };
+        self.validate_current(route, *principal, card).await?;
+        Ok(card.clone())
+    }
     pub fn new(
         identity: Arc<IdentityService>,
         journal: Arc<CloudJournal>,
@@ -241,19 +275,24 @@ impl UserInteractionBroker for SessionBroker {
                 principal,
                 card: card.clone(),
                 response,
+                draft: questions::QuestionDraft::new(&context),
             },
         );
         let _guard = RequestGuard {
             hub: self.hub.clone(),
             request,
         };
-        if self
-            .hub
-            .store
-            .interaction(&self.route, &parent, principal, card)
-            .await
-            .is_err()
-        {
+        let delivery = if matches!(context, InteractionContext::Questions { .. }) {
+            self.hub
+                .deliver_question(&self.route, &parent, principal, request, self.device)
+                .await
+        } else {
+            self.hub
+                .store
+                .interaction(&self.route, &parent, principal, card)
+                .await
+        };
+        if delivery.is_err() {
             return fallback();
         }
         tokio::select! {
@@ -289,6 +328,23 @@ fn action_response(
     source: &str,
 ) -> GatewayResult<InteractionResponse> {
     match (context, action) {
+        (InteractionContext::Questions { requests }, InteractionAction::Choose { option })
+            if requests.len() == 1 && !requests[0].multi_select =>
+        {
+            let question = &requests[0];
+            let selected = question.options.get(option).ok_or(GatewayError::Invalid)?;
+            action_response(
+                context,
+                InteractionAction::Answers {
+                    answers: vec![peri_acp_types::interaction::QuestionAnswer {
+                        id: question.id.clone(),
+                        selected: vec![selected.label.clone()],
+                        text: None,
+                    }],
+                },
+                source,
+            )
+        }
         (InteractionContext::Approval { items }, InteractionAction::AllowOnce {}) => {
             Ok(InteractionResponse::Decisions(
                 items
@@ -331,6 +387,11 @@ fn action_response(
                             .any(|option| option.label == *selected)
                     })
                     || answer.text.as_ref().is_some_and(|text| text.len() > 4096)
+                    || (answer.selected.is_empty()
+                        && answer
+                            .text
+                            .as_ref()
+                            .is_none_or(|text| text.trim().is_empty()))
                 {
                     return Err(GatewayError::Invalid);
                 }
@@ -353,9 +414,20 @@ fn unavailable(context: &InteractionContext) -> InteractionResponse {
                 })
                 .collect(),
         ),
-        // No question tool is currently installed by CloudChainAssembler. A
-        // future question-capable adapter must distinguish lifecycle cancellation
-        // in the shared broker contract before enabling timed question requests.
-        InteractionContext::Questions { .. } => InteractionResponse::Rejected,
+        InteractionContext::Questions { .. } => InteractionResponse::Cancelled,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unavailable_question_is_lifecycle_cancellation_not_user_refusal() {
+        assert!(matches!(
+            unavailable(&InteractionContext::Questions {
+                requests: Vec::new()
+            }),
+            InteractionResponse::Cancelled
+        ));
     }
 }

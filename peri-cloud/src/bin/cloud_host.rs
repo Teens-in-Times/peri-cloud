@@ -12,6 +12,10 @@ struct Args {
     /// Validate configuration without starting services or reading credentials.
     #[arg(long)]
     check_config: bool,
+    /// Authenticate configured devices without starting a model, QQ or the portal.
+    /// Existing SSH forwards must already be running.
+    #[arg(long, conflicts_with = "check_config")]
+    check_devices: bool,
 }
 
 #[tokio::main]
@@ -26,6 +30,36 @@ async fn main() -> Result<(), HostError> {
     let config = HostConfig::read(&args.config).await?;
     if args.check_config {
         tracing::info!(component = "cloud_host", "cloud configuration is valid");
+        return Ok(());
+    }
+    if args.check_devices {
+        for device in config.devices.iter().chain(
+            config
+                .isolated_instance
+                .iter()
+                .map(|local| &local.connection),
+        ) {
+            let metadata = tokio::fs::metadata(&device.token_file)
+                .await
+                .map_err(|_| HostError::Credential)?;
+            if !metadata.is_file() || metadata.len() > 8192 {
+                return Err(HostError::Credential);
+            }
+            let token = tokio::fs::read_to_string(&device.token_file)
+                .await
+                .map_err(|_| HostError::Credential)?;
+            if token.trim().is_empty() {
+                return Err(HostError::Credential);
+            }
+            let client = peri_remote_tools::DeviceClient::connect_routes(
+                device.routes(),
+                token.trim().into(),
+                device.device_id,
+            )
+            .await
+            .map_err(|_| HostError::Connection)?;
+            tracing::info!(device_id = %client.info().device_id, platform = %client.info().platform, transport = client.active_transport().await, "Executor authenticated");
+        }
         return Ok(());
     }
     let stop = CancellationToken::new();

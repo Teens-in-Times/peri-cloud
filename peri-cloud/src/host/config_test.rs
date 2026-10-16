@@ -6,14 +6,63 @@ fn config() -> Value {
 }
 
 #[test]
+fn wireguard_is_explicit_and_does_not_replace_ssh_fallback() {
+    let mut input = config();
+    input["devices"] = json!([{"device_id":"00000000-0000-0000-0000-000000000042","endpoint":"127.0.0.1:8750","token_file":"device-token", "wireguard":{"interface":"wg77","endpoint":"10.77.0.3:42371"}}]);
+    serde_json::from_value::<HostConfig>(input.clone())
+        .unwrap()
+        .validate()
+        .unwrap();
+    for endpoint in ["8.8.8.8:42371", "0.0.0.0:42371", "127.0.0.1:42371"] {
+        input["devices"][0]["wireguard"]["endpoint"] = json!(endpoint);
+        assert!(serde_json::from_value::<HostConfig>(input.clone())
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+}
+
+#[test]
 fn configuration_defaults_keep_credentials_and_channel_optional() {
     let config: HostConfig = serde_json::from_value(config()).unwrap();
     config.validate().unwrap();
     assert!(config.qq.is_none());
+    assert!(config.onebot.is_none());
     assert_eq!(config.max_iterations, 64);
     assert_eq!(config.model.context_window, 128000);
     assert_eq!(config.model.max_tokens, 32000);
     assert!(config.devices.is_empty());
+}
+
+#[test]
+fn onebot_is_optional_independent_and_requires_a_private_distinct_listener() {
+    let mut input = config();
+    input["qq"] = json!({"instance_id":"official","app_id_env":"QQ_APP","client_secret_env":"QQ_SECRET","transport":"websocket"});
+    input["onebot"] = json!({"instance_id":"personal","self_id":"12345678","listen":"127.0.0.1:8766","access_token_env":"ONEBOT_TOKEN"});
+    serde_json::from_value::<HostConfig>(input.clone())
+        .unwrap()
+        .validate()
+        .unwrap();
+    for (field, value) in [
+        ("instance_id", json!("official")),
+        ("self_id", json!("00123")),
+        ("self_id", json!("-42")),
+        ("listen", json!("0.0.0.0:8766")),
+        ("listen", json!("127.0.0.1:8765")),
+        ("access_token_env", json!("bad token")),
+    ] {
+        let mut bad = input.clone();
+        bad["onebot"][field] = value;
+        assert!(serde_json::from_value::<HostConfig>(bad)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+    input["qq"] = Value::Null;
+    serde_json::from_value::<HostConfig>(input)
+        .unwrap()
+        .validate()
+        .unwrap();
 }
 
 #[test]

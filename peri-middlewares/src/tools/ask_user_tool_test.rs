@@ -309,3 +309,18 @@ async fn test_preview_field_ignored() {
         "preview field should not cause error"
     );
 }
+
+#[tokio::test]
+async fn lifecycle_cancellation_never_claims_the_user_refused_to_answer() {
+    let tool = make_tool(InteractionResponse::Cancelled);
+    let error = tool
+        .invoke(
+            single_question_input(),
+            peri_agent::tools::ToolContext::new(&[], "."),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("未收到用户答案"));
+    assert!(!error.contains("用户拒绝回答"));
+}

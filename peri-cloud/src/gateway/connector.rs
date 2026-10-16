@@ -16,6 +16,10 @@ use crate::CloudAgent;
 /// SSH login or bearer tokens. Existing frozen sessions must reopen unchanged.
 #[async_trait]
 pub trait SessionConnector: Send + Sync {
+    fn account_models(&self) -> Option<Arc<crate::models::AccountModels>> {
+        None
+    }
+
     async fn directories(
         &self,
         _principal: Uuid,
@@ -83,6 +87,10 @@ impl NativeSessionConnector {
 
 #[async_trait]
 impl SessionConnector for NativeSessionConnector {
+    fn account_models(&self) -> Option<Arc<crate::models::AccountModels>> {
+        self.account_models.read().clone()
+    }
+
     async fn directories(
         &self,
         _principal: Uuid,

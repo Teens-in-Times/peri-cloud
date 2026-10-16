@@ -61,7 +61,7 @@ impl Connections {
             .await;
         if let Some(client) = cached.as_ref() {
             client
-                .reconnect(config.endpoint)
+                .refresh_connection()
                 .await
                 .map_err(|_| GatewayError::Connection)?;
             return Ok(client.clone());
@@ -79,7 +79,7 @@ impl Connections {
         if token.is_empty() || token.len() > 8192 {
             return Err(GatewayError::Connection);
         }
-        let client = DeviceClient::connect(config.endpoint, token, id)
+        let client = DeviceClient::connect_routes(config.routes(), token, id)
             .await
             .map_err(|_| GatewayError::Connection)?;
         self.native.register_client(client.clone());

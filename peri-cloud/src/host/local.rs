@@ -48,6 +48,7 @@ impl LocalExecutor {
         });
         Ok(Self {
             connection: DeviceConnection {
+                wireguard: None,
                 device_id: info.device_id,
                 endpoint,
                 token_file: state.join("transport-token"),

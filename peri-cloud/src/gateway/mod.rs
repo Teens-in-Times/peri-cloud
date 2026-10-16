@@ -4,12 +4,13 @@
 mod broker;
 mod connector;
 mod menu_store;
+pub(crate) mod menu_view;
 mod router;
 pub(crate) mod store;
 mod types;
 
 pub use connector::{NativeSessionConnector, SessionConnector};
-pub use router::{Gateway, WorkspaceSelection};
+pub use router::{ConversationActivity, Gateway, SavedResultPage, WorkspaceSelection};
 pub use types::{
     ChannelRoute, Delivery, DeliveryBody, DeliveryError, GatewayReceipt, InboundMessage,
     InteractionAction, InteractionCard, MenuButton, MenuCard, MessageAdapter, ReceiptState,

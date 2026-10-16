@@ -236,8 +236,9 @@ impl QqAdapter {
             DeliveryBody::Notice { text } => text.clone(),
             DeliveryBody::Menu { card } => menu_text(
                 card,
+                delivery.delivery_id,
                 native && matches!(self.interaction, QqInteractionMode::Native {}),
-            ),
+            )?,
             DeliveryBody::Interaction { card } => super::card::text(
                 card,
                 &self.web_origin,
@@ -248,17 +249,54 @@ impl QqAdapter {
         if let (true, DeliveryBody::Interaction { card }, QqInteractionMode::Native {}) =
             (native, &delivery.body, &self.interaction)
         {
+            let buttons = match &card.context {
+                peri_acp_types::interaction::InteractionContext::Approval { .. } => vec![
+                    button(
+                        "allow",
+                        "允许一次",
+                        &format!("peri:allow:{}", card.request_id),
+                    ),
+                    button(
+                        "reject",
+                        "拒绝",
+                        &format!("peri:reject:{}", card.request_id),
+                    ),
+                ],
+                peri_acp_types::interaction::InteractionContext::Questions { requests } => {
+                    let mut buttons = Vec::new();
+                    if requests.len() == 1 && !requests[0].multi_select {
+                        for (index, option) in requests[0].options.iter().take(6).enumerate() {
+                            buttons.push(button(
+                                &format!("answer-{index}"),
+                                &menu_label(index, &option.label, 3),
+                                &format!("peri:answer:{}:{index}", card.request_id),
+                            ));
+                        }
+                    }
+                    buttons.push(button(
+                        "reject",
+                        "暂不回答",
+                        &format!("peri:reject:{}", card.request_id),
+                    ));
+                    buttons
+                }
+            };
+            let rows: Vec<_> = buttons
+                .chunks(3)
+                .map(|row| json!({"buttons":row}))
+                .collect();
             body = json!({"msg_type":2,"msg_id":delivery.in_reply_to,"msg_seq":delivery.message_sequence,
             "markdown":{"content":text},
-            "keyboard":{"content":{"rows":[{"buttons":[
-                button("allow", "允许一次", &format!("peri:allow:{}",card.request_id)),
-                button("reject", "拒绝", &format!("peri:reject:{}",card.request_id))
-            ]}]}}});
+            "keyboard":{"content":{"rows":rows}}});
         }
         if let (true, DeliveryBody::Menu { card }, QqInteractionMode::Native {}) =
             (native, &delivery.body, &self.interaction)
         {
-            let rows:Vec<_>=card.buttons.chunks(3).enumerate().map(|(row_index,row)|json!({"buttons":row.iter().enumerate().map(|(index,item)|button(&format!("menu-{}",row_index*3+index),&super::card::excerpt(&item.label,20,false),&format!("peri:menu:{}",item.action_id))).collect::<Vec<_>>() })).collect();
+            let columns = menu_columns(card);
+            let rows:Vec<_>=card.buttons.chunks(columns).enumerate().map(|(row_index,row)|json!({"buttons":row.iter().enumerate().map(|(index,item)| {
+                let index = row_index * columns + index;
+                button(&format!("menu-{index}"), &menu_label(index, &item.label, columns), &format!("peri:menu:{}",item.action_id))
+            }).collect::<Vec<_>>() })).collect();
             body = json!({"msg_type":2,"msg_id":delivery.in_reply_to,"msg_seq":delivery.message_sequence,"markdown":{"content":text},"keyboard":{"content":{"rows":rows}}});
         }
         if delivery.reply_kind == crate::gateway::ReplyKind::Event {
@@ -269,33 +307,70 @@ impl QqAdapter {
     }
 }
 
-fn menu_text(card: &crate::gateway::MenuCard, markdown: bool) -> String {
-    let title = super::card::excerpt(&card.title, 60, markdown);
-    let text = card
-        .text
+fn menu_text(
+    card: &crate::gateway::MenuCard,
+    snapshot: uuid::Uuid,
+    markdown: bool,
+) -> QqResult<String> {
+    let text = crate::gateway::menu_view::page(card, snapshot, 1)
+        .map_err(|_| QqError::Configuration)?
+        .render();
+    if !markdown {
+        return Ok(text);
+    }
+    Ok(text
         .lines()
-        .take(50)
-        .map(|line| super::card::excerpt(line, 240, markdown))
+        .map(|line| super::card::excerpt(line, usize::MAX, true))
         .collect::<Vec<_>>()
-        .join("\n");
-    if markdown {
-        format!("**{title}**\n{text}")
-    } else {
-        let options = card
+        .join("\n"))
+}
+
+fn label_width(label: &str) -> usize {
+    label
+        .chars()
+        .map(|ch| if ch.is_ascii() { 1 } else { 2 })
+        .sum()
+}
+
+fn menu_columns(card: &crate::gateway::MenuCard) -> usize {
+    // Five rows is a platform limit. Fewer columns leave ordinary actions
+    // readable; long names live in the complete numbered text, not an ellipsis.
+    if card.buttons.len() <= 5
+        && card
             .buttons
             .iter()
-            .enumerate()
-            .map(|(index, button)| format!("/选 {} · {}", index + 1, button.label))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("{title}\n{text}\n\n{options}\n按钮不可用时发送上面的 /选 序号。")
+            .any(|item| label_width(&item.label) > 20)
+    {
+        1
+    } else if card.buttons.len() <= 10 {
+        2
+    } else {
+        3
+    }
+}
+
+fn menu_label(index: usize, label: &str, columns: usize) -> String {
+    let label: String = label
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let numbered = format!("{} · {label}", index + 1);
+    let budget = match columns {
+        1 => 40,
+        2 => 24,
+        _ => 16,
+    };
+    if label_width(&numbered) <= budget {
+        numbered
+    } else {
+        format!("选 {}", index + 1)
     }
 }
 
 fn button(id: &str, label: &str, data: &str) -> Value {
     // Match Hermes: let clicks reach the gateway, which authenticates the
     // observed sender against the exact pending route before consuming approval.
-    json!({"id":id,"group_id":if id.starts_with("menu-"){"menu"}else{"approval"},"render_data":{"label":label,"visited_label":"已选择","style":if id == "reject" { 0 } else { 1 }},"action":{"type":1,"permission":{"type":2},"data":data,"unsupport_tips":"请发送“菜单”或打开网页登录入口"}})
+    json!({"id":id,"group_id":if id.starts_with("menu-"){"menu"}else{"approval"},"render_data":{"label":label,"visited_label":label,"style":if id == "reject" { 0 } else { 1 }},"action":{"type":1,"permission":{"type":2},"data":data,"unsupport_tips":"请使用正文中的 /选、/回答、/允许 或 /拒绝 指令。"}})
 }
 
 #[async_trait]

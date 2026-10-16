@@ -88,6 +88,9 @@ pub enum InteractionResponse {
     Answers(Vec<QuestionAnswer>),
     /// 用户明确拒绝了交互（如在 AskUserQuestion 确认弹窗中选择拒绝）
     Rejected,
+    /// 请求因超时、任务取消或通道失效终止；没有收到用户的决定或答案。
+    /// 不等于用户拒绝，也不等于客户端声明自身没有交互界面。
+    Cancelled,
     /// 无人可以作答：客户端声明自身正常收到提问但无法征询用户（如 `-p` 打印
     /// 模式），与 [`InteractionResponse::Rejected`]（用户拒绝）和空 `Answers`
     /// （伪造成功）都不同，工具须如实转述 `cause` 而不是当作已回答。

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::{Child, Command};
 
 pub mod filesystem;
+pub mod wireguard;
 
 #[cfg(windows)]
 mod windows;

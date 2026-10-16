@@ -146,6 +146,10 @@ impl BaseTool for AskUserTool {
                     .collect();
                 Ok(parts.join("\n\n"))
             }
+            InteractionResponse::Cancelled => Err(Box::new(peri_agent::error::AgentError::ToolRejected {
+                tool: "AskUserQuestion".to_string(),
+                reason: "提问已超时、取消或交互通道不可用，未收到用户答案；这不是用户拒绝或同意，不要把它当作回答".to_string(),
+            })),
             InteractionResponse::Rejected => {
                 Err(Box::new(peri_agent::error::AgentError::ToolRejected {
                     tool: "AskUserQuestion".to_string(),

@@ -8,6 +8,7 @@ license = "Apache-2.0"
 [dependencies]
 peri-acp-types = { path = "../peri-acp-types" }
 peri-tool-runtime = { path = "../peri-tool-runtime" }
+peri-process = { path = "../peri-process" }
 async-trait.workspace = true
 reqwest.workspace = true
 serde.workspace = true

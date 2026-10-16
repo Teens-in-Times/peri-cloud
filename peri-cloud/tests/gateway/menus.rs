@@ -266,7 +266,7 @@ async fn native_menu_queue_is_owned_and_revoked_instances_cannot_be_selected() {
             instances
                 .buttons
                 .iter()
-                .find(|b| b.label.ends_with(&format!(" · {}", f.devices[0].name)))
+                .find(|b| b.label == f.devices[0].name)
                 .unwrap()
                 .action_id,
         )

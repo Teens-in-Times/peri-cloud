@@ -7,6 +7,7 @@ pub mod host;
 pub mod identity;
 pub mod limits;
 pub mod models;
+pub mod onebot;
 mod personal;
 pub mod portal;
 pub mod qq;

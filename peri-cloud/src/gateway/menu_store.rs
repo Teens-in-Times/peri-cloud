@@ -9,10 +9,21 @@ use uuid::Uuid;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum MenuAction {
     Home,
+    Personal {
+        section: String,
+        page: usize,
+    },
+    ClearPersonal {
+        field: String,
+        revision: u64,
+    },
     Instances {
         offset: usize,
     },
     Workspaces,
+    WorkspacesPage {
+        offset: usize,
+    },
     Browse {
         device: Uuid,
         path: Option<String>,
@@ -31,7 +42,33 @@ pub(super) enum MenuAction {
         mode: String,
     },
     Status,
+    Results {
+        turn: Option<Uuid>,
+        page: usize,
+    },
     Cancel,
+    QuestionPage {
+        request: Uuid,
+        revision: u32,
+        question: usize,
+        offset: usize,
+    },
+    QuestionDecline {
+        request: Uuid,
+        revision: u32,
+    },
+    QuestionOption {
+        request: Uuid,
+        revision: u32,
+        question: usize,
+        option: usize,
+        selected: bool,
+    },
+    QuestionNext {
+        request: Uuid,
+        revision: u32,
+        question: usize,
+    },
 }
 
 impl MenuAction {
@@ -39,9 +76,14 @@ impl MenuAction {
         matches!(
             self,
             Self::Select { .. }
+                | Self::ClearPersonal { .. }
                 | Self::SetDefault { .. }
                 | Self::SetPermission { .. }
                 | Self::Cancel
+                | Self::QuestionOption { .. }
+                | Self::QuestionNext { .. }
+                | Self::QuestionPage { .. }
+                | Self::QuestionDecline { .. }
         )
     }
 }
@@ -54,6 +96,41 @@ pub(super) struct MenuRecord {
 }
 
 impl GatewayStore {
+    pub(super) async fn menu_snapshot(
+        &self,
+        route: &ChannelRoute,
+        principal: Uuid,
+        snapshot: Option<Uuid>,
+    ) -> GatewayResult<Option<Delivery>> {
+        // The immutable outbox ID pins all pages to the same menu. A later
+        // menu cannot replace its names, and another route cannot read it.
+        let rows = sqlx::query(concat!(
+            "SELECT delivery_json FROM gateway_outbox WHERE principal=? ",
+            "AND state IN ('delivered','unconfirmed') ",
+            "AND json_extract(delivery_json,'$.body.kind')='menu' ",
+            "AND json_extract(delivery_json,'$.route.identity.adapter_instance_id')=? ",
+            "AND json_extract(delivery_json,'$.route.identity.external_user_id')=? ",
+            "AND json_extract(delivery_json,'$.route.conversation_id')=? ",
+            "AND (? IS NULL OR json_extract(delivery_json,'$.delivery_id')=?) ",
+            "ORDER BY rowid DESC LIMIT 1"
+        ))
+        .bind(principal.to_string())
+        .bind(&route.identity.adapter_instance_id)
+        .bind(&route.identity.external_user_id)
+        .bind(&route.conversation_id)
+        .bind(snapshot.map(|id| id.to_string()))
+        .bind(snapshot.map(|id| id.to_string()))
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let delivery: Delivery = serde_json::from_str(row.get("delivery_json"))?;
+            if delivery.route == *route && matches!(delivery.body, DeliveryBody::Menu { .. }) {
+                return Ok(Some(delivery));
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) async fn menu_number(
         &self,
         route: &ChannelRoute,
@@ -82,6 +159,29 @@ impl GatewayStore {
         }
         Err(GatewayError::StaleInteraction)
     }
+    pub(super) async fn snapshot_number(
+        &self,
+        route: &ChannelRoute,
+        principal: Uuid,
+        snapshot: Uuid,
+        index: usize,
+    ) -> GatewayResult<Uuid> {
+        if !(1..=15).contains(&index) {
+            return Err(GatewayError::Invalid);
+        }
+        let delivery = self
+            .menu_snapshot(route, principal, Some(snapshot))
+            .await?
+            .ok_or(GatewayError::StaleInteraction)?;
+        let DeliveryBody::Menu { card } = delivery.body else {
+            return Err(GatewayError::Invalid);
+        };
+        card.buttons
+            .get(index - 1)
+            .map(|button| button.action_id)
+            .ok_or(GatewayError::Invalid)
+    }
+
     pub(super) async fn save_menu_action(
         &self,
         route: &ChannelRoute,

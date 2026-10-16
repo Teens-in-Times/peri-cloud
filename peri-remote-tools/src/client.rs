@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
+use crate::transport::{self, Connection, ExecutorEndpoint};
 use peri_acp_types::device_executor::*;
 use reqwest::{Client, Method, StatusCode};
 use serde::de::DeserializeOwned;
@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("executor endpoint must listen on a loopback address")]
+    #[error("executor endpoint requires loopback or an explicit private WireGuard route")]
     NonLoopback,
     #[error("executor connection unavailable; query the existing invocation before retrying")]
     Disconnected,
@@ -32,8 +32,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Connection credentials are private and deliberately have no Debug projection.
 pub struct DeviceClient {
-    http: Client,
-    endpoint: RwLock<SocketAddr>,
+    connection: RwLock<Connection>,
+    routes: RwLock<Vec<ExecutorEndpoint>>,
     reconnect_gate: Mutex<()>,
     token: String,
     device: ExecutorInfo,
@@ -45,19 +45,23 @@ impl DeviceClient {
         token: String,
         expected_device: Uuid,
     ) -> Result<Arc<Self>> {
-        check_endpoint(endpoint)?;
-        let http = Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| Error::Protocol)?;
-        let device: ExecutorInfo =
-            send(&http, endpoint, &token, Method::GET, "/v1/info", None).await?;
-        validate_device(&device, expected_device)?;
+        Self::connect_routes(
+            vec![ExecutorEndpoint::Loopback(endpoint)],
+            token,
+            expected_device,
+        )
+        .await
+    }
+
+    pub async fn connect_routes(
+        routes: Vec<ExecutorEndpoint>,
+        token: String,
+        expected_device: Uuid,
+    ) -> Result<Arc<Self>> {
+        let (connection, device) = transport::select(&routes, &token, expected_device).await?;
         Ok(Arc::new(Self {
-            http,
-            endpoint: RwLock::new(endpoint),
+            connection: RwLock::new(connection),
+            routes: RwLock::new(routes),
             reconnect_gate: Mutex::new(()),
             token,
             device,
@@ -66,6 +70,11 @@ impl DeviceClient {
 
     pub fn info(&self) -> &ExecutorInfo {
         &self.device
+    }
+
+    /// Operator diagnostics only; never included in a model tool schema.
+    pub async fn active_transport(&self) -> &'static str {
+        self.connection.read().await.kind()
     }
 
     pub async fn directories(&self, query: DirectoryQuery) -> Result<DirectoryListing> {
@@ -77,18 +86,21 @@ impl DeviceClient {
     /// A new SSH forwarding port is published only after checking device identity.
     pub async fn reconnect(&self, endpoint: SocketAddr) -> Result<()> {
         let _gate = self.reconnect_gate.lock().await;
-        check_endpoint(endpoint)?;
-        let info: ExecutorInfo = send(
-            &self.http,
-            endpoint,
-            &self.token,
-            Method::GET,
-            "/v1/info",
-            None,
-        )
-        .await?;
-        validate_device(&info, self.device.device_id)?;
-        *self.endpoint.write().await = endpoint;
+        let routes = vec![ExecutorEndpoint::Loopback(endpoint)];
+        let (connection, _) =
+            transport::select(&routes, &self.token, self.device.device_id).await?;
+        *self.connection.write().await = connection;
+        *self.routes.write().await = routes;
+        Ok(())
+    }
+
+    /// Refresh transport without replacing frozen sessions or uncertain task ownership.
+    pub async fn refresh_connection(&self) -> Result<()> {
+        let _gate = self.reconnect_gate.lock().await;
+        let routes = self.routes.read().await.clone();
+        let (connection, _) =
+            transport::select(&routes, &self.token, self.device.device_id).await?;
+        *self.connection.write().await = connection;
         Ok(())
     }
 
@@ -149,19 +161,44 @@ impl DeviceClient {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> Result<T> {
-        let endpoint = *self.endpoint.read().await;
-        send(&self.http, endpoint, &self.token, method, path, body).await
+        let connection = self.connection.read().await.clone();
+        let result = async {
+            connection.verify_route().await?;
+            send(
+                &connection.http,
+                connection.endpoint,
+                &self.token,
+                method.clone(),
+                path,
+                body.clone(),
+            )
+            .await
+        }
+        .await;
+        if matches!(result, Err(Error::Disconnected)) {
+            // Only reads may be retried. A lost write may already have executed.
+            if method == Method::GET {
+                self.refresh_connection().await?;
+                let connection = self.connection.read().await.clone();
+                connection.verify_route().await?;
+                return send(
+                    &connection.http,
+                    connection.endpoint,
+                    &self.token,
+                    method,
+                    path,
+                    body,
+                )
+                .await;
+            }
+            // Preserve ambiguity even if the replacement route is unavailable or rejected.
+            let _ = self.refresh_connection().await;
+        }
+        result
     }
 }
 
-fn check_endpoint(endpoint: SocketAddr) -> Result<()> {
-    if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
-        return Err(Error::NonLoopback);
-    }
-    Ok(())
-}
-
-fn validate_device(info: &ExecutorInfo, expected: Uuid) -> Result<()> {
+pub(crate) fn validate_device(info: &ExecutorInfo, expected: Uuid) -> Result<()> {
     if info.device_id != expected
         || info.protocol_version != PROTOCOL_VERSION
         || !matches!(info.platform.as_str(), "windows" | "linux")
@@ -178,7 +215,7 @@ fn check_job(job: &JobSnapshot, session: Uuid, id: Uuid) -> Result<()> {
     Ok(())
 }
 
-async fn send<T: DeserializeOwned>(
+pub(crate) async fn send<T: DeserializeOwned>(
     http: &Client,
     endpoint: SocketAddr,
     token: &str,

@@ -2,6 +2,7 @@
 //! tool policy is owned by HTTP requests; deployment retains those lifecycles.
 
 mod browser;
+mod conversations;
 mod interactions;
 mod native;
 mod personal;
@@ -166,6 +167,8 @@ fn build_router(portal: Portal) -> Router {
         .route("/api/logout", post(browser::logout))
         .route("/api/account", get(browser::account))
         .route("/api/workspaces", get(workspaces::list))
+        .route("/api/conversations", get(conversations::list))
+        .route("/api/conversations/{id}/result", get(conversations::result))
         .route("/api/instances/{id}/browse", post(workspaces::browse))
         .route(
             "/api/instances/{id}/default-workspace",

@@ -2,7 +2,10 @@
 
 ```mermaid
 flowchart LR
-  QQ[QQ / 未来消息适配器] --> Gateway[网关抽象]
+  QQ[官方 QQBot] --> QqAdapter[原有 QqAdapter]
+  QqAdapter --> Gateway[同一 Gateway]
+  Personal[个人 QQ / NapCat / LLBot] --> OneBot[可选 OneBotAdapter]
+  OneBot --> Gateway
   Browser[账号网页 / PC 登录入口] --> Identity[账号与设备授权]
   Gateway --> Cloud[Peri 云端推理循环]
   Identity --> Cloud
@@ -10,6 +13,8 @@ flowchart LR
   Permission --> Remote[原生远程工具分派]
   Remote --> SSH[回环 HTTP + SSH]
   SSH --> Executor[Windows / Linux 执行器]
+  Remote --> WG[显式 WireGuard 私网线路]
+  WG --> Executor
   Remote --> Local[同宿主回环执行器]
   Local --> Tools
   Executor --> Tools[共享读写编辑搜索 Shell]
@@ -34,10 +39,12 @@ flowchart LR
 电脑登录使用 OAuth 授权码与 PKCE S256，通过临时回环回调完成本机授权确认。身份、运输连接与工具权限各有不同职责：
 
 - 账号网页决定哪个设备与聊天账号属于你。
-- SSH 配置与运输令牌决定云端如何认证、连接执行器。
+- SSH / WireGuard 线路配置与运输令牌决定云端如何认证、连接执行器。
 - 当前聊天会话的 Peri 权限模式决定哪些工具需要审批。
 
 OAuth 不把 SSH 用户名、私钥或运输令牌自动塞入工具参数。模型只收到必要的工具参数；实际执行连接由宿主持有。每次任务冻结设备与工作区，切换设备不会改变正在执行的旧任务。
+
+同一设备可以同时提供 WireGuard 和 SSH 线路，选择和恢复连接由宿主处理；线路切换保留执行器身份与任务不确定状态。只有查询可以自动重试，执行请求不会因切换线路而重放。详见[执行器连接与控制面迁移](transports.md)。
 
 QQ 绑定口令五分钟有效、只能使用一次。发送口令只生成关联申请；最后由已登录的电脑账号核对完整聊天身份并确认。
 
@@ -88,5 +95,9 @@ SQLite 日志记录入站消息、会话、云任务、审批、执行器任务�
 ## 消息与工具扩展
 
 网关适配器负责各平台的消息归一化和投递，不拥有推理循环。QQ 只是当前适配器；添加微信时可以复用账号、会话和审批基础设施。
+
+官方 QQBot 适配器继续保留。个人 QQ 账号接入按新增可选 OneBot 适配器设计，允许两者并存，不替换官方接入、不引入第二套 Agent。官方 OpenID 与个人 QQ 号使用不同适配器命名空间，各自完成账号关联；不能按相同昵称或数字自动合并身份。OneBot v11 反向 Universal WebSocket 已实现为独立可选监听，文本菜单、引用编号、审批和结果复用原有网关；真实 QQ 扫码与客户端显示仍需验收。部署与恢复语义见 [个人 QQ 接入](onebot.md)，设计依据见 [QQ 菜单与个人账号方案](qq-menus-and-personal-bots-20261016.md)。
+
+菜单视图从完整 MenuCard 生成分页正文，按钮标签仅是入口，不承载完整名称的唯一副本。分页固定持久发件 ID，通过当前账号与精确聊天路由读取，不刷新、消费或恢复操作令牌；过期菜单仍可查看文字，但操作继续受原有过期、会话和提问版本检查约束。
 
 远程工具协议为其他工具留有扩展空间，当前注册核心读写、编辑、文件查找、内容搜索和 Shell；个人文本记忆在云端处理。检索式记忆后端及 Wake-on-LAN 节点尚未交付。

@@ -1,4 +1,4 @@
-//! Bounded approval summaries. Exact parameters stay in the authenticated portal.
+//! Bounded approval summaries. QQ detail commands retain access to exact parameters.
 
 use peri_acp_types::interaction::{ApprovalItem, InteractionContext};
 
@@ -29,11 +29,42 @@ pub(super) fn text(card: &InteractionCard, origin: &str, markdown: bool) -> Stri
         if items.len() > 3 {
             lines.push(format!("另有 {} 项操作，查看详情", items.len() - 3));
         }
+        let code = &card.request_id.simple().to_string()[..8];
+        lines.push(format!(
+            "文字操作：/允许 {code} 或 /拒绝 {code}\n完整参数：/详情 {code}"
+        ));
+    }
+    if let InteractionContext::Questions { requests } = &card.context {
+        for question in requests.iter().take(3) {
+            lines.push(excerpt(&question.question, 220, markdown));
+            for (index, option) in question.options.iter().take(6).enumerate() {
+                lines.push(format!(
+                    "{}. {}",
+                    index + 1,
+                    excerpt(&option.label, 80, markdown)
+                ));
+            }
+        }
+        lines.push("在 QQ 回复 /回答 内容；多选可回复 /回答 1,2。发送 /问题 可逐题作答。".into());
     }
     lines.push(if markdown {
-        format!("[查看完整参数]({link})")
+        format!(
+            "[{}]({link})",
+            if matches!(card.context, InteractionContext::Approval { .. }) {
+                "网页查看（可选）"
+            } else {
+                "网页回答（可选）"
+            }
+        )
     } else {
-        format!("查看完整参数：{link}")
+        format!(
+            "{}：{link}",
+            if matches!(card.context, InteractionContext::Approval { .. }) {
+                "网页查看（可选）"
+            } else {
+                "网页回答（可选）"
+            }
+        )
     });
     lines.join("\n")
 }
@@ -115,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn write_body_stays_in_portal_and_batch_is_explicit() {
+    fn write_body_stays_in_details_and_batch_is_explicit() {
         let item = ApprovalItem {
             tool_call_id: "call".into(),
             tool_name: "Write".into(),
@@ -143,7 +174,8 @@ mod tests {
         let summary = text(&card(vec![item]), "https://agent.example.test", true);
         assert!(summary.contains("\\[click\\]\\(https://untrusted.test\\)"));
         assert!(summary.contains('…'));
-        assert_eq!(summary.lines().count(), 4);
+        assert_eq!(summary.lines().count(), 6);
+        assert!(summary.contains("/详情 00000000"));
         assert!(summary.chars().count() < 400);
     }
 }

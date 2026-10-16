@@ -1,6 +1,6 @@
 use super::*;
 
-async fn browser_login(process: &Process, client: &Client) -> Account {
+pub(super) async fn browser_login(process: &Process, client: &Client) -> Account {
     let response = client
         .post(format!("{}/api/login", process.base))
         .header("Origin", &process.base)
@@ -267,12 +267,12 @@ async fn local_instance_works_without_native_oauth_and_uses_same_approval_and_re
         )
         .await;
     first.message(&client, "choose-menu", "实例").await;
-    let menu = wait_menu(&wire, "选择执行实例").await;
+    let menu = wait_menu(&wire, "选择执行设备").await;
     let action = menu["keyboard"]["content"]["rows"][0]["buttons"][0]["action"]["data"]
         .as_str()
         .unwrap();
     first.event(&client,"INTERACTION_CREATE",json!({"id":"choose-local","chat_type":2,"user_openid":"owner-openid","data":{"type":11,"resolved":{"button_data":action}}})).await;
-    let selected = wait_menu(&wire, "实例与工作区已就绪").await;
+    let selected = wait_menu(&wire, "设备与工作区已就绪").await;
     assert_eq!(selected["event_id"], "choose-local");
     assert!(selected.get("msg_id").is_none());
     first.message(&client, "local-write", "写文件").await;
