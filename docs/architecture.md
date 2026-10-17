@@ -105,3 +105,7 @@ SQLite 日志记录入站消息、会话、云任务、审批、执行器任务�
 ## 网关访问控制
 
 来源准入由同一个 Gateway 执行，位于身份关联与 Agent 之前，并覆盖按钮回调及发件检查。新增适配器默认采用拒绝式白名单；官方 QQBot 显式保留原接入策略，管理员可再修改。适配器只提供可信发送者、会话分类、标识格式校验和首次引导规则，不拥有独立的权限引擎。白名单和黑名单不授予 Peri 账号归属或工具权限。菜单修改仅允许已关联的管理员私聊，采用持久版本校验与事务审计。配置不覆盖已保存策略；完整规则与恢复说明见 [网关访问控制](gateway-access.md)。
+
+## 原生命令控制面
+
+原生 CommandRegistry/CommandHandler 契约由服务器组合根装配，QQ 与认证 HTTP 共享会话执行能力；目录明确区分 available、limited、adapted、unavailable。耗时命令继续由 Runtime 持有，历史与 flags 经原 Journal 原子结算。clear/rewind 不依赖模型可用性；compact 复用 Agent 的摘要生成逻辑，不在主控读取远程 cwd。具体协议、兼容范围和扩展方式见 [QQ CLI 命令](qq-cli-commands.md)。

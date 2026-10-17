@@ -2,7 +2,7 @@
 
 支持多个独立账号的云 Agent：推理循环在服务器，工具在各自选择的 Windows / Linux 实例上执行，官方 QQBot 与可选的个人 QQ / OneBot 是并存的聊天入口。服务器本地实例仅属于管理员。
 
-本项目基于 [Peri](https://github.com/KonghaYao/peri) 的 Rust Agent 核心，拆出原生执行器并加入账号、设备连接、网关和常驻服务。发布包不包含 TUI。保留依赖所需的编译期提示词与 workflow 资源。当前版本 `v0.6.0`，仍处于预览阶段。
+本项目基于 [Peri](https://github.com/KonghaYao/peri) 的 Rust Agent 核心，拆出原生执行器并加入账号、设备连接、网关和常驻服务。发布包不包含 TUI。保留依赖所需的编译期提示词与 workflow 资源。当前版本 `v0.6.1`，仍处于预览阶段。
 
 ## 能做什么
 
@@ -61,6 +61,10 @@ cargo build --release --locked -p peri-cloud --bin peri-cloud-host -p peri-execu
 
 | 命令 | 用途 |
 | --- | --- |
+| `/new` / `/compact` / `/clear` | 新会话、摘要压缩、清空当前上下文 |
+| `/history` / `/resume 会话ID` | 查看与恢复历史会话 |
+| `/loop 目标` / `/rewind 消息ID --no-revert-files` | 原生循环目标与纯上下文回退 |
+| `/help` / `/commands` | CLI 命令用法；`/help all` 查看全部原生入口的接入状态 |
 | `菜单` / `/菜单` / `/帮助` | 打开操作卡片 |
 | `实例` / `/实例` | 打开实例选择卡片 |
 | `/选 序号` | 平台拒绝原生按钮时，选择最近一张菜单的选项 |
@@ -120,3 +124,5 @@ QQ 日常操作与交互审计：[QQ 优先交互说明](docs/qq-experience-audi
 后续设计：[跨设备上下文、模型/API 与渐进式 Skill](docs/context-and-model-control-design-20261017.md)（方案，尚未实现）。
 
 架构升级与产品边界见 [实况审计与目标方案](docs/architecture-upgrade-20261017.md)，接口、独立部署及恢复见 [控制接口与运维](docs/control-operations.md)。
+
+QQ 原生命令发现、执行 API、扩展接口和兼容范围：[QQ CLI 命令](docs/qq-cli-commands.md)。

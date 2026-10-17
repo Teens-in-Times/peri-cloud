@@ -285,7 +285,7 @@ impl Gateway {
             .await?;
         Ok(frozen)
     }
-    async fn inherit_model_selection(
+    pub(super) async fn inherit_model_selection(
         &self,
         principal: Uuid,
         from: Uuid,

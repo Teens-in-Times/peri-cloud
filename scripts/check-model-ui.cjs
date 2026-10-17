@@ -23,6 +23,7 @@ w.fetch=async(url,options)=>{
  if(url==='/api/conversations')return ok([{...session,phase:'idle',label:'空闲',permission:'默认',has_result:false}]);
  if(url==='/api/interactions')return ok([]);
  if(url==='/api/conversations/session-1/tasks')return ok({session_id:'session-1',turn_id:'turn-1',state:'queued'});
+ if(url==='/api/conversations/session-1/commands')return ok({session_id:'session-1',state:'accepted',text:null,task:{turn_id:'compact-1'}});
  if(url==='/api/aggregate/model')return ok({model:null,revision:1});
  if(url==='/api/logout')return ok({});
  throw new Error('Unexpected endpoint '+url);
@@ -48,6 +49,11 @@ for(const name of ['workspace.js','models.js','portal.js'])w.eval(fs.readFileSyn
  assert(!calls.some(c=>c.url.endsWith('/tasks')));
  get('confirmation-allow').click();get('confirmation-allow').click();await settle();
  const submitted=calls.filter(c=>c.url.endsWith('/tasks'));assert.equal(submitted.length,1);assert(submitted[0].body.request_id);assert(submitted[0].body.confirmed);
+ button(get('conversation-activity'),'配置并提交任务').click();await settle();
+ get('confirmation-details').querySelector('textarea').value='/compact';
+ get('confirmation-allow').click();get('confirmation-allow').click();await settle();
+ const commands=calls.filter(c=>c.url.endsWith('/commands'));assert.equal(commands.length,1);assert.equal(commands[0].body.command,'/compact');assert(commands[0].body.confirmed);
+ assert.equal(calls.filter(c=>c.url.endsWith('/tasks')).length,1,'CLI input must use command execution, not an LLM prompt');
  assert(calls.every(c=>!c.url.includes('/chat/completions')),'configuration never invokes inference');
  get('logout').click();await settle();assert.equal(get('aggregate-models').children.length,0);assert.equal(get('confirmation-details').children.length,0);
  console.log('PASS: central model UI, escaped channel names, exact mutation confirmation, task context, duplicate submission, no LLM management, logout clearing');

@@ -17,7 +17,9 @@ pub use topology::GatewayView;
 pub(crate) use web_entry::{WebAdapter, WEB_ADAPTER};
 
 pub use connector::{NativeSessionConnector, SessionConnector};
-pub use router::{ConversationActivity, Gateway, SavedResultPage, TaskReceipt, WorkspaceSelection};
+pub use router::{
+    CommandReceipt, ConversationActivity, Gateway, SavedResultPage, TaskReceipt, WorkspaceSelection,
+};
 pub use types::{
     ChannelRoute, Delivery, DeliveryBody, DeliveryError, GatewayReceipt, InboundMessage,
     InteractionAction, InteractionCard, MenuButton, MenuCard, MessageAdapter, ReceiptState,

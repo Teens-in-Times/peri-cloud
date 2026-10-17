@@ -146,6 +146,45 @@ impl CloudRuntime {
         Ok(id)
     }
 
+    /// Rebind an idle, owned session to its newly selected chat origin. Never
+    /// replace a broker while a turn, approval or unknown execution is live.
+    pub(crate) async fn rebind_idle(
+        &self,
+        principal: Uuid,
+        agent: Arc<CloudAgent>,
+        broker: Arc<dyn UserInteractionBroker>,
+    ) -> Result<(), RuntimeError> {
+        let frozen = agent.frozen_session(principal);
+        let state = self.journal.session(principal, frozen.session_id).await?;
+        if frozen != state.frozen
+            || !state.execution_settled()
+            || self.journal.has_unconfirmed_turn(frozen.session_id).await?
+        {
+            return Err(StateError::Busy.into());
+        }
+        let owner = self.ownership.lock();
+        if owner.closing {
+            return Err(RuntimeError::Closing);
+        }
+        if owner
+            .tasks
+            .values()
+            .any(|task| task.session_id == frozen.session_id && !task.handle.is_finished())
+        {
+            return Err(StateError::Busy.into());
+        }
+        self.sessions.write().insert(
+            frozen.session_id,
+            Arc::new(LiveSession {
+                principal_id: principal,
+                agent,
+                broker,
+                classifier: None,
+            }),
+        );
+        Ok(())
+    }
+
     pub fn journal(&self) -> &Arc<CloudJournal> {
         &self.journal
     }

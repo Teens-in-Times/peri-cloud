@@ -92,14 +92,7 @@ pub(super) async fn full_compact_inner(
     let summary = if has_history {
         // 保留历史的角色、工具配对和完整正文；摘要指令只追加到派生请求，
         // 不回写原 transcript，也不提供可执行工具。
-        let mut messages = AgentModelBridge::convert_messages(&visible)?;
-        messages.insert(0, ModelMessage::system_text(SUMMARY_SYSTEM_PROMPT));
-        messages.push(ModelMessage::user_text(SUMMARY_USER_PROMPT.replace(
-            "{summary_target_tokens}",
-            &(config.summary_max_tokens / 2).max(1).to_string(),
-        )));
-        let request = ModelRequest::new(messages).with_max_tokens(config.summary_max_tokens);
-        complete_summary(llm, request).await?
+        summarize_visible(&visible, llm, config).await?
     } else {
         // 全 System / 空历史仍保持命令输出 Human-first 的既有契约。
         "No conversation history to compact.".to_owned()
@@ -152,6 +145,39 @@ pub(super) async fn full_compact_inner(
         changed_fields: 0,
         no_op_candidates: 0,
     })
+}
+
+/// Generate the standard Full Compact summary without committing storage or
+/// reading host files. A host with its own journal commits flags and the summary
+/// atomically through that journal; no tool or executor operation is requested.
+pub async fn summarize_context(
+    transcript: &MessageTranscript,
+    llm: &dyn peri_model::Model,
+    config: &CompactConfig,
+) -> AgentResult<String> {
+    let visible = super::projection::render_persisted_llm_view(
+        transcript,
+        &AgentModelBridge::projection_capabilities(llm),
+    )?;
+    summarize_visible(&visible, llm, config).await
+}
+
+async fn summarize_visible(
+    visible: &[BaseMessage],
+    llm: &dyn peri_model::Model,
+    config: &CompactConfig,
+) -> AgentResult<String> {
+    let mut messages = AgentModelBridge::convert_messages(visible)?;
+    messages.insert(0, ModelMessage::system_text(SUMMARY_SYSTEM_PROMPT));
+    messages.push(ModelMessage::user_text(SUMMARY_USER_PROMPT.replace(
+        "{summary_target_tokens}",
+        &(config.summary_max_tokens / 2).max(1).to_string(),
+    )));
+    complete_summary(
+        llm,
+        ModelRequest::new(messages).with_max_tokens(config.summary_max_tokens),
+    )
+    .await
 }
 
 // 续写状态只属于本次摘要计算；完整成功前不向 canonical transcript 写半截摘要。

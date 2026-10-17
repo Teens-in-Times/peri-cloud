@@ -2,6 +2,7 @@
 
 pub mod aggregation;
 mod assembly;
+pub mod commands;
 mod core;
 pub mod gateway;
 pub mod host;

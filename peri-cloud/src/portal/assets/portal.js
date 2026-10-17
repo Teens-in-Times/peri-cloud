@@ -320,8 +320,14 @@ function openTaskForm(session) {
   form.addEventListener('submit',event=>{event.preventDefault();byId('confirmation-allow').click();});
   confirm('确认任务与执行目标',session.device_name+' · '+session.workspace+' · 会话 '+session.session_id,form,async()=>{
     if(!form.reportValidity())throw new Error('请填写任务目标。');
-    await api('/api/conversations/'+session.session_id+'/tasks',{request_id,confirmed:true,prompt:input.value});
-    notice('任务已受理。状态、待办和结果会在这条会话中更新。');
+    if(input.value.trim().startsWith('/')) {
+      const result=await api('/api/conversations/'+session.session_id+'/commands',{request_id,confirmed:true,command:input.value});
+      if(result.session_id)window.history.replaceState(null,'','/?session='+encodeURIComponent(result.session_id)+'#activity-panel');
+      notice(result.text||'命令已受理。状态、待办和结果会在这条会话中更新。');
+    } else {
+      await api('/api/conversations/'+session.session_id+'/tasks',{request_id,confirmed:true,prompt:input.value});
+      notice('任务已受理。状态、待办和结果会在这条会话中更新。');
+    }
   },undefined,'确认提交任务');
 }
 function cancelTask(activity) {

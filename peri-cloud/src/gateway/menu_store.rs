@@ -31,6 +31,7 @@ pub(super) enum MenuAction {
         revision: i64,
     },
     Home,
+    Commands,
     Personal {
         section: String,
         page: usize,

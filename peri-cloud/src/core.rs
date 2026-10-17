@@ -31,6 +31,9 @@ use uuid::Uuid;
 use crate::assembly::{CloudAssemblyContext, CloudChainAssembler};
 use crate::reply::{replies, ChatReply};
 
+#[path = "compact.rs"]
+mod compact;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("cloud session does not match its frozen device binding")]
@@ -87,6 +90,7 @@ pub struct CloudAgent {
     frozen_prompt: String,
     context_window: u32,
     turn_gate: Mutex<()>,
+    commands: Arc<peri_acp_types::command::CommandRegistry>,
     account_models: Option<Arc<crate::models::AccountModels>>,
 }
 
@@ -111,8 +115,17 @@ impl CloudAgent {
             frozen_prompt,
             context_window,
             turn_gate: Mutex::new(()),
+            commands: crate::commands::native_registry(),
             account_models: None,
         })
+    }
+
+    pub fn with_commands(
+        mut self,
+        commands: Arc<peri_acp_types::command::CommandRegistry>,
+    ) -> Self {
+        self.commands = commands;
+        self
     }
 
     pub fn with_account_models(mut self, models: Arc<crate::models::AccountModels>) -> Self {
@@ -139,7 +152,10 @@ impl CloudAgent {
             principal,
             max_bytes: limits.max_user_data_bytes,
         };
+        let context_only = matches!(&request.prompt, MessageContent::Text(text)
+            if self.commands.resolve(text).is_some_and(|command|matches!(command.entry.fullname.as_str(), "core:clear"|"core:rewind")));
         let inner = match &self.account_models {
+            Some(_) if context_only => self.model.clone(),
             Some(models) => models
                 .resolve_for_turn(
                     principal,
@@ -163,7 +179,7 @@ impl CloudAgent {
 
     async fn run_context_turn(
         &self,
-        request: CloudTurnRequest,
+        mut request: CloudTurnRequest,
         prompt: &str,
         model: Arc<dyn Model>,
         personal: Option<crate::personal::PersonalScope>,
@@ -172,6 +188,90 @@ impl CloudAgent {
             return Err(Error::InvalidIterationLimit);
         }
         let _gate = self.turn_gate.lock().await;
+        if let MessageContent::Text(text) = &request.prompt {
+            if text.starts_with('/') {
+                if let Some(resolved) = self.commands.resolve(text) {
+                    let parsed = resolved
+                        .entry
+                        .args_schema
+                        .as_ref()
+                        .map(|schema| crate::commands::parse_arguments(schema, &resolved.args));
+                    if parsed.as_ref().is_some_and(Result::is_err)
+                        || (resolved.entry.fullname == "core:loop" && resolved.args.is_empty())
+                    {
+                        return Ok(self.command_feedback(
+                            request,
+                            TurnStatus::Failed,
+                            "命令参数不正确。发送 /help 查看用法。",
+                        ));
+                    }
+                    if resolved.entry.fullname == "core:compact" {
+                        return Ok(self.compact_turn(request, model).await);
+                    }
+                    if matches!(
+                        resolved.entry.fullname.as_str(),
+                        "core:clear" | "core:rewind"
+                    ) {
+                        return Ok(self.history_command(request, &resolved));
+                    }
+                    let mut dependencies = peri_acp_types::command::DependencyBag::default();
+                    if let Some(scope) = &personal {
+                        dependencies.insert(
+                            std::any::TypeId::of::<crate::commands::CloudCommandScope>(),
+                            Arc::new(crate::commands::CloudCommandScope {
+                                principal_id: scope.principal,
+                                session_id: self.session_id,
+                                turn_id: request.turn_id,
+                                device_id: self.remote.device_id(),
+                            }),
+                        );
+                    }
+                    let mut context = peri_acp_types::command::CommandContext::new(
+                        self.session_id.to_string(),
+                        request
+                            .history
+                            .iter()
+                            .filter_map(|p| p.as_message().cloned())
+                            .collect(),
+                        self.remote.binding().workspace.clone(),
+                        Arc::new(compact::NoCommandEvents),
+                        request.cancellation.clone(),
+                        dependencies,
+                    );
+                    context.raw_text = text.clone();
+                    context.args = resolved.args;
+                    context.supports_inject = true;
+                    context.parsed_args = parsed.and_then(Result::ok);
+                    context.auxiliary_model = Some(model.clone());
+                    let result = tokio::select! { biased;
+                        _ = request.cancellation.cancelled() => None,
+                        result = resolved.entry.handler.execute(context) => Some(result),
+                    };
+                    match result {
+                        Some(peri_acp_types::command::CommandOutcome::Inject(text)) => {
+                            request.prompt = MessageContent::Text(text)
+                        }
+                        Some(peri_acp_types::command::CommandOutcome::Done(result)) => {
+                            return Ok(self.handler_result(request, result));
+                        }
+                        Some(peri_acp_types::command::CommandOutcome::Delegate(_)) => {
+                            return Ok(self.command_feedback(
+                                request,
+                                TurnStatus::Failed,
+                                "命令的目标执行器尚未接入，未执行或转交给模型。",
+                            ))
+                        }
+                        None => {
+                            return Ok(self.command_feedback(
+                                request,
+                                TurnStatus::Interrupted,
+                                "命令已取消；状态请通过 /status 核对。",
+                            ))
+                        }
+                    }
+                }
+            }
+        }
         let assembly = CloudAssemblyContext {
             remote: self.remote.clone(),
             broker: request.broker,

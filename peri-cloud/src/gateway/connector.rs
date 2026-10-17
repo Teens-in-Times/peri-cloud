@@ -16,6 +16,9 @@ use crate::CloudAgent;
 /// SSH login or bearer tokens. Existing frozen sessions must reopen unchanged.
 #[async_trait]
 pub trait SessionConnector: Send + Sync {
+    fn command_registry(&self) -> Option<Arc<peri_acp_types::command::CommandRegistry>> {
+        None
+    }
     /// Read-only identity authentication, without opening a session or a job.
     async fn check_connection(&self, _device: &DeviceRecord) -> GatewayResult<&'static str> {
         Err(GatewayError::Connection)
@@ -57,6 +60,7 @@ pub trait SessionConnector: Send + Sync {
 /// registers clients; automatic SSH establishment is a separate host concern.
 pub struct NativeSessionConnector {
     clients: RwLock<HashMap<Uuid, Arc<DeviceClient>>>,
+    commands: Arc<peri_acp_types::command::CommandRegistry>,
     model: Arc<dyn Model>,
     system_prompt: String,
     context_window: u32,
@@ -74,6 +78,7 @@ impl NativeSessionConnector {
         }
         Ok(Arc::new(Self {
             clients: RwLock::new(HashMap::new()),
+            commands: crate::commands::native_registry(),
             model,
             system_prompt,
             context_window,
@@ -81,6 +86,12 @@ impl NativeSessionConnector {
         }))
     }
 
+    pub fn register_command(
+        &self,
+        entry: peri_acp_types::command::command_route::RouteEntry,
+    ) -> Result<(), peri_acp_types::command::RegisterError> {
+        self.commands.register(entry)
+    }
     pub fn register_client(&self, client: Arc<DeviceClient>) {
         self.clients.write().insert(client.info().device_id, client);
     }
@@ -91,6 +102,9 @@ impl NativeSessionConnector {
 
 #[async_trait]
 impl SessionConnector for NativeSessionConnector {
+    fn command_registry(&self) -> Option<Arc<peri_acp_types::command::CommandRegistry>> {
+        Some(self.commands.clone())
+    }
     async fn check_connection(&self, device: &DeviceRecord) -> GatewayResult<&'static str> {
         let client = self
             .clients
@@ -174,6 +188,7 @@ impl SessionConnector for NativeSessionConnector {
             .map_err(|_| GatewayError::Connection)?;
         let mut agent = CloudAgent::new(session_id, remote, self.model.clone(), prompt, window)
             .map_err(|_| GatewayError::Connection)?;
+        agent = agent.with_commands(self.commands.clone());
         if let Some(models) = self.account_models.read().clone() {
             agent = agent.with_account_models(models);
         }

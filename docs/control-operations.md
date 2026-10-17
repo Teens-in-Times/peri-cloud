@@ -115,3 +115,5 @@ schema 7 → 8 是一个 SQLite 事务，只添加 model_selections、control_op
 - **QQ 异常**：官方 WebSocket ready 与 OneBot 桥鉴权分开观测；桥连接不代表个人 QQ 已登录。原始平台载荷、Key、Cookie 不展示给浏览器。
 
 自动验证：Windows cargo test/fmt/clippy、两个实际嵌入脚本 DOM 回归；Linux 只构建和启动/认证 smoke。隔离执行器测试断言审批前无写入、批准后真实文件存在、重复提交不重复执行、其他账号不能提交/审批，并验证 QQ 取消网页对同会话发起的任务。真实手机渲染和新增平台适配器仍需独立验收。
+
+QQ 原生 Slash 命令、统一命令发现/执行 API、服务器注册接口和原生兼容矩阵见 [QQ CLI 命令](qq-cli-commands.md)。命令接口不会开放任意 Shell，也不代替原工具审批。

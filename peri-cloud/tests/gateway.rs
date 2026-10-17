@@ -35,6 +35,8 @@ const PASSWORD: &str = "fixture-cloud-owner-password-for-argon2";
 const VERIFIER: &str = "fixture-native-pkce-verifier-with-at-least-43-characters";
 #[path = "gateway/access.rs"]
 mod access_tests;
+#[path = "gateway/commands.rs"]
+mod command_tests;
 #[path = "gateway/experience.rs"]
 mod experience_tests;
 #[path = "gateway/menu_details.rs"]

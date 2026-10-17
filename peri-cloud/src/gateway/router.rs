@@ -19,6 +19,13 @@ use crate::identity::{DeviceRecord, IdentityError, IdentityService};
 use crate::state::StateError;
 use crate::CloudRuntime;
 
+#[path = "command_api.rs"]
+mod command_api;
+#[path = "history.rs"]
+mod history;
+pub use command_api::CommandReceipt;
+#[path = "commands.rs"]
+mod commands;
 #[path = "model_controls.rs"]
 mod model_controls;
 #[path = "task_control.rs"]
@@ -268,7 +275,7 @@ impl Gateway {
                     GatewayError::Identity(IdentityError::RateLimited) => "请求过于频繁，请稍后重试。",
                     GatewayError::Busy | GatewayError::State(StateError::Busy) => "当前任务仍在运行或执行状态未确认；请先等待完成或发送 /取消。",
                     GatewayError::Connection => "无法建立工作区连接；请检查执行器、SSH 连接，以及路径是否是实例上存在且可访问的目录。",
-                    GatewayError::Invalid => "参数不正确。发送“菜单”打开操作卡片。",
+                    GatewayError::Invalid => "参数不正确。发送 /help 查看命令，或发送“菜单”打开操作卡片。",
                     GatewayError::StaleInteraction => "卡片已过期、已使用或会话已改变。提问可发送 /问题 重开，其他操作发送“菜单”。",
                     GatewayError::State(StateError::InvocationConflict) => "内容已被另一处修改，本次确认未生效。请查看最新内容后重新操作。",
                     _ => "这次请求未能完成，请检查云服务状态。没有自动重试执行。",
@@ -283,14 +290,46 @@ impl Gateway {
         &self,
         message: &InboundMessage,
     ) -> GatewayResult<Option<(DeliveryBody, Option<Uuid>)>> {
+        let mut normalized = message.clone();
+        normalized.text = commands::normalize(&message.text);
+        if let Some(registry) = self.connector.command_registry() {
+            if let Some(command) = registry
+                .resolve(message.text.trim())
+                .or_else(|| registry.resolve(&normalized.text))
+            {
+                if let Some(schema) = &command.entry.args_schema {
+                    if crate::commands::parse_arguments(schema, &command.args).is_err() {
+                        return Ok(Some(("命令参数不正确。发送 /help 查看用法。".into(), None)));
+                    }
+                }
+                normalized.text = if command.args.is_empty() {
+                    format!("/{}", command.entry.fullname)
+                } else {
+                    format!("/{} {}", command.entry.fullname, command.args)
+                };
+            }
+        }
+        let message = &normalized;
         let text = message.text.trim();
-        let text = match text {
-            "/help" => "/帮助",
-            "/status" => "/状态",
-            "/stop" | "/停止" => "/取消",
-            "/result" => "/结果",
-            other => other,
-        };
+        if text == "/help" || text.starts_with("/help ") {
+            return Ok(Some((
+                self.command_help(text.strip_prefix("/help").unwrap().trim())
+                    .into(),
+                self.identity
+                    .resolve_channel(&message.route.identity)
+                    .await
+                    .ok(),
+            )));
+        }
+        if ["/new", "/compact", "/pwd"]
+            .iter()
+            .any(|command| text.starts_with(&format!("{command} ")))
+        {
+            return Ok(Some((
+                "这些命令不接收参数。发送 /help 查看用法。".into(),
+                None,
+            )));
+        }
         if let Some(code) = text.strip_prefix("/绑定 ") {
             self.identity
                 .claim_pair_code(message.route.identity.clone(), code.trim())
@@ -308,6 +347,9 @@ impl Gateway {
                 .is_err()
         {
             return Ok(Some(("先在个人电脑的登录入口生成关联口令，再发送 /绑定 口令，回到网页确认账号。关联后发送“菜单”，即可选择实例、工作区和权限；选好后直接聊天。".into(), None)));
+        }
+        if let Some(body) = self.unavailable_command(text) {
+            return Ok(Some((body.into(), None)));
         }
         let (principal, devices) = self
             .identity
@@ -457,6 +499,37 @@ impl Gateway {
             .iter()
             .find(|device| device.id == state.frozen.device_id)
             .ok_or(IdentityError::Forbidden)?;
+        if text == "/new" {
+            let body = self
+                .new_chat_session(&message.route, principal, device, session)
+                .await?;
+            return Ok(Some((body.into(), Some(principal))));
+        }
+        if text == "/pwd" {
+            return Ok(Some((
+                format!(
+                    "当前会话：{}\n设备：{}\n目录：{}\n权限：{}",
+                    session,
+                    device.name,
+                    state.frozen.binding.workspace,
+                    permission_label(state.permissions()?)
+                )
+                .into(),
+                Some(principal),
+            )));
+        }
+        if text == "/threads" || text.starts_with("/threads ") || text.starts_with("/resume ") {
+            let body = self
+                .history_control(&message.route, principal, session, text)
+                .await?;
+            return Ok(Some((body.into(), Some(principal))));
+        }
+        if matches!(text, "/compact" | "/core:compact") && state.history.is_empty() {
+            return Ok(Some((
+                "当前会话没有历史可压缩，没有调用模型。".into(),
+                Some(principal),
+            )));
+        }
         if let Some(path) = text.strip_prefix("/工作区 ") {
             let frozen = self
                 .change_workspace(&message.route, principal, device, session, path.trim())
@@ -544,8 +617,16 @@ impl Gateway {
                 )));
             }
         }
-        if text.starts_with('/') {
-            return Err(GatewayError::Invalid);
+        if text.starts_with('/')
+            && !self
+                .connector
+                .command_registry()
+                .is_some_and(|r| r.resolve(text).is_some())
+        {
+            return Ok(Some((
+                "未知命令或参数不正确。发送 /help 查看完整用法；本次没有调用 Agent。".into(),
+                Some(principal),
+            )));
         }
         self.ensure_task_session(&message.route, principal, device, &state)
             .await?;

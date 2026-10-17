@@ -78,6 +78,7 @@ impl Gateway {
             .as_ref()
             .and_then(|s| devices.iter().find(|d| d.id == s.frozen.device_id));
         match action {
+            MenuAction::Commands => return Ok(self.command_help("").into()),
             MenuAction::AggregateModels { page } => {
                 return Ok(DeliveryBody::Menu {
                     card: self
@@ -174,6 +175,7 @@ impl Gateway {
                         ));
                     }
                 }
+                choices.push(("命令帮助 /help".into(), MenuAction::Commands));
                 choices.insert(0, ("选择设备".into(), MenuAction::Instances { offset: 0 }));
                 choices.push((
                     "个人设置".into(),

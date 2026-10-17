@@ -4,6 +4,7 @@
 mod access;
 mod aggregate;
 mod browser;
+mod commands;
 mod conversations;
 mod interactions;
 mod native;
@@ -209,6 +210,8 @@ fn build_router(portal: Portal) -> Router {
             post(tasks::submit).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route("/api/conversations/{id}/cancel", post(tasks::cancel))
+        .route("/api/commands", get(commands::list))
+        .route("/api/conversations/{id}/commands", post(commands::execute))
         .route("/api/conversations", get(conversations::list))
         .route("/api/conversations/{id}/result", get(conversations::result))
         .route("/api/instances/{id}/browse", post(workspaces::browse))

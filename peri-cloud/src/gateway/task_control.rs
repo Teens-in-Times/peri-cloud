@@ -69,6 +69,14 @@ impl Gateway {
         prompt: String,
     ) -> GatewayResult<TaskReceipt> {
         self.identity.browser_scope(actor).await?;
+        if prompt.trim().starts_with('/')
+            && !self
+                .connector
+                .command_registry()
+                .is_some_and(|registry| registry.resolve(prompt.trim()).is_some())
+        {
+            return Err(GatewayError::Invalid);
+        }
         if prompt.trim().is_empty() || prompt.len() > self.limits().max_prompt_bytes {
             return Err(GatewayError::Invalid);
         }
@@ -173,7 +181,7 @@ impl Gateway {
             .await?;
         result.map(Into::into)
     }
-    async fn browser_task_route(
+    pub(super) async fn browser_task_route(
         &self,
         actor: &Authenticated,
         session: Uuid,
