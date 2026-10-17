@@ -1,0 +1,19 @@
+# Upstream files intentionally modified by this distribution.
+# One path per line.  Keep this list minimal: every entry weakens the
+# byte-identical guarantee.  Paths not present in the manifest are reported
+# as notes, not failures.
+peri-acp-types/Cargo.toml
+peri-acp-types/src/lib.rs
+peri-agent/Cargo.toml
+peri-agent/src/agent/async_tasks/shell.rs
+peri-middlewares/Cargo.toml
+peri-middlewares/src/tools/ask_user_tool.rs
+peri-middlewares/src/tools/ask_user_tool_test.rs
+peri-model/Cargo.toml
+peri-model/src/openai_compatible/mod.rs
+peri-process/Cargo.toml
+peri-process/src/lib.rs
+peri-resources/Cargo.toml
+peri-resources/src/sessions/discovery.rs
+peri-js-runtime/Cargo.toml
+peri-workflow/Cargo.toml
