@@ -42,7 +42,7 @@ pub(crate) fn plain_chat(input: &str) -> String {
                 }
                 output.push_str(&rest[..start]);
                 output.push_str(&rest[start + 1..middle]);
-                output.push_str("（");
+                output.push('（');
                 output.push_str(address);
                 output.push('）');
                 rest = &rest[end + 1..];

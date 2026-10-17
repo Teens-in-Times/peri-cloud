@@ -629,7 +629,7 @@ async fn structured_controls_require_browser_authentication_and_csrf_even_withou
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::FORBIDDEN
+            StatusCode::UNAUTHORIZED
         );
     }
     let owner_login = f.identity.login("owner", PASSWORD.into()).await.unwrap();
