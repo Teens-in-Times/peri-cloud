@@ -6,6 +6,7 @@ w.scrollTo=()=>{};w.setInterval=()=>0;
 w.HTMLDialogElement.prototype.showModal=function(){this.open=true;};w.HTMLDialogElement.prototype.close=function(){this.open=false;};
 const ok=value=>({ok:true,status:200,json:async()=>value});const settle=()=>new Promise(r=>setTimeout(r,25));
 const name='<img src=x onerror=alert(1)> full provider';
+let selectedModel=null;
 let channel={id:7,name,type:1,status:1,models:'model-a,model-b',group:'default',priority:10,weight:10,base_url:'https://api.example.test',model_mapping:'{}',test_time:0,response_time:0,revision:'r1'};
 const session={session_id:'session-1',device_id:'device-1',device_name:'Device',workspace:'/srv/app',adapter:'qq',conversation_id:'group',busy:false,default_workspace:'/srv',known_workspaces:[]};
 const owner={principal:{id:'owner',display_name:'Owner'},is_admin:true,personal_data:true,service:{agent_enabled:true,model_gateway:true},gateways:[{adapter:'qq',label:'QQ',linked_identities:1}],devices:[],channels:[],pending_pair_claims:[]};
@@ -15,7 +16,7 @@ w.fetch=async(url,options)=>{
  if(url==='/api/account')return ok(owner);
  if(url==='/api/user-data')return ok({data:{instructions:'',memory:'',revision:0},usage:{turns:0,model_requests:0},limits:{daily_turns:10,daily_model_requests:10,max_active_per_user:1,max_user_data_bytes:8192}});
  if(url==='/api/model')return ok({enabled:true,aggregated:true});
- if(url==='/api/aggregate')return ok({enabled:true,admin:true,selection:{model:null,revision:0},models:['model-a','model-b'],default_model:'model-a',inference_base:'http://127.0.0.1:3000/v1'});
+ if(url==='/api/aggregate')return ok({enabled:true,admin:true,selection:{model:selectedModel,revision:selectedModel?1:0},models:['model-a','model-b'],default_model:'model-a',inference_base:'http://127.0.0.1:3000/v1'});
  if(url.startsWith('/api/aggregate/channels?'))return ok({items:[channel],total:1,page:0});
  if(url==='/api/aggregate/channel-command'){channel={...channel,status:2,revision:'r2'};return ok({success:true});}
  if(url==='/api/workspaces')return ok([session]);
@@ -32,6 +33,7 @@ for(const name of ['workspace.js','models.js','portal.js'])w.eval(fs.readFileSyn
  await settle();
  assert.equal(get('model-form').hidden,true,'central mode must not collect separate per-user upstream keys');
  assert(get('model-current').textContent.includes('New API'));
+ selectedModel='model-b';get('refresh').click();await settle();assert(get('model-current').textContent.includes('model-b'),'explicit refresh must see model changes from another entry');
  const button=(root,label)=>[...root.querySelectorAll('button')].find(b=>b.textContent===label);
  button(get('aggregate-models'),'载入渠道').click();await settle();
  assert(get('aggregate-channels').textContent.includes(name));assert.equal(get('aggregate-channels').querySelectorAll('img').length,0);

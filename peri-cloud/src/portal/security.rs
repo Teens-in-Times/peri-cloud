@@ -71,6 +71,20 @@ impl IntoResponse for PortalError {
                 (StatusCode::BAD_REQUEST, "invalid_workspace")
             }
             Self::Interaction(
+                crate::gateway::GatewayError::RecoveryRequired
+                | crate::gateway::GatewayError::Runtime(crate::RuntimeError::ExecutionUnconfirmed),
+            ) => (StatusCode::CONFLICT, "execution_unknown"),
+            Self::Interaction(
+                crate::gateway::GatewayError::State(crate::state::StateError::Limit)
+                | crate::gateway::GatewayError::Runtime(crate::RuntimeError::State(
+                    crate::state::StateError::Limit,
+                )),
+            ) => (StatusCode::TOO_MANY_REQUESTS, "turn_limit"),
+            Self::Interaction(
+                crate::gateway::GatewayError::Closing
+                | crate::gateway::GatewayError::Runtime(crate::RuntimeError::Closing),
+            ) => (StatusCode::SERVICE_UNAVAILABLE, "service_closing"),
+            Self::Interaction(
                 crate::gateway::GatewayError::Busy
                 | crate::gateway::GatewayError::State(crate::state::StateError::Busy),
             ) => (StatusCode::CONFLICT, "workspace_busy"),
@@ -231,4 +245,44 @@ pub(super) fn set_cookies(portal: &Portal, session: &str, csrf: &str, max_age: u
         );
     }
     headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn task_outcome_errors_remain_distinct_from_identity_outages() {
+        for (error, status, code) in [
+            (
+                crate::gateway::GatewayError::RecoveryRequired,
+                StatusCode::CONFLICT,
+                "execution_unknown",
+            ),
+            (
+                crate::gateway::GatewayError::Runtime(crate::RuntimeError::ExecutionUnconfirmed),
+                StatusCode::CONFLICT,
+                "execution_unknown",
+            ),
+            (
+                crate::gateway::GatewayError::Runtime(crate::RuntimeError::State(
+                    crate::state::StateError::Limit,
+                )),
+                StatusCode::TOO_MANY_REQUESTS,
+                "turn_limit",
+            ),
+            (
+                crate::gateway::GatewayError::Closing,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_closing",
+            ),
+        ] {
+            let response = PortalError::Interaction(error).into_response();
+            assert_eq!(response.status(), status);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"], code);
+        }
+    }
 }

@@ -36,6 +36,9 @@ const errors = {
   invalid_workspace: '请输入实例上的绝对路径，例如 Windows 的 C:\\Projects\\demo 或 Linux 的 /srv/demo。',
   workspace_busy: '当前任务仍在运行或执行结果未确认，请先等待完成，或在聊天中发送 /取消。',
   workspace_unavailable: '无法连接这个工作区。请检查执行器与 SSH 连接，并确认该目录存在且可以访问。',
+  execution_unknown: '任务受理或执行结果待核实。请先查看这条会话的状态，不要新建任务重复提交。',
+  turn_limit: '任务并发或今日额度已达上限，请先查看用量与正在运行的任务。',
+  service_closing: '主控正在关闭，暂不接收新任务。',
   identity_unavailable: '云服务暂时无法处理请求，请稍后再试。'
 };
 
@@ -535,7 +538,10 @@ byId('logout').addEventListener('click', () => action(byId('logout'), async () =
   clearPersonal();
   byId('logout').hidden = true; show('entry');
 }));
-byId('refresh').addEventListener('click', () => action(byId('refresh'), refresh));
+byId('refresh').addEventListener('click', () => action(byId('refresh'), async()=>{
+  if(activeAccount?.service?.model_gateway)modelOwner=null;
+  await refresh();
+}));
 byId('service-stop').addEventListener('click', () => confirm('关闭云服务？', '将停止接收新消息并结束当前任务。', '', async () => {
   await api('/api/service/shutdown', {}); activeAccount = null;
   byId('service-controls').hidden = true;
