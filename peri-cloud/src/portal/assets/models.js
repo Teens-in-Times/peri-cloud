@@ -97,10 +97,10 @@ window.ModelView = (() => {
       if(name==='priority'||name==='weight'){input.min='0';input.max='10000';}
       label.append(input);form.append(label);
     }
-    form.append(el('p','地址应填写 New API 所需的基础地址。新渠道使用 HTTPS；现有内部 HTTP 地址可以原样保留。分组应包含内部调用凭据使用的组。密钥不会回显，也不会进入模型上下文。','subtle'));
+    form.append(el('p','地址应填写 New API 所需的基础地址。新渠道使用 HTTPS；现有内部 HTTP 地址可以原样保留。更换端点须重新填写密钥。分组应包含内部调用凭据使用的组。密钥不会回显，也不会进入模型上下文。','subtle'));
     const request_id=crypto.randomUUID();
     form.addEventListener('submit',event=>{event.preventDefault();get('confirmation-allow').click();});
-    hooks.confirm(channel?'编辑 API 渠道':'新增 API 渠道','保存前核对名称、地址、模型与分组。修改将直接提交到现有 New API。',form,async()=>{
+    hooks.confirm(channel?'编辑 API 渠道':'新增 API 渠道','这是共享渠道配置，会影响使用它的所有会话的新请求。仅切换自己的模型，请使用会话模型选择。更换地址时须重填密钥。',form,async()=>{
       if(!form.reportValidity())throw new Error('请补全必要字段。');
       const data=Object.fromEntries(new FormData(form));data.type=Number(data.type);data.priority=Number(data.priority);data.weight=Number(data.weight);data.key=data.key||null;
       const action=channel?{kind:'update',id:channel.id,revision:channel.revision,fields:data}:{kind:'create',fields:data};

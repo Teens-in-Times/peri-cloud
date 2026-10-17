@@ -214,6 +214,13 @@ fn validate_fields(
         return Err(AggregateError::Invalid);
     }
     let base = Url::parse(&f.base_url).map_err(|_| AggregateError::Invalid)?;
+    if !creating
+        && original_base != Some(f.base_url.as_str())
+        && f.key.as_ref().is_none_or(|k| k.is_empty())
+    {
+        // A retained upstream credential must not silently follow a new address.
+        return Err(AggregateError::Invalid);
+    }
     let existing_http = original_base == Some(f.base_url.as_str()) && base.scheme() == "http";
     if (base.scheme() != "https" && !existing_http)
         || base.host_str().is_none()

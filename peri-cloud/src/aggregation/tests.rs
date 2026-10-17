@@ -185,6 +185,35 @@ async fn management_is_deterministic_redacted_owned_versioned_and_idempotent() {
         assert!(!encoded.contains(secret));
     }
     let revision = page.items[0].revision.clone();
+    let changed_endpoint = ChannelCommand {
+        request_id: Uuid::new_v4(),
+        confirmed: true,
+        action: ChannelAction::Update {
+            id: 7,
+            revision: revision.clone(),
+            fields: ChannelFields {
+                name: "Fixture".into(),
+                kind: 1,
+                models: "model-a".into(),
+                group: "default".into(),
+                base_url: "https://other.example.test".into(),
+                model_mapping: "{}".into(),
+                priority: 1,
+                weight: 1,
+                key: None,
+            },
+        },
+    };
+    assert!(matches!(
+        aggregate
+            .channel_command(&owner_actor, changed_endpoint)
+            .await,
+        Err(AggregateError::Invalid)
+    ));
+    assert!(
+        script.calls.lock().iter().all(|c| c.0 == "GET"),
+        "never forward a retained credential to a changed endpoint"
+    );
     let command = ChannelCommand {
         request_id: Uuid::new_v4(),
         confirmed: true,

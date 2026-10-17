@@ -17,7 +17,7 @@ let inviteId = null;
 const errors = {
   account_limit: '个人数据超过服务限制，请缩短内容后再保存。',
   data_conflict: '记忆已由另一页面或 Agent 修改，请重新载入后合并你的修改。',
-  aggregate_invalid: '请检查协议、端点、模型、映射和分组。新增渠道需要密钥；新地址需要 HTTPS。',
+  aggregate_invalid: '请检查协议、端点、模型、映射和分组。新增渠道需要密钥；新地址需要 HTTPS，更换端点须重填密钥。',
   aggregate_conflict: '配置已变更，请重新载入后编辑。',
   aggregate_unknown: '操作结果待核实，请先检查渠道和操作记录；不要重复提交。',
   aggregate_credentials: '聚合凭据被拒绝，请检查服务端管理或调用密钥。',

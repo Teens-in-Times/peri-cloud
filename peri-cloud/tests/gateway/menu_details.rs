@@ -40,16 +40,16 @@ async fn full_question_menu_pages_pin_snapshot_enforce_route_and_do_not_consume_
         .await
         .unwrap();
     let pending = f.card().await;
-    f.c().gateway.dispatch().await.unwrap();
-    let snapshot = f
-        .adapter
-        .attempts
-        .lock()
-        .iter()
-        .rev()
-        .find(|d| matches!(&d.body, DeliveryBody::Menu { card } if card.question_request.is_some()))
-        .unwrap()
-        .clone();
+    // The browser broker can expose the question before its menu is enqueued.
+    // Wait for the actual matching delivery rather than assuming both commit together.
+    let snapshot = tokio::time::timeout(Duration::from_secs(10),async {
+        loop {
+            f.c().gateway.dispatch().await.unwrap();
+            let delivered=f.adapter.attempts.lock().iter().rev().find(|d|matches!(&d.body,DeliveryBody::Menu{card} if card.question_request.is_some_and(|(id,_)|id==pending.request_id))).cloned();
+            if let Some(delivered)=delivered {break delivered;}
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("the owned question menu must be delivered");
     let DeliveryBody::Menu { card } = &snapshot.body else {
         unreachable!()
     };
