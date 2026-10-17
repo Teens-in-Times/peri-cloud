@@ -245,11 +245,12 @@ async fn formal_command_api_checks_owner_deduplicates_new_and_exposes_true_capab
         .authenticate_browser(&login.session_token)
         .await
         .unwrap();
-    assert!(c
-        .gateway
-        .execute_browser_command(&guest, receipt.session_id, Uuid::new_v4(), "/clear".into())
-        .await
-        .is_err());
+    assert!(matches!(
+        c.gateway
+            .execute_browser_command(&guest, receipt.session_id, Uuid::new_v4(), "/clear".into())
+            .await,
+        Err(GatewayError::Identity(IdentityError::Forbidden))
+    ));
     let catalog = c.gateway.command_catalog();
     assert!(catalog
         .iter()

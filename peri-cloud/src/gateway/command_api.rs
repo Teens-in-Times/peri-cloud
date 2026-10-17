@@ -51,7 +51,13 @@ impl Gateway {
         self.identity.browser_scope(actor).await?;
         self.journal()
             .session(actor.principal().id, session)
-            .await?;
+            .await
+            .map_err(|error| match error {
+                StateError::Forbidden | StateError::NotFound => {
+                    GatewayError::Identity(IdentityError::Forbidden)
+                }
+                other => other.into(),
+            })?;
         if input.len() > self.limits().max_prompt_bytes || !input.trim().starts_with('/') {
             return Err(GatewayError::Invalid);
         }
