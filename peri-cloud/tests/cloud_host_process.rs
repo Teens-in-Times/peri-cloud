@@ -25,6 +25,8 @@ const PASSWORD: &str = "fixture-host-owner-password";
 const VERIFIER: &str = "fixture-host-native-verifier-at-least-43-characters";
 const QQ_SECRET: &str = "fixture-host-qq-secret-32-characters";
 const MODEL_KEY: &str = "fixture-host-model-private-key";
+#[path = "cloud_host_process/commands.rs"]
+mod command_tests;
 #[path = "cloud_host_process/local_instance.rs"]
 mod local_instance_tests;
 #[path = "cloud_host_process/onebot.rs"]

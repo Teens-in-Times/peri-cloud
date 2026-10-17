@@ -105,6 +105,12 @@ impl Connections {
 
 #[async_trait]
 impl SessionConnector for Connections {
+    fn command_registry(&self) -> Option<Arc<peri_acp_types::command::CommandRegistry>> {
+        self.native.command_registry()
+    }
+    fn account_models(&self) -> Option<Arc<crate::models::AccountModels>> {
+        self.native.account_models()
+    }
     async fn check_connection(&self, device: &DeviceRecord) -> GatewayResult<&'static str> {
         if device.revoked {
             return Err(GatewayError::Connection);
