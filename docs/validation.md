@@ -1,5 +1,13 @@
 # 验证记录
 
+## v0.7.0 升级准备（2026-10-18）
+
+- 基线：`0941d0683802f25e21ff8b0aa8c894050e3b9377`（v0.6.1）。
+- Windows 串行回归：29 个测试二进制，371 通过，0 失败；格式检查通过；portal/model DOM 检查通过。
+- Windows 控制台须为 UTF-8（`chcp 65001`）。否则 executor 的 PowerShell 中文输出会按本地代码页解码，`shell_alias_captures_stdout_stderr_and_nonzero_exit_evidence` 会失败；这是测试机代码页问题，不是代码回归。CI 的英文 runner 不受影响。
+- schema 8 fixture 由生产库 DDL 生成（不包含数据），28 张表，`PRAGMA integrity_check` 通过。
+- v4 上游清单与生产补丁清单见 [upstream/peri-e1d1b9c0.md](upstream/peri-e1d1b9c0.md)。
+
 ## v0.5.0
 
 - 发布源码：`638bba6f5a7fcbdfd89e266d96add3e40fc02900`；[完整 CI](https://github.com/Teens-in-Times/peri-cloud/actions/runs/38961279120)。
