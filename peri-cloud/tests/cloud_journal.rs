@@ -6,6 +6,8 @@ use peri_acp_types::permission::PermissionMode;
 use peri_acp_types::store::{MessageFlags, PersistedPayload};
 use peri_cloud::state::{CloudJournal, FrozenSession, StateError, TurnState};
 use peri_cloud::{ChatReply, CloudTurnResult, TurnStatus};
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 fn binding(principal: Uuid) -> FrozenSession {
@@ -330,4 +332,152 @@ async fn unconfirmed_executor_state_blocks_new_turn_after_model_loop_finishes() 
         .await
         .unwrap();
     journal.close().await;
+}
+
+async fn raw_pool(path: &std::path::Path) -> SqlitePool {
+    SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn schema_eight_migrates_to_nine_and_preserves_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = CloudJournal::open(root.path()).await.unwrap();
+    journal.close().await;
+    drop(journal);
+
+    let path = root.path().join("cloud.sqlite");
+    let pool = raw_pool(&path).await;
+    let principal = Uuid::new_v4();
+    sqlx::query("INSERT INTO principals(id,login,display_name,password_hash) VALUES(?,?,?,?)")
+        .bind(principal.to_string())
+        .bind("migration-owner")
+        .bind("Owner")
+        .bind("hash")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE device_connections")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE web_messages")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA user_version = 8")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA application_id = 0")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let journal = CloudJournal::open(root.path())
+        .await
+        .unwrap_or_else(|error| panic!("open after downgrade: {error:?}"));
+    let pool = raw_pool(&path).await;
+    let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 9);
+    let (application_id,): (i64,) = sqlx::query_as("PRAGMA application_id")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(application_id, 1_346_720_323);
+    let (login,): (String,) = sqlx::query_as("SELECT login FROM principals WHERE id=?")
+        .bind(principal.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(login, "migration-owner");
+    for table in ["device_connections", "web_messages"] {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?")
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "{table} must exist after schema 9");
+    }
+    pool.close().await;
+    journal.close().await;
+    drop(journal);
+
+    // Reopening a schema-9 database is idempotent.
+    let journal = CloudJournal::open(root.path()).await.unwrap();
+    let pool = raw_pool(&path).await;
+    let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 9);
+    pool.close().await;
+    journal.close().await;
+}
+
+#[tokio::test]
+async fn standalone_schema_six_is_refused_before_any_migration() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("cloud.sqlite");
+    let pool = raw_pool(&path).await;
+    for statement in [
+        "CREATE TABLE principals (id TEXT PRIMARY KEY, login TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, password_hash TEXT NOT NULL)",
+        "CREATE TABLE identity_devices (id TEXT PRIMARY KEY, principal TEXT NOT NULL, record_json TEXT NOT NULL)",
+        "CREATE TABLE web_messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, route_key TEXT NOT NULL, principal TEXT NOT NULL, event_key TEXT, delivery_id TEXT UNIQUE, role TEXT NOT NULL, text TEXT NOT NULL, card_json TEXT, state TEXT NOT NULL, created_at INTEGER NOT NULL)",
+        "CREATE TABLE device_connections (id TEXT PRIMARY KEY, device_id TEXT NOT NULL UNIQUE, principal TEXT NOT NULL, endpoint TEXT NOT NULL, token_path TEXT NOT NULL, lease_expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
+        "PRAGMA user_version = 6",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+
+    assert!(matches!(
+        CloudJournal::open(root.path()).await,
+        Err(StateError::ForeignSchema)
+    ));
+
+    let pool = raw_pool(&path).await;
+    let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 6, "a refused database must not be migrated");
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='user_models'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "production tables must not be added");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn foreign_application_id_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("cloud.sqlite");
+    let pool = raw_pool(&path).await;
+    sqlx::query("PRAGMA user_version = 9")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA application_id = 42")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert!(matches!(
+        CloudJournal::open(root.path()).await,
+        Err(StateError::ForeignSchema)
+    ));
 }

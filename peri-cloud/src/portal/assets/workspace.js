@@ -59,16 +59,19 @@ window.WorkspaceView = (() => {
       card.append(heading,node('p','subtle',platform + ' · ' + (device.is_local ? '管理员提供的执行器' : '我的执行器')));
       const status = node('p','connection-status'); status.setAttribute('role','status');
       const checked = deviceChecks.get(device.id);
+      const reach = account.device_connections?.[device.id];
       if (device.revoked) status.textContent = '访问已撤销';
-      else if (!checked) status.textContent = '连接待检查';
-      else if (checked.pending) status.textContent = '正在验证连接…';
-      else {
+      else if (checked?.pending) status.textContent = '正在验证连接…';
+      else if (checked) {
         const time = new Date(checked.time).toLocaleTimeString('zh-CN', {hour12:false});
         status.textContent = checked.ok ? '已验证连接 · ' + time : '无法验证连接 · ' + time;
         status.dataset.verified = String(checked.ok);
         const routes = {wireguard:'WireGuard',loopback:'回环 / SSH'};
         card.append(node('p','subtle',checked.ok ? '本次通路：' + (routes[checked.transport] || '已认证通路') : checked.error));
-      }
+      } else if (reach?.state === 'online') status.textContent = '在线 · 设备已上报连接';
+      else if (reach?.state === 'offline') status.textContent = '暂时无法连接';
+      else if (reach?.state === 'not_configured') status.textContent = '未接入云端连接';
+      else status.textContent = '连接待检查';
       const actions = node('div','device-actions');
       if (!device.revoked) {
         actions.append(command('检查连接', button => hooks.action(button, async () => {

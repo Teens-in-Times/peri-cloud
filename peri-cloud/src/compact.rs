@@ -20,12 +20,17 @@ impl CloudAgent {
                 "当前会话没有历史可压缩，没有调用模型。".to_owned(),
             )
         } else {
-            let config = CompactConfig::default();
+            // A user-triggered command makes one bounded summary attempt. The
+            // v4 default of three recovery calls would spend quota silently.
+            let config = CompactConfig {
+                summary_max_requests: 1,
+                ..CompactConfig::default()
+            };
             let summary = tokio::select! {
                 biased;
                 _ = request.cancellation.cancelled() => None,
-                result = peri_agent::agent::compact_v2::full::summarize_context(
-                    &transcript, model.as_ref(), &config,
+                result = peri_agent::agent::compact_v2::full::full_summary_only(
+                    &transcript, Some(model.as_ref()), &config,
                 ) => Some(result),
             };
             match summary {
@@ -55,11 +60,14 @@ impl CloudAgent {
                     )));
                     (TurnStatus::Completed, format!("上下文已压缩。\n可见消息：{} → {}\n继续在当前会话发送任务即可。原始历史已保留，摘要不会修改设备、目录、权限或模型选择。", before, transcript.visible_messages().len()))
                 }
-                Some(Err(_)) => (
-                    TurnStatus::Failed,
-                    "上下文压缩失败，原历史和上下文保持不变。请检查模型、额度或服务状态后再试。"
-                        .to_owned(),
-                ),
+                Some(Err(error)) => {
+                    tracing::warn!(error = %error, "manual compact failed");
+                    (
+                        TurnStatus::Failed,
+                        "上下文压缩失败，原历史和上下文保持不变。请检查模型、额度或服务状态后再试。"
+                            .to_owned(),
+                    )
+                }
                 None => (
                     TurnStatus::Interrupted,
                     "上下文压缩已取消或达到时限，原历史和上下文保持不变。".to_owned(),
@@ -68,7 +76,7 @@ impl CloudAgent {
         };
         // The normal journal settlement owns the atomic history/flags commit.
         // Never read cwd on the cloud host to re-inject remote project files.
-        let history = transcript.persisted_payloads();
+        let history = transcript.canonical_payloads();
         let history_flags = history
             .iter()
             .map(|payload| (payload.id(), transcript.flags(payload.id())))

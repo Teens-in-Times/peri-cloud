@@ -298,6 +298,9 @@ impl CloudAgent {
         {
             let mut current = transcript.write();
             *current = MessageTranscript::new().with_own_payloads(request.history);
+            // The cloud journal is the canonical store. Keep archived entries in
+            // the hot transcript so the end-of-turn settlement preserves them.
+            current.enable_deployment_owned_compaction();
             current.set_flags_batch(request.history_flags);
         }
         let mut tool_map = BTreeMap::<String, Arc<dyn BaseTool>>::new();
@@ -322,8 +325,9 @@ impl CloudAgent {
                     contributions.collect_prompt_contributions()
                 })),
         );
-        let mut turn = session.start_turn();
-        turn.turn_id = TurnId::from_uuid(request.turn_id);
+        let turn = session
+            .start_turn()
+            .with_turn_id(TurnId::from_uuid(request.turn_id));
         let (bus, handles) = EventBus::new(Default::default());
         let mut metadata = HashMap::new();
         metadata.insert("session_id".into(), self.session_id.to_string());
@@ -372,7 +376,7 @@ impl CloudAgent {
         });
         let (history, history_flags) = {
             let current = transcript.read();
-            let history = current.persisted_payloads();
+            let history = current.canonical_payloads();
             let flags = history
                 .iter()
                 .map(|payload| (payload.id(), current.flags(payload.id())))

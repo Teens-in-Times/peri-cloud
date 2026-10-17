@@ -704,6 +704,25 @@ impl Gateway {
         self.hub.browser_cards(actor.principal().id).await
     }
 
+    /// Bounded, identity-verified transport state per account device. Enrollment
+    /// alone is never reported as online.
+    pub async fn browser_device_states(
+        &self,
+        actor: &crate::identity::Authenticated,
+    ) -> GatewayResult<HashMap<String, serde_json::Value>> {
+        self.identity.browser_scope(actor).await?;
+        let devices = self.identity.devices(actor).await?;
+        let mut states = HashMap::with_capacity(devices.len());
+        for device in devices {
+            let state = self.connector.reachability(&device).await;
+            states.insert(
+                device.id.to_string(),
+                serde_json::json!({"state": state.key(), "label": state.label()}),
+            );
+        }
+        Ok(states)
+    }
+
     pub async fn respond_browser(
         &self,
         actor: &crate::identity::Authenticated,

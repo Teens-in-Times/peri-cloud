@@ -12,6 +12,37 @@ use crate::identity::DeviceRecord;
 use crate::state::FrozenSession;
 use crate::CloudAgent;
 
+/// Deployment-observed transport state. Enrollment is never evidence of a
+/// live executor; `NotConfigured` and `Offline` stay distinct.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeviceReachability {
+    #[default]
+    Unknown,
+    NotConfigured,
+    Offline,
+    Online,
+}
+
+impl DeviceReachability {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::NotConfigured => "not_configured",
+            Self::Offline => "offline",
+            Self::Online => "online",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "",
+            Self::NotConfigured => "未接入云端连接",
+            Self::Offline => "暂时无法连接",
+            Self::Online => "在线",
+        }
+    }
+}
+
 /// Connection manager's deployment boundary. A channel cannot supply endpoint,
 /// SSH login or bearer tokens. Existing frozen sessions must reopen unchanged.
 #[async_trait]
@@ -22,6 +53,10 @@ pub trait SessionConnector: Send + Sync {
     /// Read-only identity authentication, without opening a session or a job.
     async fn check_connection(&self, _device: &DeviceRecord) -> GatewayResult<&'static str> {
         Err(GatewayError::Connection)
+    }
+    /// Bounded transport observation; never authorizes a tool or claims work.
+    async fn reachability(&self, _device: &DeviceRecord) -> DeviceReachability {
+        DeviceReachability::Unknown
     }
     fn account_models(&self) -> Option<Arc<crate::models::AccountModels>> {
         None

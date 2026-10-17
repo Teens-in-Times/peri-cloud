@@ -25,6 +25,13 @@ pub struct AgentContext<'a> {
     /// 标记已有消息是否被替换（用于输入准备 runner reconcile）
     messages_modified: bool,
 
+    /// canonical session 身份投影（`StageContext::project_session_id` 的快照；
+    /// 与 `execution_binding` 同源，供交互归属铸造）。
+    ///
+    /// `None` = 本 hook 没有真实会话身份（如子 agent 自建 session）：需要交互归属
+    /// 的 middleware 必须据此显式拒绝，不得用 agent_id 伪造会话身份。
+    session_id: Option<String>,
+
     /// 内部 recall 缓冲区，每个 hook 执行后 drain 到 ctx.recall_buffer
     recall_buffer: Vec<String>,
 }
@@ -47,6 +54,7 @@ impl<'a> AgentContext<'a> {
             messages_cache,
             input_message_ids: None,
             messages_modified: false,
+            session_id: ctx.project_session_id(),
             recall_buffer: Vec::new(),
         }
     }
@@ -82,6 +90,14 @@ impl<'a> AgentContext<'a> {
 }
 
 impl MiddlewareState for AgentContext<'_> {
+    fn execution_binding(&self) -> Option<peri_acp_types::session::ExecutionBinding> {
+        Some(self.ctx.session.turn.execution_binding())
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
     fn cwd(&self) -> &str {
         &self.ctx.session.turn.cwd
     }
@@ -121,6 +137,22 @@ impl MiddlewareState for AgentContext<'_> {
         self.ctx.session.turn.current_step()
     }
 
+    /// 阶段级适配器只有模型 turn 事实：归属恒为 `ModelTurn`（session + turn 绑定）。
+    ///
+    /// 真实会话身份取自 `project_session_id`（缺失即 `None`：不伪造身份、也不
+    /// 回退到 agent_id）。
+    fn interaction_attribution(
+        &self,
+    ) -> Option<peri_acp_types::interaction::InteractionAttribution> {
+        let session_id = self.ctx.project_session_id()?;
+        Some(
+            peri_acp_types::interaction::InteractionAttribution::model_turn(
+                session_id,
+                self.ctx.session.turn.execution_binding(),
+            ),
+        )
+    }
+
     fn push_recall(&mut self, item: String) {
         self.recall_buffer.push(item);
     }
@@ -141,12 +173,17 @@ impl MiddlewareState for AgentContext<'_> {
             .is_some_and(|probe| probe())
     }
 
-    fn inbox_handle(&self) -> Option<&peri_acp_types::session::InboxHandle> {
-        self.ctx.async_ctx.inbox_handle.as_ref()
-    }
-
     fn local_tools(&self) -> Option<&crate::agent::stages::SharedToolMap> {
         Some(&self.ctx.runtime.tools)
+    }
+    fn tool_source(&self, name: &str) -> Option<crate::session::tool_catalog::ToolSource> {
+        self.ctx
+            .runtime
+            .tool_catalog
+            .snapshot()
+            .tools
+            .get(name)
+            .map(|entry| entry.source.clone())
     }
 }
 

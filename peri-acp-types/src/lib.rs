@@ -10,37 +10,47 @@
 //! - `store` — ThreadStore 持久化契约（trait + CompactionChange + MessageFlags）；
 //!   纯历史变换见 `store::history`
 //! - `session_resources` — 会话资源门面契约（SessionResources + 中性领域 I/O、错误与能力枚举）
+//! - `history_page` — 历史分页契约（HistoryCursor/HistoryPage/HistoryPageBounds + 页装配与边界事实的唯一规则）
 //! - `projection` — compact 投影指令纯数据契约
 //! - `identity` — §9 身份标识契约（AgentId/EventEnvelope/CancelRequest/...）
 //! - `event` / `event_v2` — 事件契约（ExecutorEvent + v2 三层事件 + EventBus + v1 兼容映射）
 //! - `session` — session 契约（TurnId/MQ/inbox/cron/AgentRuntime）
-//! - `interaction` — HITL/通道交互契约（UserInteractionBroker/ChannelState/...）
+//! - `interaction` — HITL/问答交互契约（UserInteractionBroker/...）
 //! - `goal` — goal steering 契约（ThreadGoal/GoalStatus/GoalStore/...）
 //! - `frozen` — 会话冻结数据契约（FrozenData/ThreadPersistence/...）
 //! - `tasks` — 后台任务契约（BgTaskKind/BgRegistryEvent）
-//! - `tools` — 工具契约（ToolDefinition）
+//! - `tools` — 工具契约（ToolDefinition / ToolOutput / 执行身份与来源 / dispatcher 端口）
+//! - `mcp_apps` — MCP Apps relay 契约（旧 4 方法信封 + 版本常量 + `McpAppsRelayPort`）
+//! - `mcp_apps_facade` — 阶段 4a `peri/mcp/apps/*` facade 契约（身份 / 判决 /
+//!   快照 / 能力声明 / 预算常量）
+//! - `tool_invocation` — canonical 执行身份与来源契约（InvocationId/ToolCallId/InvocationOrigin）
+//! - `tool_outcome` — raw 工具结果与远端错误契约（RawToolResult/RemoteToolError 权威定义）
 //! - `compact` — compact 契约（CompactOutcome/FullEscalationReason + 提取函数）
 //! - `error` — 层边界错误契约（AgentError）
 //! - `permission` — 权限模式契约（PermissionMode/SharedPermissionMode）
 //! - `agents` — agent 定义契约（AgentOverrides/AgentCapability）
 //! - `command` — slash 命令契约（PromptStopReason/CommandHandler/CommandContext）
 //! - `skills` — skill 契约（SkillSource/SkillRoot/SkillMetadata）
-//! - `lsp` — LSP 服务器配置契约（LspServerConfig/LspConfigSource）
 //! - `meta_harness` — MetaHarness 契约（MetaHarnessState + SECTION_IDS/MIDDLEWARE_NAMES）
+//! - `beta_flags` — Beta flag 注册表与投影/冻结值契约（BETA_FLAGS + BetaFlags）
 //! - `cron` — cron 契约（CronTrigger + CronSchedulerPort）
 //! - `workflow` — workflow 协议契约（AgentRunParams/ProgressEvent/AgentExecutor/...）
 //! - `hooks` — hook 契约（HookEvent/HookType/RegisteredHook/...）
 //! - `plugin` — 插件契约（PluginManifest/LoadedPlugin/PluginLoadResult/PluginManagerPort）
-//! - `ports` — 装配注入端口（McpPoolPort/ToolSearchPort/WorkflowMiddlewarePort/SkillsPort）
+//! - `builtin_mcp` — builtin MCP 注册表纯数据（实例 / 原始工具名 / effective name / direct / 声明模板）
+//! - `ports` — 装配注入端口（McpPoolPort/ToolSearchPort/AgentCatalogPort）
 
 pub mod acp_mcp;
 pub mod agents;
+pub mod beta_flags;
+pub mod builtin_mcp;
 pub mod command;
 // 注册表顶层 re-export（Phase 2 消费方路径 `peri_acp_types::command_registry::*`，
 // 挂载本体在 command.rs 契约子模块区，避免双份模块实例）。
 pub use command::command_registry;
 pub mod compact;
 pub mod compact_reminder;
+pub mod configuration;
 pub mod cron;
 pub mod device_enrollment;
 pub mod device_executor;
@@ -51,25 +61,29 @@ pub mod event_data;
 pub mod event_v2;
 pub mod frozen;
 pub mod goal;
+pub mod history_page;
 pub mod hooks;
 pub mod identity;
 pub mod interaction;
-pub mod lsp;
 pub mod mcp;
 pub mod mcp_apps;
+pub mod mcp_apps_facade;
 pub mod mcp_skills;
 pub mod messages;
 pub mod meta_harness;
 pub mod model;
+pub mod oauth_credentials;
 pub mod peri_caps;
 pub use peri_caps::PeriCaps;
 pub mod permission;
 pub mod plugin;
+pub mod plugin_scope;
 pub mod ports;
 pub mod projection;
 pub mod runtime;
 pub mod sentinel;
 pub mod session;
+pub mod session_authorization;
 pub mod session_resources;
 pub mod session_store;
 pub mod skills;
@@ -78,7 +92,11 @@ pub mod summary;
 pub mod system_reminder;
 pub mod tasks;
 pub mod thread;
+pub mod tool_invocation;
+pub mod tool_outcome;
 pub mod tools;
 pub mod workflow;
 
 pub mod workspace;
+pub mod workspace_output;
+pub mod workspace_resources;

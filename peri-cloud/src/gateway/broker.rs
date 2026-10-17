@@ -5,7 +5,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use peri_acp_types::interaction::{
-    ApprovalDecision, InteractionContext, InteractionResponse, UserInteractionBroker,
+    ApprovalDecision, InteractionContext, InteractionResponse, TrustedInteractionOwner,
+    UserInteractionBroker,
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -230,8 +231,18 @@ impl Drop for RequestGuard {
 
 #[async_trait]
 impl UserInteractionBroker for SessionBroker {
-    async fn request(&self, context: InteractionContext) -> InteractionResponse {
+    async fn request(
+        &self,
+        owner: TrustedInteractionOwner,
+        context: InteractionContext,
+    ) -> InteractionResponse {
         let fallback = || unavailable(&context);
+        let Some((owner_session, owner_turn, _)) = owner.model_turn() else {
+            return fallback();
+        };
+        if owner_session != self.session.to_string() {
+            return fallback();
+        }
         let Some(origin) = self.origin.read().clone() else {
             return fallback();
         };
@@ -252,6 +263,9 @@ impl UserInteractionBroker for SessionBroker {
         let Ok(Some(turn)) = self.hub.journal.active_turn(principal, self.session).await else {
             return fallback();
         };
+        if owner_turn.as_uuid() != turn.turn_id {
+            return fallback();
+        }
         if turn.state != TurnState::Running || turn.cancel_requested {
             return fallback();
         }
@@ -425,7 +439,9 @@ fn unavailable(context: &InteractionContext) -> InteractionResponse {
                 })
                 .collect(),
         ),
-        InteractionContext::Questions { .. } => InteractionResponse::Cancelled,
+        InteractionContext::Questions { .. } => InteractionResponse::Interrupted {
+            reason: "审批已过期或交互通道不可用；没有获得本次答复".into(),
+        },
     }
 }
 
@@ -438,7 +454,7 @@ mod tests {
             unavailable(&InteractionContext::Questions {
                 requests: Vec::new()
             }),
-            InteractionResponse::Cancelled
+            InteractionResponse::Interrupted { .. }
         ));
     }
 }

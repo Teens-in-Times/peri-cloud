@@ -16,7 +16,7 @@ mod web_entry;
 pub use topology::GatewayView;
 pub(crate) use web_entry::{WebAdapter, WEB_ADAPTER};
 
-pub use connector::{NativeSessionConnector, SessionConnector};
+pub use connector::{DeviceReachability, NativeSessionConnector, SessionConnector};
 pub use router::{
     CommandReceipt, ConversationActivity, Gateway, SavedResultPage, TaskReceipt, WorkspaceSelection,
 };
@@ -48,6 +48,8 @@ pub enum GatewayError {
     Closing,
     #[error("device connection is unavailable or has a different identity")]
     Connection,
+    #[error("device has no deployment-owned transport configuration")]
+    NotConfigured,
     #[error("interaction is expired or no longer belongs to this session")]
     StaleInteraction,
     #[error("gateway owned operation requires recovery")]

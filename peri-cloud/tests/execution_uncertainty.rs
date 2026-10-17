@@ -12,7 +12,9 @@ use axum::routing::post;
 use axum::{Json, Router};
 use parking_lot::Mutex;
 use peri_acp_types::device_executor::SubmitJob;
-use peri_acp_types::interaction::{InteractionContext, InteractionResponse, UserInteractionBroker};
+use peri_acp_types::interaction::{
+    InteractionContext, InteractionResponse, TrustedInteractionOwner, UserInteractionBroker,
+};
 use peri_acp_types::messages::MessageContent;
 use peri_acp_types::permission::{PermissionMode, SharedPermissionMode};
 use peri_acp_types::tools::{ToolContext, ToolExecutionStatus, ToolOutput};
@@ -189,7 +191,11 @@ async fn model(
 struct NoApproval;
 #[async_trait]
 impl UserInteractionBroker for NoApproval {
-    async fn request(&self, _: InteractionContext) -> InteractionResponse {
+    async fn request(
+        &self,
+        _: TrustedInteractionOwner,
+        _: InteractionContext,
+    ) -> InteractionResponse {
         panic!("existing Bypass policy should not ask for approval")
     }
 }

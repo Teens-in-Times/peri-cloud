@@ -14,6 +14,9 @@ fn make_task(id: &str) -> BackgroundTask {
         pid: None,
         output_preview: None,
         agent_inbox: None,
+        initiator_session_id: None,
+        owner_session_id: None,
+        owner_identity: None,
     }
 }
 
@@ -145,4 +148,35 @@ async fn test_registry_cancel_wins_completion_claim_and_suppresses_late_complete
     }
     assert!(saw_cancelled);
     assert!(!saw_completed);
+}
+
+#[tokio::test]
+async fn snapshot_and_events_join_without_missing_a_fast_completion() {
+    let registry = BackgroundTaskRegistry::new();
+    let mut changes = registry.subscribe_events();
+    registry.register_with_kind(make_task("fast")).unwrap();
+    assert!(registry.complete("fast", result("fast")));
+    let snapshot = registry.snapshot();
+    assert_eq!(snapshot.revision, 2);
+    assert_eq!(snapshot.tasks.len(), 1);
+    assert_eq!(snapshot.tasks[0].status, "completed");
+    assert_eq!(registry.active_count(), 0);
+    let started = changes.recv().await.unwrap();
+    let completed = changes.recv().await.unwrap();
+    assert!(
+        matches!(completed.event, BgRegistryEvent::Completed { .. }),
+        "第二次事件应是终态 Completed"
+    );
+    // 快照的 revision 与终态事件同源：complete() 在持有 projection 锁时发布终态
+    // revision，因此其后取得的快照必然看到同一 revision；更早的事件 revision 更小。
+    assert_eq!(
+        snapshot.revision, completed.revision,
+        "snapshot 必须与终态事件来自同一 revision"
+    );
+    assert!(started.revision < snapshot.revision);
+
+    registry.register_with_kind(make_task("later")).unwrap();
+    let change = changes.recv().await.unwrap();
+    assert!(change.revision > snapshot.revision);
+    assert!(matches!(change.event, BgRegistryEvent::Started { .. }));
 }

@@ -30,7 +30,8 @@ flowchart LR
 | peri-tool-runtime | 两端共享的文件与 Shell 工具实现 |
 | peri-acp-types | 身份、交互和设备执行的公共数据契约 |
 | peri-agent / peri-middlewares / peri-model | 原有推理循环、权限和模型接口 |
-| peri-process / peri-resources / peri-workflow / peri-lsp / peri-js-runtime | 上述模块需要的基础依赖 |
+| peri-config / peri-time / peri-mcp-core / mcp-packages | v4 配置、时间、MCP 核心与内置能力包 |
+| peri-process / peri-resources / peri-workflow / peri-js-runtime | 上述模块需要的基础依赖 |
 
 发布源码还保留 `peri-acp/prompts` 中被编译期引用的提示词资源；不包含 ACP 宿主、TUI 或其界面代码。
 

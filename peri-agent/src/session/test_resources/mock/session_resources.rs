@@ -8,12 +8,14 @@ use super::*;
 /// 才做发现、登记与复核。
 fn doubled_workspace(cwd: &str) -> ResolvedWorkspace {
     let cwd = std::path::PathBuf::from(cwd);
+    let workspace_id = peri_acp_types::workspace::WorkspaceId::new();
     ResolvedWorkspace {
         project_id: peri_acp_types::workspace::ProjectId::new(),
-        workspace_id: peri_acp_types::workspace::WorkspaceId::new(),
+        workspace_id,
         cwd: cwd.clone(),
         root: cwd,
         relative_cwd: std::path::PathBuf::new(),
+        discovery_snapshot: None,
     }
 }
 
@@ -31,12 +33,12 @@ impl SessionResources for MockSessionResources {
     ) -> SessionResourceResult<SessionAvailability> {
         Ok(SessionAvailability {
             access: AccessMode::ReadWrite,
+            execution: Some(peri_acp_types::session_resources::ExecutionAvailability::Available),
             capabilities: if self.history_read_only.load(Ordering::SeqCst) {
                 DataCapabilities::HistoryReadOnly
             } else {
                 DataCapabilities::Complete
             },
-            execution: Some(ExecutionAvailability::Available),
         })
     }
 
@@ -55,34 +57,41 @@ impl SessionResources for MockSessionResources {
         Ok(())
     }
 
-    async fn acquire_execution(
-        &self,
-        _id: &ThreadId,
-        _workspace: &ResolvedWorkspace,
-    ) -> SessionResourceResult<Arc<dyn peri_acp_types::workspace::SessionExecutionLease>> {
-        Err(unsupported("acquire_execution"))
+    async fn finish_close(&self, id: &ThreadId) -> SessionResourceResult<()> {
+        self.ensure_writable()?;
+        self.closing.lock().unwrap().remove(id);
+        Ok(())
     }
 
-    async fn reset_dirty_execution(
+    async fn close_settlement(
         &self,
-        _request: &peri_acp_types::workspace::ResetDirtyRequest,
-    ) -> SessionResourceResult<()> {
-        Err(unsupported("reset_dirty_execution"))
+        id: &ThreadId,
+    ) -> SessionResourceResult<peri_acp_types::session_resources::CloseSettlement> {
+        Ok(if self.closing.lock().unwrap().contains(id) {
+            peri_acp_types::session_resources::CloseSettlement::Pending
+        } else {
+            peri_acp_types::session_resources::CloseSettlement::Finished
+        })
     }
 
-    async fn create_session(
-        &self,
-        _input: &NewSession,
-    ) -> SessionResourceResult<Arc<dyn peri_acp_types::workspace::SessionExecutionLease>> {
+    async fn create_session(&self, _input: &NewSession) -> SessionResourceResult<()> {
         Err(unsupported("create_session"))
     }
 
-    async fn abandon_initialization(
-        &self,
-        _id: &ThreadId,
-        _lease: &Arc<dyn peri_acp_types::workspace::SessionExecutionLease>,
-    ) -> SessionResourceResult<()> {
+    async fn abandon_initialization(&self, _id: &ThreadId) -> SessionResourceResult<()> {
         Err(unsupported("abandon_initialization"))
+    }
+
+    async fn begin_initialization(
+        &self,
+        _draft: &peri_acp_types::session_resources::NewSessionDraft,
+    ) -> SessionResourceResult<Arc<dyn peri_acp_types::session_resources::SessionInitialization>>
+    {
+        Err(unsupported("begin_initialization"))
+    }
+
+    async fn discard_incomplete_initialization(&self, _id: &ThreadId) -> SessionResourceResult<()> {
+        Err(unsupported("discard_incomplete_initialization"))
     }
 
     async fn adopt_legacy_session(
@@ -215,10 +224,48 @@ impl SessionResources for MockSessionResources {
         Ok(())
     }
 
-    async fn save_fork(
+    async fn append_reminder_if_absent(
         &self,
-        fork: &ForkSnapshot,
-    ) -> SessionResourceResult<Arc<dyn peri_acp_types::workspace::SessionExecutionLease>> {
+        id: &ThreadId,
+        message_id: peri_acp_types::messages::MessageId,
+        reminder: &peri_acp_types::system_reminder::TrustedSystemReminder,
+    ) -> SessionResourceResult<bool> {
+        self.ensure_writable()?;
+        self.with_region(id, |region| {
+            if let Some(existing) = region
+                .payloads
+                .iter()
+                .find(|payload| payload.id() == message_id)
+            {
+                if let PersistedPayload::SystemReminder {
+                    reminder: stored, ..
+                } = existing
+                {
+                    if stored.as_reminder() == reminder.as_reminder() {
+                        return Ok(false);
+                    }
+                }
+                return Err(unsupported("append_reminder_if_absent conflict"));
+            }
+            region.payloads.push(PersistedPayload::SystemReminder {
+                id: message_id,
+                reminder: reminder.clone(),
+            });
+            Ok(true)
+        })
+    }
+
+    async fn mark_session_closing(&self, id: &ThreadId) -> SessionResourceResult<()> {
+        self.ensure_writable()?;
+        self.closing.lock().unwrap().insert(id.clone());
+        Ok(())
+    }
+
+    async fn is_session_closing(&self, id: &ThreadId) -> SessionResourceResult<bool> {
+        Ok(self.closing.lock().unwrap().contains(id))
+    }
+
+    async fn save_fork(&self, fork: &ForkSnapshot) -> SessionResourceResult<()> {
         self.ensure_writable()?;
         let target = &fork.target;
         self.with_region(&target.thread_id, |region| {
@@ -228,14 +275,10 @@ impl SessionResources for MockSessionResources {
             region.payloads = fork.payloads.clone();
             region.flags = fork.flags.clone();
         });
-        Ok(self.lease(&target.thread_id))
+        Ok(())
     }
 
-    async fn save_child(
-        &self,
-        child: &ChildSnapshot,
-        _lease: &Arc<dyn peri_acp_types::workspace::SessionExecutionLease>,
-    ) -> SessionResourceResult<()> {
+    async fn save_child(&self, child: &ChildSnapshot) -> SessionResourceResult<()> {
         self.ensure_writable()?;
         let target = &child.target;
         // 与真实门面同构：child 的 frozen 逐字节取自 root 已保存快照、绑定继承父会话、
@@ -331,7 +374,8 @@ impl SessionResources for MockSessionResources {
         &self,
         id: &ThreadId,
         boundary: RewindBoundary,
-    ) -> SessionResourceResult<()> {
+        clear_excluded: &[MessageId],
+    ) -> SessionResourceResult<RewindOutcome> {
         self.ensure_writable()?;
         self.injection.lock().unwrap().rewind_calls += 1;
         let target = boundary.message_id();
@@ -351,22 +395,28 @@ impl SessionResources for MockSessionResources {
                 .iter()
                 .position(|payload| payload.id() == target),
         };
+        // 未知边界与真实后端同一语义：不动历史、也不清零，但如实回报「没生效」。
         let Some(len) = keep else {
-            return Err(SessionResourceError::new(
-                SessionResourceErrorKind::NotFound,
-            ));
+            return Ok(RewindOutcome::BoundaryMissing);
         };
         let removed: Vec<MessageId> = region.payloads[len..]
             .iter()
             .map(PersistedPayload::id)
             .collect();
+        let cleared = clear_excluded.to_vec();
         self.with_region(id, |region| {
             region.payloads.truncate(len);
             for removed_id in &removed {
                 region.flags.remove(removed_id);
             }
+            // 有效视图重建与边界删除同属一次提交：mock 也一并生效，只清 excluded 位。
+            for cleared_id in &cleared {
+                if let Some(flags) = region.flags.get_mut(cleared_id) {
+                    flags.excluded = false;
+                }
+            }
         });
-        Ok(())
+        Ok(RewindOutcome::Applied)
     }
 
     async fn remove_history_entries(

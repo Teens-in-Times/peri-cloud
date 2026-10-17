@@ -209,7 +209,7 @@ pub(super) async fn run_writer(
 
     let mut pending_appends: Vec<PersistedPayload> = Vec::new();
     let mut pending_reserved = Reservation::default();
-    let mut window_start: std::time::Instant = std::time::Instant::now();
+    let mut window_start: std::time::Instant = peri_time::monotonic_now();
 
     loop {
         // 失败后的积压仅用于 barrier 诊断，不能继续驱动批处理定时器。
@@ -218,7 +218,7 @@ pub(super) async fn run_writer(
             rx.recv().await
         } else {
             let remaining = APPEND_BATCH_WINDOW.saturating_sub(window_start.elapsed());
-            match tokio::time::timeout(remaining, rx.recv()).await {
+            match peri_time::timeout(remaining, rx.recv()).await {
                 Ok(op) => op,
                 Err(_) => {
                     // 窗口到期：批量落库后继续等待
@@ -240,7 +240,7 @@ pub(super) async fn run_writer(
         match op {
             Some(PersistOp::Append { payload, reserved }) => {
                 if pending_appends.is_empty() {
-                    window_start = std::time::Instant::now();
+                    window_start = peri_time::monotonic_now();
                 }
                 pending_reserved.merge(reserved);
                 pending_appends.push(payload);
@@ -315,11 +315,21 @@ pub(super) async fn run_writer(
                 )
                 .await;
                 let (reservation, result) = match other {
+                    // transcript 自身的截断（保留到目标为止）：只把内存里已经丢掉的后缀同步删掉，
+                    // 不重建有效视图——保留前缀的 flags 在内存里没有被改过，这里清零任何
+                    // `excluded` 都会让存储与 transcript 分叉。有效视图重建属于 ACP rewind
+                    // （`SessionResources::rewind_history` 的 clear_excluded 参数）。
+                    //
+                    // 与 ACP rewind 的区别就在这里：`BoundaryMissing` 对本路径是**成功**——
+                    // 内存已经截断，存储里没有这一行就没有要删的后缀，本次同步的目的已经
+                    // 达成（目标行缺失时删除下界无从谈起，重试也不会变）。ACP rewind 相反：
+                    // 它要发布一份「已按边界重建」的热态，边界没生效就绝不能发布。
                     PersistOp::RewindTo { id, reserved } => (
                         reserved,
                         store
-                            .rewind_history(&tid, RewindBoundary::KeepThrough(id))
-                            .await,
+                            .rewind_history(&tid, RewindBoundary::KeepThrough(id), &[])
+                            .await
+                            .map(|_| ()),
                     ),
                     PersistOp::UpdateFlags {
                         id,

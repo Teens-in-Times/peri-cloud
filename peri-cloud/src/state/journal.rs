@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 use peri_acp_types::device_executor::{JobSnapshot, JobStatus};
@@ -18,6 +18,7 @@ use crate::CloudTurnResult;
 /// lock prevents another process from recovering a still-live owner's turns.
 pub struct CloudJournal {
     pool: SqlitePool,
+    root: PathBuf,
     _owner: File,
     gateway_claimed: std::sync::atomic::AtomicBool,
 }
@@ -44,9 +45,10 @@ impl CloudJournal {
         let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
-        if !matches!(version, 0..=8) {
+        if !matches!(version, 0..=9) {
             return Err(StateError::Version);
         }
+        super::schema::reject_foreign(&pool, version).await?;
         if version == 0 {
             let mut tx = pool.begin().await?;
             sqlx::query("CREATE TABLE cloud_sessions (id TEXT PRIMARY KEY, principal TEXT NOT NULL, state_json TEXT NOT NULL)").execute(&mut *tx).await?;
@@ -64,8 +66,10 @@ impl CloudJournal {
         super::userdata::migrate(&pool).await?;
         crate::gateway::access::migrate(&pool).await?;
         crate::aggregation::migrate(&pool).await?;
+        super::schema::migrate(&pool).await?;
         let journal = Self {
             pool,
+            root: root.to_owned(),
             _owner: owner,
             gateway_claimed: std::sync::atomic::AtomicBool::new(false),
         };
@@ -79,6 +83,10 @@ impl CloudJournal {
 
     pub(crate) fn identity_pool(&self) -> SqlitePool {
         self.pool.clone()
+    }
+
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.root
     }
 
     pub(crate) fn claim_gateway(&self) -> bool {

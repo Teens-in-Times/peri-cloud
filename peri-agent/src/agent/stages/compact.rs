@@ -77,17 +77,9 @@ async fn compact_core(input: CompactInput) -> (crate::error::AgentResult<Compact
             }
         };
 
-        // 禁用检查（v2 stage 入口显式判定，替代已删除的 CompactMiddleware::is_disabled）
-        // v1 曾通过 before_model 钩子判定；v2 必须在 stage 入口显式检查，
-        // 否则 DISABLE_COMPACT/DISABLE_AUTO_COMPACT 会被忽略。
-        let is_disabled = std::env::var("DISABLE_COMPACT").is_ok()
-            || std::env::var("DISABLE_AUTO_COMPACT").is_ok()
-            || !config.auto_compact_enabled;
-        if is_disabled {
-            tracing::trace!(
-                step,
-                "Compact 已禁用（env 或 config.auto_compact_enabled=false）"
-            );
+        // The host resolves config and environment overrides before running the loop.
+        if !config.auto_compact_enabled {
+            tracing::trace!(step, "Compact 已禁用（config.auto_compact_enabled=false）");
             break 'compact_core Ok(CompactOutput { compacted: false });
         }
 
@@ -198,7 +190,13 @@ async fn compact_core(input: CompactInput) -> (crate::error::AgentResult<Compact
 
         // G6: 记录 compact 前的可见消息数，供 cancel arm 发射 MessagesCompacted 事件使用
         let before_visible_len = transcript_owned.visible_messages().len();
-        let before_entries_len = transcript_owned.len();
+        // 「同一工作单元」判定必须在 Full 改动 transcript 之前采集：Full 追加的摘要不是
+        // 新工作，收缩释放条目后位置也不可比（水印用末尾摘要的稳定身份）。
+        let new_work_before_full = ctx
+            .compact
+            .budget_recovery
+            .lock()
+            .new_work_since_full(&transcript_owned);
 
         if let Some(key) = pressure_sample {
             ctx.compact
@@ -206,6 +204,11 @@ async fn compact_core(input: CompactInput) -> (crate::error::AgentResult<Compact
                 .write()
                 .consume_pressure_sample(key);
         }
+
+        // Full 会在 compact_v2 内另建一份整份历史视图作为摘要请求。只有确实要构造摘要
+        // 视图时才释放本槽（否则整个摘要请求期间多驻留一份历史正文）；Micro/Smart 未
+        // 落地、shadow、空计划未达 Full 阈值等路径没有第二份正文，缓存继续供 Reason 复用。
+        let before_full_summary = || ctx.model_view.release();
 
         // 包在 select! biased 中：cancel 优先，避免 Full Compact 的长 LLM 调用阻塞中断。
         // 注：run_compact 内部不感知 turn cancel_token，必须在此层显式 select。
@@ -287,6 +290,7 @@ async fn compact_core(input: CompactInput) -> (crate::error::AgentResult<Compact
                 false, // force=false（自动触发）
                 &mut consecutive,
                 ctx.cwd(),
+                Some(&before_full_summary),
             ) => r,
         };
 
@@ -391,9 +395,7 @@ async fn compact_core(input: CompactInput) -> (crate::error::AgentResult<Compact
                 let guard = ctx.session.transcript.read();
                 let visible: Vec<crate::messages::BaseMessage> =
                     guard.visible_messages().into_iter().cloned().collect();
-                // 从最后几条消息提取 re_inject 元信息（CompactFileInfo / Skills 名称）
-                // 注：run_compact 内 re_inject_v2 已把 [最近读取的文件: ...] / [激活的 Skill 指令: ...]
-                // 追加到 transcript 末尾，可直接用 extract_file_info / extract_skill_names 解析
+                // Full 只追加摘要；已有消息中的元信息仍由类型层提取。
                 let combined_files = crate::agent::compact_v2::extract_file_info(&visible);
                 let combined_skills = crate::agent::compact_v2::extract_skill_names(&visible);
                 (visible, combined_files, combined_skills)
@@ -410,7 +412,7 @@ async fn compact_core(input: CompactInput) -> (crate::error::AgentResult<Compact
                     ctx.compact
                         .budget_recovery
                         .lock()
-                        .record_full_applied(&transcript, before_entries_len);
+                        .record_full_applied(&transcript, new_work_before_full);
                 }
                 // P1-3: 直接操作 StageContext.token_tracker
                 ctx.compact.token_tracker.write().reset();
@@ -476,7 +478,7 @@ async fn compact_core(input: CompactInput) -> (crate::error::AgentResult<Compact
 }
 
 // An unacknowledged durable commit must stop the loop before Reason can consume the
-// old in-memory history. Phase 8 carries this state to the host for cold recovery.
+// old in-memory history. Phase 8 reports this state for explicit history reload.
 fn uncertain_compaction_error(ctx: &super::StageContext) -> crate::error::AgentError {
     ctx.runtime
         .event_bus

@@ -1,20 +1,12 @@
 pub mod ask_user_tool;
-pub mod filesystem;
-pub mod output_persist;
-pub mod output_truncate;
 pub mod todo;
 
 use std::sync::Arc;
 
 pub use ask_user_tool::AskUserTool;
 use async_trait::async_trait;
-pub use filesystem::{
-    EditFileTool, FolderOperationsTool, GlobFilesTool, GrepTool, ReadFileTool, WriteFileTool,
-};
 use peri_agent::tools::{BaseTool, ToolOutput};
 pub use todo::{TodoItem, TodoState, TodoStatus, TodoWriteTool};
-
-pub(crate) use peri_tool_runtime::numeric::parse_optional_u64;
 
 /// ArcToolWrapper - 将 Arc<dyn BaseTool> 包装为 Box<dyn BaseTool> 可用的形式
 ///
@@ -76,6 +68,14 @@ impl BaseTool for BoxToolWrapper {
         self.0.mcp_server_name()
     }
 
+    fn mcp_tool_name(&self) -> Option<&str> {
+        self.0.mcp_tool_name()
+    }
+
+    fn builtin_mcp_instance(&self) -> Option<&str> {
+        self.0.builtin_mcp_instance()
+    }
+
     fn timeout(&self) -> Option<std::time::Duration> {
         self.0.timeout()
     }
@@ -131,6 +131,14 @@ impl BaseTool for ArcToolWrapper {
 
     fn mcp_server_name(&self) -> Option<&str> {
         self.0.mcp_server_name()
+    }
+
+    fn mcp_tool_name(&self) -> Option<&str> {
+        self.0.mcp_tool_name()
+    }
+
+    fn builtin_mcp_instance(&self) -> Option<&str> {
+        self.0.builtin_mcp_instance()
     }
 
     fn timeout(&self) -> Option<std::time::Duration> {

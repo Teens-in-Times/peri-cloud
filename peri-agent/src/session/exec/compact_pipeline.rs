@@ -5,9 +5,9 @@
 //! `compact_v2::run_compact`）的 `/compact` 命令执行体；ACP 协议面
 //! `session::command::compact::pipeline` 保留 re-export 薄壳。
 //!
-//! [v2] 从 v1 `full_compact + re_inject` 迁移到 `compact_v2::run_compact(force=true)`：
+//! [v2] 从 v1 压缩路径迁移到 `compact_v2::run_compact(force=true)`：
 //! - 把 history 加载进临时 `MessageTranscript`
-//! - 调用 `run_compact` 触发 Full Compact + re-inject
+//! - 调用 `run_compact` 触发 Full Compact
 //! - 从 transcript 拿 compact 后的 visible_messages 组装事件载荷
 //!
 //! 编排层（`compact.rs::execute`）只做组合。
@@ -25,6 +25,7 @@
 //! 以 `compact_config` 投影（ACP 装配点按 `load_compact_config` 语义预填，
 //! env overrides 每轮重新应用，语义保持）。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use peri_acp_types::command::{
@@ -33,8 +34,9 @@ use peri_acp_types::command::{
 };
 use peri_acp_types::compact::CompactConfig;
 use peri_acp_types::event::CompactTrigger;
-use peri_acp_types::messages::BaseMessage;
+use peri_acp_types::messages::{BaseMessage, MessageId};
 use peri_acp_types::session_resources::DataCapabilities;
+use peri_acp_types::store::PersistedPayload;
 use tokio_util::sync::CancellationToken as AgentCancellationToken;
 use tracing::{info, warn};
 
@@ -45,7 +47,7 @@ use super::events::{emit_compact_completed, emit_compact_started};
 
 /// Pipeline 终态。编排层据此决定返回值与是否中途 short-circuit。
 pub enum PipelineOutcome {
-    /// 正常完成：组装后的消息（首条 Human + re-inject 消息...）。
+    /// 正常完成：组装后的消息（首条 Human 为摘要）。
     Completed {
         messages: Vec<BaseMessage>,
         /// v2 compact 操作计数（feedback 文案「已压缩 N 条消息」的 N）。
@@ -148,33 +150,24 @@ pub async fn run_pipeline(ctx: CommandContext) -> PipelineOutcome {
             return PipelineOutcome::EarlyReturn {
                 history,
                 stop_reason: PromptStopReason::EndTurn,
-                message: "compact persistence failed".to_string(),
+                message: format!("compact persistence failed: {error:#}"),
             };
         }
     }
 
-    // 阶段 5: 已存在的 thread 从一次一致快照重建。Host 跨 turn 保留 canonical
-    // history（含 excluded 原文），先核对完整消息身份与顺序，再恢复 flags 供 Full
-    // 选择可见内容；不能拿 visible view 与 canonical 输入比较。
+    // 阶段 5: 已存在的 thread 从一次一致快照重建。先核对消息身份与顺序，再恢复
+    // flags 供 Full 选择可见内容；不能拿 visible view 与 canonical 输入比较。
     let snapshot = match session_resources.load_session_snapshot(&thread_id).await {
         Ok(snapshot) => snapshot,
-        Err(_) => {
-            warn!("compact: failed to load persisted history");
+        Err(error) => {
+            warn!(error = %format_args!("{error:#}"), "compact: failed to load persisted history");
             return PipelineOutcome::EarlyReturn {
                 history,
                 stop_reason: PromptStopReason::EndTurn,
-                message: "compact persistence failed".to_string(),
+                message: format!("compact persistence failed: {error:#}"),
             };
         }
     };
-    // 仅用普通消息投影校验调用方身份；真正的摘要输入恢复完整 payload。
-    let persisted_history: Vec<BaseMessage> = snapshot
-        .inherited
-        .payloads
-        .iter()
-        .chain(&snapshot.payloads)
-        .filter_map(|payload| payload.as_message().cloned())
-        .collect();
     let mut transcript = MessageTranscript::new().with_compaction_commit_state(commit_state);
     if snapshot.payloads.is_empty() && snapshot.inherited.payloads.is_empty() {
         if history.is_empty() {
@@ -188,19 +181,43 @@ pub async fn run_pipeline(ctx: CommandContext) -> PipelineOutcome {
         for message in &history {
             transcript.append(message.clone());
         }
-        if transcript.flush_persistence().await.is_err() {
-            warn!("compact: failed to persist initial history");
+        if let Err(error) = transcript.flush_persistence().await {
+            warn!(error = %format_args!("{error:#}"), "compact: failed to persist initial history");
             return PipelineOutcome::EarlyReturn {
                 history,
                 stop_reason: PromptStopReason::EndTurn,
-                message: "compact persistence failed".to_string(),
+                message: format!("compact persistence failed: {error:#}"),
             };
         }
     } else {
-        let history_matches = persisted_history.len() == history.len()
+        // 调用方身份只按**有效集合**校验（spec D3）：成功 Full 提交会释放热态里的
+        // excluded 原文（D1 transcript shrink），宿主下一轮带回的历史天然只剩有效
+        // 条目。两侧用同一次快照的 flags 对称剔除 excluded 后比较 id 序列；调用方
+        // 多带的未知 id 仍会因长度不符被拒绝，校验强度不降。
+        let excluded_ids: HashSet<MessageId> = snapshot
+            .inherited
+            .flags
+            .iter()
+            .chain(snapshot.flags.iter())
+            .filter(|(_, flags)| flags.excluded)
+            .map(|(id, _)| *id)
+            .collect();
+        let persisted_history: Vec<&BaseMessage> = snapshot
+            .inherited
+            .payloads
+            .iter()
+            .chain(&snapshot.payloads)
+            .filter(|payload| !excluded_ids.contains(&payload.id()))
+            .filter_map(PersistedPayload::as_message)
+            .collect();
+        let command_history: Vec<&BaseMessage> = history
+            .iter()
+            .filter(|message| !excluded_ids.contains(&message.id()))
+            .collect();
+        let history_matches = persisted_history.len() == command_history.len()
             && persisted_history
                 .iter()
-                .zip(&history)
+                .zip(&command_history)
                 .all(|(persisted, incoming)| persisted.id() == incoming.id());
         if !history_matches {
             warn!("compact: persisted canonical history does not match command history");
@@ -210,6 +227,8 @@ pub async fn run_pipeline(ctx: CommandContext) -> PipelineOutcome {
                 message: "compact persistence context mismatch".to_string(),
             };
         }
+        // 校验通过后从完整快照重建：excluded 原文仍是 canonical 历史的一部分，
+        // Full 只对有效条目落 flags。
         transcript = transcript
             .with_ancestor_payloads(snapshot.inherited.payloads)
             .with_own_payloads(snapshot.payloads);
@@ -319,6 +338,7 @@ async fn run_v2_compact_with_cancel(
             true,
             consecutive_failures,
             cwd,
+            None,
         ) => r,
     };
 
@@ -350,7 +370,7 @@ async fn run_v2_compact_with_cancel(
     Ok(result)
 }
 
-/// 组装最终消息：从 transcript visible_messages 提取首条 Human + re-inject 消息。
+/// 组装最终消息：从 transcript visible_messages 提取摘要及保留的可见消息。
 ///
 /// [TRAP] compact 后消息结构必须以 `BaseMessage::human(summary + continuation)` 开头。
 /// 但 v2 的 run_compact 已经在 transcript 内部追加了符合不变量的消息，

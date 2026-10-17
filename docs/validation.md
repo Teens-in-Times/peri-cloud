@@ -3,7 +3,11 @@
 ## v0.7.0 升级准备（2026-10-18）
 
 - 基线：`0941d0683802f25e21ff8b0aa8c894050e3b9377`（v0.6.1）。
-- Windows 串行回归：29 个测试二进制，371 通过，0 失败；格式检查通过；portal/model DOM 检查通过。
+- v4 核心叠加到 `e1d1b9c034092e4e58c163f1a8e5005a1db5f68c`：上游 manifest 1264 个文件，1244 个一致，20 个允许清单内的生产补丁，0 缺失、0 未声明漂移。
+- 升级后 Windows 串行回归：30 个测试二进制，371 通过，0 失败；`cargo check --workspace --all-targets` 通过。
+- Peri v4 核心回归：32 个测试二进制，4509 通过，0 失败；`peri-cloud` 与 `peri-executor` 的严格 Clippy 通过。
+- 手动 `/compact` 只生成摘要并由云 journal 结算；自动 Full Compact 使用 deployment-owned 模式，热 transcript 不提前释放被排除历史，避免 journal 丢失 canonical 消息。
+- Windows 串行基线（升级前）：29 个测试二进制，371 通过，0 失败；格式检查通过；portal/model DOM 检查通过。
 - Windows 控制台须为 UTF-8（`chcp 65001`）。否则 executor 的 PowerShell 中文输出会按本地代码页解码，`shell_alias_captures_stdout_stderr_and_nonzero_exit_evidence` 会失败；这是测试机代码页问题，不是代码回归。CI 的英文 runner 不受影响。
 - schema 8 fixture 由生产库 DDL 生成（不包含数据），28 张表，`PRAGMA integrity_check` 通过。
 - v4 上游清单与生产补丁清单见 [upstream/peri-e1d1b9c0.md](upstream/peri-e1d1b9c0.md)。

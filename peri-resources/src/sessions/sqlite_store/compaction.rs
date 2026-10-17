@@ -3,12 +3,11 @@
 use super::failure::commit_failure;
 use super::{database::SqliteSessionDatabase, row_mapping::role_of};
 use anyhow::Result;
-use chrono::Utc;
 use peri_acp_types::{
     store::{CompactionChange, MessageFlags},
     thread::ThreadId,
 };
-use sqlx::SqliteConnection;
+use sqlx::{AssertSqlSafe, SqliteConnection};
 use std::collections::HashMap;
 
 pub(super) async fn delete_messages(
@@ -28,7 +27,7 @@ pub(super) async fn delete_messages(
             .execute(&mut *tx)
             .await?;
     }
-    let now = Utc::now().to_rfc3339();
+    let now = peri_time::now_utc_rfc3339();
     sqlx::query(
         "UPDATE threads SET updated_at = ?1,
                 message_count = (SELECT COUNT(*) FROM messages WHERE thread_id = ?2)
@@ -41,7 +40,6 @@ pub(super) async fn delete_messages(
     tx.commit()
         .await
         .map_err(|_| commit_failure(Some(thread_id.clone())))?;
-    database.invalidate_context_cache(thread_id).await?;
     Ok(())
 }
 
@@ -66,16 +64,6 @@ pub(super) async fn update_message_flags(
     .execute(&database.pool)
     .await?;
 
-    // 消息可见性变更（truncation/excluded/projection）影响上下文视图，失效 cached_context
-    let thread_id: Option<(String,)> =
-        sqlx::query_as("SELECT thread_id FROM messages WHERE message_id = ?1")
-            .bind(&id_str)
-            .fetch_optional(&database.pool)
-            .await?;
-    if let Some((tid,)) = thread_id {
-        database.invalidate_context_cache(&tid).await?;
-    }
-
     Ok(())
 }
 
@@ -85,7 +73,18 @@ pub(super) async fn commit_compaction_lifecycle(
     lifecycle: &CompactionChange,
 ) -> Result<()> {
     let mut tx = database.pool.begin().await?;
+    commit_compaction_lifecycle_on(&mut tx, thread_id, lifecycle).await?;
+    tx.commit()
+        .await
+        .map_err(|_| commit_failure(Some(thread_id.clone())))?;
+    Ok(())
+}
 
+pub(super) async fn commit_compaction_lifecycle_on(
+    tx: &mut SqliteConnection,
+    thread_id: &ThreadId,
+    lifecycle: &CompactionChange,
+) -> Result<()> {
     for (message_id, flags) in &lifecycle.flag_updates {
         let projection_json = flags
             .projection
@@ -127,13 +126,11 @@ pub(super) async fn commit_compaction_lifecycle(
         .await?;
     }
 
-    let now = Utc::now().to_rfc3339();
+    let now = peri_time::now_utc_rfc3339();
     sqlx::query(
         "UPDATE threads
              SET updated_at = ?1,
-                 message_count = (SELECT COUNT(*) FROM messages WHERE thread_id = ?2),
-                 cached_context = NULL,
-                 context_cache_epoch = context_cache_epoch + 1
+                 message_count = (SELECT COUNT(*) FROM messages WHERE thread_id = ?2)
              WHERE id = ?2",
     )
     .bind(&now)
@@ -141,9 +138,6 @@ pub(super) async fn commit_compaction_lifecycle(
     .execute(&mut *tx)
     .await?;
 
-    tx.commit()
-        .await
-        .map_err(|_| commit_failure(Some(thread_id.clone())))?;
     Ok(())
 }
 
@@ -153,6 +147,16 @@ pub(super) async fn load_message_flags(
 ) -> Result<HashMap<peri_acp_types::messages::MessageId, MessageFlags>> {
     let mut connection = database.pool.acquire().await?;
     load_flags_on(&mut connection, thread_id).await
+}
+
+/// 按 id 集合读取 flags（有界）：只查给定 id，不做全历史扫描。
+pub(super) async fn load_flags_for_ids(
+    database: &SqliteSessionDatabase,
+    thread_id: &ThreadId,
+    ids: &[peri_acp_types::messages::MessageId],
+) -> Result<HashMap<peri_acp_types::messages::MessageId, MessageFlags>> {
+    let mut connection = database.pool.acquire().await?;
+    load_flags_for_ids_on(&mut connection, thread_id, ids).await
 }
 
 /// flags 是派生视图：只返回非默认标记。
@@ -171,6 +175,61 @@ pub(super) async fn load_flags_on(
     .fetch_all(&mut *connection)
     .await?;
 
+    decode_flag_rows(rows)
+}
+
+/// 有效范围 flags 的语句原文（计划证据与生产读取同一份文本，见 `session_history_perf_test.rs`）。
+pub(in crate::sessions) const ACTIVE_FLAGS_SQL: &str =
+    "SELECT message_id, truncated, excluded, projection FROM messages \
+             WHERE thread_id = ?1 AND excluded = 0 AND (truncated = 1 OR projection IS NOT NULL)";
+
+/// 有效范围的 flags：与有效 payload 同一过滤条件（`excluded = 0`），
+/// 因此已排除条目的标记不返回。`excluded = 1` 分支在此条件下恒不成立，故不列出。
+pub(super) async fn load_active_flags_on(
+    connection: &mut SqliteConnection,
+    thread_id: &ThreadId,
+) -> Result<HashMap<peri_acp_types::messages::MessageId, MessageFlags>> {
+    let rows: Vec<(String, bool, bool, Option<String>)> = sqlx::query_as(ACTIVE_FLAGS_SQL)
+        .bind(thread_id.as_str())
+        .fetch_all(&mut *connection)
+        .await?;
+
+    decode_flag_rows(rows)
+}
+
+/// 给定 id 集合的 flags：范围由调用方的 id 列表界定（空列表不查库，直接是空结果）。
+///
+/// 占位符个数随 id 数量生成，值全部走绑定参数：语句里不出现任何 id 文本。
+pub(super) async fn load_flags_for_ids_on(
+    connection: &mut SqliteConnection,
+    thread_id: &ThreadId,
+    ids: &[peri_acp_types::messages::MessageId],
+) -> Result<HashMap<peri_acp_types::messages::MessageId, MessageFlags>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = (2..=ids.len() + 1)
+        .map(|position| format!("?{position}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut query = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT message_id, truncated, excluded, projection FROM messages \
+             WHERE thread_id = ?1 AND message_id IN ({placeholders}) \
+               AND (truncated = 1 OR excluded = 1 OR projection IS NOT NULL)"
+    )))
+    .bind(thread_id.as_str());
+    for id in ids {
+        query = query.bind(id.as_uuid().to_string());
+    }
+    let rows: Vec<(String, bool, bool, Option<String>)> = query.fetch_all(&mut *connection).await?;
+
+    decode_flag_rows(rows)
+}
+
+/// 行 → flags（行内 ID 必须是可解释的 uuid；projection 不可读即失败）。
+fn decode_flag_rows(
+    rows: Vec<(String, bool, bool, Option<String>)>,
+) -> Result<HashMap<peri_acp_types::messages::MessageId, MessageFlags>> {
     let mut flags = HashMap::with_capacity(rows.len());
     for (id_str, truncated, excluded, projection_json) in rows {
         let id = uuid::Uuid::parse_str(&id_str)
@@ -211,7 +270,7 @@ pub(super) async fn delete_messages_since(
             .bind(rowid)
             .execute(&mut *tx)
             .await?;
-        let now = Utc::now().to_rfc3339();
+        let now = peri_time::now_utc_rfc3339();
         sqlx::query(
             "UPDATE threads SET updated_at = ?1,
                     message_count = (SELECT COUNT(*) FROM messages WHERE thread_id = ?2)
@@ -224,7 +283,6 @@ pub(super) async fn delete_messages_since(
         tx.commit()
             .await
             .map_err(|_| commit_failure(Some(thread_id.clone())))?;
-        database.invalidate_context_cache(thread_id).await?;
     }
     Ok(())
 }

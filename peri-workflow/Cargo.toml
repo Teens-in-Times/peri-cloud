@@ -1,16 +1,18 @@
 [package]
-license = "AGPL-3.0-only"
 name = "peri-workflow"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
+peri-time = { path = "../peri-time" }
 peri-acp-types = { path = "../peri-acp-types" }
 peri-js-runtime = { path = "../peri-js-runtime" }
+peri-process = { path = "../peri-process" }
 tokio.workspace = true
 tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 thiserror.workspace = true
@@ -24,4 +26,8 @@ tempfile.workspace = true
 dirs-next.workspace = true
 
 [dev-dependencies]
+serial_test.workspace = true
 tokio-test = "0.4"
+
+[target.'cfg(not(target_os = "emscripten"))'.dependencies]
+tokio = { workspace = true, features = ["full"] }

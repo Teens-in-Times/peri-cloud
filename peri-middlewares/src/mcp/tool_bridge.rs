@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use peri_acp_types::tool_outcome::RawToolResult;
 use peri_agent::tools::BaseTool;
 use rmcp::model::{ContentBlock, Tool};
 use thiserror::Error;
 
+use super::client::output_store::format_output;
 use super::client::{McpClientHandle, McpClientPool};
-use crate::tools::output_persist::persist_truncated_output;
 
 /// MCP 工具调用错误
 #[derive(Debug, Error)]
@@ -45,12 +46,17 @@ pub struct McpToolBridge {
     direct: bool,
     server_generation: u64,
     client: Arc<McpClientHandle>,
-    binding_leases: Option<Arc<super::apps::McpAppBindingLeaseRegistry>>,
+    binding_leases: Option<Arc<super::apps::McpAppBindingRegistry>>,
     admission: Option<super::dynamic::admission::DynamicMcpAdmissionGate>,
+    output_pool: Option<std::sync::Weak<McpClientPool>>,
+    output_session_id: Option<String>,
 }
 
-const TOOL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-const MAX_MCP_LINES: usize = 2000;
+/// External MCP requests share a 120-second deadline across send and response.
+/// Only the workspace builtin retains its native file/shell deadlines. Identity
+/// comes from ConfigSource; other builtins retain the bounded MCP call contract.
+/// In particular Bash must finish promotion and return its receipt at the 120s boundary.
+pub(crate) const TOOL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Sanitize name components to match API tool name pattern: ^[a-zA-Z0-9_-]+$
 pub(crate) fn sanitize_name_component(name: &str) -> String {
@@ -71,11 +77,6 @@ fn app_allowed_tools(
     tools: &[Tool],
     dispatcher: &dyn peri_acp_types::tools::EffectiveToolDispatcher,
 ) -> std::collections::HashMap<String, String> {
-    let dispatcher_tools = dispatcher
-        .tools()
-        .into_iter()
-        .map(|tool| tool.name)
-        .collect::<std::collections::HashSet<_>>();
     tools
         .iter()
         .filter(|tool| {
@@ -84,10 +85,9 @@ fn app_allowed_tools(
         })
         .filter_map(|tool| {
             let name = tool.name.to_string();
-            let effective = effective_mcp_tool_name(server_name, &name);
-            dispatcher_tools
-                .contains(&effective)
-                .then_some((name, effective))
+            dispatcher
+                .admitted_mcp_tool_name(server_name, &name)
+                .map(|effective| (name, effective))
         })
         .collect()
 }
@@ -100,29 +100,64 @@ pub(crate) fn effective_mcp_tool_name(server_name: &str, tool_name: &str) -> Str
     )
 }
 
+/// 单个外部 MCP 工具 description 的字节预算（M7）。
+///
+/// 描述来自外部 server（不受本仓库控制），无预算时一条巨型描述会挤占每次
+/// 请求的 tools 参数。超预算按 UTF-8 边界截断，并在**预算内**追加截断标记
+/// （标记计入预算，模型看到的是有界文本且知道被截断）。
+const MAX_TOOL_DESCRIPTION_BYTES: usize = 8 * 1024;
+
+/// 构造模型可见的工具描述：`[MCP:{server}] {description}`，超预算时截断。
+fn bounded_tool_description(server_name: &str, description: Option<&str>) -> String {
+    let text = format!("[MCP:{}] {}", server_name, description.unwrap_or(""));
+    if text.len() <= MAX_TOOL_DESCRIPTION_BYTES {
+        return text;
+    }
+    let total = text.len();
+    let marker = format!("… [description truncated: {total} bytes total]");
+    let budget = MAX_TOOL_DESCRIPTION_BYTES.saturating_sub(marker.len());
+    let mut truncated = peri_agent::agent::async_tasks::truncate_bytes(&text, budget);
+    truncated.push_str(&marker);
+    truncated
+}
+
+/// builtin 声明表中声明为 host-only（`model_visible: false`）的工具。
+///
+/// 判定要求来源确为 builtin（`ConfigSource::Builtin` 且实例身份与 server name
+/// 一致）：保留名接管在加载期已拒绝，此处仍按来源判定，不依赖配置校验的间接
+/// 结论，外部 / 动态 server 因此永不受声明表影响。声明表之外恒 `false`
+/// （可见性默认开放，保守默认不改变既有实例行为）。
+pub(crate) fn declared_model_hidden(client: &McpClientHandle, tool_name: &str) -> bool {
+    matches!(
+        &client.source,
+        Some(super::config::ConfigSource::Builtin { instance }) if instance == &client.name
+    ) && super::builtin::is_declared_model_hidden(&client.name, tool_name)
+}
+
 impl McpToolBridge {
     pub fn new(server_name: &str, tool: &Tool, client: Arc<McpClientHandle>) -> Self {
         let tool_name = tool.name.to_string();
         let full_name = effective_mcp_tool_name(server_name, &tool_name);
-        let description = format!(
-            "[MCP:{}] {}",
-            server_name,
-            tool.description.as_ref().map(|d| d.as_ref()).unwrap_or("")
-        );
+        let description =
+            bounded_tool_description(server_name, tool.description.as_ref().map(|d| d.as_ref()));
         let input_schema = serde_json::to_value(&*tool.input_schema)
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        let model_visible =
+            super::apps::tool_visibility(tool).model && !declared_model_hidden(&client, &tool_name);
         Self {
             server_name: server_name.to_string(),
             tool_name,
             full_name,
             description,
             input_schema,
-            model_visible: super::apps::tool_visibility(tool).model,
+            model_visible,
             direct: false,
             server_generation: 0,
             client,
             binding_leases: None,
             admission: None,
+            output_pool: None,
+            output_session_id: None,
         }
     }
 
@@ -138,14 +173,12 @@ impl McpToolBridge {
                 server: server_name.to_string(),
             });
         }
-        let description = format!(
-            "[MCP:{}] {}",
+        let description = bounded_tool_description(
             server_name,
-            tool.description
-                .as_ref()
-                .map(|value| value.as_ref())
-                .unwrap_or("")
+            tool.description.as_ref().map(|value| value.as_ref()),
         );
+        let model_visible =
+            super::apps::tool_visibility(tool).model && !declared_model_hidden(&client, &tool_name);
         Ok(Self {
             server_name: server_name.to_string(),
             full_name: effective_mcp_tool_name(server_name, &tool_name),
@@ -153,13 +186,25 @@ impl McpToolBridge {
             description,
             input_schema: serde_json::to_value(&*tool.input_schema)
                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
-            model_visible: super::apps::tool_visibility(tool).model,
+            model_visible,
             direct: false,
             server_generation: 0,
             client,
             binding_leases: None,
             admission: Some(admission),
+            output_pool: None,
+            output_session_id: None,
         })
+    }
+
+    pub fn with_output_store(
+        mut self,
+        pool: &Arc<McpClientPool>,
+        session_id: Option<&str>,
+    ) -> Self {
+        self.output_pool = Some(Arc::downgrade(pool));
+        self.output_session_id = session_id.map(str::to_string);
+        self
     }
 
     pub fn with_server_generation(mut self, generation: u64) -> Self {
@@ -169,21 +214,23 @@ impl McpToolBridge {
 
     pub fn with_binding_leases(
         mut self,
-        registry: Arc<super::apps::McpAppBindingLeaseRegistry>,
+        registry: Arc<super::apps::McpAppBindingRegistry>,
     ) -> Self {
         self.binding_leases = Some(registry);
         self
     }
 
-    /// 将本 bridge 提升为 direct（无需模型先搜索即可出现在 tools 参数中）。
-    ///
-    /// 只改 direct 标记：visibility、名称、client、generation、admission 与
-    /// binding leases 均不变，也不产生副本或新注册。
-    ///
-    /// 调用点归 `system_tools::prepare_system_tools`（同 Wave 落地）。
-    pub(crate) fn with_direct(mut self) -> Self {
+    /// 仅启动清单选中的 system 工具使用原始模型名；wire 身份始终保存在 tool_name。
+    pub(crate) fn with_system_direct(mut self) -> Self {
         self.direct = true;
+        self.full_name = self.tool_name.clone();
         self
+    }
+
+    /// The explicitly selected HTTP Workspace publishes its complete model tool
+    /// surface through the live tools/list response.
+    pub(crate) fn with_workspace_direct(self) -> Self {
+        self.with_system_direct()
     }
 
     /// MCP 声明的原始工具名（未净化、未加 server 前缀）。
@@ -195,6 +242,14 @@ impl McpToolBridge {
     /// 调用点归 `system_tools::prepare_system_tools`（同 Wave 落地）。
     pub(crate) fn original_tool_name(&self) -> &str {
         &self.tool_name
+    }
+
+    /// 本 bridge 绑定的连接句柄（session-owned 入口的提交复核用它绑定 peer）。
+    ///
+    /// 只暴露句柄引用：wire 调用仍必须经 `invoke_output`（超时 / 输出预算 /
+    /// 任务提升等语义在 bridge 内，不得绕过）。
+    pub(crate) fn client_handle(&self) -> &Arc<McpClientHandle> {
+        &self.client
     }
 }
 
@@ -223,6 +278,17 @@ impl BaseTool for McpToolBridge {
         Some(&self.server_name)
     }
 
+    fn mcp_tool_name(&self) -> Option<&str> {
+        Some(&self.tool_name)
+    }
+
+    fn builtin_mcp_instance(&self) -> Option<&str> {
+        match &self.client.source {
+            Some(super::config::ConfigSource::Builtin { instance }) => Some(instance),
+            _ => None,
+        }
+    }
+
     fn timeout(&self) -> Option<std::time::Duration> {
         None
     }
@@ -235,11 +301,30 @@ impl BaseTool for McpToolBridge {
         self.direct
     }
 
+    /// 文本投影落点：只返回模型/UI 投影文本。MCP 的 canonical 落点是
+    /// [`BaseTool::invoke_output`]，本方法在其上丢弃 raw 与 `isError` 事实。
     async fn invoke(
         &self,
         input: serde_json::Value,
         ctx: peri_agent::tools::ToolContext<'_>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.invoke_output(input, ctx).await?.text)
+    }
+
+    /// MCP adapter 的 canonical 落点：**先保存 outcome，再投影**。
+    ///
+    /// 远端 `tools/call` 结果以 [`RawToolResult`] 保真随 `outcome` 返回（`content`
+    /// 含多模态块、`structuredContent`、`_meta`、`isError`），调用方（App relay /
+    /// ACP / 模型面）各自从返回值解读，不得经旁路 registry 捞取。
+    ///
+    /// `isError: true` 是工具报告的**结果事实**而不是调用失败：它作为
+    /// [`ToolOutcome::Reported`] 的正常返回值离开本函数。只有 transport/协议层失败
+    /// 才返回 `Err`。
+    async fn invoke_output(
+        &self,
+        input: serde_json::Value,
+        ctx: peri_agent::tools::ToolContext<'_>,
+    ) -> Result<peri_agent::tools::ToolOutput, Box<dyn std::error::Error + Send + Sync>> {
         let _permit = match &self.admission {
             Some(gate) => Some(gate.try_acquire().map_err(|_| {
                 Box::new(ToolCallError::Unavailable {
@@ -260,117 +345,328 @@ impl BaseTool for McpToolBridge {
         }
 
         let peer = self.client.peer.as_ref().unwrap();
-
-        // 2. 构建 rmcp 请求参数
-        let arguments = input.as_object().cloned().unwrap_or_default();
-        let request = rmcp::model::CallToolRequestParams::new(self.tool_name.clone())
-            .with_arguments(arguments);
-
-        // 3. 带超时调用 peer.call_tool()
-        let result = tokio::time::timeout(TOOL_CALL_TIMEOUT, peer.call_tool(request))
-            .await
-            .map_err(|_| ToolCallError::Timeout {
+        let session_id = ctx.session_id.as_deref().ok_or_else(|| {
+            Box::new(ToolCallError::CallFailed {
                 server: self.server_name.clone(),
                 tool: self.tool_name.clone(),
-                timeout_secs: TOOL_CALL_TIMEOUT.as_secs(),
-            })?
-            .map_err(|e| ToolCallError::CallFailed {
-                server: self.server_name.clone(),
-                tool: self.tool_name.clone(),
-                reason: e.to_string(),
+                reason: "MCP tool call requires a trusted session binding".into(),
+            }) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        let pool = self
+            .output_pool
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| {
+                Box::new(ToolCallError::CallFailed {
+                    server: self.server_name.clone(),
+                    tool: self.tool_name.clone(),
+                    reason: "session MCP task owner unavailable".into(),
+                }) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+        let mut execution_guard = pool
+            .begin_external_task_execution(session_id, &self.server_name)
+            .map_err(|reason| {
+                Box::new(ToolCallError::CallFailed {
+                    server: self.server_name.clone(),
+                    tool: self.tool_name.clone(),
+                    reason,
+                }) as Box<dyn std::error::Error + Send + Sync>
             })?;
 
-        // 4. 处理 is_error 标志。失败的实例化调用不得签发 App lease。
-        if result.is_error.unwrap_or(false) {
-            let error_text = format_contents(&result.content);
-            let lines: Vec<&str> = error_text.lines().collect();
-            let reason = if lines.len() > MAX_MCP_LINES {
-                let persist_hint = persist_truncated_output(&error_text);
-                let truncated: String = lines[..MAX_MCP_LINES].join("\n");
-                format!(
-                    "{truncated}\n\n[MCP error output truncated: {} total lines]{persist_hint}",
-                    lines.len()
-                )
-            } else {
-                error_text
-            };
-            return Err(Box::new(ToolCallError::CallFailed {
+        let delivery = ctx.task_terminal_delivery.clone();
+        // 2. 构建 rmcp 请求参数
+        let arguments = input.as_object().cloned().unwrap_or_default();
+        let mut request = rmcp::model::CallToolRequestParams::new(self.tool_name.clone())
+            .with_arguments(arguments);
+        // per-call 会话身份（`peri/taskScope` 能力令牌）随源接线：workspace 工具面
+        // 与 builtin `workflow` 实例面共用同一签发面（design `workflow-mcp` §3
+        // 「per-call 身份沿用 `_meta["peri/taskScope"]`」，为 workflow 源接线）。
+        let task_scope_source = matches!(
+            self.client.source.as_ref(),
+            Some(super::config::ConfigSource::Builtin { instance })
+                if instance == "workspace" || instance == "workflow"
+        ) || matches!(
+            self.client.source.as_ref(),
+            Some(super::config::ConfigSource::WorkspaceRemote)
+        );
+        if task_scope_source {
+            request.meta = pool.task_scope_meta_for(&self.server_name, session_id);
+        }
+        request.meta = Some(super::invocation::request_meta(&ctx, request.meta)?);
+
+        // Workspace tools retain their own deadlines (Bash promotes at <=120s).
+        // Source identity, not a spoofable server name, grants this behavior.
+        let timeout = (!matches!(
+            self.client.source.as_ref(),
+            Some(super::config::ConfigSource::Builtin { instance }) if instance == "workspace"
+        ))
+        .then_some(TOOL_CALL_TIMEOUT);
+        let response = match super::tool_request::call_tool(peer, request, timeout).await {
+            Ok(response) => response,
+            Err(error) => {
+                // 只有真正的传输/协议失败走这条路。远端 JSON-RPC error 的
+                // `code`/`message`/`data` 目前只经 `Display` 进入文本投影；
+                // 移除条件（阶段 2/3）：App relay 需要把上游 JSON-RPC error 转发给 App 时
+                // （需要 App 侧消费方 + Host invoke 入口共用同一出口），在此用
+                // `rmcp::ServiceError::McpError(data)` 构造 `RemoteToolError::from_jsonrpc`
+                // 并挂到 `EffectiveToolError::with_remote_error` 上，不靠 error code 反推。
+                let e = error;
+                return Err(Box::new(
+                    if let rmcp::ServiceError::Timeout { timeout } = e {
+                        ToolCallError::Timeout {
+                            server: self.server_name.clone(),
+                            tool: self.tool_name.clone(),
+                            timeout_secs: timeout.as_secs(),
+                        }
+                    } else {
+                        ToolCallError::CallFailed {
+                            server: self.server_name.clone(),
+                            tool: self.tool_name.clone(),
+                            reason: e.to_string(),
+                        }
+                    },
+                ));
+            }
+        };
+        let result = match response {
+            rmcp::model::CallToolResponse::Complete(result) => {
+                execution_guard.confirm_stopped();
+                result
+            }
+            rmcp::model::CallToolResponse::Task(created) => {
+                let task_created_at = created.task.created_at;
+                let task_id = created.task.task_id;
+                let is_shell = self.tool_name == "Bash"
+                    && (matches!(
+                        self.client.source.as_ref(),
+                        Some(super::config::ConfigSource::Builtin { instance })
+                            if instance == "workspace"
+                    ) || matches!(
+                        self.client.source.as_ref(),
+                        Some(super::config::ConfigSource::WorkspaceRemote)
+                    ));
+                let summary = if is_shell {
+                    input
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Bash")
+                } else {
+                    self.tool_name.as_str()
+                };
+                let kind = if is_shell {
+                    peri_acp_types::tasks::BgTaskKind::Shell
+                } else {
+                    peri_acp_types::tasks::BgTaskKind::Mcp
+                };
+                let (manager, registration) = pool.external_task_registration(
+                    session_id,
+                    Some(session_id),
+                    delivery.clone(),
+                    &self.server_name,
+                    &task_id,
+                    kind,
+                    summary,
+                    is_shell,
+                    &task_created_at,
+                )?;
+                let public_id = match manager.register_external(registration) {
+                    Ok(task_id) => {
+                        execution_guard.confirm_stopped();
+                        task_id
+                    }
+                    Err(reason) => {
+                        return Err(Box::new(ToolCallError::CallFailed {
+                            server: self.server_name.clone(),
+                            tool: self.tool_name.clone(),
+                            reason: format!("{reason}; remote task {task_id} started but local registration failed; do not repeat the invocation"),
+                        }));
+                    }
+                };
+                if let Err(error) = pool.spawn_managed_task_subscription(
+                    self.server_name.clone(),
+                    session_id.to_owned(),
+                    task_id.clone(),
+                    public_id.clone(),
+                    is_shell,
+                    peer.clone(),
+                ) {
+                    if error != super::task_scope::TaskAdmissionError::DuplicateKey {
+                        return Err(Box::new(ToolCallError::CallFailed {
+                                    server: self.server_name.clone(),
+                                    tool: self.tool_name.clone(),
+                                    reason: format!(
+                                        "background task {public_id} exists, but its monitor was not admitted: {error}; completion delivery is not guaranteed; do not repeat the command"
+                                    ),
+                                }));
+                    }
+                }
+                // 回执只承诺可达的投递：有 canonical 路由 = 持久送达
+                // （resume 后仍可见）；否则只声称活跃期送达。
+                let delivery_note = if delivery.is_some() {
+                    "Its completion reminder is committed to the initiating session's \
+                             transcript and stays visible after resume."
+                } else {
+                    "Its completion reminder is delivered to the initiating session \
+                             while that session is live."
+                };
+                return Ok(peri_agent::tools::ToolOutput::from_legacy(format!(
+                    "Background task started: {public_id}. {delivery_note}"
+                )));
+            }
+            _ => {
+                return Err(Box::new(ToolCallError::CallFailed {
+                    server: self.server_name.clone(),
+                    tool: self.tool_name.clone(),
+                    reason: "unsupported MCP tool response".into(),
+                }));
+            }
+        };
+
+        // 4. 先保存结果事实：`isError: true` 与多模态 content / structuredContent /
+        //    `_meta` 一样属于结果，不再被折叠成错误路径。文本投影是最后一步的派生
+        //    视图，不是事实源（step 6）。
+        //
+        //    保真边界：本值来自 rmcp 解析后的 typed 结果，rmcp `CallToolResult` 没有
+        //    未知字段承接位，因此线上未被 rmcp 建模的顶层扩展字段在此已丢失；要覆盖
+        //    它们需要在 transport 层抓取原始 JSON（见本函数末尾的移除条件）。
+        let raw = RawToolResult::new(serde_json::to_value(&result).map_err(|error| {
+            Box::new(ToolCallError::CallFailed {
                 server: self.server_name.clone(),
                 tool: self.tool_name.clone(),
-                reason,
-            }));
-        }
+                reason: format!("failed to serialize MCP tool result: {error}"),
+            }) as Box<dyn std::error::Error + Send + Sync>
+        })?);
 
-        if let (
-            Some(registry),
-            Some(dispatcher),
-            Some(session_id),
-            Some(turn_generation),
-            Some(invocation_id),
-        ) = (
+        // 5. 实例化调用（模型 / 嵌套 / Host 发起）为带 UI URI 的工具签发**调用记录**。
+        //
+        //    App 自己发起的执行不签发记录：来源判定只看 typed
+        //    [`InvocationOrigin::App`]（取代旧的 `invocation_id.starts_with("mcp-app:")`
+        //    字符串前缀判定）。
+        //
+        //    签发面（阶段 4a，裁决 D5 + 设计 §4）：
+        //    - **`isError:true` 同样签发**：它是结果事实，不是「没有可展示内容」；
+        //      模型的失败调用也可能带 UI（原 `!raw.is_error()` 门已删除）。
+        //    - 模型可见但 app 不可见的工具同样签发，资格为
+        //      [`AppQualification::DisplayOnly`]（可显示、**零 callback 资格**）。
+        //
+        //    记录是**纯数据** + 五层取消令牌中的 App 层：不再携带 dispatcher、
+        //    取消令牌、turn generation、catalog 或 EventBus（设计 §4 删除清单 3）。
+        //    App 回调的执行由 session-owned canonical 入口按 record 身份重新取用。
+        if let (Some(registry), Some(session_id), Some(invocation_id)) = (
             self.binding_leases.as_ref(),
-            ctx.effective_tool_dispatcher.clone(),
             ctx.session_id.clone(),
-            ctx.turn_generation.clone(),
             ctx.invocation_id.clone(),
         ) {
-            if invocation_id.starts_with("mcp-app:") {
-                if let Ok(raw_result) = serde_json::to_value(&result)
-                    .and_then(serde_json::from_value::<peri_acp_types::mcp_apps::RawCallToolResult>)
-                {
-                    registry.record_raw_result(
-                        &invocation_id,
-                        serde_json::to_value(raw_result).unwrap_or(serde_json::Value::Null),
-                    );
+            let app_initiated = ctx
+                .origin
+                .as_ref()
+                .is_some_and(peri_agent::tools::InvocationOrigin::is_app);
+            if !app_initiated {
+                // 展示资格：带 UI URI，且至少对模型或 App 一面可见（两面都不可见的
+                // 工具不得因带 UI URI 而获得展示面）。
+                let ui_tool = self
+                    .client
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name.as_ref() == self.tool_name)
+                    .and_then(|tool| {
+                        let visibility = super::apps::tool_visibility(tool);
+                        if !visibility.model && !visibility.app {
+                            return None;
+                        }
+                        super::apps::tool_resource_uri(tool)
+                            .map(|resource_uri| (resource_uri, visibility))
+                    });
+                if let Some((resource_uri, visibility)) = ui_tool {
+                    let qualification = if visibility.app {
+                        let allowed_tools = match ctx.effective_tool_dispatcher.as_ref() {
+                            Some(dispatcher) => app_allowed_tools(
+                                &self.server_name,
+                                &resource_uri,
+                                &self.client.tools,
+                                dispatcher.as_ref(),
+                            ),
+                            None => std::collections::HashMap::new(),
+                        };
+                        // 白名单为空 ⇒ 没有任何可回调工具，等价于仅可显示。
+                        if allowed_tools.is_empty() {
+                            peri_acp_types::mcp_apps_facade::AppQualification::DisplayOnly
+                        } else {
+                            peri_acp_types::mcp_apps_facade::AppQualification::Interactive {
+                                allowed_tools,
+                            }
+                        }
+                    } else {
+                        peri_acp_types::mcp_apps_facade::AppQualification::DisplayOnly
+                    };
+                    match registry.session_incarnation(&session_id) {
+                        Some(incarnation) => {
+                            // 实例化令牌：本次执行身份的一次性消费键
+                            //（`peri/mcp/open` 用它换取 App 实例）。
+                            let invocation_token = invocation_id.to_string();
+                            let record =
+                                super::apps::McpAppRecord::new(super::apps::McpAppRecordSpec {
+                                    owner_session_id: session_id.clone(),
+                                    server_id: self.server_name.clone(),
+                                    server_generation: self.server_generation,
+                                    resource_uri,
+                                    instantiating_tool: self.tool_name.clone(),
+                                    invocation_id,
+                                    invocation_token,
+                                    tool_call_id: ctx.tool_call_id.clone(),
+                                    incarnation,
+                                    qualification,
+                                    // 实际（审批后 effective）参数：snapshot 的初始输入真相。
+                                    effective_input: input.as_object().cloned().unwrap_or_default(),
+                                    // `Arc` 共享：多 tab attach 不复制同一结果（设计 §9.1）。
+                                    initial_result: std::sync::Arc::new(raw.clone()),
+                                });
+                            if let Err(rejection) = registry.issue(std::sync::Arc::new(record)) {
+                                tracing::warn!(
+                                    server = %self.server_name,
+                                    tool = %self.tool_name,
+                                    %rejection,
+                                    "MCP App record not issued"
+                                );
+                            }
+                        }
+                        None => tracing::warn!(
+                            server = %self.server_name,
+                            tool = %self.tool_name,
+                            session_id = %session_id,
+                            "MCP App record not issued: session incarnation is not registered"
+                        ),
+                    }
                 }
-            } else if let Some(resource_uri) = self
-                .client
-                .tools
-                .iter()
-                .find(|tool| tool.name.as_ref() == self.tool_name)
-                .filter(|tool| super::apps::tool_visibility(tool).app)
-                .and_then(super::apps::tool_resource_uri)
-            {
-                let allowed_tools = app_allowed_tools(
-                    &self.server_name,
-                    &resource_uri,
-                    &self.client.tools,
-                    dispatcher.as_ref(),
-                );
-                registry.issue(super::apps::McpAppBindingLease::new(
-                    session_id,
-                    turn_generation,
-                    self.server_name.clone(),
-                    self.server_generation,
-                    resource_uri,
-                    self.tool_name.clone(),
-                    invocation_id,
-                    allowed_tools,
-                    dispatcher,
-                    ctx.cancellation.clone(),
-                ));
             }
         }
 
-        // 5. 格式化返回（截断超大输出）
+        // 6. 文本投影（截断超大输出）。投影与改动前逐字节一致：`isError` 结果仍带
+        //    失败上下文，模型/ACP 看到的文本不回退，事实由 outcome 承载。
         let formatted = format_contents(&result.content);
-        let lines: Vec<&str> = formatted.lines().collect();
-        let output = if lines.len() > MAX_MCP_LINES {
-            let persist_hint = persist_truncated_output(&formatted);
-            let truncated: String = lines[..MAX_MCP_LINES].join("\n");
-            format!(
-                "{truncated}\n\n[MCP output truncated: {} total lines]{persist_hint}",
-                lines.len()
-            )
+        let pool = self.output_pool.as_ref().and_then(std::sync::Weak::upgrade);
+        let session_id = self
+            .output_session_id
+            .as_deref()
+            .or(ctx.session_id.as_deref());
+        let text = if raw.is_error() {
+            let reason = format_output(pool.as_deref(), session_id, formatted, true).await;
+            ToolCallError::CallFailed {
+                server: self.server_name.clone(),
+                tool: self.tool_name.clone(),
+                reason,
+            }
+            .to_string()
         } else {
-            formatted
+            format_output(pool.as_deref(), session_id, formatted, false).await
         };
-        Ok(output)
+        // 远端 JSON-RPC error 的原始载荷尚未在协议失败分支接线，见该分支注释。
+        Ok(peri_agent::tools::ToolOutput::from_raw_result(text, raw))
     }
 }
 
-/// 将 content 列表格式化为纯文本字符串
-fn format_contents(contents: &[ContentBlock]) -> String {
+/// 将 content 列表格式化为纯文本字符串（模型面与宿主面 `call_instance_tool` 共用）。
+pub(crate) fn format_contents(contents: &[ContentBlock]) -> String {
     let mut parts = Vec::new();
     for content in contents {
         match content {
@@ -402,26 +698,69 @@ fn format_contents(contents: &[ContentBlock]) -> String {
 
 /// 会话可见的 typed bridge 集合（唯一 typed 构造入口）。
 ///
-/// `build_tool_bridges` / [`McpToolBridge::with_direct`] 的 typed 版本：调用方
-/// 可以在同一批对象上做分类（如 [`McpToolBridge::with_direct`]）后只装箱一次，
+/// `build_tool_bridges` / [`McpToolBridge::with_system_direct`] 的 typed 版本：调用方
+/// 可以在同一批对象上做分类后只装箱一次，
 /// 避免同一工具被注册两份。两种 constructor、generation 与 binding leases 行为
 /// 与原实现一致。
 ///
 /// `session_id` 为 `None` 表示不过滤（部署面视图）；`Some` 时排除其他会话的
 /// ACP 连接（`McpClientPool::is_visible_to_session`），避免会话间工具泄漏。
+///
+/// **IF-D13 生效点**：注册表中**声明为 direct** 的 builtin 工具在这里直接
+/// `.with_system_direct()`（`direct = 声明的 direct || 启动期 system_mcp_tools 提升`，两者由
+/// 「声明 direct 集合 == `system_mcp_tools` 集合」的断言锁死，不得冲突）。其余一律
+/// 保持 deferred。判定只走 `builtin::is_declared_direct`（未实现 / 未知名恒 false），
+/// 不在本文件硬编码任何 `mcp__*` 字面量或实例名。
 pub(crate) fn build_typed_tool_bridges_visible_to(
-    pool: &McpClientPool,
+    pool: &Arc<McpClientPool>,
+    session_id: Option<&str>,
+) -> Vec<McpToolBridge> {
+    build_bridges(pool, true, session_id)
+}
+
+/// 部署面视图的 typed 版本（无会话归属过滤）。
+pub(crate) fn build_typed_tool_bridges(pool: &Arc<McpClientPool>) -> Vec<McpToolBridge> {
+    build_bridges(pool, true, None)
+}
+
+/// 强制 deferred 的 typed 版本：public [`build_tool_bridges`] 专用。
+///
+/// 与 [`build_typed_tool_bridges_visible_to`] 的唯一差异是不应用声明 direct，因此
+/// public builder 在 builtin 与外部 server 两种输入下的行为都与提取出 typed
+/// builder 之前**逐位一致**。
+pub(crate) fn build_deferred_tool_bridges(pool: &Arc<McpClientPool>) -> Vec<McpToolBridge> {
+    build_bridges(pool, false, None)
+}
+
+fn build_bridges(
+    pool: &Arc<McpClientPool>,
+    apply_declared_direct: bool,
     session_id: Option<&str>,
 ) -> Vec<McpToolBridge> {
     let mut bridges: Vec<McpToolBridge> = Vec::new();
-    for client in pool.get_all_clients_visible_to(session_id) {
+    let mut clients = pool.get_all_clients_visible_to(session_id);
+    clients.sort_by(|left, right| left.name.cmp(&right.name));
+    for client in clients {
         let generation = pool.handle_generation(&client);
         for tool in &client.tools {
-            bridges.push(
-                McpToolBridge::new(&client.name, tool, Arc::clone(&client))
-                    .with_server_generation(generation)
-                    .with_binding_leases(Arc::clone(&pool.app_binding_leases)),
-            );
+            let mut bridge = McpToolBridge::new(&client.name, tool, Arc::clone(&client))
+                .with_server_generation(generation)
+                .with_binding_leases(Arc::clone(&pool.app_binding_leases))
+                .with_output_store(pool, session_id);
+            if apply_declared_direct
+                && matches!(
+                    &client.source,
+                    Some(super::config::ConfigSource::WorkspaceRemote)
+                )
+            {
+                bridge = bridge.with_workspace_direct();
+            } else if apply_declared_direct
+                && matches!(&client.source, Some(super::config::ConfigSource::Builtin { instance }) if instance == &client.name)
+                && super::builtin::is_declared_direct(&client.name, tool.name.as_ref())
+            {
+                bridge = bridge.with_system_direct();
+            }
+            bridges.push(bridge);
         }
     }
     bridges
@@ -429,25 +768,28 @@ pub(crate) fn build_typed_tool_bridges_visible_to(
 
 /// 从 McpClientPool 的所有已连接客户端中批量创建 McpToolBridge
 ///
-/// 全部返回值保持 deferred 默认行为（`is_direct() == false`）。
+/// 全部返回值保持 deferred 默认行为（`is_direct() == false`）——包括 builtin 实例的
+/// 工具：未类型化的 public builder 不参与 direct 提升（IF-D13），保持既有契约不变。
 ///
 /// 不过滤会话归属（部署面视图）：会话内装配必须走
 /// [`build_tool_bridges_visible_to`]，否则会拿到其他会话声明的 ACP 工具。
-pub fn build_tool_bridges(pool: &McpClientPool) -> Vec<Box<dyn BaseTool>> {
-    build_tool_bridges_visible_to(pool, None)
-}
-
-/// 会话可见的 bridge 集合（[`build_tool_bridges`] 的 ACP 归属过滤版）。
-pub fn build_tool_bridges_visible_to(
-    pool: &McpClientPool,
-    session_id: Option<&str>,
-) -> Vec<Box<dyn BaseTool>> {
-    build_typed_tool_bridges_visible_to(pool, session_id)
+pub fn build_tool_bridges(pool: &Arc<McpClientPool>) -> Vec<Box<dyn BaseTool>> {
+    build_deferred_tool_bridges(pool)
         .into_iter()
         .map(|bridge| Box::new(bridge) as Box<dyn BaseTool>)
         .collect()
 }
 
+/// 会话可见的 bridge 集合（[`build_tool_bridges`] 的 ACP 归属过滤版）。
+pub fn build_tool_bridges_visible_to(
+    pool: &Arc<McpClientPool>,
+    session_id: Option<&str>,
+) -> Vec<Box<dyn BaseTool>> {
+    build_bridges(pool, false, session_id)
+        .into_iter()
+        .map(|bridge| Box::new(bridge) as Box<dyn BaseTool>)
+        .collect()
+}
 /// 统一工具池组装：内置工具优先去重
 
 #[cfg(test)]
@@ -477,6 +819,8 @@ mod direct_flag_tests {
         Arc::new(McpClientHandle {
             name: server.to_string(),
             version: None,
+            connected_at: None,
+            protocol_version: None,
             cache_version: None,
             peer: None,
             tools,
@@ -486,8 +830,62 @@ mod direct_flag_tests {
             source: None,
             url: None,
             skills_capable: false,
-            channel_capable: false,
         })
+    }
+
+    fn make_builtin_handle(instance: &str) -> Arc<McpClientHandle> {
+        Arc::new(McpClientHandle {
+            name: instance.to_string(),
+            version: None,
+            connected_at: None,
+            protocol_version: None,
+            cache_version: None,
+            peer: None,
+            tools: vec![],
+            resources: vec![],
+            status: ClientStatus::Connected,
+            oauth_status: Default::default(),
+            source: Some(crate::mcp::config::ConfigSource::Builtin {
+                instance: instance.to_string(),
+            }),
+            url: None,
+            skills_capable: false,
+        })
+    }
+
+    /// host-only 发现过滤：bridge 的 `visible_to_model()` 等于注册表逐工具
+    /// `model_visible`（builtin 来源）；非 builtin 来源不受声明表影响。
+    ///
+    /// 派生式断言：首个 host-only 条目（workflow 的 `WorkflowAgentResult`）随实例
+    /// 注册落地后自动被覆盖，不需要改本用例。
+    #[test]
+    fn builtin_declared_model_visibility_is_applied_to_bridges() {
+        for instance in peri_acp_types::builtin_mcp::BUILTIN_MCP_INSTANCES {
+            for tool in instance.tools {
+                let bridge = McpToolBridge::new(
+                    instance.name,
+                    &make_tool(tool.original_name),
+                    make_builtin_handle(instance.name),
+                );
+                assert_eq!(
+                    bridge.visible_to_model(),
+                    tool.model_visible,
+                    "{}/{} 的桥接可见性必须等于注册表 model_visible",
+                    instance.name,
+                    tool.original_name
+                );
+            }
+        }
+        // 非 builtin 来源（source: None）：同名工具名不受 builtin 声明表影响。
+        let external = McpToolBridge::new(
+            "workflow",
+            &make_tool("WorkflowAgentResult"),
+            make_handle("workflow", vec![], ClientStatus::Connected),
+        );
+        assert!(
+            external.visible_to_model(),
+            "非 builtin 来源不得消费 builtin 声明表"
+        );
     }
 
     #[test]
@@ -502,9 +900,10 @@ mod direct_flag_tests {
         let parameters = bridge.parameters();
         assert!(bridge.visible_to_model());
 
-        let promoted = bridge.with_direct();
+        let promoted = bridge.with_system_direct();
         assert!(promoted.is_direct());
-        assert_eq!(promoted.name(), name);
+        assert_eq!(promoted.name(), "Read");
+        assert_ne!(promoted.name(), name);
         assert_eq!(promoted.original_tool_name(), "Read");
         assert_eq!(promoted.mcp_server_name(), Some("workspace"));
         assert_eq!(promoted.parameters(), parameters);
@@ -514,24 +913,43 @@ mod direct_flag_tests {
         );
     }
 
+    /// typed builder 的输入取注册表中**声明 deferred** 的 builtin 工具。
+    ///
+    /// 只有输入确实声明为 deferred，「不提升」才是有信息的断言：wave 3 起 `workspace`
+    /// 的 7 个工具全部 `direct: true`（注册表第五项），继续拿它当输入会变成「提升」的
+    /// 反面 —— 断言会红，而修法绝不是放宽断言。名字从注册表派生，不新增第二份名单。
     #[test]
     fn test_build_tool_bridges_keeps_deferred_default_and_matches_typed() {
-        let pool = McpClientPool::new_pending();
+        let (instance, tool) = peri_acp_types::builtin_mcp::BUILTIN_MCP_INSTANCES
+            .iter()
+            .find_map(|instance| {
+                instance
+                    .tools
+                    .iter()
+                    .find(|tool| !tool.direct)
+                    .map(|tool| (instance, tool))
+            })
+            .expect("注册表必须至少保留一个 deferred 声明的 builtin 工具");
+        let pool = Arc::new(McpClientPool::new_pending());
         let handle = make_handle(
-            "workspace",
-            vec![make_tool("Read")],
+            instance.name,
+            vec![make_tool(tool.original_name)],
             ClientStatus::Connected,
         );
         pool.clients
             .write()
-            .insert("workspace".to_string(), Arc::clone(&handle));
+            .insert(instance.name.to_string(), Arc::clone(&handle));
 
-        let typed = build_typed_tool_bridges_visible_to(&pool, None);
+        let typed = build_typed_tool_bridges(&pool);
         let boxed = build_tool_bridges(&pool);
         assert_eq!(typed.len(), 1);
         assert_eq!(boxed.len(), typed.len());
         assert_eq!(boxed[0].name(), typed[0].name());
-        assert!(!typed[0].is_direct(), "typed builder 缺省必须为 deferred");
+        assert!(
+            !typed[0].is_direct(),
+            "注册表声明 deferred 的 builtin 工具（{}）在 typed builder 中必须保持 deferred",
+            tool.effective_name
+        );
         assert!(
             !boxed[0].is_direct(),
             "public builder 必须保持 deferred 默认"
@@ -539,5 +957,30 @@ mod direct_flag_tests {
         // 既有 generation / binding leases 传递行为不得因提取 typed builder 而丢失
         assert_eq!(typed[0].server_generation, pool.handle_generation(&handle));
         assert!(typed[0].binding_leases.is_some());
+    }
+
+    #[test]
+    fn remote_workspace_direct_tools_follow_live_list_without_registry_names() {
+        let pool = Arc::new(McpClientPool::new_pending());
+        let mut handle = make_handle(
+            "workspace",
+            vec![make_tool("NewRemoteTool")],
+            ClientStatus::Connected,
+        );
+        Arc::get_mut(&mut handle).unwrap().source =
+            Some(super::super::config::ConfigSource::WorkspaceRemote);
+        pool.clients.write().insert("workspace".into(), handle);
+        let typed = build_typed_tool_bridges(&pool);
+        assert_eq!(typed.len(), 1);
+        assert_eq!(typed[0].name(), "NewRemoteTool");
+        assert!(typed[0].is_direct());
+        assert_eq!(typed[0].builtin_mcp_instance(), None);
+
+        let empty = Arc::new(McpClientPool::new_pending());
+        let mut handle = make_handle("workspace", vec![], ClientStatus::Connected);
+        Arc::get_mut(&mut handle).unwrap().source =
+            Some(super::super::config::ConfigSource::WorkspaceRemote);
+        empty.clients.write().insert("workspace".into(), handle);
+        assert!(build_typed_tool_bridges(&empty).is_empty());
     }
 }

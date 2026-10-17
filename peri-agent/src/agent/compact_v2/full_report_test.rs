@@ -246,7 +246,10 @@ async fn test_full_report_only_history_and_successive_snapshots() {
     assert!(!second.contains("FIRST_REPORT"));
     assert!(second.contains("LATER_REPORT"));
     assert!(second.contains("REPORT_DECISION"));
-    assert!(transcript.flags(first).excluded && transcript.flags(later).excluded);
+    assert!(
+        transcript.get(first).is_none() && transcript.get(later).is_none(),
+        "Full 提交后已排除报告必须从热态释放（持久化事实仍带 excluded）"
+    );
     assert_eq!(transcript.visible_model_messages().unwrap().len(), 1);
 }
 
@@ -293,12 +296,12 @@ async fn test_full_report_request_preserves_structured_tool_history() {
     assert!(request.tools.is_empty(), "摘要请求不得开放工具执行");
 }
 
-/// [回归测试] 摘要空白或截断时不排除报告、不提交占位摘要。
+/// [回归测试] 摘要只有隐藏思考时不排除报告、不提交占位摘要。
 #[tokio::test]
 async fn test_full_report_invalid_summary_preserves_original_history() {
     for (summary, stop) in [
         ("<analysis>thinking only</analysis>", StopReason::EndTurn),
-        ("<summary>partial", StopReason::MaxTokens),
+        ("<analysis>thinking only</analysis>", StopReason::MaxTokens),
     ] {
         let bound = TestSession::open().await;
         let mut transcript =
@@ -318,15 +321,18 @@ async fn test_full_report_invalid_summary_preserves_original_history() {
         )
         .await
         .unwrap_err();
-        match model.stop {
-            StopReason::EndTurn => assert!(matches!(error, AgentError::CompactEmptyResponse)),
-            _ => assert!(matches!(
+        // 首轮无正文 → 重新生成一次 → 仍无正文 → 恢复耗尽；两种 stop 都不算成功。
+        assert!(
+            matches!(
                 error,
-                AgentError::CompactIncompleteResponse {
-                    stop_reason: StopReason::MaxTokens
+                AgentError::CompactRecoveryExhausted {
+                    attempts: 2,
+                    last_reason: peri_acp_types::error::SummaryRecoveryReason::EmptyResponse,
                 }
-            )),
-        }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), 2);
         assert!(!transcript.flags(id).excluded);
         assert_eq!(transcript.visible_model_messages().unwrap().len(), 1);
         let stored = bound
@@ -404,7 +410,10 @@ async fn test_full_report_inherited_context_preserves_ancestor_ownership() {
     let body = serde_json::to_string(&model.requests.lock().unwrap()[0]).unwrap();
     assert!(body.contains("ANCESTOR_REPORT") && body.contains("OWN_REPORT"));
     assert!(!transcript.flags(ancestor).excluded);
-    assert!(transcript.flags(own).excluded);
+    assert!(
+        transcript.get(own).is_none(),
+        "own 报告必须从热态释放，ancestor 保留"
+    );
     let stored = bound
         .resources
         .load_session_snapshot(&bound.thread_id)
@@ -439,7 +448,10 @@ async fn test_full_report_arriving_during_summary_stays_available() {
     assert!(!request.contains("REPORT_ARRIVED_DURING_FULL"));
     crate::agent::stages::append_messages_to_transcript(&mut transcript, queue.drain_all());
     transcript.flush_persistence().await.unwrap();
-    assert!(transcript.flags(old).excluded);
+    assert!(
+        transcript.get(old).is_none(),
+        "Full 已排除的旧报告必须从热态释放"
+    );
     let visible = transcript.visible_model_messages().unwrap();
     assert_eq!(visible.len(), 2);
     assert!(visible[0].content().contains("REPORT_DECISION"));

@@ -30,16 +30,18 @@ impl MiddlewareChainAssembler for CloudChainAssembler {
 
     fn assemble(&self, blueprint: &[ChainSlot], ctx: &Self::Context) -> Self::Output {
         let mut chain = MiddlewareChain::new();
+        // v4 removed the Filesystem/Terminal slots. The device tools are
+        // installed explicitly before approval, preserving the old chain order.
+        chain.add(Box::new(DeviceTools {
+            remote: ctx.remote.clone(),
+            shell: false,
+        }));
+        chain.add(Box::new(DeviceTools {
+            remote: ctx.remote.clone(),
+            shell: true,
+        }));
         for slot in blueprint {
             match slot {
-                ChainSlot::Filesystem => chain.add(Box::new(DeviceTools {
-                    remote: ctx.remote.clone(),
-                    shell: false,
-                })),
-                ChainSlot::Terminal => chain.add(Box::new(DeviceTools {
-                    remote: ctx.remote.clone(),
-                    shell: true,
-                })),
                 ChainSlot::Permission => {
                     chain.add(Box::new(PermissionMiddleware::with_shared_mode(
                         ctx.broker.clone(),

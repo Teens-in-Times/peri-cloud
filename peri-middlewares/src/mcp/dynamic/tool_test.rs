@@ -12,7 +12,8 @@ use peri_acp_types::{
 use peri_agent::{
     agent::{react::ToolCall, state::AgentState},
     interaction::{
-        ApprovalDecision, InteractionContext, InteractionResponse, UserInteractionBroker,
+        ApprovalDecision, InteractionContext, InteractionResponse, TrustedInteractionOwner,
+        UserInteractionBroker,
     },
     tools::{BaseTool, ToolContext, ToolInvocationResolver},
 };
@@ -106,6 +107,19 @@ fn load_input() -> serde_json::Value {
             }
         }
     })
+}
+
+#[tokio::test]
+async fn dynamic_load_does_not_require_store_execution_ownership() {
+    let deployment = Arc::new(FakeDeployment::default());
+    let tool = DynamicMcpTool::new("session-a", deployment.clone());
+    let invocation = tool.bind_invocation(load_input()).unwrap().unwrap();
+    invocation
+        .target
+        .invoke(json!({}), ToolContext::new(&[], "/tmp"))
+        .await
+        .unwrap();
+    assert_eq!(deployment.actions.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -282,7 +296,11 @@ struct RecordingRejectBroker {
 
 #[async_trait]
 impl UserInteractionBroker for RecordingRejectBroker {
-    async fn request(&self, context: InteractionContext) -> InteractionResponse {
+    async fn request(
+        &self,
+        _owner: TrustedInteractionOwner,
+        context: InteractionContext,
+    ) -> InteractionResponse {
         if let InteractionContext::Approval { items } = context {
             self.names
                 .lock()
@@ -320,9 +338,15 @@ async fn permission_broker_observes_method_level_name_before_side_effects() {
     );
     let call = ToolCall::new("call-approval", bound.policy_name, bound.policy_input);
 
-    let result = permission
-        .before_tool(&mut AgentState::new("/tmp"), &call)
-        .await;
+    // 审批态带 turn 身份：交互归属从 state 投影（缺失即显式拒绝）。
+    let mut state = AgentState::new("/tmp").with_turn_identity(
+        "session-test",
+        peri_acp_types::session::ExecutionBinding {
+            turn_id: peri_acp_types::session::TurnId::new(),
+            attempt_id: peri_acp_types::identity::AttemptId::new(),
+        },
+    );
+    let result = permission.before_tool(&mut state, &call).await;
 
     assert!(result.is_err());
     assert_eq!(broker.names.lock().unwrap().as_slice(), ["DynamicMCP.load"]);

@@ -16,6 +16,7 @@ use peri_agent::session::subagent::{ForkDirectiveKind, SubagentCancelPolicy, Sub
 use peri_agent::tools::BaseTool;
 
 impl super::SubAgentTool {
+    #[allow(clippy::too_many_arguments)] // 通道参数逐项显式传递，与 spawn_config_base 同口径
     pub(crate) async fn invoke_background(
         &self,
         prompt: String,
@@ -24,6 +25,7 @@ impl super::SubAgentTool {
         is_fork: bool,
         parent_messages: Vec<BaseMessage>,
         model: Option<&str>,
+        parent_tool_call_id: Option<String>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         // task_manager 必填（后台任务注册）；来自 parent_session 的 host 或 tool host 回退。
         // 后台 sub-agent 不设并发上限：无入口预检，注册阶段（register_with_kind）
@@ -38,26 +40,25 @@ impl super::SubAgentTool {
             // fork 路径（bg fork）：父消息注入 + fork directive 包装；
             // model 参数忽略——fork 恒继承父模型（与同步 fork 路径一致）
             let llm = (self.llm_factory)(None);
-            let system_prompt = host
-                .frozen_system_prompt
-                .clone()
-                .map(|sp| sp.as_ref().to_string())
-                .or_else(|| self.system_builder.as_ref().map(|b| b(None, &cwd)));
+            // 子身份 system（H2 子能力投影）：fork 无定义 overrides，由
+            // system_builder 重建；不复制父冻结字节。
+            let system_prompt = self.system_builder.as_ref().map(|b| b(None, &cwd));
             let tools: Vec<Arc<dyn BaseTool>> = self.parent_tools.iter().cloned().collect();
             let config = self.spawn_config_base(
                 "fork".to_string(),
                 prompt.clone(),
                 parent_messages,
                 SubagentCancelPolicy::Independent,
-                200,
+                crate::subagent::DEFAULT_SUBAGENT_MAX_ITERATIONS,
                 Some(ForkDirectiveKind::Fork),
                 SubagentRunMode::Background,
                 llm,
                 tools,
-                Arc::new(|name| name != "Agent"),
+                crate::subagent::fork::child_inheritance_filter(),
                 system_prompt,
                 Vec::new(),
                 cwd.clone(),
+                parent_tool_call_id.clone(),
             );
             self.spawn(config).await?
         } else {
@@ -67,15 +68,15 @@ impl super::SubAgentTool {
                 None => {
                     let error =
                         "Error: background mode requires subagent_type parameter (or use fork: true)";
-                    return Err(self.agent_error_with_suggestions(error, None, &cwd).into());
+                    return Err(self.agent_error_with_suggestions(error, None).into());
                 }
             };
 
-            let agent_def = match self.load_agent_def(&agent_id, &cwd) {
+            let agent_def = match self.load_agent_def(&agent_id).await {
                 Ok(a) => a,
                 Err(e) => {
                     return Err(self
-                        .agent_error_with_suggestions(&e, Some(&agent_id), &cwd)
+                        .agent_error_with_suggestions(&e, Some(&agent_id))
                         .into());
                 }
             };
@@ -112,6 +113,7 @@ impl super::SubAgentTool {
                 build_result.system_prompt,
                 build_result.skill_names,
                 cwd.clone(),
+                parent_tool_call_id,
             );
             self.spawn(config).await?
         };
@@ -121,10 +123,18 @@ impl super::SubAgentTool {
             .clone()
             .unwrap_or_else(|| "bg-unknown".to_string());
         if session_resources.is_some() {
+            // 回执直接给出可复用的线程身份：规范句与 bg 完成通知（peri-acp-types
+            // event.rs）逐字同形，模型无需从两个裸 UUID 里推测哪个能 resume；
+            // task_id 保留（取消/状态查询用），但不带 `(thread: …)` 这类无指引标注
+            // ——task 身份（`bg-{uuid}`）与 child thread 身份是两次独立生成的 v7 UUID，
+            // 前缀相同，去掉 `bg-` 仍不是线程身份（resume 会以 thread not found 拒绝）。
             Ok(format!(
-                "Background task {} started (thread: {}). You will be notified when it completes. \
-                 You can continue with other tasks in the meantime.",
-                task_id, spawned.child_thread_id
+                "Background task {} started. You will be notified when it completes. \
+                 You can continue with other tasks in the meantime.\n\
+                 child_thread_id: {} (resume with Agent(resume_thread_id: {}))\n\
+                 While active, include a non-empty prompt to send supplemental instructions; \
+                 omit prompt only when resuming a non-active thread.",
+                task_id, spawned.child_thread_id, spawned.child_thread_id
             ))
         } else {
             Ok(format!(

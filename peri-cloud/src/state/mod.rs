@@ -1,6 +1,7 @@
 //! Durable cloud session and turn journal. No transport credentials live here.
 
 mod journal;
+mod schema;
 mod types;
 pub(crate) mod userdata;
 
@@ -22,6 +23,8 @@ pub enum StateError {
     AlreadyOwned,
     #[error("cloud state version is unsupported")]
     Version,
+    #[error("database belongs to a different Peri Cloud schema lineage")]
+    ForeignSchema,
     #[error("cloud session or turn was not found")]
     NotFound,
     #[error("cloud principal does not own this session")]

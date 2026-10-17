@@ -235,6 +235,7 @@ fn build_router(portal: Portal) -> Router {
         )
         .route("/oauth/token", post(native::token))
         .route("/api/native/device", post(native::register_device))
+        .route("/api/native/connection", post(native::register_connection))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(middleware::from_fn_with_state(
             portal.clone(),

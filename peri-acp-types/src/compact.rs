@@ -144,22 +144,11 @@ fn default_excluded_tools() -> Vec<String> {
 fn default_summary_max_tokens() -> u32 {
     16000
 }
-fn default_re_inject_max_files() -> usize {
-    5
-}
-fn default_re_inject_max_tokens_per_file() -> u32 {
-    5000
-}
-fn default_re_inject_file_budget() -> u32 {
-    25000
-}
-fn default_re_inject_skills_budget() -> u32 {
-    25000
-}
-fn default_max_consecutive_failures() -> u32 {
+/// 单次 Full Compact 内允许的逻辑摘要生成次数（首轮 + 恢复）。
+fn default_summary_max_requests() -> u32 {
     3
 }
-fn default_ptl_max_retries() -> u32 {
+fn default_max_consecutive_failures() -> u32 {
     3
 }
 fn default_smart_keep_recent_msgs() -> usize {
@@ -228,20 +217,23 @@ pub struct CompactConfig {
     /// 默认保留 AskUserQuestion、goal、TodoWrite（对话/任务状态不可恢复），其余工具全部截断。
     #[serde(default = "default_excluded_tools")]
     pub micro_excluded_tools: Vec<String>,
+    /// Full Compact 摘要的**长度目标上限**（不是 provider 输出上限的覆写）。
+    ///
+    /// 有效目标 = `min(summary_max_tokens, 当前模型已解析的单次输出上限)`；目标只
+    /// 影响提示词中的长度说明，实际请求预算仍来自同一已解析上限，二者同源（H6）。
+    /// 模型上限无法解析时目标取本值，请求沿用 provider 默认。零值不是「不限」，
+    /// 而是明确的配置错误（`CompactSummaryBudgetInvalid`）。
     #[serde(default = "default_summary_max_tokens")]
     pub summary_max_tokens: u32,
-    #[serde(default = "default_re_inject_max_files")]
-    pub re_inject_max_files: usize,
-    #[serde(default = "default_re_inject_max_tokens_per_file")]
-    pub re_inject_max_tokens_per_file: u32,
-    #[serde(default = "default_re_inject_file_budget")]
-    pub re_inject_file_budget: u32,
-    #[serde(default = "default_re_inject_skills_budget")]
-    pub re_inject_skills_budget: u32,
+    /// 单次 Full Compact 内允许的逻辑摘要生成次数（首轮 1 次 + 恢复至多 N-1 次）。
+    ///
+    /// 空响应重新生成、截断续写与格式补全共用这一个预算：每次调用摘要模型前
+    /// 递增计数，绝不发起第 N+1 次逻辑生成。值为 1 时只运行首次生成（不恢复）；
+    /// 0 不是「不限」，而是明确的配置错误（`CompactSummaryBudgetInvalid`）。
+    #[serde(default = "default_summary_max_requests")]
+    pub summary_max_requests: u32,
     #[serde(default = "default_max_consecutive_failures")]
     pub max_consecutive_failures: u32,
-    #[serde(default = "default_ptl_max_retries")]
-    pub ptl_max_retries: u32,
 
     // ── Smart Compact 配置 ──────────────────────────────────────────────
     /// [DEPRECATED] 不再使用。Smart Compact 已计划废弃并收敛为 Micro Compact。
@@ -295,12 +287,8 @@ impl Default for CompactConfig {
             micro_compact_stale_steps: default_stale_steps(),
             micro_excluded_tools: default_excluded_tools(),
             summary_max_tokens: default_summary_max_tokens(),
-            re_inject_max_files: default_re_inject_max_files(),
-            re_inject_max_tokens_per_file: default_re_inject_max_tokens_per_file(),
-            re_inject_file_budget: default_re_inject_file_budget(),
-            re_inject_skills_budget: default_re_inject_skills_budget(),
+            summary_max_requests: default_summary_max_requests(),
             max_consecutive_failures: default_max_consecutive_failures(),
-            ptl_max_retries: default_ptl_max_retries(),
             smart_compact_enabled: default_false(),
             smart_keep_recent_msgs: default_smart_keep_recent_msgs(),
             smart_keep_recent_tools: default_smart_keep_recent_tools(),
@@ -315,6 +303,13 @@ impl Default for CompactConfig {
         }
     }
 }
+
+/// 已删除的 compact 配置键（旧配置文件仍可能携带）。
+///
+/// `ptl_max_retries` 从不参与运行，已从配置模型、默认值与文档中删除。类型化模型
+/// 不再认识该键，serde 会静默忽略它——所以调用方必须在**原始文档**上核对并给出
+/// 显式迁移诊断，不能让它悄悄换语义。
+pub const LEGACY_COMPACT_KEYS: [&str; 1] = ["ptl_max_retries"];
 
 impl CompactConfig {
     pub fn has_valid_micro_field_limits(&self) -> bool {

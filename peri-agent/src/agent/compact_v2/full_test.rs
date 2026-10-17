@@ -107,11 +107,14 @@ impl Model for FullLifecycleModel {
 // ── Full Compact 测试 ──────────────────────────────────────────────────────
 
 // 审计中确认的失败反例，修复后作为默认执行的回归测试。
-// 对应 spec/issues/2026-09-10-p0-full-micro-compact-churn.md。
+// 对应 spec/history/2026-09.md 2026-09-10 条目。
 async fn make_audit_full_history() -> (tempfile::TempDir, MessageTranscript) {
     let dir = tempfile::tempdir().unwrap();
     let store = MockSessionResources::new();
-    let thread_id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    let thread_id = store
+        .create_thread(ThreadMeta::new_at("/tmp", peri_time::now_wall()))
+        .await
+        .unwrap();
     let mut transcript = MessageTranscript::new().with_persistence(store, thread_id);
     for turn in 0..4 {
         let call_id = format!("audit-bash-{turn}");
@@ -149,7 +152,8 @@ async fn test_audit_full_excluded_history_must_not_be_micro_candidate() {
     let (_dir, transcript) = make_audit_full_history().await;
     let plan = plan_micro(&transcript, &CompactConfig::default(), true);
     let before = transcript.visible_model_messages().unwrap();
-    let after = projection::render_llm_view(&transcript, &plan, &Default::default()).unwrap();
+    let after =
+        projection::render_llm_view(&transcript, &plan.actions, &Default::default()).unwrap();
     assert_eq!(
         serde_json::to_value(before).unwrap(),
         serde_json::to_value(after).unwrap()
@@ -184,6 +188,7 @@ async fn test_audit_excluded_savings_must_not_suppress_full() {
         false,
         &mut failures,
         dir.path().to_str().unwrap(),
+        None,
     )
     .await;
     assert_eq!(
@@ -248,7 +253,10 @@ async fn test_full_compact_summarizes_and_excludes_canonical_report() {
         ReminderSource, SystemReminder, TrustedSystemReminderFactory, SYSTEM_REMINDER_VERSION,
     };
     let store = MockSessionResources::new();
-    let thread_id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    let thread_id = store
+        .create_thread(ThreadMeta::new_at("/tmp", peri_time::now_wall()))
+        .await
+        .unwrap();
     let mut transcript = MessageTranscript::new().with_persistence(store, thread_id);
     transcript.append(make_human("question"));
     let reminder_id = transcript.append_system_reminder(
@@ -288,8 +296,10 @@ async fn test_full_compact_summarizes_and_excludes_canonical_report() {
             .contains("REPORT_TAIL_FACT"),
         "Full 摘要请求必须包含超过旧 2000 字符预览的报告结论"
     );
-    assert!(transcript.flags(reminder_id).excluded);
-    assert!(transcript.get(reminder_id).is_some());
+    assert!(
+        transcript.get(reminder_id).is_none(),
+        "Full 提交后已排除条目必须从热态释放（持久化事实仍带 excluded）"
+    );
     assert!(!transcript
         .visible_model_messages()
         .unwrap()
@@ -300,7 +310,10 @@ async fn test_full_compact_summarizes_and_excludes_canonical_report() {
 #[tokio::test]
 async fn full_excludes_loaded_root_history() {
     let store = MockSessionResources::new();
-    let thread_id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    let thread_id = store
+        .create_thread(ThreadMeta::new_at("/tmp", peri_time::now_wall()))
+        .await
+        .unwrap();
     let question = make_human("previous turn question");
     let answer = make_ai("previous turn answer");
     store
@@ -328,8 +341,10 @@ async fn full_excludes_loaded_root_history() {
     .unwrap();
 
     assert_eq!(result.affected_count, 2);
-    assert!(transcript.flags(question.id()).excluded);
-    assert!(transcript.flags(answer.id()).excluded);
+    assert!(
+        transcript.get(question.id()).is_none() && transcript.get(answer.id()).is_none(),
+        "Full 提交后已加载的旧历史必须从热态释放"
+    );
     let provider_messages = transcript.visible_model_messages().unwrap();
     assert_eq!(
         provider_messages.len(),
@@ -347,7 +362,10 @@ async fn full_excludes_loaded_root_history() {
 #[tokio::test]
 async fn full_affected_count_tracks_only_false_to_true_transitions() {
     let store = MockSessionResources::new();
-    let thread_id = store.create_thread(ThreadMeta::new("/tmp")).await.unwrap();
+    let thread_id = store
+        .create_thread(ThreadMeta::new_at("/tmp", peri_time::now_wall()))
+        .await
+        .unwrap();
     let mut transcript = MessageTranscript::new().with_persistence(store, thread_id);
     transcript.append(BaseMessage::system("system"));
     transcript.append(make_human("question"));
@@ -374,65 +392,63 @@ async fn full_affected_count_tracks_only_false_to_true_transitions() {
     assert_eq!(second.affected_count, 1, "第二轮只应排除首轮 summary");
 }
 
+/// [回归测试] 历史 Read/Skill 路径只属于工具环境；Full 不能从计算实例同名路径回读。
 #[tokio::test]
-async fn consecutive_full_requires_new_visible_read_to_reinject_file() {
+async fn full_compact_uses_historical_tool_results_without_local_file_re_read() {
     let dir = tempfile::tempdir().unwrap();
-    let file_path = dir.path().join("current.txt");
-    std::fs::write(&file_path, "version one").unwrap();
+    let file_path = dir.path().join("remote.txt");
+    let skill_path = dir.path().join("skills/demo/SKILL.md");
+    std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, "LOCAL_FILE_MARKER").unwrap();
+    std::fs::write(&skill_path, "LOCAL_SKILL_MARKER").unwrap();
     let store = MockSessionResources::new();
     let thread_id = store
-        .create_thread(ThreadMeta::new(dir.path().to_string_lossy().to_string()))
+        .create_thread(ThreadMeta::new_at(
+            dir.path().to_string_lossy().to_string(),
+            peri_time::now_wall(),
+        ))
         .await
         .unwrap();
     let mut transcript = MessageTranscript::new().with_persistence(store, thread_id);
-    transcript.append(make_human("read it"));
-    transcript.append(make_ai_with_read_tool(&file_path.to_string_lossy()));
-
+    transcript.append(make_human("read the remote workspace"));
+    let read = transcript.append(make_ai_with_read_tool(&file_path.to_string_lossy()));
+    let result = transcript.append(BaseMessage::tool_result(
+        "full-lifecycle-read",
+        "REMOTE_FILE_MARKER",
+    ));
+    transcript.append(BaseMessage::ai_with_tool_calls(
+        "activate skill",
+        vec![crate::messages::ToolCallRequest::new(
+            "remote-skill-read",
+            "Read",
+            serde_json::json!({ "file_path": skill_path }),
+        )],
+    ));
+    transcript.append(BaseMessage::tool_result(
+        "remote-skill-read",
+        "REMOTE_SKILL_MARKER",
+    ));
+    let model = CapturingFullModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+    };
     full_compact_inner(
         &mut transcript,
-        Some(&FullLifecycleModel),
+        Some(&model),
         &CompactConfig::default(),
         &dir.path().to_string_lossy(),
     )
     .await
     .unwrap();
-    let first_reinject_count = transcript
-        .entries()
-        .iter()
-        .filter(|entry| entry.message().content().contains("version one"))
-        .count();
-
-    full_compact_inner(
-        &mut transcript,
-        Some(&FullLifecycleModel),
-        &CompactConfig::default(),
-        &dir.path().to_string_lossy(),
-    )
-    .await
-    .unwrap();
-    let second_reinject_count = transcript
-        .entries()
-        .iter()
-        .filter(|entry| entry.message().content().contains("version one"))
-        .count();
-
-    std::fs::write(&file_path, "version two").unwrap();
-    transcript.append(make_ai_with_read_tool(&file_path.to_string_lossy()));
-    full_compact_inner(
-        &mut transcript,
-        Some(&FullLifecycleModel),
-        &CompactConfig::default(),
-        &dir.path().to_string_lossy(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(first_reinject_count, 1);
-    assert_eq!(second_reinject_count, 1, "无新 Read 不得重复注入旧文件");
-    assert!(transcript
-        .entries()
-        .iter()
-        .any(|entry| entry.message().content().contains("version two")));
+    let model_input = serde_json::to_string(&model.requests.lock().unwrap()[0]).unwrap();
+    assert!(model_input.contains("REMOTE_FILE_MARKER"));
+    assert!(model_input.contains("REMOTE_SKILL_MARKER"));
+    assert!(!model_input.contains("LOCAL_FILE_MARKER"));
+    assert!(!model_input.contains("LOCAL_SKILL_MARKER"));
+    assert!(
+        transcript.get(read).is_none() && transcript.get(result).is_none(),
+        "Full 提交后 own 工具配对必须从热态释放"
+    );
+    assert_eq!(transcript.visible_messages().len(), 1, "Full 仅追加摘要");
 }
 
 #[tokio::test]
@@ -494,12 +510,20 @@ async fn test_full_compact_sqlite_persists_lifecycle_and_preserves_ancestor_and_
         "成功提交的 Full Compact 必须标记为 history replacement"
     );
     assert!(
+        transcript.get(ancestor.id()).is_some(),
+        "ancestor 必须留在热态"
+    );
+    assert!(
         !transcript.flags(ancestor.id()).excluded,
         "ancestor 不得被排除"
     );
+    assert!(transcript.get(own_system).is_some(), "System 必须留在热态");
     assert!(!transcript.flags(own_system).excluded, "System 不得被排除");
-    assert!(transcript.flags(own_human).excluded, "own Human 必须被排除");
-    assert!(transcript.flags(own_ai).excluded, "own AI 必须被排除");
+    assert!(
+        transcript.get(own_human).is_none(),
+        "own Human 必须从热态释放"
+    );
+    assert!(transcript.get(own_ai).is_none(), "own AI 必须从热态释放");
 
     let summary = transcript
         .entries()
@@ -508,21 +532,20 @@ async fn test_full_compact_sqlite_persists_lifecycle_and_preserves_ancestor_and_
         .expect("应追加 summary")
         .message()
         .clone();
-    let reinject = transcript
-        .entries()
-        .iter()
-        .find(|entry| entry.message().content().contains("[最近读取的文件:"))
-        .expect("应追加重新注入的文件")
-        .message()
-        .clone();
 
     // 一次一致快照：payload 与 flags 同一次读取，不拼跨时刻结果。
     let stored = store
         .load_session_snapshot(&thread_id)
         .await
         .expect("加载 SQLite 快照失败");
+    // 热态只剩有效集合，因此与存储的**有效视图**逐条对齐；完整历史（含被释放的
+    // excluded 原文与标记）仍留在存储里，由上面的 `stored` 核对。
+    let active = store
+        .load_active_snapshot(&thread_id)
+        .await
+        .expect("加载 SQLite 有效视图失败");
     assert_eq!(
-        stored
+        active
             .payloads
             .iter()
             .map(PersistedPayload::id)
@@ -532,20 +555,62 @@ async fn test_full_compact_sqlite_persists_lifecycle_and_preserves_ancestor_and_
             .iter()
             .map(|entry| entry.id())
             .collect::<Vec<_>>(),
-        "内存与 SQLite history 必须一致"
+        "内存与 SQLite 有效视图必须一致"
     );
     assert!(transcript
         .entries()
         .iter()
         .any(|entry| entry.id() == summary.id()));
-    assert!(transcript
-        .entries()
-        .iter()
-        .any(|entry| entry.id() == reinject.id()));
+    assert_eq!(
+        transcript.visible_messages().len(),
+        3,
+        "ancestor、System 与摘要可见"
+    );
     assert!(!stored.flags.contains_key(&ancestor.id()));
     assert!(!stored.flags.contains_key(&own_system));
     assert!(stored.flags[&own_human].excluded);
     assert!(stored.flags[&own_ai].excluded);
+
+    // 取代关系（写入侧契约）：被归档条目在同一批 flags 里记下取代它的摘要 id。
+    for id in [own_human, own_ai] {
+        assert_eq!(
+            stored.flags[&id].superseded_by(),
+            Some(summary.id()),
+            "每条被归档条目必须指向追加的摘要消息 {id:?}"
+        );
+    }
+    // 「每条」由整体核对：存储里带 excluded 的条目恰好是本次被归档的两条。
+    assert_eq!(
+        stored.flags.values().filter(|flags| flags.excluded).count(),
+        2,
+        "本次归档只排除 own Human 与 own AI"
+    );
+    // ② 摘要自身留在有效视图里，且没有取代关系（它取代别人，不被别人取代）。
+    assert!(!transcript.flags(summary.id()).excluded, "摘要不得被排除");
+    assert_eq!(transcript.flags(summary.id()).superseded_by(), None);
+    assert!(
+        stored
+            .flags
+            .get(&summary.id())
+            .is_none_or(|flags| !flags.excluded),
+        "摘要的有效性由 flags 缺省（非 excluded）表达"
+    );
+    // ③ 未被排除的条目不带取代关系。
+    for id in [ancestor.id(), own_system] {
+        assert_eq!(
+            transcript.flags(id).superseded_by(),
+            None,
+            "未被排除的条目不得带取代关系 {id:?}"
+        );
+        assert_eq!(
+            stored
+                .flags
+                .get(&id)
+                .and_then(|flags| flags.superseded_by()),
+            None,
+            "存储侧同样不得给未排除条目写取代关系 {id:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -560,7 +625,10 @@ async fn test_full_compact_history_read_only_backend_leaves_memory_and_store_unc
     // 再切换到只读能力面——历史本身必须由可写句柄产生，只读句柄不接受写入。
     let store = MockSessionResources::new();
     let thread_id = store
-        .create_thread(ThreadMeta::new(dir.path().to_string_lossy().to_string()))
+        .create_thread(ThreadMeta::new_at(
+            dir.path().to_string_lossy().to_string(),
+            peri_time::now_wall(),
+        ))
         .await
         .expect("创建 thread 失败");
 
@@ -654,142 +722,3 @@ async fn test_full_compact_empty_transcript_skips() {
 }
 
 // ── 辅助函数测试 ───────────────────────────────────────────────────────────
-
-#[test]
-fn test_postprocess_summary_removes_analysis() {
-    let raw = "<analysis>some analysis</analysis><summary>the summary</summary>";
-    let result = postprocess_summary(raw).unwrap();
-    assert!(!result.contains("<analysis>"));
-}
-
-#[test]
-fn test_postprocess_summary_extracts_summary() {
-    let raw = "prefix text <summary>real summary content</summary> suffix";
-    let result = postprocess_summary(raw).unwrap();
-    assert!(result.contains("real summary content"));
-    assert!(!result.contains("<summary>"));
-    assert!(!result.contains("prefix text"));
-}
-
-#[test]
-fn test_postprocess_summary_no_tags() {
-    let raw = "plain summary text";
-    let result = postprocess_summary(raw).unwrap();
-    assert!(result.contains("plain summary text"));
-}
-
-#[test]
-fn test_postprocess_summary_collapses_newlines() {
-    let raw = "line1\n\n\n\n\nline2";
-    let result = postprocess_summary(raw).unwrap();
-    assert!(!result.contains("\n\n\n"), "应折叠连续空行");
-}
-
-#[test]
-fn test_postprocess_summary_rejects_reasoning_only_and_malformed_blocks() {
-    for raw in [
-        "<analysis><analysis>private</analysis></analysis>",
-        "<analysis>first</analysis> <thinking>second</thinking>",
-        "<thinking><analysis>private</analysis></thinking>",
-        "<analysis><thinking>unfinished",
-        "<think>unfinished",
-        "</analysis>",
-        "<analysis>private</thinking>",
-    ] {
-        assert!(
-            postprocess_summary(raw).is_none(),
-            "思考标签不得变成可提交摘要：{raw}"
-        );
-    }
-}
-
-#[test]
-fn test_postprocess_summary_preserves_body_after_nested_reasoning() {
-    let raw = "<thinking>hidden <analysis>nested hidden</analysis></thinking><summary>保留结论与 analysis 方法。</summary><analysis>unfinished tail";
-    let summary = postprocess_summary(raw).unwrap();
-    assert!(summary.ends_with("保留结论与 analysis 方法。"));
-    assert!(!summary.contains("hidden"));
-    assert!(!summary.contains("unfinished"));
-}
-
-#[test]
-fn test_postprocess_summary_preserves_plain_text_and_similar_tag_names() {
-    let body = "analysis and thinking are ordinary words; <analysis_notes>保留正文</analysis_notes> &lt;analysis&gt;";
-    let summary = postprocess_summary(body).unwrap();
-    assert!(
-        summary.ends_with(body),
-        "只识别精确控制标签，不剥除相近正文"
-    );
-}
-
-// ── CompactResult 测试 ─────────────────────────────────────────────────────
-
-#[test]
-fn test_compact_result_fields() {
-    let result = crate::agent::compact_v2::CompactResult {
-        strategy: CompactStrategy::Micro,
-        affected_count: 3,
-        estimated_tokens_saved: 1500,
-        before_visible_len: 10,
-        after_visible_len: 7,
-        summary: None,
-        full_escalation_reason: None,
-        outcome: crate::agent::compact_v2::CompactOutcome::MicroApplied,
-        failure: None,
-        changed_messages: 0,
-        changed_fields: 0,
-        no_op_candidates: 0,
-    };
-    assert_eq!(result.strategy, CompactStrategy::Micro);
-    assert_eq!(result.affected_count, 3);
-    assert_eq!(result.estimated_tokens_saved, 1500);
-    assert!(result.summary.is_none());
-}
-
-#[test]
-fn test_compact_strategy_equality() {
-    assert_eq!(CompactStrategy::Micro, CompactStrategy::Micro);
-    assert_ne!(CompactStrategy::Micro, CompactStrategy::Full);
-}
-
-// ── 集成测试：Full Compact 消息结构 ─────────────────────────────────────────
-
-#[test]
-fn test_full_compact_message_structure() {
-    // 模拟 Full Compact 后的消息结构：
-    // 旧消息标 excluded + Human 摘要追加
-    let mut t = MessageTranscript::new();
-    let id1 = t.append(make_human("user question"));
-    let id2 = t.append(make_ai("assistant response"));
-
-    // 模拟 excluded
-    t.set_excluded(id1, true);
-    t.set_excluded(id2, true);
-
-    // 追加 Human 摘要（与 full_compact_inner 中的格式一致）
-    let summary_text = format!(
-        "<system-reminder>\n{}\n\n## Summary\nPrevious conversation about X.\n</system-reminder>",
-        crate::agent::compact_v2::CONTINUATION_HINT
-    );
-    t.append(BaseMessage::human(summary_text));
-
-    // 验证：只有摘要可见
-    let visible = t.visible_messages();
-    assert_eq!(visible.len(), 1, "只有摘要消息应可见");
-    assert!(
-        visible[0].content().contains("compact"),
-        "可见消息应包含摘要内容"
-    );
-}
-
-#[test]
-fn test_excluded_not_visible() {
-    let mut t = MessageTranscript::new();
-    let id1 = t.append(make_human("visible"));
-    let id2 = t.append(make_human("will be hidden"));
-    t.set_excluded(id2, true);
-
-    let visible = t.visible_messages();
-    assert_eq!(visible.len(), 1);
-    assert_eq!(visible[0].id(), id1);
-}

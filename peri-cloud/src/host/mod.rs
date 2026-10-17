@@ -194,6 +194,7 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
         model,
         config.system_prompt,
         config.model.context_window,
+        Some(identity.connection_store()),
     )?;
     connector.set_account_models(account_models.clone());
     let runtime =

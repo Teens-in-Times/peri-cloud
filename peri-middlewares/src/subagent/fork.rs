@@ -1,25 +1,101 @@
-//! Fork semantics: tool filtering, fork directive construction, agent override extraction.
+//! Fork semantics: tool filtering, pre-launch context gate, fork directive
+//! construction, agent override extraction.
 //!
 //! Pure computation functions for sub-agent inheritance from parent agent.
 //! No async, no external state mutation — safe for unit testing without mocks.
 
 use std::sync::Arc;
 
-use peri_agent::tools::BaseTool;
+use peri_agent::tools::{BaseTool, ContextUsage};
 
-use crate::tool_search::core_tools::TOOL_AGENT;
-use crate::{agent_define::AgentOverrides, claude_agent_parser::ToolsValue, tools::ArcToolWrapper};
+use crate::tool_search::core_tools::{TOOL_AGENT, TOOL_ASK_USER};
+use crate::tools::ArcToolWrapper;
+use peri_acp_types::agents::AgentOverrides;
+use peri_mcp_core::agent_definition::ToolsValue;
+
+/// Fork 启动时父会话上下文使用率上限（百分比）。
+///
+/// fork 继承父会话完整上下文，接近上下文上限时启动等于把压力整体转嫁给子执行；
+/// 高于本上限时拒绝 fork 并引导调用方改用非 fork 子 agent。
+pub const FORK_CONTEXT_USAGE_LIMIT_PERCENT: f64 = 75.0;
+
+/// Fork 上下文门（启动前评估，纯函数）。
+///
+/// - `None`（无 context budget 或无估算）→ 无法评估，放行；
+/// - `≤ 75%` → 放行；
+/// - `> 75%` → 拒绝，返回引导改用非 fork 子 agent 的错误文本。
+pub fn fork_context_usage_gate(usage: Option<ContextUsage>) -> Result<(), String> {
+    let Some(percent) = usage.and_then(|u| u.percent()) else {
+        return Ok(());
+    };
+    if percent <= FORK_CONTEXT_USAGE_LIMIT_PERCENT {
+        return Ok(());
+    }
+    Err(format!(
+        "Error: fork mode is unavailable: the parent context is at {percent:.1}% usage, \
+         above the {limit:.0}% fork limit. A fork inherits the full parent context, so it \
+         cannot start at this context pressure. Use a non-fork sub-agent instead: call Agent \
+         with a subagent_type and a self-contained prompt (optionally run_in_background: true), \
+         or resume an existing child thread with resume_thread_id.",
+        limit = FORK_CONTEXT_USAGE_LIMIT_PERCENT
+    ))
+}
+
+/// 子链不持有的 builtin 实例（按 `BaseTool::builtin_mcp_instance()` 的**可信
+/// 实例身份**判定，不按工具名猜）：
+/// - `cron`：v4 起是 builtin 实例，子链没有其持有者，因此不进入子执行；
+/// - `workflow`：编排能力（`mcp__workflow__Workflow` / `WorkflowStatus` /
+///   `WorkflowKill`）整体不进入子执行（workflow as MCP P5：按实例整体排除，
+///   不再按裸名 `Workflow` 逐名猜）。
+const CHILD_ABSENT_BUILTIN_INSTANCES: [&str; 2] = ["cron", "workflow"];
+
+/// 子 Agent 继承策略（**单一权威**，与 `subagent/tool/descriptions/agent.md`
+/// 的继承声明同一契约）：父工具集中这些扩展面不进入子执行——
+/// `Agent`（防递归）、`AskUserQuestion`（子链无提问持有者，与子能力投影
+/// `subagent_chain_capabilities` 的 ask_user=false 一致）、builtin `cron` 与
+/// `workflow` 实例的全部工具（P5：workflow 的排除按实例身份整体处理）。
+///
+/// 定义型（[`canonical_tool_filter`] 组合本函数）与前台/后台 fork 共用本函数；
+/// deferred 搜索与执行消费同一 `tool_filter`（`SessionToolCatalog::with_filter`
+/// 的 published 视图派生 ToolSearch 索引），因此 direct 与 deferred 同步闭合。
+///
+/// Plugin 扩展面无需在此列：插件命令不是模型工具，插件声明的 MCP server 不进入
+/// `build_parent_tools`（其只桥接 builtin 实例），不会经继承进入子执行——不新增
+/// 按名字猜插件的第二份名单。名字匹配对用户 MCP 同名工具是 fail-closed 的过度
+/// 过滤，不是放行。
+pub fn child_inheritance_filter() -> peri_agent::session::tool_catalog::ToolFilter {
+    std::sync::Arc::new(|tool: &dyn BaseTool| {
+        let excluded = tool.name() == TOOL_AGENT
+            || tool.name() == TOOL_ASK_USER
+            || tool
+                .builtin_mcp_instance()
+                .is_some_and(|instance| CHILD_ABSENT_BUILTIN_INSTANCES.contains(&instance));
+        !excluded
+    })
+}
 
 pub fn canonical_tool_filter(
     allowed: &ToolsValue,
     disallowed: &ToolsValue,
-) -> Arc<dyn Fn(&str) -> bool + Send + Sync> {
+) -> peri_agent::session::tool_catalog::ToolFilter {
     let allowed = match allowed {
         ToolsValue::Empty => None,
         ToolsValue::NoTools => Some(Vec::new()),
-        ToolsValue::List(names) => Some(names.clone()),
+        // A lone `*` inherits all. In a mixed list it was never a wildcard:
+        // preserve the explicit names without widening the child tool set.
+        ToolsValue::List(names) if names.len() == 1 && names[0] == "*" => Some(names.clone()),
+        ToolsValue::List(names) => {
+            Some(names.iter().filter(|name| *name != "*").cloned().collect())
+        }
     };
-    peri_agent::session::tool_catalog::ToolFilterPolicy::canonical(allowed, disallowed.to_vec())
+    let policy = peri_agent::session::tool_catalog::ToolFilterPolicy::canonical(
+        allowed,
+        disallowed.to_vec(),
+    );
+    // 定义型与 fork 共用同一继承策略（含 Agent/AskUser/cron/workflow 实例），
+    // 再叠加定义自身的 allow/disallow 策略。
+    let inheritance = child_inheritance_filter();
+    Arc::new(move |tool| inheritance(tool) && policy(tool))
 }
 
 /// Filter tools from parent set based on agent definition's tools/disallowedTools fields.
@@ -28,51 +104,23 @@ pub fn canonical_tool_filter(
 /// - `tools` is omitted -> inherit all parent tools (but always exclude `Agent` itself to prevent recursion)
 /// - `tools: []` -> inherit no parent tools
 /// - `tools` has value -> only keep tools in the list (also exclude `Agent`)
+/// - `tools: ["*"]` alone inherits all; `*` in a mixed list adds no permissions
 /// - then remove tools listed in `disallowed_tools` from the result
 ///
-/// Matching is case-insensitive (users often write PascalCase in agent.md).
+/// Matching is case-insensitive. Explicit builtin allowlists also check the bound
+/// tool source, so an external MCP tool named `Read` cannot enter a read-only agent.
 pub fn filter_tools(
     parent_tools: &[Arc<dyn BaseTool>],
     allowed: &ToolsValue,
     disallowed: &ToolsValue,
 ) -> Vec<Box<dyn BaseTool>> {
-    let disallowed_list = disallowed.to_vec();
+    let filter = canonical_tool_filter(allowed, disallowed);
 
     parent_tools
         .iter()
-        .filter(|tool| {
-            let name = tool.name();
-            let name_lower = name.to_lowercase();
-            if name == TOOL_AGENT {
-                return false;
-            }
-            let is_allowed = match allowed {
-                ToolsValue::Empty => true,
-                ToolsValue::NoTools => false,
-                ToolsValue::List(allowed_list) => {
-                    allowed_list.len() == 1 && allowed_list[0] == "*"
-                        || allowed_list.iter().any(|n| n.to_lowercase() == name_lower)
-                }
-            };
-            if !is_allowed {
-                return false;
-            }
-            if disallowed_list
-                .iter()
-                .any(|n| n.to_lowercase() == name_lower)
-            {
-                return false;
-            }
-            true
-        })
+        .filter(|tool| filter(tool.as_ref()))
         .map(|tool| Box::new(ArcToolWrapper(Arc::clone(tool))) as Box<dyn BaseTool>)
         .collect()
-}
-
-/// Whether an agent declaration permits tools injected outside parent-tool inheritance.
-/// Explicit `tools: []` is a strict zero-tool boundary.
-pub(crate) fn allows_injected_tools(allowed: &ToolsValue) -> bool {
-    !matches!(allowed, ToolsValue::NoTools)
 }
 
 /// Extract [`AgentOverrides`] from already-parsed agent definition fields.

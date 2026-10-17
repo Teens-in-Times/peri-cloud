@@ -1,5 +1,4 @@
 [package]
-license = "AGPL-3.0-only"
 name = "peri-acp-types"
 version.workspace = true
 edition.workspace = true

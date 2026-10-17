@@ -17,15 +17,13 @@ pub(super) struct StatementSpec {
     pub(super) params: Vec<Value>,
 }
 
-/// 手写 Debug：只给语句头与参数个数，不把绑定值（可能含会话内容）带进日志。
 impl fmt::Debug for StatementSpec {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let head: String = self.sql.chars().take(32).collect();
-        write!(
-            formatter,
-            "StatementSpec({head}…, {} params)",
-            self.params.len()
-        )
+        formatter
+            .debug_struct("StatementSpec")
+            .field("sql", &self.sql)
+            .field("params", &self.params)
+            .finish()
     }
 }
 
@@ -45,7 +43,9 @@ impl StatementSpec {
     #[cfg(test)]
     pub(super) fn is_read_only(&self) -> bool {
         let head = self.sql.trim_start().to_ascii_uppercase();
-        head.starts_with("SELECT") || head.starts_with("WITH")
+        head.starts_with("SELECT")
+            || head.starts_with("WITH")
+            || head.starts_with("PRAGMA TABLE_XINFO(")
     }
 }
 

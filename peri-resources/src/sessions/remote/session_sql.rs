@@ -13,22 +13,28 @@
 //! 列文本核对前缀关系。
 
 use peri_acp_types::session_resources::{
-    NewSession, SessionMetaPatch, SessionResourceError, SessionResourceErrorKind,
+    NewSession, NewSessionDraft, SessionMetaPatch, SessionResourceError, SessionResourceErrorKind,
     SessionResourceResult,
 };
 use peri_acp_types::store::{MessageFlags, PersistedPayload};
 use peri_acp_types::thread::AgentStatus;
-use peri_acp_types::workspace::{ScopedThreadQuery, SessionBinding, ThreadScope};
+use peri_acp_types::workspace::{ScopedThreadQuery, SessionBinding, ThreadScope, WorkspaceId};
 use turso_serverless::Value;
 
 use super::session_codec::{int_value, optional_text, payload_params};
 use super::sql::StatementSpec;
+use crate::sessions::canonical;
 
 /// 会话行投影的公共前缀：一列一行，顺序即解码下标。
+///
+/// `content_size` 没有落列，也没有生产消费者；此前的 `SUM(LENGTH(content))` 相关子查询
+/// 每次读取都要聚合整份历史（恢复热路径与列表都受影响，随历史增长而变慢）。这里保留
+/// 列位（别名 + 常量 0）以维持行形状与解码下标，不做聚合；需要真实字节数时应另设
+/// 按需读取，不把全历史聚合塞回这条投影。
 macro_rules! meta_columns {
     () => {
         "s.id, s.title, s.cwd, s.created_at, s.updated_at, s.message_count,
-    (SELECT COALESCE(SUM(LENGTH(m.content)), 0) FROM messages m WHERE m.thread_id = s.id),
+    0 as content_size,
     s.parent_thread_id, s.snapshot_at_message_id, s.hidden, s.cancel_policy, s.config, s.agent_status"
     };
 }
@@ -132,6 +138,115 @@ const SELECT_MESSAGES_SQL: &str =
     "SELECT m.message_id, m.content, m.truncated, m.excluded, m.projection
     FROM messages m WHERE m.thread_id = ?1 ORDER BY m.rowid ASC";
 
+/// 有效范围的自有 payload 行：`excluded = 0` 是读取条件的一部分，已排除正文不出库、
+/// 不进入内存；顺序仍是 canonical 插入序（`rowid`）。
+const SELECT_ACTIVE_MESSAGES_SQL: &str =
+    "SELECT m.message_id, m.content, m.truncated, m.excluded, m.projection
+    FROM messages m WHERE m.thread_id = ?1 AND m.excluded = 0 ORDER BY m.rowid ASC";
+
+/// 浏览范围的边界事实（分页读取与初始 load 共用的**唯一**一条边界语句）：会话存在吗、
+/// 浏览范围起点是谁、锚点行在不在。
+///
+/// 会话不存在时**没有行**（`NotFound`）；起点缺失为 NULL，锚点列只是**存在性判据**
+/// （`NULL` = 锚点已不在；边界读取固定传 NULL，只取起点一列）。刻意不写
+/// `COALESCE(..., MAX(rowid)+1)` 这类兜底：锚点消失必须失败关闭，不能悄悄把它变成
+/// 「从最新一页开始」。
+const SELECT_HISTORY_PAGE_BOUNDS_SQL: &str = "SELECT
+        (SELECT m.message_id FROM messages m WHERE m.thread_id = t.id ORDER BY m.rowid ASC LIMIT 1),
+        (SELECT m.rowid FROM messages m WHERE m.thread_id = t.id AND m.message_id = ?2)
+    FROM threads t WHERE t.id = ?1";
+
+/// 一页候选行的**阶段一**读取：（身份 + 存储序键 + 正文长度），keyset 遍历，最多
+/// `limit + 1` 行，**不取正文**。
+///
+/// `?2` 为空 = 首屏，从最新一行开始——只有首屏允许这条路径：带游标时锚点行的存在性已由
+/// [`SELECT_HISTORY_PAGE_BOUNDS_SQL`] 证明，`NULL` 在那里已经变成失败。锚点用**子查询按
+/// `message_id` 定位**（同一条语句内完成，两次语句之间不引入新的时间点），排序才用
+/// `rowid`：删掉尾部行之后新插入的行会复用这些 rowid，rowid 不是稳定的条目身份。
+///
+/// 长度是**字节数**（`length(CAST(content AS BLOB))`；直接 `length(content)` 数的是字符），
+/// 与页预算同一口径。
+const SELECT_HISTORY_PAGE_ROWS_SQL: &str = "SELECT s.message_id, s.rowid,
+        length(CAST(s.content AS BLOB))
+    FROM messages s
+    WHERE s.thread_id = ?1 AND (?2 IS NULL OR s.rowid < (
+        SELECT m.rowid FROM messages m WHERE m.thread_id = ?1 AND m.message_id = ?2))
+    ORDER BY s.rowid DESC LIMIT ?3";
+
+/// 页内一条条目的正文：**阶段二**只按本页那些行的 id 取，一条语句一个 id，同一批次读出。
+///
+/// 批内 `LIMIT 1` 与唯一约束共同保证「一个 id 至多一行」：多行即回复形状不符（调用方
+/// 按损坏失败），绝不取第一行。
+const SELECT_HISTORY_PAGE_BODY_SQL: &str =
+    "SELECT s.content FROM messages s WHERE s.thread_id = ?1 AND s.message_id = ?2 LIMIT 1";
+
+/// 自有**有效**条目的存储序键（`message_id → rowid`）：不读正文、不做全历史扫描。
+///
+/// 读取条件与有效视图一致（`excluded = 0`）：归档正文连行都不必返回，客户端要的只是
+/// 「这一条自有有效条目排在哪儿」（初始 load 回放的位置戳）。
+const SELECT_ACTIVE_ENTRY_POSITIONS_SQL: &str =
+    "SELECT m.message_id, m.rowid FROM messages m WHERE m.thread_id = ?1 AND m.excluded = 0
+    ORDER BY m.rowid ASC";
+
+// ─── 向前段读取（canonical 完整回放，REQ §5.3） ──────────────────────────────
+
+/// 段读取的边界事实：会话存在吗 + 本次回放的固定上界（该线程自有行的最大 `rowid`，
+/// 没有自有行时为 NULL）。
+///
+/// 与 [`SELECT_HISTORY_PAGE_BOUNDS_SQL`] 同形（`threads` 单行 + 子查询）：会话不存在时
+/// **没有行**（`NotFound`）。上界在这里读出来交给游标，行则由
+/// [`SELECT_HISTORY_SEGMENT_HEAD_SQL`] 在同一批次内再算一次 `MAX(rowid)` 作谓词——两条语句
+/// 落在同一个只读批次里，区间与行同源。
+const SELECT_HISTORY_SEGMENT_TAIL_SQL: &str = "SELECT
+        (SELECT MAX(m.rowid) FROM messages m WHERE m.thread_id = t.id)
+    FROM threads t WHERE t.id = ?1";
+
+/// 首段候选行（**阶段一**：身份 + 存储序键 + 正文长度），最多 `limit + 1` 行，**升序**
+/// （canonical 完整回放方向），**不取正文**。
+///
+/// 与非首段同形，只是去掉 `rowid > ?2`，并把上界交给同一条语句内的 `MAX(rowid)` 子查询：
+/// 首段的上界就是这一刻的最大 `rowid`，没有可以预先绑定的值（它由本次读取确定）。
+const SELECT_HISTORY_SEGMENT_HEAD_SQL: &str = "SELECT s.message_id, s.rowid,
+        length(CAST(s.content AS BLOB))
+    FROM messages s
+    WHERE s.thread_id = ?1 AND s.rowid <= (
+        SELECT MAX(m.rowid) FROM messages m WHERE m.thread_id = ?1)
+    ORDER BY s.rowid ASC LIMIT ?2";
+
+/// 锚点存在性 + 会话存在性（一次单行读取）：`rowid = ?2` 的那一行就是游标的 `after`。
+///
+/// `NULL` = 锚点已不在（游标失效）；一条行都没有 = 会话不存在（`NotFound`）。刻意不写
+/// `COALESCE(..., 0)` 这类兜底：锚点消失必须失败关闭，不能悄悄退化成一个从头开始的区间。
+const SELECT_HISTORY_SEGMENT_ANCHOR_SQL: &str = "SELECT
+        (SELECT m.rowid FROM messages m WHERE m.thread_id = t.id AND m.rowid = ?2)
+    FROM threads t WHERE t.id = ?1";
+
+/// 非首段候选行：`rowid > after` 且 `rowid <= tail`，升序，最多 `limit + 1` 行。
+///
+/// `tail` 是**数值**上界，不是一条要查回来的行：回放期间追加的行 `rowid > tail`，因此不进入
+/// 本次遍历；`tail` 那一行自己被删掉也不影响区间。
+const SELECT_HISTORY_SEGMENT_NEXT_SQL: &str = "SELECT s.message_id, s.rowid,
+        length(CAST(s.content AS BLOB))
+    FROM messages s
+    WHERE s.thread_id = ?1 AND s.rowid > ?2 AND s.rowid <= ?3
+    ORDER BY s.rowid ASC LIMIT ?4";
+
+/// 首段要放在最前面的继承区快照（`threads.inherited_context` 单行）：一列，与本地
+/// `INHERITED_CONTEXT_SQL` 说同一件事。
+///
+/// 不借会话事实行（`SELECT_SESSION_SQL`）来读它：那条语句还会拉上绑定四列与 frozen 正文，
+/// 而首段只要继承区 payload。
+const SELECT_INHERITED_CONTEXT_SQL: &str =
+    "SELECT s.inherited_context FROM threads s WHERE s.id = ?1";
+
+/// 有界 flags 读取的单条语句：`?1` 是会话、`?2` 是条目。
+///
+/// 范围由调用方给出的 id 集合决定（一条语句一个 id，同一批次读出），不做全历史扫描；
+/// 与全量 flags 视图同一规则：只返回非默认标记。
+const SELECT_MESSAGE_FLAGS_SQL: &str = "SELECT message_id, truncated, excluded, projection
+    FROM messages WHERE thread_id = ?1 AND message_id = ?2
+      AND (truncated = 1 OR excluded = 1 OR projection IS NOT NULL)";
+
 /// 沿父链上溯到的根（含自身即根的情形）；链上没有根时不返回行，由调用方判为事实不完整。
 const SELECT_ROOT_SQL: &str = "WITH RECURSIVE a AS (
     SELECT s.id, s.parent_thread_id FROM threads s WHERE s.id = ?1
@@ -153,11 +268,41 @@ const SELECT_PAGE_SQL: &str = concat!(
     "SELECT ",
     page_columns!(),
     " FROM threads s LEFT JOIN session_bindings b ON b.thread_id = s.id
-    WHERE s.hidden = 0 AND s.message_count > 0
+    WHERE s.parent_thread_id IS NULL AND s.hidden = 0 AND s.archived = ?8 AND s.message_count > 0
       AND (?1 = 0
         OR (?1 = 1 AND b.project_id = ?2)
+        OR (?1 = 2 AND s.workspace_id = ?2)
+        OR (?1 = 3 AND s.workspace_id = ?2 AND b.relative_cwd = ?3))
+      AND (?4 = 0 OR (s.updated_at, s.id) < (?5, ?6))
+    ORDER BY s.updated_at DESC, s.id DESC LIMIT ?7"
+);
+
+const SELECT_ENV_PAGE_SQL: &str = concat!(
+    "SELECT ",
+    page_columns!(),
+    " FROM threads s LEFT JOIN session_bindings b ON b.thread_id = s.id
+    WHERE s.parent_thread_id IS NULL AND s.hidden = 0 AND s.archived = ?8 AND s.message_count > 0
+      AND EXISTS (SELECT 1 FROM workspaces w WHERE w.id = s.workspace_id AND w.machine_id = ?2)
+      AND (?4 = 0 OR (s.updated_at, s.id) < (?5, ?6))
+    ORDER BY s.updated_at DESC, s.id DESC LIMIT ?7"
+);
+
+const SELECT_PAGE_V11_SQL: &str = concat!(
+    "SELECT ",
+    page_columns!(),
+    " FROM threads s LEFT JOIN session_bindings b ON b.thread_id = s.id
+    WHERE s.hidden = 0 AND s.message_count > 0
+      AND (?1 = 0 OR (?1 = 1 AND b.project_id = ?2)
         OR (?1 = 2 AND b.workspace_id = ?2)
         OR (?1 = 3 AND b.workspace_id = ?2 AND b.relative_cwd = ?3))
+      AND (?4 = 0 OR (s.updated_at, s.id) < (?5, ?6))
+    ORDER BY s.updated_at DESC, s.id DESC LIMIT ?7"
+);
+const SELECT_ENV_PAGE_V11_SQL: &str = concat!(
+    "SELECT ", page_columns!(),
+    " FROM threads s LEFT JOIN session_bindings b ON b.thread_id = s.id
+    WHERE s.hidden = 0 AND s.message_count > 0
+      AND EXISTS (SELECT 1 FROM session_environments env WHERE env.thread_id = s.id AND env.machine_id = ?2)
       AND (?4 = 0 OR (s.updated_at, s.id) < (?5, ?6))
     ORDER BY s.updated_at DESC, s.id DESC LIMIT ?7"
 );
@@ -187,10 +332,137 @@ pub(super) fn select_messages_statement(id: &str) -> StatementSpec {
     StatementSpec::new(SELECT_MESSAGES_SQL, vec![Value::Text(id.to_owned())])
 }
 
+/// 有效范围的自有 payload 行（同一顺序，读取条件带未排除约束）。
+pub(super) fn select_active_messages_statement(id: &str) -> StatementSpec {
+    StatementSpec::new(SELECT_ACTIVE_MESSAGES_SQL, vec![Value::Text(id.to_owned())])
+}
+
+/// 分页读取的边界事实：`anchor` 为 `None` 时锚点列恒为 NULL（首屏）。
+pub(super) fn history_page_bounds_statement(id: &str, anchor: Option<&str>) -> StatementSpec {
+    StatementSpec::new(
+        SELECT_HISTORY_PAGE_BOUNDS_SQL,
+        vec![
+            Value::Text(id.to_owned()),
+            match anchor {
+                Some(anchor) => Value::Text(anchor.to_owned()),
+                None => Value::Null,
+            },
+        ],
+    )
+}
+
+/// 一页候选行（阶段一：身份 + 存储序键 + 正文长度）：`anchor` 为 `None` 时取最新
+/// `limit + 1` 行（只有首屏会这样调用）。
+pub(super) fn history_page_rows_statement(
+    id: &str,
+    anchor: Option<&str>,
+    limit: i64,
+) -> StatementSpec {
+    StatementSpec::new(
+        SELECT_HISTORY_PAGE_ROWS_SQL,
+        vec![
+            Value::Text(id.to_owned()),
+            match anchor {
+                Some(anchor) => Value::Text(anchor.to_owned()),
+                None => Value::Null,
+            },
+            Value::Integer(limit),
+        ],
+    )
+}
+
+/// 阶段二：一条语句取**一个**本页条目的正文（一条语句一个 id，调用方按同一批次一起发）。
+pub(super) fn history_page_body_statement(id: &str, message_id: &str) -> StatementSpec {
+    StatementSpec::new(
+        SELECT_HISTORY_PAGE_BODY_SQL,
+        vec![
+            Value::Text(id.to_owned()),
+            Value::Text(message_id.to_owned()),
+        ],
+    )
+}
+
+/// 自有有效条目的存储序键（一次有界读取，不读正文）。
+pub(super) fn active_entry_positions_statement(id: &str) -> StatementSpec {
+    StatementSpec::new(
+        SELECT_ACTIVE_ENTRY_POSITIONS_SQL,
+        vec![Value::Text(id.to_owned())],
+    )
+}
+
+/// 段读取的边界事实（会话存在吗 + 固定上界）。
+pub(super) fn history_segment_tail_statement(id: &str) -> StatementSpec {
+    StatementSpec::new(
+        SELECT_HISTORY_SEGMENT_TAIL_SQL,
+        vec![Value::Text(id.to_owned())],
+    )
+}
+
+/// 首段候选行（阶段一：身份 + 存储序键 + 正文长度，最多 `limit + 1` 行）。
+pub(super) fn history_segment_head_statement(id: &str, limit: i64) -> StatementSpec {
+    StatementSpec::new(
+        SELECT_HISTORY_SEGMENT_HEAD_SQL,
+        vec![Value::Text(id.to_owned()), Value::Integer(limit)],
+    )
+}
+
+/// 锚点存在性（游标的 `after` 行的 `rowid`；`NULL` = 已不在）。
+pub(super) fn history_segment_anchor_statement(id: &str, after: i64) -> StatementSpec {
+    StatementSpec::new(
+        SELECT_HISTORY_SEGMENT_ANCHOR_SQL,
+        vec![Value::Text(id.to_owned()), Value::Integer(after)],
+    )
+}
+
+/// 非首段候选行（`rowid > after AND rowid <= tail`，升序，最多 `limit + 1` 行）。
+pub(super) fn history_segment_next_statement(
+    id: &str,
+    after: i64,
+    tail: i64,
+    limit: i64,
+) -> StatementSpec {
+    StatementSpec::new(
+        SELECT_HISTORY_SEGMENT_NEXT_SQL,
+        vec![
+            Value::Text(id.to_owned()),
+            Value::Integer(after),
+            Value::Integer(tail),
+            Value::Integer(limit),
+        ],
+    )
+}
+
+/// 首段的继承区快照（单行一列）。
+pub(super) fn inherited_context_statement(id: &str) -> StatementSpec {
+    StatementSpec::new(
+        SELECT_INHERITED_CONTEXT_SQL,
+        vec![Value::Text(id.to_owned())],
+    )
+}
+
+/// 单个条目的 flags（有界读取的一条语句；调用方按 id 集合组成同一批次）。
+pub(super) fn select_message_flags_statement(id: &str, message_id: &str) -> StatementSpec {
+    StatementSpec::new(
+        SELECT_MESSAGE_FLAGS_SQL,
+        vec![
+            Value::Text(id.to_owned()),
+            Value::Text(message_id.to_owned()),
+        ],
+    )
+}
+
 /// 分页列举语句；scope 里的相对路径必须能作为文本绑定，否则拒绝（不猜路径相等，
 /// 也不把「无法比较」静默当成「匹配为空」）。
 pub(super) fn page_statement(query: &ScopedThreadQuery) -> SessionResourceResult<StatementSpec> {
+    page_statement_for_archive(query, false)
+}
+
+pub(super) fn page_statement_for_archive(
+    query: &ScopedThreadQuery,
+    archived: bool,
+) -> SessionResourceResult<StatementSpec> {
     let (kind, scope_id, relative) = match &query.scope {
+        ThreadScope::Environment(machine_id) => (4, Value::Text(machine_id.clone()), Value::Null),
         ThreadScope::All => (0_i64, Value::Null, Value::Null),
         ThreadScope::Project(project) => (1, Value::Text(project.to_string()), Value::Null),
         ThreadScope::Workspace(workspace) => (2, Value::Text(workspace.to_string()), Value::Null),
@@ -220,7 +492,11 @@ pub(super) fn page_statement(query: &ScopedThreadQuery) -> SessionResourceResult
     };
     let limit = i64::from(query.limit.clamp(1, 200)) + 1;
     Ok(StatementSpec::new(
-        SELECT_PAGE_SQL,
+        if matches!(query.scope, ThreadScope::Environment(_)) {
+            SELECT_ENV_PAGE_SQL
+        } else {
+            SELECT_PAGE_SQL
+        },
         vec![
             int_value(kind),
             scope_id,
@@ -229,26 +505,92 @@ pub(super) fn page_statement(query: &ScopedThreadQuery) -> SessionResourceResult
             cursor_at,
             cursor_id,
             int_value(limit),
+            int_value(i64::from(archived)),
         ],
     ))
 }
 
+pub(super) fn page_statement_v11(
+    query: &ScopedThreadQuery,
+) -> SessionResourceResult<StatementSpec> {
+    let mut spec = page_statement_for_archive(query, false)?;
+    spec.sql = if matches!(query.scope, ThreadScope::Environment(_)) {
+        SELECT_ENV_PAGE_V11_SQL
+    } else {
+        SELECT_PAGE_V11_SQL
+    };
+    spec.params.pop();
+    Ok(spec)
+}
+
 // ─── 写入语句 ─────────────────────────────────────────────────────────────────
 
-/// 会话行插入：与本机 `sqlite_store/session_rows.rs::insert_thread_row` 同一列清单（含
-/// `cached_context` / `context_cache_epoch` 的缺省起点——那两列是本机读取缓存的失效位，远端
-/// 与本地一样从缺省值起步）。
 const INSERT_THREAD_SQL: &str =
     "INSERT INTO threads (id, title, cwd, created_at, updated_at, message_count,
-        parent_thread_id, snapshot_at_message_id, hidden, cancel_policy, config, cached_context,
-        frozen_context, agent_status, context_cache_epoch)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, 0)";
+        parent_thread_id, snapshot_at_message_id, hidden, cancel_policy, config,
+        frozen_context, agent_status, workspace_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+        COALESCE(?14, (SELECT workspace_id FROM threads WHERE id = ?7)))";
+
+/// 未发布创建（J2 第一阶段）：与整份创建同一列形状，只有 `frozen_context` 写 NULL。
+///
+/// 远端写的是**草稿**，内容由
+/// [`super::session_write::RemoteSessionData::write_commit_frozen`] 一次性补上。
+const INSERT_THREAD_DRAFT_SQL: &str =
+    "INSERT INTO threads (id, title, cwd, created_at, updated_at, message_count,
+        parent_thread_id, snapshot_at_message_id, hidden, cancel_policy, config,
+        frozen_context, agent_status, workspace_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12,
+        COALESCE(?13, (SELECT workspace_id FROM threads WHERE id = ?7)))";
+
+/// 一次性提交 frozen（write-once CAS）：只对尚未提交的草稿生效。
+const COMMIT_FROZEN_SQL: &str =
+    "UPDATE threads SET frozen_context = ?1 WHERE id = ?2 AND frozen_context IS NULL";
+
+/// 删除整段会话历史的全部条目（与 `canonical::THREAD_CHILD_DELETES` 同一份语句）。
+pub(super) const DELETE_SESSION_MESSAGES_SQL: &str = canonical::DELETE_MESSAGES_BY_THREAD_SQL;
+
+/// 删除会话的不可变绑定行（统一后绑定住在 `session_bindings`，不再是会话行上的扁平列）。
+pub(super) const DELETE_SESSION_BINDINGS_SQL: &str = canonical::DELETE_BINDINGS_BY_THREAD_SQL;
+
+/// 删除会话行（与 `canonical::DELETE_THREAD_ROW_SQL` 同一份语句）。
+pub(super) const DELETE_SESSION_SQL: &str = canonical::DELETE_THREAD_ROW_SQL;
+
+/// write-once 未发布创建的撤销语句集（fork 等失败补偿）：四条删除**不带** frozen 判据。
+///
+/// 与 [`revoke_draft_statements`] 的唯一差别就是判据：那一条按调用方语义分档
+/// （两阶段草稿要求 `frozen IS NULL`），不由本函数推断。
+pub(super) fn revoke_session_statements(id: &str) -> Vec<StatementSpec> {
+    [
+        DELETE_SESSION_MESSAGES_SQL,
+        DELETE_SESSION_BINDINGS_SQL,
+        DELETE_SESSION_SQL,
+    ]
+    .into_iter()
+    .map(|sql| StatementSpec::new(sql, vec![Value::Text(id.to_owned())]))
+    .collect()
+}
+
+/// 未发布创建的撤销：各条删除都带同一判据（`frozen_context IS NULL`），因此同一批里
+/// 「会话行还在不在」与「历史/绑定删没删」不会分叉——已提交 frozen 的会话一条都不删。
+const DELETE_DRAFT_MESSAGES_SQL: &str = concat!(
+    "DELETE FROM messages WHERE thread_id = ?1",
+    " AND EXISTS (SELECT 1 FROM threads WHERE id = ?1 AND frozen_context IS NULL)"
+);
+const DELETE_DRAFT_BINDINGS_SQL: &str = concat!(
+    "DELETE FROM session_bindings WHERE thread_id = ?1",
+    " AND EXISTS (SELECT 1 FROM threads WHERE id = ?1 AND frozen_context IS NULL)"
+);
+const DELETE_DRAFT_SESSION_SQL: &str =
+    "DELETE FROM threads WHERE id = ?1 AND frozen_context IS NULL";
 
 /// 不可变绑定行插入：与本机 `session_rows.rs::insert_binding_row` 同一份语句，绑定住在
 /// `session_bindings` 表里（不再是会话行上的四个扁平列）。
 const INSERT_BINDING_SQL: &str =
-    "INSERT INTO session_bindings (thread_id, schema_version, project_id, workspace_id, relative_cwd)
-     VALUES (?1, ?2, ?3, ?4, ?5)";
+    "INSERT INTO session_bindings (thread_id, schema_version, project_id, workspace_id, relative_cwd,
+        discovery_snapshot, evidence_origin)
+     VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6,
+        (SELECT discovery_snapshot FROM session_bindings WHERE thread_id = ?7)), 'creation_snapshot')";
 
 /// 继承区写入：与本机 child 路径同一份语句（创建行之后单独写一次，INSERT 不多带一列）。
 const UPDATE_INHERITED_SQL: &str = "UPDATE threads SET inherited_context = ?1 WHERE id = ?2";
@@ -290,6 +632,8 @@ pub(super) struct SessionInsert<'a> {
     pub(super) binding: &'a SessionBinding,
     /// 已生效会话的 agent 状态；新行一律 `active`。
     pub(super) agent_status: &'a str,
+    pub(super) owner_workspace_id: Option<WorkspaceId>,
+    pub(super) discovery_snapshot: Option<&'a str>,
 }
 
 /// 由 [`NewSession`] 组装一行插入参数（创建/fork/child 三条路径共用同一列形状）。
@@ -317,6 +661,8 @@ pub(super) fn session_insert<'a>(
         inherited,
         binding: &input.binding,
         agent_status: AgentStatus::Active.as_str(),
+        owner_workspace_id: None,
+        discovery_snapshot: None,
     }
 }
 
@@ -345,6 +691,9 @@ pub(super) fn insert_session_statements(
                 Value::Null,
                 Value::Text(row.frozen.to_owned()),
                 Value::Text(row.agent_status.to_owned()),
+                row.owner_workspace_id
+                    .map(|id| Value::Text(id.to_string()))
+                    .unwrap_or(Value::Null),
             ],
         ),
         StatementSpec::new(
@@ -355,6 +704,8 @@ pub(super) fn insert_session_statements(
                 Value::Text(row.binding.project_id.to_string()),
                 Value::Text(row.binding.workspace_id.to_string()),
                 Value::Text(relative),
+                optional_text(row.discovery_snapshot),
+                optional_text(row.parent_thread_id),
             ],
         ),
     ];
@@ -368,6 +719,76 @@ pub(super) fn insert_session_statements(
         ));
     }
     Ok(statements)
+}
+
+/// 未发布创建（草稿）的落库语句集：`threads` 行（frozen NULL）+ 绑定行。
+///
+/// 与 [`insert_session_statements`] 同一列形状与同一顺序，唯一差别是 frozen 写 NULL；
+/// 内容准入由 [`commit_frozen_statement`] 一次性补上。
+pub(super) fn insert_session_draft_statements(
+    draft: &NewSessionDraft,
+    owner_workspace_id: Option<WorkspaceId>,
+    discovery_snapshot: Option<&str>,
+) -> SessionResourceResult<Vec<StatementSpec>> {
+    let relative = binding_relative_text(&draft.binding)?;
+    let snapshot_at = draft
+        .meta
+        .snapshot_at_message_id
+        .map(|id| id.as_uuid().to_string());
+    Ok(vec![
+        StatementSpec::new(
+            INSERT_THREAD_DRAFT_SQL,
+            vec![
+                Value::Text(draft.thread_id.as_str().to_owned()),
+                optional_text(draft.meta.title.as_deref()),
+                Value::Text(draft.meta.cwd.clone()),
+                Value::Text(draft.created_at.clone()),
+                Value::Text(draft.created_at.clone()),
+                int_value(0),
+                optional_text(draft.meta.parent_thread_id.as_deref()),
+                optional_text(snapshot_at.as_deref()),
+                int_value(i64::from(draft.meta.hidden)),
+                Value::Text(draft.meta.cancel_policy.as_str().to_owned()),
+                Value::Null,
+                Value::Text(AgentStatus::Active.as_str().to_owned()),
+                owner_workspace_id
+                    .map(|id| Value::Text(id.to_string()))
+                    .unwrap_or(Value::Null),
+            ],
+        ),
+        StatementSpec::new(
+            INSERT_BINDING_SQL,
+            vec![
+                Value::Text(draft.thread_id.as_str().to_owned()),
+                int_value(i64::from(draft.binding.schema_version)),
+                Value::Text(draft.binding.project_id.to_string()),
+                Value::Text(draft.binding.workspace_id.to_string()),
+                Value::Text(relative),
+                optional_text(discovery_snapshot),
+                optional_text(draft.meta.parent_thread_id.as_deref()),
+            ],
+        ),
+    ])
+}
+
+/// 一次性提交 frozen 的语句（write-once CAS；受影响行数由调用方按 1 核对）。
+pub(super) fn commit_frozen_statement(id: &str, frozen: &str) -> StatementSpec {
+    StatementSpec::new(
+        COMMIT_FROZEN_SQL,
+        vec![Value::Text(frozen.to_owned()), Value::Text(id.to_owned())],
+    )
+}
+
+/// 撤销未发布创建的语句集：三条删除共用 `frozen_context IS NULL` 判据（先子后父）。
+pub(super) fn revoke_draft_statements(id: &str) -> Vec<StatementSpec> {
+    [
+        DELETE_DRAFT_MESSAGES_SQL,
+        DELETE_DRAFT_BINDINGS_SQL,
+        DELETE_DRAFT_SESSION_SQL,
+    ]
+    .into_iter()
+    .map(|sql| StatementSpec::new(sql, vec![Value::Text(id.to_owned())]))
+    .collect()
 }
 
 /// 历史行的插入语句：flags 与内容一次写入（fork 目标由门面完成 ID 重映射，本层不重跑算法）。
@@ -439,4 +860,41 @@ pub(super) fn binding_relative_text(binding: &SessionBinding) -> SessionResource
             detail: "session binding cwd is not valid UTF-8".to_owned(),
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 远端两条撤销入口的判据点：write-once（fork 补偿）不叠加 frozen 判据，
+    /// 两阶段草稿的三条删除全部带 `frozen_context IS NULL`。
+    #[test]
+    fn revocation_statements_split_by_entry_point() {
+        // 两阶段草稿：判据在每一条删除上（同一批内不会出现「历史删了、会话行还在」）。
+        let draft = revoke_draft_statements("s");
+        assert_eq!(draft.len(), 3);
+        for statement in &draft {
+            assert!(
+                statement.sql.contains("frozen_context IS NULL"),
+                "草稿撤销的每条删除都必须带未提交判据: {}",
+                statement.sql
+            );
+            assert!(
+                statement.sql.starts_with("DELETE"),
+                "只允许删除语句: {}",
+                statement.sql
+            );
+        }
+        // write-once：撤销未发布创建（fork 等）不叠加 frozen 判据——目标创建即带 frozen，
+        // 补偿就是把它整条删掉。
+        let write_once = revoke_session_statements("s");
+        assert_eq!(write_once.len(), 3);
+        for statement in &write_once {
+            assert!(
+                !statement.sql.contains("frozen_context"),
+                "write-once 撤销不得叠加 frozen 判据: {}",
+                statement.sql
+            );
+        }
+    }
 }

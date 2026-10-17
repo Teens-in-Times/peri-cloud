@@ -61,7 +61,7 @@ fn test_session_config_access() {
     let frozen = FrozenContext::builder().build();
     let session = Session::new(cwd, frozen, None);
 
-    assert_eq!(session.config().max_iterations(), 500);
+    assert_eq!(session.config().max_iterations(), usize::MAX);
     session.config().set_max_iterations(100);
     assert_eq!(session.config().max_iterations(), 100);
 }
@@ -91,7 +91,8 @@ fn test_start_turn_independent_turn_ids() {
     let ctx1 = session.start_turn();
     let ctx2 = session.start_turn();
     assert_ne!(
-        ctx1.turn_id, ctx2.turn_id,
+        ctx1.turn_id(),
+        ctx2.turn_id(),
         "每次 start_turn 应生成独立 TurnId"
     );
 }

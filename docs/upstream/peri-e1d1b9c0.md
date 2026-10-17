@@ -48,7 +48,7 @@
 3. `peri-remote-tools`
 4. `peri-tool-runtime`
 
-## 生产补丁清单（当前 HEAD 相对 `d7ee444e`）
+## 升级前生产补丁清单（相对 `d7ee444e`）
 
 按 Git blob 比较（忽略工作区换行差异）：
 
@@ -183,4 +183,4 @@ peri-workflow/Cargo.toml
 
 `docs/upstream/peri-e1d1b9c0.manifest` 记录叠加范围内每个文件的上游 blob 哈希；`scripts/check-upstream.py` 校验本发行文件。允许清单内的生产补丁漂移，其余文件必须与上游一致。
 
-Phase 1 完成前校验会报告差异，属预期；Phase 1 后纳入 CI。
+Phase 1 叠加后校验结果：1264 个上游文件，1244 个与上游一致，20 个为允许清单内的生产补丁，0 缺失、0 未声明漂移。CI 在 Windows 任务执行 `python scripts/check-upstream.py`。

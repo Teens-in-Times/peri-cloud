@@ -115,7 +115,9 @@ impl NativeTools {
         tokio::task::spawn_blocking(move || {
             runtime.block_on(async {
                 let mut context = ToolContext::new(&[], &cwd);
-                context.invocation_id = Some(request.invocation_id.to_string());
+                context.invocation_id = Some(peri_acp_types::tool_invocation::InvocationId::new(
+                    request.invocation_id.to_string(),
+                ));
                 context.session_id = Some(request.session_id.to_string());
                 context.cancellation = cancellation;
                 tool.invoke_output(request.input, context)

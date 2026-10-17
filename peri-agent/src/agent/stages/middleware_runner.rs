@@ -18,14 +18,49 @@
 //! - messages_cache 保持为一次性快照（后续 `messages()` 零开销引用）
 
 use crate::agent::agent_context::AgentContext;
-use crate::agent::stages::StageContext;
+use crate::agent::stages::{InvocationContext, ModelTurnFacts, StageContext};
 use crate::middleware::capabilities as hook_state;
 use crate::middleware::state::MiddlewareState;
 use crate::session::tool_catalog::StartupToolUpdate;
+use peri_acp_types::mcp_apps::SkippedPostHook;
 
 /// 从 StageContext 构造 AgentContext
 fn make_context_from_stage(ctx: &StageContext) -> AgentContext<'_> {
     AgentContext::from_stage(ctx)
+}
+
+/// 中断 hook 执行：`cancel` 命中优先于 hook 结果。
+///
+/// 取消令牌是唯一的中断事实源：阶段级 hook 用 turn 令牌（turn 与 `SessionConfig`
+/// 共享），canonical 执行用 [`InvocationContext::cancellation`]（App / Host 入口由
+/// 调用方令牌决定）。
+async fn run_interruptible_hook<T>(
+    cancel: &tokio_util::sync::CancellationToken,
+    hook: &'static str,
+    future: impl std::future::Future<Output = crate::error::AgentResult<T>>,
+) -> crate::error::AgentResult<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            tracing::debug!(hook, "middleware hook interrupted");
+            Err(crate::error::AgentError::Interrupted)
+        }
+        result = future => result,
+    }
+}
+
+pub(crate) async fn run_first_turn_reminders(
+    ctx: &StageContext,
+) -> crate::error::AgentResult<Vec<String>> {
+    let mut cx = make_context_from_stage(ctx);
+    run_interruptible_hook(
+        &ctx.session.turn.cancel_token,
+        "first_turn_reminder",
+        ctx.runtime
+            .middleware_chain
+            .run_first_turn_reminders(&mut cx),
+    )
+    .await
 }
 
 /// 启动闸门状态：暂存本次准入的候选工具更新。
@@ -83,10 +118,14 @@ impl hook_state::StartupState for StartupGateState {
 /// 丢弃，目录不变——调用方据此阻止进入 Compact。
 pub async fn run_before_react_start(ctx: &StageContext) -> crate::error::AgentResult<()> {
     let mut gate = StartupGateState::default();
-    ctx.runtime
-        .middleware_chain
-        .run_before_react_start(&mut gate)
-        .await?;
+    run_interruptible_hook(
+        &ctx.session.turn.cancel_token,
+        "before_react_start",
+        ctx.runtime
+            .middleware_chain
+            .run_before_react_start(&mut gate),
+    )
+    .await?;
     let Some(update) = hook_state::StartupState::take_startup_tools(&mut gate) else {
         return Ok(());
     };
@@ -111,11 +150,12 @@ pub async fn run_before_react_start(ctx: &StageContext) -> crate::error::AgentRe
 /// 调用 middleware chain 的 `before_compact` 钩子（只读，无 drain）
 pub async fn run_before_compact(ctx: &StageContext) -> crate::error::AgentResult<()> {
     let mut cx = make_context_from_stage(ctx);
-    let result = ctx
-        .runtime
-        .middleware_chain
-        .run_before_compact(&mut cx)
-        .await;
+    let result = run_interruptible_hook(
+        &ctx.session.turn.cancel_token,
+        "before_compact",
+        ctx.runtime.middleware_chain.run_before_compact(&mut cx),
+    )
+    .await;
     let rec = cx.drain_recall();
     if !rec.is_empty() {
         ctx.recall_buffer.write().extend(rec);
@@ -126,11 +166,12 @@ pub async fn run_before_compact(ctx: &StageContext) -> crate::error::AgentResult
 /// 调用 middleware chain 的 `after_compact` 钩子（只读，无 drain）
 pub async fn run_after_compact(ctx: &StageContext) -> crate::error::AgentResult<()> {
     let mut cx = make_context_from_stage(ctx);
-    let result = ctx
-        .runtime
-        .middleware_chain
-        .run_after_compact(&mut cx)
-        .await;
+    let result = run_interruptible_hook(
+        &ctx.session.turn.cancel_token,
+        "after_compact",
+        ctx.runtime.middleware_chain.run_after_compact(&mut cx),
+    )
+    .await;
     let rec = cx.drain_recall();
     if !rec.is_empty() {
         ctx.recall_buffer.write().extend(rec);
@@ -144,7 +185,12 @@ pub async fn run_before_agent(
     input_message_ids: &[crate::messages::MessageId],
 ) -> crate::error::AgentResult<()> {
     let mut cx = make_context_from_stage(ctx).with_input_message_ids(input_message_ids);
-    let result = ctx.runtime.middleware_chain.run_before_agent(&mut cx).await;
+    let result = run_interruptible_hook(
+        &ctx.session.turn.cancel_token,
+        "before_agent",
+        ctx.runtime.middleware_chain.run_before_agent(&mut cx),
+    )
+    .await;
     let rec = cx.drain_recall();
     if !rec.is_empty() {
         ctx.recall_buffer.write().extend(rec);
@@ -170,7 +216,12 @@ pub async fn run_before_input(
         return Ok(());
     }
     let mut cx = make_context_from_stage(ctx).with_input_message_ids(input_message_ids);
-    let result = ctx.runtime.middleware_chain.run_before_input(&mut cx).await;
+    let result = run_interruptible_hook(
+        &ctx.session.turn.cancel_token,
+        "before_input",
+        ctx.runtime.middleware_chain.run_before_input(&mut cx),
+    )
+    .await;
     if cx.messages_modified() {
         cx.reconcile_to_transcript(&mut ctx.session.transcript.write());
     }
@@ -180,11 +231,14 @@ pub async fn run_before_input(
 /// 调用 middleware chain 的 Reason 工具目录刷新钩子。
 pub async fn run_before_reason_catalog(ctx: &StageContext) -> crate::error::AgentResult<()> {
     let mut cx = make_context_from_stage(ctx);
-    let result = ctx
-        .runtime
-        .middleware_chain
-        .run_before_reason_catalog(&mut cx)
-        .await;
+    let result = run_interruptible_hook(
+        &ctx.session.turn.cancel_token,
+        "before_reason_catalog",
+        ctx.runtime
+            .middleware_chain
+            .run_before_reason_catalog(&mut cx),
+    )
+    .await;
     let rec = cx.drain_recall();
     if !rec.is_empty() {
         ctx.recall_buffer.write().extend(rec);
@@ -195,7 +249,12 @@ pub async fn run_before_reason_catalog(ctx: &StageContext) -> crate::error::Agen
 /// 调用 middleware chain 的 `before_model` 钩子
 pub async fn run_before_model(ctx: &StageContext) -> crate::error::AgentResult<()> {
     let mut cx = make_context_from_stage(ctx);
-    let result = ctx.runtime.middleware_chain.run_before_model(&mut cx).await;
+    let result = run_interruptible_hook(
+        &ctx.session.turn.cancel_token,
+        "before_model",
+        ctx.runtime.middleware_chain.run_before_model(&mut cx),
+    )
+    .await;
     let rec = cx.drain_recall();
     if !rec.is_empty() {
         ctx.recall_buffer.write().extend(rec);
@@ -209,11 +268,14 @@ pub async fn run_after_model(
     reasoning: &crate::agent::react::Reasoning,
 ) -> crate::error::AgentResult<()> {
     let mut cx = make_context_from_stage(ctx);
-    let result = ctx
-        .runtime
-        .middleware_chain
-        .run_after_model(&mut cx, reasoning)
-        .await;
+    let result = run_interruptible_hook(
+        &ctx.session.turn.cancel_token,
+        "after_model",
+        ctx.runtime
+            .middleware_chain
+            .run_after_model(&mut cx, reasoning),
+    )
+    .await;
     let rec = cx.drain_recall();
     if !rec.is_empty() {
         ctx.recall_buffer.write().extend(rec);
@@ -221,41 +283,256 @@ pub async fn run_after_model(
     result
 }
 
-/// 调用 middleware chain 的 `before_tools_batch` 钩子（批量审批）
-pub async fn run_before_tools_batch(
-    ctx: &StageContext,
+/// Production approval receives the exact targets already bound by dispatch.
+///
+/// 调用级入口：事实来自 [`InvocationContext`]（会话快照 + turn 事实），不再经过
+/// 阶段上下文。取消时逐条返回 `Interrupted`；无 turn 时逐条返回**同一个 typed
+/// 不可用错误**（[`AgentError::NotAvailableWithoutTurn`]，带入口名与已知 session
+/// 身份：审批不可用而不是放行，也不退化成泛化 `MiddlewareError`）。
+/// 无绑定目标的场景（测试）显式传空表。
+pub(crate) async fn run_before_bound_tools_batch(
+    ctx: &InvocationContext,
     calls: &[crate::agent::react::ToolCall],
+    targets: &std::collections::HashMap<String, std::sync::Arc<dyn crate::tools::BaseTool>>,
 ) -> Vec<crate::error::AgentResult<crate::agent::react::ToolCall>> {
-    let mut cx = make_context_from_stage(ctx);
-    let result = ctx
-        .runtime
-        .middleware_chain
-        .run_before_tools_batch(&mut cx, calls.to_vec())
-        .await;
-    let rec = cx.drain_recall();
-    if !rec.is_empty() {
-        ctx.recall_buffer.write().extend(rec);
+    let interrupted = || {
+        calls
+            .iter()
+            .map(|_| Err(crate::error::AgentError::Interrupted))
+            .collect::<Vec<_>>()
+    };
+    // 审批规则的输入全部是 session 级事实（会话身份 + 归属 + 工具表），因此
+    // `turn: None` 下**不早退**：App / Host idle 入口照常执行既有 before-tool 规则
+    //（Hook PreToolUse + Permission），归属由 `InteractionAttribution` 承载。
+    //
+    // 唯一的显式不可用来自**模型来源**（模型批次 / 显式模型调用）：它们按定义处于
+    // 模型 turn 内（render 事件纽带、step、turn_generation 都绑定真实 turn），
+    // 无 turn 属不成立组合 ⇒ 逐条返回同一个 typed 不可用事实，不伪装成取消、
+    // 不静默放行、也不降级为泛化 `MiddlewareError`。
+    //
+    // `AgentError` 不实现 `Clone`（内含 `anyhow::Error`），因此按同一准入入口与已知
+    // session 身份**重建同值错误**：`require_turn` 的唯一错误来源就是这两个字段。
+    let turn = match ctx.require_model_turn("before_tools_batch") {
+        Ok(turn) => turn,
+        Err(_) => {
+            return calls
+                .iter()
+                .map(|_| {
+                    Err(crate::error::AgentError::NotAvailableWithoutTurn {
+                        entry: "before_tools_batch",
+                        session_id: ctx.session_id().map(str::to_owned),
+                    })
+                })
+                .collect();
+        }
+    };
+    let mut state = BoundApprovalState {
+        view: InvocationState { context: ctx, turn },
+        targets,
+    };
+    match run_interruptible_hook(ctx.cancellation(), "before_tools_batch", async {
+        Ok(ctx
+            .middleware_chain()
+            .run_before_tools_batch(&mut state, calls.to_vec())
+            .await)
+    })
+    .await
+    {
+        Ok(results) => results,
+        Err(_) => interrupted(),
     }
-    result
 }
 
-/// 调用 middleware chain 的 `after_tool` 钩子
-pub async fn run_after_tool(
-    ctx: &StageContext,
+/// 调用期只读视图：会话快照 + turn 事实（可缺），外加队列与 hook 输出端口。
+struct InvocationState<'a> {
+    context: &'a InvocationContext,
+    /// `None` = 无活跃 turn（idle 执行）：规则显式看到缺 turn，不伪造 step。
+    turn: Option<&'a ModelTurnFacts>,
+}
+
+impl hook_state::StateView for InvocationState<'_> {
+    fn execution_binding(&self) -> Option<peri_acp_types::session::ExecutionBinding> {
+        self.turn.map(|turn| turn.execution_binding())
+    }
+    fn session_id(&self) -> Option<&str> {
+        self.context.session_id()
+    }
+    fn interaction_attribution(
+        &self,
+    ) -> Option<peri_acp_types::interaction::InteractionAttribution> {
+        self.context.attribution().cloned()
+    }
+    fn cwd(&self) -> &str {
+        self.context.cwd()
+    }
+    fn messages(&self) -> &[crate::messages::BaseMessage] {
+        self.context.messages()
+    }
+    /// `None` = 无活跃 turn（idle 执行）：规则必须显式处理，不得把 `0` 当第一步。
+    fn current_step(&self) -> Option<usize> {
+        self.turn.map(|turn| turn.step())
+    }
+}
+
+impl hook_state::QueueState for InvocationState<'_> {
+    fn v2_queue(&self) -> &crate::session::MessageQueue {
+        self.context.queue().queue()
+    }
+
+    fn enqueue_v2_message(&self, msg: crate::session::QueuedMessage) {
+        self.context.queue().enqueue(msg);
+    }
+}
+
+/// 显式实现：调用期窄状态不实现 `MiddlewareState`（不提供 `add_message` /
+/// `replace_message` 等写能力），因此不走通用适配器的 blanket impl。
+impl hook_state::AfterToolState for InvocationState<'_> {}
+
+impl hook_state::HookOutputState for InvocationState<'_> {
+    fn enqueue_hook_model_reminder(
+        &self,
+        reminder: peri_acp_types::system_reminder::TrustedSystemReminder,
+    ) {
+        self.context
+            .queue()
+            .enqueue(hook_state::hook_output_message(reminder));
+    }
+
+    fn enqueue_hook_client_notice(
+        &self,
+        reminder: peri_acp_types::system_reminder::TrustedSystemReminder,
+    ) {
+        self.context
+            .queue()
+            .enqueue(hook_state::hook_output_message(reminder));
+    }
+
+    fn enqueue_session_start_message(
+        &self,
+        reminder: peri_acp_types::system_reminder::TrustedSystemReminder,
+    ) {
+        self.context
+            .queue()
+            .enqueue(hook_state::hook_output_message(reminder));
+    }
+}
+
+/// 工具审批状态：调用期只读视图 + 已绑定目标身份。
+struct BoundApprovalState<'a> {
+    view: InvocationState<'a>,
+    targets: &'a std::collections::HashMap<String, std::sync::Arc<dyn crate::tools::BaseTool>>,
+}
+
+impl hook_state::StateView for BoundApprovalState<'_> {
+    fn execution_binding(&self) -> Option<peri_acp_types::session::ExecutionBinding> {
+        self.view.execution_binding()
+    }
+    fn session_id(&self) -> Option<&str> {
+        self.view.session_id()
+    }
+    fn interaction_attribution(
+        &self,
+    ) -> Option<peri_acp_types::interaction::InteractionAttribution> {
+        self.view.interaction_attribution()
+    }
+    fn cwd(&self) -> &str {
+        self.view.cwd()
+    }
+    fn messages(&self) -> &[crate::messages::BaseMessage] {
+        self.view.messages()
+    }
+    fn current_step(&self) -> Option<usize> {
+        self.view.current_step()
+    }
+}
+
+impl hook_state::HookOutputState for BoundApprovalState<'_> {
+    fn enqueue_hook_model_reminder(
+        &self,
+        reminder: peri_acp_types::system_reminder::TrustedSystemReminder,
+    ) {
+        self.view.enqueue_hook_model_reminder(reminder);
+    }
+
+    fn enqueue_hook_client_notice(
+        &self,
+        reminder: peri_acp_types::system_reminder::TrustedSystemReminder,
+    ) {
+        self.view.enqueue_hook_client_notice(reminder);
+    }
+
+    fn enqueue_session_start_message(
+        &self,
+        reminder: peri_acp_types::system_reminder::TrustedSystemReminder,
+    ) {
+        self.view.enqueue_session_start_message(reminder);
+    }
+}
+
+impl hook_state::BeforeToolState for BoundApprovalState<'_> {
+    fn tool_origin(&self, call_id: &str) -> Option<hook_state::BoundToolOrigin> {
+        self.targets
+            .get(call_id)
+            .map(|tool| hook_state::BoundToolOrigin {
+                mcp_server_name: tool.mcp_server_name().map(str::to_owned),
+                mcp_tool_name: tool.mcp_tool_name().map(str::to_owned),
+                builtin_mcp_instance: tool.builtin_mcp_instance().map(str::to_owned),
+            })
+    }
+}
+
+/// 调用 middleware chain 的 `after_tool` 钩子（调用级）。
+///
+/// 结果视图 = dispatch 时刻的可见消息快照（提交前视图）；不触碰 transcript，
+/// hook 输出经 [`InvocationContext`] 队列与 render 端口投递。
+///
+/// 无 turn（idle）时**显式记录跳过**（裁决 R2）：事后钩子需要 turn 绑定的事实，
+/// 跳过写入执行入口的 outcome 元数据并告警，**不**把已发生副作用的执行改写成失败。
+pub(crate) async fn run_after_tool(
+    ctx: &InvocationContext,
     call: &crate::agent::react::ToolCall,
     result: &crate::agent::react::ToolResult,
 ) -> crate::error::AgentResult<()> {
-    let mut cx = make_context_from_stage(ctx);
-    let res = ctx
-        .runtime
-        .middleware_chain
-        .run_after_tool(&mut cx, call, result)
-        .await;
-    let rec = cx.drain_recall();
-    if !rec.is_empty() {
-        ctx.recall_buffer.write().extend(rec);
-    }
-    res
+    let Some(turn) = ctx.turn() else {
+        ctx.record_skipped_post_hook(SkippedPostHook::AfterToolNotAvailableWithoutTurn);
+        return Ok(());
+    };
+    let mut state = InvocationState {
+        context: ctx,
+        turn: Some(turn),
+    };
+    run_interruptible_hook(
+        ctx.cancellation(),
+        "after_tool",
+        ctx.middleware_chain()
+            .run_after_tool(&mut state, call, result),
+    )
+    .await
+}
+
+/// 调用 middleware chain 的 `on_error` 钩子（调用级）。
+///
+/// 与阶段级 [`run_on_error`] 分开：canonical 执行有明确的执行入口（会话快照 +
+/// turn 事实 + 入口令牌），阶段级失败（Reason / Compact）没有执行身份，不构造
+/// 伪造的执行上下文。无 turn（idle）时同 [`run_after_tool`]：显式记录跳过。
+pub(crate) async fn run_invocation_on_error(
+    ctx: &InvocationContext,
+    error: &crate::error::AgentError,
+) -> crate::error::AgentResult<()> {
+    let Some(turn) = ctx.turn() else {
+        ctx.record_skipped_post_hook(SkippedPostHook::OnErrorNotAvailableWithoutTurn);
+        return Ok(());
+    };
+    let mut state = InvocationState {
+        context: ctx,
+        turn: Some(turn),
+    };
+    run_interruptible_hook(
+        ctx.cancellation(),
+        "on_error",
+        ctx.middleware_chain().run_on_error(&mut state, error),
+    )
+    .await
 }
 
 /// 调用 middleware chain 的 `after_tools_batch` 钩子
@@ -267,11 +544,14 @@ pub async fn run_after_tools_batch(
     )],
 ) -> crate::error::AgentResult<()> {
     let mut cx = make_context_from_stage(ctx);
-    let result = ctx
-        .runtime
-        .middleware_chain
-        .run_after_tools_batch(&mut cx, results)
-        .await;
+    let result = run_interruptible_hook(
+        &ctx.session.turn.cancel_token,
+        "after_tools_batch",
+        ctx.runtime
+            .middleware_chain
+            .run_after_tools_batch(&mut cx, results),
+    )
+    .await;
     let rec = cx.drain_recall();
     if !rec.is_empty() {
         ctx.recall_buffer.write().extend(rec);
@@ -285,11 +565,14 @@ pub async fn run_after_agent(
     output: crate::agent::react::AgentOutput,
 ) -> crate::error::AgentResult<crate::agent::react::AgentOutput> {
     let mut cx = make_context_from_stage(ctx);
-    let result = ctx
-        .runtime
-        .middleware_chain
-        .run_after_agent(&mut cx, output)
-        .await;
+    let result = run_interruptible_hook(
+        &ctx.session.turn.cancel_token,
+        "after_agent",
+        ctx.runtime
+            .middleware_chain
+            .run_after_agent(&mut cx, output),
+    )
+    .await;
     let rec = cx.drain_recall();
     if !rec.is_empty() {
         ctx.recall_buffer.write().extend(rec);
@@ -303,11 +586,12 @@ pub async fn run_on_error(
     error: &crate::error::AgentError,
 ) -> crate::error::AgentResult<()> {
     let mut cx = make_context_from_stage(ctx);
-    let result = ctx
-        .runtime
-        .middleware_chain
-        .run_on_error(&mut cx, error)
-        .await;
+    let result = run_interruptible_hook(
+        &ctx.session.turn.cancel_token,
+        "on_error",
+        ctx.runtime.middleware_chain.run_on_error(&mut cx, error),
+    )
+    .await;
     let rec = cx.drain_recall();
     if !rec.is_empty() {
         ctx.recall_buffer.write().extend(rec);
@@ -320,3 +604,7 @@ pub async fn run_on_error(
 #[cfg(test)]
 #[path = "middleware_runner_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "middleware_cancel_test.rs"]
+mod cancel_tests;

@@ -102,6 +102,11 @@ pub(super) async fn account(
     headers: HeaderMap,
 ) -> Result<Json<Value>, PortalError> {
     let actor = security::browser(&portal, &headers, false).await?;
+    let devices = portal.identity.devices(&actor).await?;
+    let device_connections = match &portal.gateway {
+        Some(gateway) => gateway.browser_device_states(&actor).await?,
+        None => std::collections::HashMap::new(),
+    };
     let gateways = match &portal.gateway {
         Some(gateway) => gateway.browser_gateways(&actor).await?,
         None => Vec::new(),
@@ -112,7 +117,8 @@ pub(super) async fn account(
         "principal": actor.principal(),
         "is_admin": portal.identity.is_admin(&actor).await?,
         "personal_data": portal.gateway.is_some(),
-        "devices": portal.identity.devices(&actor).await?,
+        "devices": devices,
+        "device_connections": device_connections,
         "channels": portal.identity.channels(&actor).await?.into_iter().filter(|c|c.adapter_instance_id!=crate::gateway::WEB_ADAPTER).collect::<Vec<_>>(),
         "pending_pair_claims": portal.identity.pending_pair_claims(&actor).await?,
     })))

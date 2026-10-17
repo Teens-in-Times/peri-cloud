@@ -88,6 +88,25 @@ pub struct RegistrationReceipt {
     pub device: DeviceRecord,
 }
 
+/// Authenticated device report of a cloud-reachable loopback endpoint. The
+/// transport token deliberately has no Debug implementation and must not be
+/// logged. The cloud validates the loopback endpoint and stores the token under
+/// deployment-private storage; it never enters model or browser input.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionReport {
+    pub device_id: Uuid,
+    pub endpoint: String,
+    pub transport_token: String,
+    pub lease_seconds: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionReceipt {
+    pub connection_id: Uuid,
+    pub lease_expires_at: i64,
+}
+
 #[cfg(test)]
 #[path = "device_enrollment_test.rs"]
 mod tests;

@@ -1,4 +1,4 @@
-//! 祖先 payload 边界、上下文缓存与线程树读取。
+//! 祖先 payload 边界、上下文与线程树读取。
 //!
 //! 读取分两层：`*_on(connection, …)` 是连接作用域原语，供需要「一次读取视图」的
 //! 调用方（一致 snapshot、事务内复核）使用；`impl SqliteSessionDatabase` 上的方法
@@ -9,7 +9,6 @@ use super::{
     row_mapping::{meta_from_row, ThreadRow, THREAD_META_COLUMNS},
 };
 use anyhow::Result;
-use chrono::Utc;
 use peri_acp_types::{
     messages::BaseMessage,
     store::{deserialize_persisted_payload, InheritedContext, PersistedPayload},
@@ -19,7 +18,7 @@ use sqlx::{AssertSqlSafe, SqliteConnection};
 use std::collections::HashSet;
 
 impl SqliteSessionDatabase {
-    /// 小型 metadata 投影：不含 `cached_context`（派生缓存不是 metadata 事实）。
+    /// 小型 metadata 投影；上下文事实由独立历史读取提供。
     pub(super) async fn load_meta(&self, id: &ThreadId) -> Result<ThreadMeta> {
         let mut connection = self.pool.acquire().await?;
         load_meta_on(&mut connection, id).await
@@ -48,37 +47,12 @@ impl SqliteSessionDatabase {
     }
 
     pub(super) async fn load_context(&self, thread_id: &ThreadId) -> Result<Vec<BaseMessage>> {
-        let messages = self
+        Ok(self
             .load_context_payloads(thread_id)
             .await?
             .into_iter()
             .filter_map(|payload| payload.as_message().cloned())
-            .collect::<Vec<_>>();
-        if !messages.is_empty() {
-            self.save_context_cache(thread_id, &messages).await?;
-        }
-        Ok(messages)
-    }
-
-    /// 将消息序列化为 JSON 并保存到 cached_context 列
-    async fn save_context_cache(
-        &self,
-        thread_id: &ThreadId,
-        messages: &[BaseMessage],
-    ) -> Result<()> {
-        // Read APIs must remain usable without an execution owner and never dirty a bound session.
-        if self.read_only || self.load_session_binding_impl(thread_id).await?.is_some() {
-            return Ok(());
-        }
-        let cached = serde_json::to_string(messages)?;
-        let now = Utc::now().to_rfc3339();
-        sqlx::query("UPDATE threads SET cached_context = ?1, updated_at = ?2 WHERE id = ?3")
-            .bind(&cached)
-            .bind(&now)
-            .bind(thread_id.as_str())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+            .collect::<Vec<_>>())
     }
 
     pub(super) async fn list_child_threads(&self, parent_id: &ThreadId) -> Result<Vec<ThreadMeta>> {
@@ -109,23 +83,6 @@ impl SqliteSessionDatabase {
 
         decode_meta_rows(rows)
     }
-
-    pub(super) async fn invalidate_context_cache(&self, thread_id: &ThreadId) -> Result<()> {
-        sqlx::query("UPDATE threads SET cached_context = NULL WHERE id = ?1")
-            .bind(thread_id.as_str())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    pub(super) async fn get_context_cache_epoch(&self, thread_id: &ThreadId) -> Result<u64> {
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT context_cache_epoch FROM threads WHERE id = ?1")
-                .bind(thread_id.as_str())
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(e,)| e as u64).unwrap_or(0))
-    }
 }
 
 fn decode_meta_rows(rows: Vec<ThreadRow>) -> Result<Vec<ThreadMeta>> {
@@ -133,26 +90,32 @@ fn decode_meta_rows(rows: Vec<ThreadRow>) -> Result<Vec<ThreadMeta>> {
         .map(|row| {
             meta_from_row(
                 row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10,
-                row.11, row.12, row.13,
+                row.11, row.12,
             )
         })
         .collect()
 }
 
-/// 单条 metadata 读取（不含 `cached_context`）。
+/// 单条 metadata 的语句原文：列投影与谓词只有这一份定义。
+///
+/// 投影里**不得**出现全历史聚合（曾经的 `SUM(LENGTH(content))`，见 `row_mapping.rs`）：恢复
+/// 热路径执行的就是这条语句，有界读取的计划证据必须与它同文（见 `session_history_perf_test.rs`）。
+pub(in crate::sessions) fn meta_by_id_statement() -> String {
+    format!("SELECT {THREAD_META_COLUMNS} FROM threads t WHERE t.id = ?1")
+}
+
+/// 单条 metadata 读取。
 pub(super) async fn load_meta_on(
     connection: &mut SqliteConnection,
     id: &ThreadId,
 ) -> Result<ThreadMeta> {
-    let row: ThreadRow = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT {THREAD_META_COLUMNS} FROM threads t WHERE t.id = ?1"
-    )))
-    .bind(id.as_str())
-    .fetch_one(&mut *connection)
-    .await?;
+    let row: ThreadRow = sqlx::query_as(AssertSqlSafe(meta_by_id_statement()))
+        .bind(id.as_str())
+        .fetch_one(&mut *connection)
+        .await?;
     meta_from_row(
         row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
-        row.12, row.13,
+        row.12,
     )
 }
 
@@ -167,6 +130,28 @@ pub(super) async fn load_payloads_on(
     .bind(id.as_str())
     .fetch_all(&mut *connection)
     .await?;
+    decode_payload_rows(rows)
+}
+
+/// 有效范围自有 payload 的语句原文（计划证据与生产读取同一份文本，见 `session_history_perf_test.rs`）。
+pub(in crate::sessions) const ACTIVE_PAYLOADS_SQL: &str =
+    "SELECT message_id, content FROM messages WHERE thread_id = ?1 AND excluded = 0 ORDER BY rowid";
+
+/// 有效范围的自有 payload 读取：排除在 SQL 条件里完成（`excluded = 0`），
+/// 已排除正文不进入内存，也不在 Rust 侧二次过滤。
+pub(super) async fn load_active_payloads_on(
+    connection: &mut SqliteConnection,
+    id: &ThreadId,
+) -> Result<Vec<PersistedPayload>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(ACTIVE_PAYLOADS_SQL)
+        .bind(id.as_str())
+        .fetch_all(&mut *connection)
+        .await?;
+    decode_payload_rows(rows)
+}
+
+/// 行内 ID 与主键必须一致：不一致是数据故障，不把两套身份混起来。
+fn decode_payload_rows(rows: Vec<(String, String)>) -> Result<Vec<PersistedPayload>> {
     rows.into_iter()
         .map(|(row_id, content)| {
             let payload = deserialize_persisted_payload(&content)?;
@@ -189,16 +174,23 @@ pub(super) async fn load_context_payloads_on(
     Ok(payloads)
 }
 
+/// 继承区快照读取的语句原文（主键单行；计划证据与生产读取同一份文本）。
+pub(in crate::sessions) const INHERITED_CONTEXT_SQL: &str =
+    "SELECT inherited_context FROM threads WHERE id = ?1";
+
+/// 祖先链上一条边的语句原文（主键单行；计划证据与生产读取同一份文本）。
+pub(in crate::sessions) const PARENT_THREAD_ID_SQL: &str =
+    "SELECT parent_thread_id FROM threads WHERE id = ?1";
+
 pub(super) async fn load_inherited_context_on(
     connection: &mut SqliteConnection,
     thread_id: &ThreadId,
 ) -> Result<InheritedContext> {
     // 已保存的继承快照是权威值：父会话之后的 compact/rewind 都不改变它。
-    let stored: (Option<String>,) =
-        sqlx::query_as("SELECT inherited_context FROM threads WHERE id = ?1")
-            .bind(thread_id)
-            .fetch_one(&mut *connection)
-            .await?;
+    let stored: (Option<String>,) = sqlx::query_as(INHERITED_CONTEXT_SQL)
+        .bind(thread_id)
+        .fetch_one(&mut *connection)
+        .await?;
     if let Some(snapshot) = stored.0 {
         return InheritedContext::from_json(&snapshot);
     }
@@ -207,11 +199,10 @@ pub(super) async fn load_inherited_context_on(
     // Each edge's cutoff belongs to its child. A stored snapshot replaces all
     // inherited state, so later parent compaction/rewind cannot change it.
     for (index, tid) in chain.iter().enumerate() {
-        let stored: (Option<String>,) =
-            sqlx::query_as("SELECT inherited_context FROM threads WHERE id = ?1")
-                .bind(tid)
-                .fetch_one(&mut *connection)
-                .await?;
+        let stored: (Option<String>,) = sqlx::query_as(INHERITED_CONTEXT_SQL)
+            .bind(tid)
+            .fetch_one(&mut *connection)
+            .await?;
         if let Some(snapshot) = stored.0 {
             context = InheritedContext::from_json(&snapshot)?;
             continue;
@@ -265,11 +256,10 @@ async fn resolve_ancestor_chain_on(
     let mut chain = vec![thread_id.clone()];
     let mut current = thread_id.clone();
     loop {
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT parent_thread_id FROM threads WHERE id = ?1")
-                .bind(current.as_str())
-                .fetch_optional(&mut *connection)
-                .await?;
+        let row: Option<(Option<String>,)> = sqlx::query_as(PARENT_THREAD_ID_SQL)
+            .bind(current.as_str())
+            .fetch_optional(&mut *connection)
+            .await?;
         match row {
             Some((Some(parent),)) => {
                 if chain.contains(&parent) {

@@ -1,6 +1,19 @@
 use super::*;
 
 #[test]
+fn current_run_identity_is_stable_and_distinct() {
+    let cancellation = Arc::new(CancellationToken::new());
+    let context = TurnContext::new(Arc::from("/tmp"), Arc::clone(&cancellation));
+    let other = TurnContext::new(Arc::from("/tmp"), Arc::new(CancellationToken::new()));
+    let binding = context.execution_binding();
+    context.advance_step();
+    cancellation.cancel();
+    assert_eq!(context.execution_binding(), binding);
+    assert_eq!(context.turn_id(), binding.turn_id);
+    assert_ne!(binding, other.execution_binding());
+}
+
+#[test]
 fn test_turn_id_unique_and_ordered() {
     let id1 = TurnId::new();
     let id2 = TurnId::new();
@@ -43,4 +56,13 @@ fn test_turn_context_child_token_cascades() {
     assert!(!child.is_cancelled());
     token.cancel();
     assert!(child.is_cancelled(), "子 token 应跟随父 token 取消");
+}
+
+#[test]
+fn persisted_turn_identity_replaces_the_generated_one() {
+    let cancellation = Arc::new(CancellationToken::new());
+    let persisted = TurnId::new();
+    let context = TurnContext::new(Arc::from("/tmp"), cancellation).with_turn_id(persisted);
+    assert_eq!(context.turn_id(), persisted);
+    assert_eq!(context.execution_binding().turn_id, persisted);
 }

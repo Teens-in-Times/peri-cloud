@@ -17,6 +17,30 @@ use crate::{
 /// object-safe：无 `Clone`/`'static` 约束、无泛型方法（`impl Into<String>` 改为 `String`）。
 /// 各生命周期的公开能力由 `capabilities` 组合，适配器不持有新的 owner。
 pub trait MiddlewareState: Send + Sync {
+    fn execution_binding(&self) -> Option<peri_acp_types::session::ExecutionBinding> {
+        None
+    }
+
+    /// 本 state 代表的 canonical session 身份（与 `execution_binding` 同源）。
+    ///
+    /// 默认 `None`（legacy / 测试适配器）：交互归属因此无法铸造，需要归属的
+    /// middleware 必须显式拒绝；生产 v2 适配器（`AgentContext`）与调用期窄状态
+    /// 从 `StageContext` / `InvocationContext` 投影真实值。
+    fn session_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// 本次执行的交互归属事实（与 `session_id` / `execution_binding` 同源）。
+    ///
+    /// 默认 `None`（legacy / 测试适配器）：需要交互归属的 middleware 必须显式
+    /// 拒绝；生产 v2 适配器（`AgentContext`）从 `StageContext` 的 turn 事实投影，
+    /// 调用期窄状态从 `InvocationContext` 投影。
+    fn interaction_attribution(
+        &self,
+    ) -> Option<peri_acp_types::interaction::InteractionAttribution> {
+        None
+    }
+
     fn cwd(&self) -> &str;
 
     fn messages(&self) -> &[BaseMessage];
@@ -49,18 +73,9 @@ pub trait MiddlewareState: Send + Sync {
         false
     }
 
-    /// 会话级 inbox 句柄（middleware 注入 Defer/Prompt 时应经此 wake `await_wake`）。
-    fn inbox_handle(&self) -> Option<&peri_acp_types::session::InboxHandle> {
-        None
-    }
-
-    /// 写入会话队列；有 inbox 时经 `InboxHandle::push` 唤醒 idle loop。
+    /// 发布到同一会话 mailbox，由消息类型统一决定唤醒。
     fn enqueue_v2_message(&self, msg: crate::session::QueuedMessage) {
-        if let Some(inbox) = self.inbox_handle() {
-            inbox.push(msg);
-        } else {
-            self.v2_queue().push(msg);
-        }
+        self.v2_queue().push(msg);
     }
 
     /// 返回当前 turn 的本地工具视图（stage_builder 每 turn 构建，含当前链
@@ -70,8 +85,12 @@ pub trait MiddlewareState: Send + Sync {
     /// `Some(&StageContext.runtime.tools)`。背景：宿主级 `shared_tools`
     /// 生产路径写入点归零后恒为空表（`MIDDLEWARE_TOOL_NAMES` 注释），
     /// `ToolSearchMiddleware` 等消费方必须经此读取本地视图，否则 deferred
-    /// tool 索引永不构建（issue 2026-08-15-workflow-deferred-tool-missing）。
+    /// tool 索引永不构建（issue 2026-08-15-workflow-deferred-tool-missing，已归档至
+    /// `spec/history/2026-08.md`）。
     fn local_tools(&self) -> Option<&crate::agent::stages::SharedToolMap> {
+        None
+    }
+    fn tool_source(&self, _name: &str) -> Option<crate::session::tool_catalog::ToolSource> {
         None
     }
 }
@@ -81,6 +100,25 @@ pub trait MiddlewareState: Send + Sync {
 /// 通过显式 `AgentState::method(self, ...)` 调用避免与 `MiddlewareState` 自身方法递归。
 /// `String` 参数满足 `AgentState` 的 `impl Into<String>` 约束（`String: Into<String>`）。
 impl MiddlewareState for AgentState {
+    fn execution_binding(&self) -> Option<peri_acp_types::session::ExecutionBinding> {
+        AgentState::declared_execution_binding(self)
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        AgentState::declared_session_id(self)
+    }
+
+    /// legacy / 测试适配器：显式声明的 turn 身份投影为模型归属
+    ///（`AgentState::with_turn_identity`）。声明缺失 ⇒ `None`（fail-closed），
+    /// 不从 `current_step` 之类的非身份字段拼装。
+    fn interaction_attribution(
+        &self,
+    ) -> Option<peri_acp_types::interaction::InteractionAttribution> {
+        let session_id = AgentState::declared_session_id(self)?;
+        let binding = AgentState::declared_execution_binding(self)?;
+        Some(peri_acp_types::interaction::InteractionAttribution::model_turn(session_id, binding))
+    }
+
     fn cwd(&self) -> &str {
         AgentState::cwd(self)
     }

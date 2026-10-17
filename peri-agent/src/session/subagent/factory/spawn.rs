@@ -6,7 +6,10 @@ use peri_acp_types::store::{InheritedContext, PersistedPayload};
 
 use super::super::background::spawn_background_subagent;
 use super::super::directives::{build_bg_fork_directive, build_fork_directive};
-use super::super::run_sync::run_sync_subagent;
+use super::super::run_sync::{
+    handoff_event_handler, new_sync_task_id, run_sync_subagent, run_sync_with_registered_handoff,
+    SyncCompletion,
+};
 use super::super::types::{
     ForkDirectiveKind, SubagentRunMode, SubagentSpawnConfig, SubagentSpawned,
 };
@@ -55,11 +58,14 @@ pub(super) async fn spawn_subagent_impl(
     parent: Option<&Arc<Session>>,
     config: SubagentSpawnConfig,
 ) -> Result<SubagentSpawned, Box<dyn std::error::Error + Send + Sync>> {
+    if parent.is_some_and(|session| session.store().frozen.legacy_embedded_instructions) {
+        return Err("V1 frozen prompt contains embedded external instructions; create a new session before spawning a subagent".into());
+    }
     // 解构 config：字段分散使用，避免部分 move 后整体借用冲突
     let SubagentSpawnConfig {
         agent_name,
         prompt,
-        parent_messages,
+        mut parent_messages,
         cancel_policy,
         max_iterations,
         fork_directive_kind,
@@ -70,14 +76,11 @@ pub(super) async fn spawn_subagent_impl(
         tools,
         tool_filter,
         system_prompt,
-        error_suggest_registry,
-        tool_registry_snapshot,
         tool_invocation_resolver,
         compact_config,
         context_budget,
         compact_llm,
         session_resources,
-        execution_owner,
         event_handler,
         bg_event_sender,
         task_manager,
@@ -88,6 +91,7 @@ pub(super) async fn spawn_subagent_impl(
         register_runtime,
         deregister_runtime,
         parent_agent_id,
+        parent_tool_call_id,
         cancel_token: cancel_token_cfg,
         cwd: cwd_cfg,
         parent_thread_id: parent_thread_id_cfg,
@@ -122,6 +126,40 @@ pub(super) async fn spawn_subagent_impl(
         .or(frozen_date_cfg);
     let frozen_claude_local_md = frozen_claude_local_md_cfg;
 
+    // Child identity is persisted as an ordinary System entry for resume, but it
+    // belongs to the parent child session, not to a fork's inherited conversation.
+    // Match its canonical ID in the parent's own region so unrelated System
+    // messages (including identical text from another source) remain intact.
+    let parent_is_child = if parent.is_some() && !parent_messages.is_empty() {
+        if let (Some(store), Some(parent_id)) = (&session_resources, &parent_thread_id) {
+            let meta = store.load_session_meta(parent_id).await?;
+            meta.hidden && meta.parent_thread_id.is_some()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if let Some(parent) = parent.filter(|_| parent_is_child) {
+        let transcript = parent.transcript();
+        let transcript = transcript.read();
+        let identity = parent.store().frozen.system_prompt.as_ref();
+        if !identity.is_empty() {
+            let identity_id = transcript
+                .entries()
+                .iter()
+                .skip(transcript.ancestor_len())
+                .filter_map(|entry| entry.as_message())
+                .find(|message| {
+                    matches!(message, BaseMessage::System { .. }) && message.content() == identity
+                })
+                .map(BaseMessage::id);
+            if let Some(identity_id) = identity_id {
+                parent_messages.retain(|message| message.id() != identity_id);
+            }
+        }
+    }
+
     // cancel token：Cascade = 父 cancel 传播（parent 优先，回退 config 注入的
     // 父 token；均缺失时新建），Independent = 新建（与迁移前语义一致）
     let cancel_policy = cancel_policy.as_cancel_policy();
@@ -138,8 +176,8 @@ pub(super) async fn spawn_subagent_impl(
     if !inherited.payloads.is_empty() {
         if let (Some(store), Some(parent_id)) = (&session_resources, &parent_thread_id) {
             // 继承来源是一次**一致快照**：canonical payload（含 reminder）与 flags 同一次
-            // 读取，不再分 load_inherited_context / load_payloads / load_message_flags 三次。
-            let snapshot = store.load_session_snapshot(parent_id).await?;
+            // 读取。正文只取父会话当前有效条目——已排除正文不再是继承来源。
+            let snapshot = store.load_active_snapshot(parent_id).await?;
             let mut canonical = snapshot
                 .inherited
                 .payloads
@@ -161,20 +199,23 @@ pub(super) async fn spawn_subagent_impl(
                 .payloads
                 .iter()
                 .map(PersistedPayload::id)
-                .collect::<std::collections::HashSet<_>>();
+                .collect::<Vec<_>>();
+            // 继承区**必须**带上父会话当时的失效标记：有效视图的 flags 只覆盖未排除 id，
+            // 而父会话已压缩的继承前缀仍会以正文形式进入子会话继承区。缺了这些标记，
+            // 子会话会把父会话已经退出有效上下文的原文当成活跃上下文发给模型。
+            // 有界读取（按继承 id 取，含 excluded）避免为此全量加载父历史。
             inherited.flags = snapshot.inherited.flags;
-            inherited.flags.extend(
-                snapshot
-                    .flags
-                    .into_iter()
-                    .filter(|(id, _)| inherited_ids.contains(id)),
-            );
+            inherited
+                .flags
+                .extend(store.load_message_flags(parent_id, &inherited_ids).await?);
         } else if let Some(parent) = parent {
             // 无持久化路径（测试/遗留）：只能用父会话内存副本对齐 canonical 与 flags。
+            // 继承区只可能落在父会话热态仍有效的条目上——已排除条目自己不构成继承来源，
+            // 父会话 Full Compact 释放它们之后这里取不到 canonical 是正确结果。
             let transcript = parent.transcript();
             let transcript = transcript.read();
             let canonical = transcript
-                .persisted_payloads()
+                .active_payloads()
                 .into_iter()
                 .map(|payload| (payload.id(), payload))
                 .collect::<std::collections::HashMap<_, _>>();
@@ -202,7 +243,8 @@ pub(super) async fn spawn_subagent_impl(
         let parent_id = parent_thread_id
             .clone()
             .ok_or("spawn_subagent: 持久化 child 需要 parent thread id（无父会话则无继承来源）")?;
-        let snapshot = store.load_session_snapshot(&parent_id).await?;
+        // 本步只消费 binding/frozen/meta：读有效视图，不加载 own 正文。
+        let snapshot = store.load_active_snapshot(&parent_id).await?;
         let binding = match &snapshot.binding {
             peri_acp_types::session_resources::BindingState::Bound(binding) => binding.clone(),
             other => {
@@ -227,14 +269,11 @@ pub(super) async fn spawn_subagent_impl(
             return Err(peri_acp_types::workspace::WorkspaceError::ExecutionBindingMismatch.into());
         }
         let root_id = super::execution_root(store.as_ref(), &parent_id).await?;
-        let lease = execution_owner.as_ref().ok_or(
-            "spawn_subagent: child 保存需要本会话 root 的执行所有权（save_child 不接受借来的所有权）",
-        )?;
         let snapshot_id = parent_messages.last().map(|m| m.id());
         let child = peri_acp_types::session_resources::ChildSnapshot {
             target: peri_acp_types::session_resources::NewSession {
                 thread_id: child_thread_id.clone(),
-                created_at: chrono::Utc::now().to_rfc3339(),
+                created_at: peri_time::now_utc_rfc3339(),
                 meta: peri_acp_types::session_resources::NewSessionMeta {
                     title: Some(agent_name.clone()),
                     cwd: cwd.clone(),
@@ -250,15 +289,17 @@ pub(super) async fn spawn_subagent_impl(
             root_id,
             inherited: inherited.clone(),
         };
-        store.save_child(&child, lease).await?;
+        store.save_child(&child).await?;
     }
 
     // 5. 构造子 session + 链装配 + v2_ctx（共享 helper [build_subagent_session_v2]：
     //    frozen 从父 copy 不重读磁盘，transcript 恢复只读 inherited snapshot 后绑定存储）
-    //    注入 parent_messages / system_prompt / prompt 留在本函数——spawn 与
-    //    resume 的消息注入差异大，不进 helper（D1）
+    //    身份（H1/M3）：子 `FrozenContext.system_prompt` = system_builder 的子能力
+    //    投影字节（定义型带 overrides / fork 无 overrides）——不复制父字节；
+    //    注入 prompt 留在本函数，不进 helper（D1）
     let frozen = inherited_frozen_context(
         parent,
+        system_prompt.as_deref(),
         &frozen_claude_md,
         &frozen_skill_summary,
         &frozen_date,
@@ -268,6 +309,7 @@ pub(super) async fn spawn_subagent_impl(
         frozen,
         cancel_token.clone(),
         child_thread_id.clone(),
+        parent.and_then(|session| session.subagent_host()),
         session_resources.clone(),
         inherited,
         Vec::new(), // 新 child 没有 own history
@@ -283,28 +325,30 @@ pub(super) async fn spawn_subagent_impl(
         frozen_claude_local_md,
         frozen_skill_summary,
         tool_invocation_resolver,
-        error_suggest_registry,
-        tool_registry_snapshot,
         compact_config,
         context_budget,
         compact_llm,
         Some(agent_id_from_child_thread(&child_thread_id)),
-    );
-
-    let transcript = session.transcript();
+        // 身份随 transcript 持久化（见 6b），故开启定向吸收：请求投影按内容相等
+        // 丢弃该条，身份在请求面只由 bridge base system 出现一次。
+        true,
+    )
+    .await?;
 
     // 父上下文已作为只读 ancestor 装载；不可用原 ID append 到 child messages。
-
-    // 6b. SubAgent system_prompt（身份构建）注入到 transcript 开头位置：
-    // - fork 路径：在 parent_messages 之后（让身份提示词位于对话上下文之后、
-    //   prompt 之前——SubAgent 的 prompt 由下方 push 到 queue，Receive 阶段追加）
-    // - 非 fork 路径：parent_messages 为空，直接 append 到 transcript 开头
     //
-    // 注意：这是 session 起始身份构建（在 run_react_loop 调用前注入），不是中途纠正，
-    // 用 BaseMessage::System 合法（CLAUDE.md TRAP 仅禁止中途纠正用 System）。
-    if let Some(sp) = system_prompt {
-        let mut tx = transcript.write();
-        tx.append(BaseMessage::system(sp));
+    // 6b（H1/M3 + 身份持久化）：子身份同时落在两处，各司其职——
+    // - `FrozenContext.system_prompt`：bridge base system，负责**每次请求**的注入；
+    // - transcript 起始处的 System 消息：负责**持久化**。执行恢复 metadata 通道
+    //   已随 recovery 移除，transcript 是本分支上身份唯一的持久事实；恢复路径
+    //   （见 `resume.rs`）不再注入身份，而是读回这条历史，避免重注入。
+    //   归一化吸收（上方 `normalize_persisted_identity`）保证请求面仍恰一次，
+    //   transcript 本体不被改写、历史保持可读。
+    // - fork 路径：位于 parent_messages/ancestor 之后（身份在对话上下文之后）。
+    if let Some(identity) = system_prompt.as_deref() {
+        let transcript = session.transcript();
+        let mut guard = transcript.write();
+        guard.append(BaseMessage::system(identity));
     }
 
     // 6c. push prompt 到 queue（fork 路径套 fork directive 模板）
@@ -313,38 +357,64 @@ pub(super) async fn spawn_subagent_impl(
         Some(ForkDirectiveKind::Bg) => build_bg_fork_directive(&prompt),
         None => prompt.clone(),
     };
-    v2_ctx.context.session.queue.push(QueuedMessage::new(
+    let queued = QueuedMessage::new(
         MessageKind::Prompt,
         MessageSource::UserInput,
         BaseMessage::human(prompt_message),
-    ));
+    );
+    v2_ctx.context.session.queue.push(queued);
 
     match run_mode {
         SubagentRunMode::Sync => {
-            let interrupted = run_sync_subagent(
-                &child_thread_id,
-                &agent_name,
-                &cwd,
-                max_iterations,
-                event_handler,
-                on_subagent_start,
-                on_subagent_stop,
-                session_resources,
-                register_runtime,
-                deregister_runtime,
-                langfuse_bridge,
-                parent_agent_id,
-                v2_ctx,
+            let run_thread_id = child_thread_id.clone();
+            let run_agent_name = agent_name.clone();
+            let run_cwd = cwd.clone();
+            let run_session = session.clone();
+            let sync_task_id = new_sync_task_id();
+            let completion = run_sync_with_registered_handoff(
                 session.clone(),
-                None,
+                child_thread_id.clone(),
+                agent_name.clone(),
+                parent
+                    .and_then(|session| session.subagent_host())
+                    .and_then(|host| host.task_manager.clone()),
+                Some(sync_task_id.clone()),
+                super::completion_delivery(parent, on_bg_complete),
+                move |handoff_start, handed_off| async move {
+                    run_sync_subagent(
+                        &run_thread_id,
+                        &run_agent_name,
+                        &run_cwd,
+                        max_iterations,
+                        handoff_event_handler(event_handler, bg_event_sender, handed_off),
+                        on_subagent_start,
+                        on_subagent_stop,
+                        session_resources,
+                        register_runtime,
+                        deregister_runtime,
+                        langfuse_bridge,
+                        parent_agent_id,
+                        parent_tool_call_id,
+                        v2_ctx,
+                        run_session,
+                        None,
+                        Some(handoff_start),
+                    )
+                    .await
+                },
             )
             .await?;
+            let (interrupted, pending_tasks, pending_task_id) = match completion {
+                SyncCompletion::Finished(interrupted) => (interrupted, Vec::new(), None),
+                SyncCompletion::Pending(tasks) => (false, tasks, Some(sync_task_id)),
+            };
             Ok(SubagentSpawned {
                 child_thread_id,
-                task_id: None,
+                task_id: pending_task_id,
                 session,
                 cancel_token,
                 interrupted,
+                pending_tasks,
             })
         }
         SubagentRunMode::Background => {
@@ -358,7 +428,7 @@ pub(super) async fn spawn_subagent_impl(
                 max_iterations,
                 bg_event_sender,
                 task_manager,
-                on_bg_complete,
+                super::completion_delivery(parent, on_bg_complete),
                 langfuse_bridge,
                 session_resources,
                 deregister_runtime,
@@ -366,8 +436,10 @@ pub(super) async fn spawn_subagent_impl(
                 on_subagent_stop,
                 register_runtime,
                 parent_agent_id,
+                parent_tool_call_id,
                 cancel_token.clone(),
                 v2_ctx,
+                None,
             )
             .await?;
             Ok(SubagentSpawned {
@@ -376,6 +448,7 @@ pub(super) async fn spawn_subagent_impl(
                 session,
                 cancel_token,
                 interrupted: false,
+                pending_tasks: Vec::new(),
             })
         }
     }

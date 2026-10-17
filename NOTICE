@@ -3,13 +3,15 @@ Copyright 2026 Peri Cloud contributors.
 
 This product includes software developed by the Peri project:
 https://github.com/KonghaYao/peri
-Base revision: d7ee444efe7a461b0696bd6c27c6c91f946fdec1
+Base revision: e1d1b9c034092e4e58c163f1a8e5005a1db5f68c
 Peri is distributed under the Apache License, Version 2.0.
 Existing source notices are retained.
 
 Modifications in this distribution include a personal cloud host, account portal,
 OAuth device enrollment, optional message gateways, a Windows/Linux executor,
-remote execution protocol, shared filesystem/shell runtime and approval UI.
+remote execution protocol, shared filesystem/shell runtime, approval UI, and the
+v4 core overlay with its MCP capability packages. The overlay scope and patch
+list are recorded in docs/upstream/.
 This is a separate distribution and is not an official upstream Peri release.
 
 The QQ adapter was independently implemented in Rust with protocol guidance from

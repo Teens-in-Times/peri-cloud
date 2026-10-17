@@ -118,6 +118,59 @@ async fn main() -> anyhow::Result<()> {
             server_stop.clone(),
         ))
     });
+    if let (Some(endpoint), Some(origin)) = (
+        args.tunnel.ssh_reverse_listen,
+        load_cloud_origin(&args.state_dir),
+    ) {
+        let report_state_dir = args.state_dir.clone();
+        let report_name = name.clone();
+        tokio::spawn(async move {
+            let workspace = match std::env::current_dir() {
+                Ok(workspace) => workspace,
+                Err(_) => return,
+            };
+            let client = match LoginClient::new(
+                &origin,
+                &report_state_dir,
+                &report_name,
+                &workspace,
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(_) => {
+                    tracing::warn!(
+                        component = "connection_report",
+                        "could not initialize connection reports"
+                    );
+                    return;
+                }
+            };
+            loop {
+                match client.report_connection(endpoint, 90).await {
+                    Ok(_) => {}
+                    Err(peri_executor::login::LoginError::Rejected(404)) => {
+                        tracing::warn!(
+                            component = "connection_report",
+                            "host does not support connection reports; continuing"
+                        );
+                    }
+                    Err(peri_executor::login::LoginError::LoginRequired) => {
+                        tracing::warn!(
+                            component = "connection_report",
+                            "no saved login; connection reports disabled"
+                        );
+                        return;
+                    }
+                    Err(_) => tracing::warn!(
+                        component = "connection_report",
+                        "connection report failed; retrying"
+                    ),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
     let connection = tokio::spawn(
         args.tunnel
             .supervise(listener.local_addr()?, tunnel_stop.clone()),
@@ -195,6 +248,7 @@ async fn account_command(
                 receipt.device.id,
                 receipt.device.default_workspace
             )?;
+            save_cloud_origin(root, origin)?;
         }
         Command::LoginStatus { .. } => match client.status().await? {
             Some(status) => writeln!(
@@ -213,6 +267,7 @@ async fn account_command(
                 receipt.device.id,
                 receipt.device.default_workspace
             )?;
+            save_cloud_origin(root, origin)?;
         }
         Command::ForgetLogin { .. } => {
             client.forget_local_login().await?;
@@ -223,6 +278,20 @@ async fn account_command(
         }
     }
     Ok(())
+}
+
+fn save_cloud_origin(root: &std::path::Path, origin: &str) -> std::io::Result<()> {
+    let origin = origin.trim().trim_end_matches('/');
+    std::fs::write(root.join("cloud-origin"), origin.as_bytes())
+}
+
+fn load_cloud_origin(root: &std::path::Path) -> Option<String> {
+    let origin = std::fs::read_to_string(root.join("cloud-origin")).ok()?;
+    let origin = origin.trim().to_owned();
+    if origin.is_empty() || origin.len() > 2048 {
+        return None;
+    }
+    Some(origin)
 }
 
 async fn open_browser(url: &str) -> std::io::Result<()> {

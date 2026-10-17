@@ -9,8 +9,7 @@
 //! 不变量（与 v1 一致）：
 //! - **延迟写入**：before_tool / after_tool 期间 transcript 不含本轮 AI 消息
 //! - **deferred_error**：多工具并发循环不在中途返回，先收集所有错误
-//! - **error_suggest 注入**：在 run_after_tool 之后、写 transcript 之前；只修改 output 文本
-//! - **ToolEnd emit 时机**：在 error_suggest 注入之前 emit
+//! - **ToolEnd emit 时机**：工具完成即刻 emit，早于 after_tool 后处理
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,17 +20,32 @@ mod effective_dispatcher;
 mod execution;
 
 use super::middleware_runner::run_after_tools_batch;
-use super::StageContext;
+use super::{ExecutionEntryOrigin, InvocationContext, StageContext};
 use crate::agent::events_v2::RenderEvent;
 use crate::agent::react::{Reasoning, ToolCall, ToolResult};
 use crate::error::{AgentError, AgentResult};
 use crate::messages::{BaseMessage, ToolCallRequest};
 use crate::session::tool_catalog::SessionToolCatalogSnapshot;
 use crate::tools::{BaseTool, CanonicalToolInvocation};
-use execution::collect_tool_results;
+use execution::{collect_tool_results, SettledInvocation};
 
 /// 连续失败检测阈值
 const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 5;
+
+/// session-owned canonical 执行入口：把一次执行（会话事实 + pinned catalog）投影为
+/// [`EffectiveToolDispatcher`]。
+///
+/// 与 Act 批次走**同一条**管线（before-tool 规则 → 批准 → 执行 → after_tool），
+/// 但调用方自带 `InvocationContext`（App / Host idle 入口由
+/// [`InvocationContext::from_source`] 构造）。具体实现类型保持 crate 私有。
+pub fn invocation_dispatcher(
+    ctx: InvocationContext,
+    catalog: Arc<SessionToolCatalogSnapshot>,
+) -> Arc<dyn crate::tools::EffectiveToolDispatcher> {
+    Arc::new(effective_dispatcher::StageEffectiveToolDispatcher::new(
+        ctx, catalog,
+    ))
+}
 
 /// 分发结果
 pub struct DispatchOutcome {
@@ -138,11 +152,11 @@ pub async fn dispatch_tools(
             ));
             continue;
         }
-        match ctx
+        let resolved = ctx
             .runtime
             .tool_invocation_resolver
-            .resolve(call, &all_tools)
-        {
+            .resolve_model(call, &all_tools);
+        match resolved {
             Ok(invocation) => invocations.push(invocation),
             Err(error) => resolution_errors.push((
                 call.clone(),
@@ -151,6 +165,16 @@ pub async fn dispatch_tools(
         }
     }
     for (call, result) in &resolution_errors {
+        // 结算路径的逐条记录点：解析失败的工具不进入 policy/invoke，执行路径的
+        // `tool call failed`（tool_dispatch/execution.rs）覆盖不到它们，只能在
+        // 这里补齐，否则错误只以事件（ToolEnded{is_error:true}）离开进程。
+        //
+        tracing::warn!(
+            tool_call_id = %call.id,
+            tool = %call.name,
+            reason = %result.output,
+            "tool call resolution failed"
+        );
         if should_emit_settled_tool_render(call) {
             emit_settled_tool_render(ctx, call, result);
         }
@@ -181,8 +205,13 @@ pub async fn dispatch_tools(
         .collect();
 
     // 阶段 A：收集所有工具调用结果（不写 transcript）
+    //
+    // canonical 执行上下文只投影会话事实与端口：transcript 提交、after_tools_batch、
+    // 失败计数与事件投影留在本函数（Act 侧）。
+    let invocation_context =
+        InvocationContext::from_stage(ctx, ExecutionEntryOrigin::ModelBatch, cancel.clone());
     let mut collect_outcome = collect_tool_results(
-        ctx,
+        &invocation_context,
         policy_calls,
         &event_calls,
         &target_tools,
@@ -190,6 +219,7 @@ pub async fn dispatch_tools(
         cancel,
         ai_msg_id,
         &ai_msg,
+        None,
     )
     .await?;
 
@@ -197,7 +227,8 @@ pub async fn dispatch_tools(
     {
         let mut tx = ctx.session.transcript.write();
         tx.stage_ai_message(ai_msg);
-        for (_, result) in &collect_outcome.results {
+        for settled in &collect_outcome.results {
+            let result = &settled.result;
             let tool_msg = BaseMessage::tool_result_with_execution_and_failure(
                 &result.tool_call_id,
                 result.output.as_str(),
@@ -216,19 +247,28 @@ pub async fn dispatch_tools(
         tx.commit_staged();
     }
 
-    // 只计入已提交的最外层结果，包括错误结果；PTC 内部调用没有独立 transcript
+    // 只计入已提交的工具结果，包括错误结果。
     // 提交，不在这里重复计量。先记账再运行后置 hook，确保 hook 失败也不丢增长。
     {
         let mut tracker = ctx.compact.token_tracker.write();
-        for (_, result) in collect_outcome.results.iter().chain(&resolution_errors) {
+        for result in collect_outcome
+            .results
+            .iter()
+            .map(|settled| &settled.result)
+            .chain(resolution_errors.iter().map(|(_, result)| result))
+        {
             tracker.add_estimated_tool_tokens(&result.output);
         }
     }
 
     // 阶段 C：仅已进入 policy 的调用触发 after_tools_batch。
     // Resolution 错误在 middleware 前结算，不能产生任何 hook 副作用。
-    run_after_tools_batch(ctx, &collect_outcome.results).await?;
-    collect_outcome.results.extend(resolution_errors);
+    run_after_tools_batch(ctx, &collect_outcome.result_pairs()).await?;
+    collect_outcome.results.extend(
+        resolution_errors
+            .into_iter()
+            .map(|(call, result)| SettledInvocation::unreported(call, result)),
+    );
 
     // 连续失败追踪 + ToolFailureWarning 注入
     handle_consecutive_failures(ctx, &collect_outcome.results);
@@ -246,7 +286,7 @@ pub async fn dispatch_tools(
     }
 
     Ok(DispatchOutcome {
-        results: collect_outcome.results,
+        results: collect_outcome.result_pairs(),
     })
 }
 
@@ -254,8 +294,9 @@ pub async fn dispatch_tools(
 ///
 /// v2 简化为总计数（AtomicU32）。失败累计达阈值时推送 Info 消息到 v2 queue，
 /// 下轮 Receive 阶段消费（带 `<system-reminder>` 包裹）。
-fn handle_consecutive_failures(ctx: &StageContext, results: &[(ToolCall, ToolResult)]) {
-    for (_, result) in results {
+fn handle_consecutive_failures(ctx: &StageContext, results: &[SettledInvocation]) {
+    for settled in results {
+        let result = &settled.result;
         if result.is_error {
             let current = ctx
                 .compact

@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use futures::stream;
 use parking_lot::Mutex;
 use peri_acp_types::{
-    interaction::{InteractionContext, InteractionResponse, UserInteractionBroker},
+    interaction::{
+        InteractionContext, InteractionResponse, TrustedInteractionOwner, UserInteractionBroker,
+    },
     messages::MessageContent,
     permission::PermissionMode,
 };
@@ -66,7 +68,11 @@ impl Model for ModelGate {
 struct Broker;
 #[async_trait]
 impl UserInteractionBroker for Broker {
-    async fn request(&self, _context: InteractionContext) -> InteractionResponse {
+    async fn request(
+        &self,
+        _owner: TrustedInteractionOwner,
+        _context: InteractionContext,
+    ) -> InteractionResponse {
         InteractionResponse::Rejected
     }
 }

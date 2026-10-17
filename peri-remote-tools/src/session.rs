@@ -225,7 +225,8 @@ impl RemoteSession {
             .ok_or(Error::MissingIdentity)?;
         let invocation = ctx
             .invocation_id
-            .as_deref()
+            .as_ref()
+            .map(|id| id.as_str())
             .filter(|s| !s.is_empty())
             .ok_or(Error::MissingIdentity)?;
         // The host must persist its turn identity to retain this key across

@@ -1,10 +1,12 @@
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use peri_acp_types::device_enrollment::{
-    DeviceRecord, NativeAuthorization, NativeTokens, RegistrationReceipt, NATIVE_CLIENT_ID,
+    ConnectionReceipt, ConnectionReport, DeviceRecord, NativeAuthorization, NativeTokens,
+    RegistrationReceipt, NATIVE_CLIENT_ID,
 };
 use peri_acp_types::device_executor::ExecutorInfo;
 use serde::de::DeserializeOwned;
@@ -176,6 +178,75 @@ impl LoginClient {
         }
         drop(vault);
         result
+    }
+
+    /// Report this executor's cloud-side loopback reverse-tunnel endpoint and
+    /// transport token. Older hosts answer 404; the caller keeps serving.
+    pub async fn report_connection(
+        &self,
+        endpoint: SocketAddr,
+        lease_seconds: u32,
+    ) -> Result<ConnectionReceipt> {
+        let vault = self.vault().await?;
+        let (vault, credential) = load(vault).await?;
+        let mut credential = credential.ok_or(LoginError::LoginRequired)?;
+        validate_credential(&credential, &self.origin, self.device.device_id)?;
+        if credential.refresh_pending {
+            return Err(LoginError::RefreshUncertain);
+        }
+        let mut vault = vault;
+        if credential.access_expires_at <= now().saturating_add(30) {
+            (credential, vault) = self.refresh(vault, credential).await?;
+        }
+        let report = ConnectionReport {
+            device_id: self.device.device_id,
+            endpoint: endpoint.to_string(),
+            transport_token: self.transport_token().await?,
+            lease_seconds,
+        };
+        let mut result = self.post_connection(&credential, &report).await;
+        if matches!(result, Err(LoginError::Rejected(401))) {
+            (credential, vault) = self.refresh(vault, credential).await?;
+            result = self.post_connection(&credential, &report).await;
+        }
+        drop(vault);
+        result
+    }
+
+    async fn transport_token(&self) -> Result<String> {
+        let path = self.root.join("transport-token");
+        let token = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|_| LoginError::Storage)?;
+        let token = token.trim().to_owned();
+        if !(64..=8192).contains(&token.len())
+            || token
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            return Err(LoginError::Configuration);
+        }
+        Ok(token)
+    }
+
+    async fn post_connection(
+        &self,
+        credential: &Credential,
+        report: &ConnectionReport,
+    ) -> Result<ConnectionReceipt> {
+        let response = self
+            .http
+            .post(format!("{}/api/native/connection", self.origin))
+            .bearer_auth(&credential.access_token)
+            .json(report)
+            .send()
+            .await
+            .map_err(|_| LoginError::Network)?;
+        let receipt: ConnectionReceipt = decode(response).await?;
+        if receipt.connection_id.is_nil() || receipt.lease_expires_at <= 0 {
+            return Err(LoginError::Protocol);
+        }
+        Ok(receipt)
     }
 
     /// Remove this origin/device's local credential only. Use the cloud portal

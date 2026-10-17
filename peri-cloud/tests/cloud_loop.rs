@@ -10,7 +10,8 @@ use axum::{Json, Router};
 use parking_lot::Mutex;
 use peri_acp_types::event_v2::RenderEvent;
 use peri_acp_types::interaction::{
-    ApprovalDecision, InteractionContext, InteractionResponse, UserInteractionBroker,
+    ApprovalDecision, InteractionContext, InteractionResponse, TrustedInteractionOwner,
+    UserInteractionBroker,
 };
 use peri_acp_types::messages::{BaseMessage, MessageContent};
 use peri_acp_types::permission::{PermissionMode, SharedPermissionMode};
@@ -65,7 +66,11 @@ struct Broker {
 
 #[async_trait]
 impl UserInteractionBroker for Broker {
-    async fn request(&self, context: InteractionContext) -> InteractionResponse {
+    async fn request(
+        &self,
+        _owner: TrustedInteractionOwner,
+        context: InteractionContext,
+    ) -> InteractionResponse {
         self.requests.lock().push(context.clone());
         match context {
             InteractionContext::Approval { items } => InteractionResponse::Decisions(

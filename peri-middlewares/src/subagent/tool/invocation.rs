@@ -1,29 +1,56 @@
 //! Tolerant invocation decoding and live parent-message selection.
 use peri_agent::messages::BaseMessage;
+use peri_agent::tools::{EffectiveToolError, EffectiveToolErrorCode};
 
 pub(super) struct InvocationArgs {
     pub(super) resume_thread_id: Option<String>,
     pub(super) prompt: Option<String>,
     pub(super) subagent_type: Option<String>,
     pub(super) model: Option<String>,
-    pub(super) run_in_background: bool,
+    /// **显式**意图（`None` = 调用未给出该字段）：缺省由装配期注入的有效缺省补齐。
+    ///
+    /// 显式与缺省必须分开承载：只有显式 `true` 会与「后台能力未装配」的场景
+    /// （MCP Agent / resume）冲突，缺省不得把它们推进报错路径。
+    pub(super) run_in_background: Option<bool>,
     pub(super) cwd: String,
     pub(super) is_fork: bool,
 }
 
 impl InvocationArgs {
-    pub(super) fn parse(input: &serde_json::Value, parent_cwd: &str) -> Self {
-        // resume_thread_id 仅在值为有效 UUID 时才视为恢复意图（「不填 = 新建」语义）：
-        // LLM 表达「省略」时常用 "" / "new" / "__omit__" 等占位符（或把意图填进
-        // 该字段），若按 is_some 判断会被劫持进 resume 分支并触发 invalid thread id
-        // 失败——占位符一律忽略，走正常新建路径（subagent_type / fork / prompt）。
-        // 真实 child_thread_id 恒为 UUID（spawn 时 Uuid::now_v7 生成），过滤不损失语义。
+    /// 解析工具入参；`resume_thread_id` 非空但非法（非 UUID）时返回明确错误。
+    ///
+    /// `result_large_err`：本函数对外只剩 `Box<dyn Error>`（调用方看不到具体 Err 类型），
+    /// lint 只是看穿了 `?` 的装箱转换。装箱由调用方完成，这里不额外包装；债务归属契约层
+    /// ——`EffectiveToolError` 携带 `RemoteToolError` 后变大，若后续再触发该 lint，
+    /// 应在契约层决定是否装箱，而不是在本函数堆多层 allow。
+    #[allow(clippy::result_large_err)]
+    pub(super) fn parse(
+        input: &serde_json::Value,
+        parent_cwd: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // resume_thread_id 的三分语义（「不填 = 新建」）：
+        // - 字段缺失 / 非字符串 / 空串 → 未提供，走新建路径（LLM 表达「省略」时常用
+        //   ""；它等同未填，不得被当成恢复意图；错误类型的宽容解码与 model / cwd /
+        //   fork 等相邻字段一致）；
+        // - 合法 UUID → 恢复该 child thread（spawn 时 `Uuid::now_v7` 生成）；
+        // - 其它非空字符串 → 明确报错，不得静默忽略该字段。
+        //
+        // 后台 task_id 形如 `bg-{uuid}`（`session/subagent/factory/spawn.rs` 生成），
+        // 与 child_thread_id 同属 id 形状：静默忽略会让一次「恢复」调用转入新建
+        // 路径——同一任务被重复执行并造成工作区竞争，因此必须显式失败而非降级。
         let resume_thread_id = input
             .get("resume_thread_id")
             .and_then(|v| v.as_str())
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty() && uuid::Uuid::parse_str(s).is_ok())
-            .map(|s| s.to_string());
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                if uuid::Uuid::parse_str(s).is_ok() {
+                    Ok(s.to_string())
+                } else {
+                    Err(invalid_resume_thread_id(s))
+                }
+            })
+            .transpose()?;
         // prompt 改为 Option：resume 路径可缺省（缺省注入隐式 continue，issue 决策 9）；
         // 非 resume 路径下方运行时校验兜底（required:[] 后语义不变）
         let prompt = input
@@ -42,10 +69,7 @@ impl InvocationArgs {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
-        let run_in_background = input
-            .get("run_in_background")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let run_in_background = input.get("run_in_background").and_then(|v| v.as_bool());
         let cwd = input
             .get("cwd")
             .and_then(|v| v.as_str())
@@ -54,7 +78,7 @@ impl InvocationArgs {
         let is_fork = input.get("fork").and_then(|v| v.as_bool()).unwrap_or(false)
             || subagent_type.as_deref() == Some("fork");
 
-        Self {
+        Ok(Self {
             resume_thread_id,
             prompt,
             subagent_type,
@@ -62,8 +86,22 @@ impl InvocationArgs {
             run_in_background,
             cwd,
             is_fork,
-        }
+        })
     }
+}
+
+/// `resume_thread_id` 非法（非 UUID）时的明确拒绝：消息保留收到的值（有界），
+/// 说明 task_id 不能用于 resume，并给出两条出路（用 child_thread_id / 省略字段）。
+fn invalid_resume_thread_id(raw: &str) -> EffectiveToolError {
+    EffectiveToolError::new(
+        EffectiveToolErrorCode::InvalidInput,
+        format!(
+            "invalid resume_thread_id: {} — expected the child thread UUID reported as \
+             `child_thread_id` (a background task id such as `bg-...` cannot be used to \
+             resume); omit resume_thread_id to start a new sub-agent instead",
+            peri_acp_types::session::bounded_error_message(raw, 120)
+        ),
+    )
 }
 
 impl super::SubAgentTool {

@@ -9,6 +9,11 @@ if ($taskCacheRoot.StartsWith($taskUserRoot, [StringComparison]::OrdinalIgnoreCa
 $env:CARGO_HOME = $taskCacheRoot
 $env:CARGO_INCREMENTAL = '0'
 $env:CARGO_ENCODED_RUSTFLAGS = @("--remap-path-prefix=$taskSourceRoot=/src", "--remap-path-prefix=$taskCacheRoot=/cargo") -join [char]31
-cargo build --manifest-path (Join-Path $taskSourceRoot 'Cargo.toml') --release --locked -p peri-cloud --bin peri-cloud-host -p peri-executor --bin peri-executor
-if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+Push-Location $taskSourceRoot
+try {
+    bash (Join-Path $taskSourceRoot 'scripts/cargo-rmcp-patched.sh') build --release --locked -p peri-cloud --bin peri-cloud-host -p peri-executor --bin peri-executor
+    if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+} finally {
+    Pop-Location
+}
 # Ship optimized .exe files only. Do not distribute PDBs, configuration or state.

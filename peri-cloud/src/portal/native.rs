@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 use super::{security, Portal, PortalError};
 use crate::identity::{DeviceRecord, IdentityError, NativeAuthorization, RegistrationReceipt};
+use peri_acp_types::device_enrollment::{ConnectionReceipt, ConnectionReport};
 
 pub(super) async fn consent_page(
     RawQuery(query): RawQuery,
@@ -148,4 +149,21 @@ pub(super) async fn register_device(
         .ok_or(IdentityError::Unauthorized)?;
     let actor = portal.identity.authenticate_native(bearer).await?;
     Ok(Json(portal.identity.register_device(&actor, device).await?))
+}
+
+pub(super) async fn register_connection(
+    State(portal): State<Portal>,
+    headers: HeaderMap,
+    Json(report): Json<ConnectionReport>,
+) -> Result<Json<ConnectionReceipt>, PortalError> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| value.len() == 64)
+        .ok_or(IdentityError::Unauthorized)?;
+    let actor = portal.identity.authenticate_native(bearer).await?;
+    Ok(Json(
+        portal.identity.register_connection(&actor, report).await?,
+    ))
 }

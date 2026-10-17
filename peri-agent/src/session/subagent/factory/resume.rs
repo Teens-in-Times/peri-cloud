@@ -5,7 +5,10 @@ use std::sync::Arc;
 use peri_acp_types::store::PersistedPayload;
 
 use super::super::background::spawn_background_subagent;
-use super::super::run_sync::run_sync_subagent;
+use super::super::run_sync::{
+    handoff_event_handler, new_sync_task_id, run_sync_subagent, run_sync_with_registered_handoff,
+    SyncCompletion,
+};
 use super::super::types::{SubagentResumeConfig, SubagentRunMode, SubagentSpawned};
 use super::super::v2_bridge::agent_id_from_child_thread;
 use super::claim::ResumeClaim;
@@ -49,6 +52,9 @@ pub(super) async fn resume_subagent_impl(
     parent: Option<&Arc<Session>>,
     config: SubagentResumeConfig,
 ) -> Result<SubagentSpawned, Box<dyn std::error::Error + Send + Sync>> {
+    if parent.is_some_and(|session| session.store().frozen.legacy_embedded_instructions) {
+        return Err("V1 frozen prompt contains embedded external instructions; create a new session before resuming a subagent".into());
+    }
     // 解构 config（cwd 不用于恢复——cwd 取 meta.cwd，thread 创建时固化）
     let SubagentResumeConfig {
         thread_id,
@@ -61,8 +67,6 @@ pub(super) async fn resume_subagent_impl(
         tools,
         tool_filter,
         tool_invocation_resolver,
-        error_suggest_registry,
-        tool_registry_snapshot,
         compact_config,
         context_budget,
         compact_llm,
@@ -77,6 +81,7 @@ pub(super) async fn resume_subagent_impl(
         register_runtime,
         deregister_runtime,
         parent_agent_id,
+        parent_tool_call_id,
         cancel_token: cancel_token_cfg,
         cwd: _,
         frozen_claude_md: frozen_claude_md_cfg,
@@ -88,7 +93,8 @@ pub(super) async fn resume_subagent_impl(
     // 绑定校验用一次一致快照：child 的绑定必须与 owning parent 完全相同，且两者同根。
     // 存在性是本函数的第一个校验分支：快照读取报 `NotFound` 即「thread not found」，
     // 与后续 `ResumeClaim` 的状态校验分开报错（不能把「不存在」说成「仍处于运行态」）。
-    let child_snapshot = match session_resources.load_session_snapshot(&thread_id).await {
+    // 本步只消费 binding：读有效视图，不加载 own 正文。
+    let child_snapshot = match session_resources.load_active_snapshot(&thread_id).await {
         Ok(snapshot) => snapshot,
         Err(error)
             if matches!(
@@ -110,7 +116,7 @@ pub(super) async fn resume_subagent_impl(
     if binding.is_some() {
         let parent_id = super::spawn::parent_thread_id_of(parent)
             .ok_or("bound child resume requires its owning parent session")?;
-        let parent_snapshot = session_resources.load_session_snapshot(&parent_id).await?;
+        let parent_snapshot = session_resources.load_active_snapshot(&parent_id).await?;
         let parent_binding = match &parent_snapshot.binding {
             peri_acp_types::session_resources::BindingState::Bound(binding) => binding.clone(),
             _ => return Err("bound subagent parent has no execution binding".into()),
@@ -127,11 +133,14 @@ pub(super) async fn resume_subagent_impl(
     let ownership = task_manager
         .as_ref()
         .map(|manager| {
-            peri_acp_types::tasks::TaskManager::begin_external_execution(manager.as_ref())
+            peri_acp_types::tasks::TaskManager::begin_external_execution(
+                manager.as_ref(),
+                "subagent-resume",
+            )
         })
         .transpose()?;
     let cluster_root = super::execution_root(session_resources.as_ref(), &thread_id).await?;
-    let (meta, claim) = ResumeClaim::acquire(
+    let (meta, mut claim) = ResumeClaim::acquire(
         Arc::clone(&session_resources),
         thread_id.clone(),
         cluster_root,
@@ -144,8 +153,9 @@ pub(super) async fn resume_subagent_impl(
     // the worker that performed the active write.
     let restored = async {
         // 一次一致快照：inherit 区与自有 payload/flags 同一次读取（不再分三次）。
+        // 恢复只重建有效视图：已排除 own 正文不属于续聊的当前上下文。
         let snapshot = session_resources
-            .load_session_snapshot(&thread_id)
+            .load_active_snapshot(&thread_id)
             .await
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         let mut inherited = snapshot.inherited;
@@ -206,8 +216,20 @@ pub(super) async fn resume_subagent_impl(
     let frozen_date = parent
         .map(|p| p.store().frozen.date.to_string())
         .or(frozen_date_cfg);
+    // Spawn puts the child's identity first in its own persisted history. Only
+    // hidden child threads use that convention; legacy/non-child history has no
+    // typed identity marker and its first System must remain ordinary history.
+    // For older hidden children, the first own System is the compatible identity
+    // slot. A future typed payload can remove this historical convention.
+    let identity = (meta.hidden && meta.parent_thread_id.is_some())
+        .then(|| loaded.first().and_then(PersistedPayload::as_message))
+        .flatten()
+        .and_then(|message| {
+            matches!(message, BaseMessage::System { .. }).then(|| message.content().to_owned())
+        });
     let frozen = inherited_frozen_context(
         parent,
+        identity.as_deref(),
         &frozen_claude_md,
         &frozen_skill_summary,
         &frozen_date,
@@ -232,6 +254,7 @@ pub(super) async fn resume_subagent_impl(
         frozen,
         cancel_token.clone(),
         thread_id.clone(),
+        parent.and_then(|session| session.subagent_host()),
         Some(Arc::clone(&session_resources)),
         inherited,
         loaded,
@@ -247,13 +270,13 @@ pub(super) async fn resume_subagent_impl(
         frozen_claude_local_md_cfg,
         frozen_skill_summary,
         tool_invocation_resolver,
-        error_suggest_registry,
-        tool_registry_snapshot,
         compact_config,
         context_budget,
         compact_llm,
         Some(agent_id_from_child_thread(&thread_id)),
-    );
+        identity.is_some(),
+    )
+    .await?;
 
     // Assembly is synchronous but can observe cancellation from another task
     // (or a callback). Sync callers still receive the established interrupted
@@ -268,6 +291,7 @@ pub(super) async fn resume_subagent_impl(
             session,
             cancel_token,
             interrupted: true,
+            pending_tasks: Vec::new(),
         });
     }
 
@@ -283,31 +307,55 @@ pub(super) async fn resume_subagent_impl(
     // 8. 执行（run mode 由本次调用决定，issue 决策 8）
     match run_mode {
         SubagentRunMode::Sync => {
-            // Transfer the live claim into execution, not a disarmed marker.
-            let interrupted = run_sync_subagent(
-                &thread_id,
-                &agent_name,
-                &cwd,
-                max_iterations,
-                event_handler,
-                on_subagent_start,
-                on_subagent_stop,
-                Some(Arc::clone(&session_resources)),
-                register_runtime,
-                deregister_runtime,
-                langfuse_bridge,
-                parent_agent_id,
-                v2_ctx,
+            let run_thread_id = thread_id.clone();
+            let run_agent_name = agent_name.clone();
+            let run_cwd = cwd.clone();
+            let run_session = session.clone();
+            let sync_task_id = new_sync_task_id();
+            let completion = run_sync_with_registered_handoff(
                 session.clone(),
-                Some(claim),
+                thread_id.clone(),
+                agent_name.clone(),
+                parent
+                    .and_then(|session| session.subagent_host())
+                    .and_then(|host| host.task_manager.clone()),
+                Some(sync_task_id.clone()),
+                super::completion_delivery(parent, on_bg_complete),
+                move |handoff_start, handed_off| async move {
+                    run_sync_subagent(
+                        &run_thread_id,
+                        &run_agent_name,
+                        &run_cwd,
+                        max_iterations,
+                        handoff_event_handler(event_handler, bg_event_sender, handed_off),
+                        on_subagent_start,
+                        on_subagent_stop,
+                        Some(session_resources),
+                        register_runtime,
+                        deregister_runtime,
+                        langfuse_bridge,
+                        parent_agent_id,
+                        parent_tool_call_id,
+                        v2_ctx,
+                        run_session,
+                        Some(claim),
+                        Some(handoff_start),
+                    )
+                    .await
+                },
             )
             .await?;
+            let (interrupted, pending_tasks, pending_task_id) = match completion {
+                SyncCompletion::Finished(interrupted) => (interrupted, Vec::new(), None),
+                SyncCompletion::Pending(tasks) => (false, tasks, Some(sync_task_id)),
+            };
             Ok(SubagentSpawned {
                 child_thread_id: thread_id,
-                task_id: None,
+                task_id: pending_task_id,
                 session,
                 cancel_token,
                 interrupted,
+                pending_tasks,
             })
         }
         SubagentRunMode::Background => {
@@ -324,7 +372,7 @@ pub(super) async fn resume_subagent_impl(
                 max_iterations,
                 bg_event_sender,
                 task_manager,
-                on_bg_complete,
+                super::completion_delivery(parent, on_bg_complete),
                 langfuse_bridge,
                 Some(Arc::clone(&session_resources)),
                 deregister_runtime,
@@ -332,12 +380,14 @@ pub(super) async fn resume_subagent_impl(
                 on_subagent_stop,
                 register_runtime,
                 parent_agent_id,
+                parent_tool_call_id,
                 cancel_token.clone(),
                 v2_ctx,
+                Some(&mut claim),
             )
             .await
             {
-                Ok(()) => claim.release().await,
+                Ok(()) => {}
                 Err(e) => {
                     // review MEDIUM-1 回滚：注册失败（task_manager 缺失 /
                     // register_with_kind 撞 per-kind 上限）时任务未执行——status
@@ -356,6 +406,7 @@ pub(super) async fn resume_subagent_impl(
                 session,
                 cancel_token,
                 interrupted: false,
+                pending_tasks: Vec::new(),
             })
         }
     }

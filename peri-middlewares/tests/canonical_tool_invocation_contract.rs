@@ -329,6 +329,7 @@ async fn hook_receives_canonical_alias_identity() {
         matcher: Some("Bash".to_string()),
         plugin_name: "contract".to_string(),
         plugin_id: "contract".to_string(),
+        plugin_source: None,
         plugin_root: PathBuf::from("/tmp"),
         plugin_data_dir: PathBuf::from("/tmp"),
         plugin_options: HashMap::new(),
@@ -460,6 +461,7 @@ struct RejectingBroker;
 impl peri_agent::interaction::UserInteractionBroker for RejectingBroker {
     async fn request(
         &self,
+        _owner: peri_agent::interaction::TrustedInteractionOwner,
         context: peri_agent::interaction::InteractionContext,
     ) -> peri_agent::interaction::InteractionResponse {
         let peri_agent::interaction::InteractionContext::Approval { items } = context else {

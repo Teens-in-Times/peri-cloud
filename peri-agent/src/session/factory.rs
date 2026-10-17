@@ -21,7 +21,7 @@ pub use peri_acp_types::frozen::{
 /// 生产链槽位（顺序 = 行为契约，ARC-MIDDLEWARE-001，禁止重排）。
 ///
 /// 顺序与迁移前 `peri-acp/src/agent/builder.rs` 的 `MiddlewareChain`
-/// 构造顺序完全一致，按功能分组；条件注册（MCP/Workflow/LSP/Goal）与
+/// 构造顺序完全一致，按功能分组；条件注册（MCP/Workflow/Goal）与
 /// Hook 组展开由装配实现按上下文判断。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainSlot {
@@ -32,8 +32,6 @@ pub enum ChainSlot {
     Lang,
     /// AgentsMd（CLAUDE.md 指引注入）
     AgentsMd,
-    /// AgentDefine（agent 定义注入）
-    AgentDefine,
     /// Plugin（插件加载结果注入）
     Plugin,
     /// Skills（技能摘要注入）
@@ -44,22 +42,18 @@ pub enum ChainSlot {
     AtMention,
     /// Image（@image 附件转 ContentBlock::Image）
     Image,
-    // ── 第二组：文件/终端/Web 工具提供器 ──
-    /// Filesystem（文件系统工具）
-    Filesystem,
+    // ── 第二组：工作区观察类注入器 ──
+    // v4-part-4 W3-C1：原 `Filesystem` / `Terminal` 两槽位已删除——7 个文件/终端工具
+    // （Read / Write / Edit / Glob / Grep / folder_operations / Bash）的唯一提供面是
+    // builtin `workspace` 实例的 bridge（模型面名字 `mcp__workspace__*`）。
+    // v4 wave 4：原 `GitWatch` 槽位已删除——git ref 变化改由 builtin `workspace` 实例的
+    // `workspace://git/ref` 资源 + MCP 2026-07-28 订阅回传（提醒映射内置在宿主侧），
+    // 本组只剩 `GitAttribution`。
     /// GitAttribution（git 归属注入）
     GitAttribution,
-    /// GitWatch（分支 / HEAD 变化 Info 注入）
-    GitWatch,
-    /// Terminal（终端命令工具）
-    Terminal,
-    /// Web（Web 工具）
-    Web,
-    // ── 第三组：Todo / Cron ──
+    // ── 第三组：Todo ──
     /// Todo（todo 工具）
     Todo,
-    /// Cron（cron 工具）
-    Cron,
     // ── 第四组：Hook 中间件（插件 hooks + 自定义 hooks） ──
     /// Hook 哨兵：每个非空 hook group 展开一个 HookMiddleware 实例
     Hook,
@@ -70,20 +64,15 @@ pub enum ChainSlot {
     AskUser,
     /// SubAgent（子 Agent 工具）
     SubAgent,
-    // ── 第六组：MCP / Workflow / ToolSearch（工具提供器，条件注册） ──
+    // ── 第六组：MCP / ToolSearch（工具提供器，条件注册） ──
+    // P5：原 `Workflow` 槽位已删除——编排能力是 builtin `workflow` 实例的
+    // MCP 工具面（`mcp__workflow__*`），不再有链上 middleware（见
+    // `docs/design/workflow-mcp.md` §7 删除清单）。
     /// Mcp（MCP 工具，pool 可用时注册）
     Mcp,
-    /// Workflow（workflow 工具，executor 可用时注册）
-    Workflow,
-    /// PTC（deferred RunPtcCode 与 session-local tools bridge）
-    Ptc,
     /// ToolSearch（deferred 工具搜索/执行代理）
     ToolSearch,
-    /// Artifact（公开 Artifact 上传工具）
-    Artifact,
-    // ── 第七组：LSP / Goal（辅助诊断，条件注册；Goal 在链最后） ──
-    /// Lsp（LSP 诊断工具，servers 非空时注册）
-    Lsp,
+    // ── 第七组：Goal（steering，条件注册；在链最后） ──
     /// Goal（goal 紧迫感 steering，controller 可用时注册）
     Goal,
 }
@@ -98,35 +87,26 @@ pub fn production_blueprint() -> Vec<ChainSlot> {
         ChainSlot::DefaultSystemPrompt,
         ChainSlot::Lang,
         ChainSlot::AgentsMd,
-        ChainSlot::AgentDefine,
         ChainSlot::Plugin,
         ChainSlot::Skills,
         ChainSlot::SkillPreload,
         ChainSlot::AtMention,
         ChainSlot::Image,
-        // 第二组：文件/终端/Web 工具提供器
-        ChainSlot::Filesystem,
+        // 第二组：工作区观察类注入器（文件/终端/GitWatch 均已离开链：
+        // 文件/终端工具迁 builtin `workspace` 实例，git ref 变化迁该实例的订阅回传）
         ChainSlot::GitAttribution,
-        ChainSlot::GitWatch,
-        ChainSlot::Terminal,
-        ChainSlot::Web,
-        // 第三组：Todo / Cron
+        // 第三组：Todo
         ChainSlot::Todo,
-        ChainSlot::Cron,
         // 第四组：Hook 中间件
         ChainSlot::Hook,
         // 第五组：Permission + AskUser + SubAgent
         ChainSlot::Permission,
         ChainSlot::AskUser,
         ChainSlot::SubAgent,
-        // 第六组：MCP / Workflow / ToolSearch
+        // 第六组：MCP / ToolSearch（Workflow 槽位已随 P5 删除）
         ChainSlot::Mcp,
-        ChainSlot::Workflow,
-        ChainSlot::Ptc,
         ChainSlot::ToolSearch,
-        ChainSlot::Artifact,
-        // 第七组：LSP / Goal
-        ChainSlot::Lsp,
+        // 第七组：Goal
         ChainSlot::Goal,
     ]
 }
@@ -157,13 +137,79 @@ pub fn build_middleware_chain<A: MiddlewareChainAssembler>(
     assembler.assemble(&production_blueprint(), ctx)
 }
 
+// ── idle 准入规则链（设计 §3.2 / root 裁决 R1）──────────────────────────────
+
+/// idle 准入规则蓝本：由 [`production_blueprint`] **白名单派生**，不另写一份槽位清单。
+///
+/// 只保留能在**没有 turn 事实**下正确运行的准入规则：
+///
+/// - [`ChainSlot::Hook`]：PreToolUse 规则的输入全是 session 级事实（hook 组 /
+///   cwd / 权限模式 / broker / 任务管理器），无需 turn；`ask` 路径的审批归属由
+///   调用方铸造的 `InteractionAttribution` 提供。
+/// - [`ChainSlot::Permission`]：审批规则同样只消费 session 级事实（权限模式 /
+///   broker / auto-classifier）；需要 turn 的部分只是事件与 `step` 写入，
+///   由管线在 `turn: None` 下显式不发。
+///
+/// **被排除的槽位及原因**（每个都必须写明「为何无法在无 turn 下运行」）：
+///
+/// | 槽位 | 排除原因 |
+/// |---|---|
+/// | `DefaultSystemPrompt` / `Lang` / `AgentsMd` / `Plugin` / `Skills` / `SkillPreload` / `AtMention` / `Image` | 上下文注入器：产出要写进**模型请求**，idle 入口按构造没有模型请求 |
+/// | `GitAttribution` | 依赖 turn 的 git 快照投影（无 turn 时无快照事实可注） |
+/// | `Todo` | 写 turn 级 todo 通道与 `step` 进度，idle 无 `step` 事实 |
+/// | `AskUser` | 提问通道由**模型工具**触发（`AskUserQuestion` 工具在 `collect_tools` 暴露），idle 不产生模型可见工具视图 |
+/// | `SubAgent` | 子代理需要父 turn 身份与 transcript 继承事实，idle 没有 |
+/// | `Mcp` | 目录准入由本入口自己经 `McpAdmissionPreparation` 完成（同一原语），
+///   链上实例会重复提供工具面并写 notifier 副作用 |
+/// | `ToolSearch` | 面向模型 deferred 工具检索，idle 不产生模型可见目录 |
+/// | `Goal` | goal steering 依附模型循环，idle 没有循环 |
+pub fn invocation_rule_blueprint() -> Vec<ChainSlot> {
+    production_blueprint()
+        .into_iter()
+        .filter(|slot| matches!(slot, ChainSlot::Hook | ChainSlot::Permission))
+        .collect()
+}
+
+/// idle 准入规则链（与 per-turn 生产链**不同类型**的窄链）。
+///
+/// 类型分工（root 审查要求）：per-turn `ChainAssembly.chain` 不能直接注入
+/// session-owned 服务——那会让 session 服务挂住 per-turn 对象（`StageContext`
+/// / `EventBus` / pinned catalog）。唯一生产构造入口是
+/// [`build_invocation_rule_chain`]（派生蓝本 + 同一 `ProductionChainAssembler`）。
+pub struct InvocationRuleChain(Arc<MiddlewareChain>);
+
+impl InvocationRuleChain {
+    /// 由**派生蓝本装配产物**构造（生产入口经 [`build_invocation_rule_chain`]；
+    /// 测试可用它包住手写链以覆盖规则路径）。
+    pub fn from_derived_blueprint(chain: MiddlewareChain) -> Self {
+        Self(Arc::new(chain))
+    }
+
+    /// 规则链的共享句柄（`InvocationContext` 执行期借用；不得用于 turn 链装配）。
+    pub fn shared(&self) -> Arc<MiddlewareChain> {
+        Arc::clone(&self.0)
+    }
+}
+
+/// 按 idle 准入规则蓝本装配窄链（同一装配器、同一上下文类型）。
+///
+/// `Context` / `Output` 固定为生产装配类型：调用方无法用它装配轮次链或
+/// 拿到轮次 `ChainAssembly`。
+pub fn build_invocation_rule_chain<A>(assembler: &A, ctx: &AssemblyContext) -> InvocationRuleChain
+where
+    A: MiddlewareChainAssembler<Context = AssemblyContext, Output = ChainAssembly>,
+{
+    let ChainAssembly { chain, .. } = assembler.assemble(&invocation_rule_blueprint(), ctx);
+    InvocationRuleChain::from_derived_blueprint(chain)
+}
+
 // ── 装配上下文（L5：自 peri-middlewares/src/assembly.rs 迁入）────────────────
 //
 // 链装配上下文与产物的类型事实源归本层（§2 装配归 Agent 层 session 工厂）：
 // 装配实现方（`peri-middlewares::assembly::ProductionChainAssembler`）依赖
 // 本层类型，避免 Agent 层反向依赖 middlewares 成环。middlewares 具体类型
 // 全部经 `peri-acp-types` 端口（McpPoolPort / ToolSearchPort /
-// WorkflowMiddlewarePort / CronSchedulerPort）或注入面接入。
+// CronSchedulerPort）或注入面接入。
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashSet};
@@ -177,28 +223,25 @@ use peri_acp_types::cron::CronSchedulerPort;
 use peri_acp_types::event::AgentEventHandler;
 use peri_acp_types::goal::GoalController;
 use peri_acp_types::hooks::RegisteredHook;
-use peri_acp_types::interaction::{ChannelState, UserInteractionBroker};
-use peri_acp_types::lsp::LspServerConfig;
+use peri_acp_types::interaction::UserInteractionBroker;
 use peri_acp_types::mcp_skills::McpSkillRegistry;
 use peri_acp_types::plugin::LoadedPlugin;
-use peri_acp_types::ports::{LspPoolPort, McpPoolPort, ToolSearchPort, WorkflowMiddlewarePort};
+use peri_acp_types::ports::{McpPoolPort, ToolSearchPort};
 use peri_acp_types::session_resources::SessionResources;
 use peri_acp_types::skills::SkillRoot;
 use peri_acp_types::tools::TodoItem;
-use peri_acp_types::workflow::AgentExecutor;
 use peri_acp_types::{identity::AgentId, permission::SharedPermissionMode};
 
-use crate::agent::async_tasks::{BgTaskKind, TaskManager};
-use crate::agent::events::BackgroundTaskResult;
-use crate::agent::react::ReactLLM;
+use crate::agent::async_tasks::TaskManager;
 use crate::agent::LangfuseBridgeLike;
 use crate::agent::{AgentCancellationToken, ExecutorEvent};
 use crate::middleware::chain::MiddlewareChain;
+use crate::session::exec::executor::SubagentLlmFactory;
 use crate::session::Session;
 use crate::tools::BaseTool;
 
 /// 后台任务完成回调类型（第二参为任务 kind，供 continuation scheduler 过滤）。
-pub type OnBgCompleteFn = Arc<dyn Fn(&BackgroundTaskResult, BgTaskKind) + Send + Sync>;
+pub use peri_acp_types::tasks::OnBgCompleteFn;
 /// System prompt 构建器类型。
 pub type SystemPromptBuilder = Arc<dyn Fn(Option<&AgentOverrides>, &str) -> String + Send + Sync>;
 
@@ -265,12 +308,14 @@ pub struct AssemblyContext {
     /// 自动分类模型（HITL auto-classifier）
     pub auto_classifier_model: Arc<tokio::sync::Mutex<Box<dyn peri_model::Model>>>,
     // ── 配置 / 插件 / 技能 ──
-    /// CLAUDE.md 排除项
-    pub claude_md_excludes: Vec<String>,
     /// 预加载技能名
     pub preload_skills: Vec<String>,
     /// 插件技能根目录
     pub plugin_skill_roots: Vec<SkillRoot>,
+    /// Agent 候选目录端口（W5）：链装配点用它绑定会话级 MCP Agent registry
+    /// （`resolve_ports`），prompt 渲染经它取 `{{available_agents}}` 候选；
+    /// 唯一来源，不回落磁盘。
+    pub agent_catalog: Arc<dyn peri_acp_types::ports::AgentCatalogPort>,
     /// 已加载插件
     pub plugin_loaded: Vec<LoadedPlugin>,
     /// Hook 组（每组一个 HookMiddleware 实例）
@@ -295,19 +340,14 @@ pub struct AssemblyContext {
         Arc<parking_lot::Mutex<Option<Arc<dyn peri_acp_types::ports::SessionMcpProjectionLease>>>>,
     /// Session ID bound into DynamicMCP operations.
     pub session_id: String,
-    /// Channel 状态（MultiplexBroker 包装用）
-    pub channel_state: Option<Arc<ChannelState>>,
     /// 工具搜索索引端口
     pub tool_search_index: Arc<dyn ToolSearchPort>,
     /// 共享工具注册表（deferred tools；AskUserTool 插入、snapshot 构造）
     pub shared_tools: Arc<RwLock<BTreeMap<String, Arc<dyn BaseTool>>>>,
-    pub lsp_servers: Vec<LspServerConfig>,
-    /// 会话级 LSP 服务器池端口（复用，None = 构造临时实例；装配方 downcast 还原）
-    pub lsp_pool: Option<Arc<dyn LspPoolPort>>,
-    /// Workflow executor（Some 时注册 Workflow 中间件）
-    pub workflow_executor: Option<Arc<dyn AgentExecutor>>,
-    /// 会话级 WorkflowMiddleware 端口（复用，None = 构造临时实例）
-    pub workflow_middleware: Option<Arc<dyn WorkflowMiddlewarePort>>,
+    /// 会话级 workflow 完成通知源（P5：替代旧链 `WorkflowMiddlewarePort`；
+    /// 运行时状态与执行依赖归 builtin `workflow` 实例，本句柄只承载完成
+    /// 通知的订阅与单次消费门）。
+    pub workflow_notifications: Option<Arc<peri_acp_types::workflow::WorkflowNotifications>>,
     // ── 事件 / 后台 ──
     /// 事件 handler（子 agent 事件转发）
     pub event_handler: Arc<dyn AgentEventHandler>,
@@ -342,8 +382,8 @@ pub struct AssemblyContext {
     /// C5 移除，本字段由 stage 装配直接填入主 prompt）
     pub system_prompt_for_sub: String,
     // ── 工厂 ──
-    /// 子 agent LLM 工厂（支持 SubAgent LLM 缓存复用）
-    pub llm_factory: Arc<dyn Fn(Option<&str>) -> Box<dyn ReactLLM + Send + Sync> + Send + Sync>,
+    /// 子 agent 模型工厂（支持 SubAgent LLM 缓存复用；H1：只产出模型来源）
+    pub llm_factory: SubagentLlmFactory,
     /// System prompt 构建器（SubAgent 用）
     pub system_builder: SystemPromptBuilder,
     /// Todo 更新通道发送端（todo_rx 由上层持有）
@@ -356,6 +396,12 @@ pub struct AssemblyContext {
     /// `FrozenSessionData::meta_harness().disabled_middlewares`，
     /// 禁止从每 turn 当前配置重建——ARC-FROZEN-001）。
     pub meta_harness_disabled: HashSet<String>,
+    // ── beta flag 投影（设计 §消费契约）──
+    /// `Agent` 工具 `run_in_background` 的有效缺省（源自会话冻结的 beta flag 投影，
+    /// 禁止回退每 turn 当前配置）：middleware 装配参数，`false` 与 flag 引入前一致。
+    ///
+    /// 装配面只传值，不在执行路径解析 flag 语义。
+    pub agent_default_run_in_background: bool,
     // ── 基础系统提示词段持有者（波 4 演进 2）──
     /// agent overrides（DefaultSystemPromptMiddleware 的 persona 段内容源；
     /// 与 render_system_prompt 闭包收到的是同一份值，保证链收集与渲染一致）
@@ -370,8 +416,4 @@ pub struct ChainAssembly {
     pub chain: MiddlewareChain,
     /// SubAgent 中间件端口（链中已有一份 clone；供上层注入主 agent 身份）
     pub subagent_mw: Option<Arc<dyn SubAgentMiddlewarePort>>,
-    /// 错误感知建议注册表
-    pub error_suggest_registry: Option<Arc<crate::error_suggest::ErrorSuggestRegistry>>,
-    /// 工具注册表快照（工具名 + subagent 类型）
-    pub tool_registry_snapshot: Arc<crate::error_suggest::ToolRegistrySnapshot>,
 }

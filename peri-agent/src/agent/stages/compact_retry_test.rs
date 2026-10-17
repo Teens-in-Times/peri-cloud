@@ -81,6 +81,7 @@ struct SummaryModel {
     calls: AtomicUsize,
     order: Arc<parking_lot::Mutex<Vec<&'static str>>>,
     cancel: Option<Arc<CancellationToken>>,
+    requests: parking_lot::Mutex<Vec<ModelRequest>>,
 }
 
 #[async_trait::async_trait]
@@ -97,10 +98,11 @@ impl peri_model::Model for SummaryModel {
     }
     async fn complete(
         &self,
-        _: ModelRequest,
+        request: ModelRequest,
         _: CancellationToken,
     ) -> peri_model::ModelResult<ModelResponse> {
         self.order.lock().push("summary");
+        self.requests.lock().push(request);
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(cancel) = &self.cancel {
             if call == 1 {
@@ -154,6 +156,7 @@ async fn make_scenario(
         calls: AtomicUsize::new(0),
         order: order.clone(),
         cancel: cancel_retry.then(|| turn.cancel_token.clone()),
+        requests: Default::default(),
     });
     let (bus, handles) = EventBus::new(Default::default());
     let ctx = StageContext::builder(turn, session.transcript(), session.queue().clone())
@@ -176,20 +179,35 @@ async fn make_scenario(
     (bound, ctx, model, summary, handles)
 }
 
-/// [回归测试] 109% 时摘要先失败两次，必须在下一次 Reason 前完成 Full。
+/// [回归测试] 109% 时首轮空摘要，必须在下一次 Reason 前于同一次 Full 内重新生成成功。
 #[tokio::test]
 async fn test_compact_retry_recovers_inside_tool_loop() {
-    let (bound, ctx, model, summary, mut handles) = make_scenario(2, false).await;
+    let (bound, ctx, model, summary, mut handles) = make_scenario(1, false).await;
     let result = run_react_loop(ctx.clone(), 10).await;
     assert!(matches!(result, LoopResult::Completed), "{result:?}");
     assert_eq!(
         *model.order.lock(),
-        ["reason", "tool", "summary", "summary", "summary", "reason"]
+        ["reason", "tool", "summary", "summary", "reason"],
+        "恢复发生在同一次 Full 内，不产生第二次 Full 重试"
     );
-    assert_eq!(summary.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(summary.calls.load(Ordering::SeqCst), 2);
     assert!(model.requests.lock()[1]
         .iter()
         .any(|message| message.content().contains("RECOVERED")));
+    {
+        let requests = summary.requests.lock();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].messages.iter().all(|message| !matches!(
+                message,
+                ModelMessage::Assistant { content, .. } if content.is_empty()
+            )),
+            "重新生成不得回填空 assistant"
+        );
+        assert!(serde_json::to_string(&requests[1])
+            .unwrap()
+            .contains("original task"));
+    }
     assert_eq!(
         std::iter::from_fn(|| handles.try_observe())
             .filter(|e| matches!(e, ObserveEvent::MessagesCompacted { .. }))
@@ -203,12 +221,38 @@ async fn test_compact_retry_recovers_inside_tool_loop() {
         .load_session_snapshot(&bound.thread_id)
         .await
         .unwrap();
-    for message in transcript.entries().iter().take(3) {
+    // 热态已释放被排除的旧工作（收缩），因此按持久化事实核对「成功摘要替换旧工作」：
+    // 摘要（含 CONTINUATION_HINT）之前的历史必须全部带 excluded；摘要与其后的新工作
+    // 不在本次压缩范围内，不得被标记。
+    let summary_index = snapshot
+        .payloads
+        .iter()
+        .position(|payload| {
+            payload.as_message().is_some_and(|message| {
+                message
+                    .content()
+                    .contains(crate::agent::compact_v2::CONTINUATION_HINT)
+            })
+        })
+        .expect("持久化历史必须包含 continuation 摘要");
+    assert!(summary_index > 0, "摘要之前必须有被替换的旧工作");
+    for payload in &snapshot.payloads[..summary_index] {
         assert!(
-            snapshot.flags[&message.id()].excluded,
-            "成功摘要必须在持久化历史中替换旧工作"
+            snapshot
+                .flags
+                .get(&payload.id())
+                .is_some_and(|flags| flags.excluded),
+            "成功摘要之前的历史必须在持久化事实中被排除（{:?}）",
+            payload.id()
         );
     }
+    assert!(
+        transcript
+            .entries()
+            .iter()
+            .all(|entry| !transcript.flags(entry.id()).excluded),
+        "收缩后热态不得残留被排除条目"
+    );
 }
 
 /// [回归测试] 连续空摘要不得静默禁用 Compact 并继续发送超预算请求。
@@ -222,16 +266,18 @@ async fn test_compact_retry_exhaustion_stops_before_next_reason() {
     assert!(
         matches!(
             error,
-            AgentError::CompactRetriesExhausted {
-                attempts: 3,
-                // 工具调用名称/参数的请求增量约 2 tokens，工具结果约 3。
-                context_tokens: 109_005,
-                context_window: 100_000,
+            AgentError::CompactRecoveryExhausted {
+                attempts: 2,
+                last_reason: crate::error::SummaryRecoveryReason::EmptyResponse,
             }
         ),
-        "{error}"
+        "高压下恢复耗尽必须带真实次数与原因终止：{error}"
     );
-    assert_eq!(summary.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        summary.calls.load(Ordering::SeqCst),
+        2,
+        "空响应只允许一次重新生成，不与外层重试相乘"
+    );
     assert_eq!(model.requests.lock().len(), 1);
     assert!(ctx
         .session

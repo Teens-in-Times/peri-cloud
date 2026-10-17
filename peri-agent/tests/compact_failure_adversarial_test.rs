@@ -3,7 +3,7 @@
 use peri_acp_types::session_resources::{
     FrozenSnapshotBytes, NewSession, NewSessionMeta, SessionResources,
 };
-use peri_acp_types::workspace::{SessionBinding, SessionExecutionLease, SESSION_BINDING_VERSION};
+use peri_acp_types::workspace::{SessionBinding, SESSION_BINDING_VERSION};
 use peri_agent::agent::compact_v2::CompactConfig;
 use peri_agent::agent::events_v2::{EventBus, EventHandles, ObserveEvent};
 use peri_agent::agent::react::{ReactLLM, Reasoning, StreamingContext};
@@ -27,7 +27,6 @@ use tokio_util::sync::CancellationToken;
 struct BoundSession {
     resources: Arc<dyn SessionResources>,
     thread_id: String,
-    _lease: Arc<dyn SessionExecutionLease>,
     db: tempfile::TempDir,
     repo: tempfile::TempDir,
 }
@@ -70,7 +69,7 @@ impl BoundSession {
         );
         let workspace = resources.resolve_workspace(repo.path()).await.unwrap();
         let thread_id = uuid::Uuid::now_v7().to_string();
-        let lease = resources
+        resources
             .create_session(&NewSession {
                 thread_id: thread_id.clone(),
                 created_at: "2026-09-28T00:00:00Z".into(),
@@ -96,7 +95,6 @@ impl BoundSession {
         Self {
             resources,
             thread_id,
-            _lease: lease,
             db,
             repo,
         }
@@ -119,6 +117,7 @@ struct SummaryModel {
     calls: AtomicUsize,
     successful_after: usize,
     cancel_after_call: Option<(usize, Arc<CancellationToken>)>,
+    requests: parking_lot::Mutex<Vec<ModelRequest>>,
 }
 
 #[async_trait::async_trait]
@@ -135,9 +134,10 @@ impl peri_model::Model for SummaryModel {
     }
     async fn complete(
         &self,
-        _: ModelRequest,
+        request: ModelRequest,
         _: CancellationToken,
     ) -> peri_model::ModelResult<ModelResponse> {
+        self.requests.lock().push(request);
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some((target, token)) = &self.cancel_after_call {
             if call == *target {
@@ -216,6 +216,36 @@ impl peri_model::Model for SummaryText {
 
 #[async_trait::async_trait]
 impl ReactLLM for ReasonModel {
+    fn prepare_reasoning(
+        &self,
+        messages: &[BaseMessage],
+        _: &[&dyn BaseTool],
+    ) -> AgentResult<peri_model::PreparedModelCall> {
+        let checkpoint = serde_json::json!({"messages": messages});
+        Ok(peri_model::PreparedModelCall::new(checkpoint, |_| {
+            Ok(ModelStream::new(futures::stream::empty()))
+        }))
+    }
+
+    async fn generate_prepared_reasoning(
+        &self,
+        prepared: peri_model::PreparedModelCall,
+        streaming: Option<StreamingContext>,
+    ) -> AgentResult<Reasoning> {
+        let messages =
+            serde_json::from_value::<Vec<BaseMessage>>(prepared.checkpoint()["messages"].clone())
+                .map_err(|error| AgentError::LlmError(error.to_string()))?;
+        prepared
+            .start(
+                streaming
+                    .as_ref()
+                    .map(|context| context.cancel.clone())
+                    .unwrap_or_default(),
+            )
+            .map_err(AgentError::ModelError)?;
+        self.generate_reasoning(&messages, &[], streaming).await
+    }
+
     async fn generate_reasoning(
         &self,
         messages: &[BaseMessage],
@@ -273,6 +303,7 @@ async fn make_case(
         calls: AtomicUsize::new(0),
         successful_after,
         cancel_after_call: cancel_on.map(|call| (call, turn.cancel_token.clone())),
+        requests: Default::default(),
     });
     let reason = Arc::new(ReasonModel::default());
     let (bus, handles) = EventBus::new(Default::default());
@@ -348,32 +379,46 @@ async fn assert_unusable_summary_blocks_reason(failure: Failure) {
             assert!(matches!(error, AgentError::ModelError(_)));
             assert_eq!(public.diagnostic.unwrap().retry_attempts(), Some(3));
         }
-        Failure::MaxTokens => assert!(matches!(
-            error,
-            AgentError::CompactIncompleteResponse {
-                stop_reason: StopReason::MaxTokens
-            }
-        )),
         Failure::ToolUse => assert!(matches!(
             error,
             AgentError::CompactIncompleteResponse {
                 stop_reason: StopReason::ToolUse
             }
         )),
-        Failure::AnalysisOnly => assert!(matches!(
-            error,
-            AgentError::CompactRetriesExhausted { attempts: 3, .. }
-        )),
-        Failure::Success => unreachable!(),
+        Failure::AnalysisOnly => {
+            assert!(
+                matches!(
+                    error,
+                    AgentError::CompactRecoveryExhausted {
+                        attempts: 2,
+                        last_reason: peri_acp_types::error::SummaryRecoveryReason::EmptyResponse,
+                    }
+                ),
+                "{error:?}"
+            );
+            // 恢复耗尽的次数与原因必须能经 ACP 错误分类看到，而不是被改写成模型输出耗尽。
+            assert_eq!(
+                public.error_category.as_deref(),
+                Some("compact_recovery_exhausted")
+            );
+            assert_eq!(public.kind.wire_name(), "llm");
+            assert!(
+                public.public_message.contains("2"),
+                "用户文案必须包含实际次数：{}",
+                public.public_message
+            );
+        }
+        Failure::MaxTokens | Failure::Success => unreachable!(),
     }
     assert_eq!(
         summary.calls.load(Ordering::SeqCst),
-        if matches!(failure, Failure::AnalysisOnly | Failure::MaxTokens) {
-            3
+        if matches!(failure, Failure::AnalysisOnly) {
+            // 首轮空 + 一次重新生成后提前结束，不与外层重试相乘。
+            2
         } else {
             1
         },
-        "空摘要重试和 MaxTokens 续写有界；Provider 失败不能在 Compact 层重启"
+        "空摘要恢复有界；Provider 失败不能在 Compact 层重启"
     );
 }
 
@@ -395,24 +440,63 @@ async fn test_provider_retry_exhaustion_blocks_reason() {
     assert_unusable_summary_blocks_reason(Failure::ProviderRetryExhausted).await;
 }
 
-/// [回归测试] MaxTokens 输出不是完整摘要，失败后不得拿原高压历史继续请求。
+/// [回归测试] 始终截断的续写在预算内继续，耗尽后不提交半截摘要、不发第三次以后的请求。
 #[tokio::test]
-async fn test_max_tokens_summary_blocks_reason() {
-    assert_unusable_summary_blocks_reason(Failure::MaxTokens).await;
+async fn test_max_tokens_summary_exhausts_budget_without_committing() {
+    let (bound, ctx, reason, summary, _) =
+        make_case(Failure::MaxTokens, usize::MAX, false, None).await;
+    let result = run_react_loop(ctx.clone(), 4).await;
+    assert!(
+        matches!(
+            result,
+            LoopResult::Error(AgentError::CompactRecoveryExhausted {
+                attempts: 3,
+                last_reason: peri_acp_types::error::SummaryRecoveryReason::OutputLimitTruncated,
+            })
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        summary.calls.load(Ordering::SeqCst),
+        3,
+        "绝不发起第 4 次生成"
+    );
+    assert!(reason.requests.lock().is_empty());
+    {
+        let requests = summary.requests.lock();
+        assert_eq!(requests.len(), 3);
+        // 已有片段按原顺序各回填一次，不重复、不插入分隔符。
+        let latest = serde_json::to_string(&requests[2]).unwrap();
+        assert_eq!(latest.matches("incomplete task").count(), 1, "{latest}");
+        assert_eq!(latest.matches("still pending").count(), 1, "{latest}");
+        assert!(
+            latest.find("incomplete task").unwrap() < latest.find("still pending").unwrap(),
+            "{latest}"
+        );
+    }
+    let transcript = std::mem::take(&mut *ctx.session.transcript.write());
+    transcript.flush_persistence().await.unwrap();
+    let stored = bound
+        .resources
+        .load_session_snapshot(&bound.thread_id)
+        .await
+        .unwrap();
+    assert!(stored.flags.values().all(|flags| !flags.excluded));
+    assert_eq!(stored.payloads.len(), 2, "半截摘要不得写入 canonical 历史");
 }
 
 /// [回归测试] 最后一次续写成功后，下一次 Reason 必须看到所有摘要片段而不是原历史。
 #[tokio::test]
 async fn test_max_tokens_summary_continuation_resumes_reason_with_complete_summary() {
-    let (_bound, ctx, reason, summary, _) = make_case(Failure::MaxTokens, 2, false, None).await;
+    let (_bound, ctx, reason, summary, _) = make_case(Failure::MaxTokens, 1, false, None).await;
     let result = run_react_loop(ctx, 4).await;
     assert!(matches!(result, LoopResult::Completed), "{result:?}");
-    assert_eq!(summary.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(summary.calls.load(Ordering::SeqCst), 2);
     let requests = reason.requests.lock();
     assert_eq!(requests.len(), 1);
-    assert!(requests[0].iter().any(|message| message
-        .content()
-        .contains("incomplete task still pending RECOVERED task")));
+    assert!(requests[0]
+        .iter()
+        .any(|message| message.content().contains("incomplete task RECOVERED task")));
     assert!(!requests[0]
         .iter()
         .any(|message| message.content() == "original task"));
@@ -449,12 +533,13 @@ async fn test_analysis_only_exhaustion_blocks_reason() {
     assert_unusable_summary_blocks_reason(Failure::AnalysisOnly).await;
 }
 
+/// [回归测试] 首轮空响应后重新生成成功，必须保留 canonical 历史替换语义。
 #[tokio::test]
-async fn test_analysis_only_recovers_at_last_attempt_and_preserves_canonical() {
-    let (bound, ctx, reason, summary, _) = make_case(Failure::AnalysisOnly, 2, false, None).await;
+async fn test_analysis_only_recovers_after_regeneration_and_preserves_canonical() {
+    let (bound, ctx, reason, summary, _) = make_case(Failure::AnalysisOnly, 1, false, None).await;
     let result = run_react_loop(ctx.clone(), 4).await;
     assert!(matches!(result, LoopResult::Completed), "{result:?}");
-    assert_eq!(summary.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(summary.calls.load(Ordering::SeqCst), 2);
     assert_eq!(reason.requests.lock().len(), 1);
     assert!(reason.requests.lock()[0]
         .iter()
@@ -485,14 +570,15 @@ async fn test_analysis_only_recovers_at_last_attempt_and_preserves_canonical() {
 
 #[tokio::test]
 async fn test_cancel_on_last_empty_attempt_wins_over_exhaustion() {
-    let (_, ctx, reason, summary, _) =
-        make_case(Failure::AnalysisOnly, usize::MAX, false, Some(3)).await;
+    // 重新生成是预算内最后一次生成；此时取消必须优先于恢复耗尽。
+    let (_bound, ctx, reason, summary, _) =
+        make_case(Failure::AnalysisOnly, usize::MAX, false, Some(2)).await;
     let result = run_react_loop(ctx, 4).await;
     assert!(
         matches!(result, LoopResult::Interrupted),
         "取消应优先于摘要耗尽：{result:?}"
     );
-    assert_eq!(summary.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(summary.calls.load(Ordering::SeqCst), 2);
     assert!(reason.requests.lock().is_empty());
 }
 
@@ -504,11 +590,11 @@ async fn test_micro_persists_when_full_empty_attempts_exhaust() {
     assert!(
         matches!(
             result,
-            LoopResult::Error(AgentError::CompactRetriesExhausted { attempts: 3, .. })
+            LoopResult::Error(AgentError::CompactRecoveryExhausted { attempts: 2, .. })
         ),
         "{result:?}"
     );
-    assert_eq!(summary.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(summary.calls.load(Ordering::SeqCst), 2);
     assert!(reason.requests.lock().is_empty());
     let transcript = std::mem::take(&mut *ctx.session.transcript.write());
     transcript.flush_persistence().await.unwrap();
@@ -580,7 +666,7 @@ async fn test_cancel_after_micro_preserves_projection_without_reason() {
 
 #[tokio::test]
 async fn test_missing_summary_model_blocks_high_pressure_reason() {
-    let (_, mut ctx, reason, summary, _) = make_case(Failure::Success, 0, false, None).await;
+    let (_bound, mut ctx, reason, summary, _) = make_case(Failure::Success, 0, false, None).await;
     ctx.compact.compact_llm = None;
     let result = run_react_loop(ctx, 4).await;
     assert!(
@@ -649,6 +735,7 @@ async fn test_manual_force_still_applies_full_when_shadow_enabled() {
         true,
         &mut failures,
         bound.repo.path().to_str().unwrap(),
+        None,
     )
     .await;
     assert!(result.outcome().is_full_applied());
@@ -704,6 +791,7 @@ async fn test_force_with_zero_retry_budget_reports_exhaustion_without_model_call
         true,
         &mut failures,
         bound.repo.path().to_str().unwrap(),
+        None,
     )
     .await;
     assert!(matches!(
@@ -745,6 +833,7 @@ async fn test_exhausted_full_budget_does_not_fail_low_pressure_disabled_or_shado
             false,
             &mut failures,
             bound.repo.path().to_str().unwrap(),
+            None,
         )
         .await;
         assert!(
@@ -816,7 +905,7 @@ async fn test_summary_inside_reasoning_cannot_replace_history() {
     assert!(
         matches!(
             result,
-            LoopResult::Error(AgentError::CompactRetriesExhausted { attempts: 3, .. })
+            LoopResult::Error(AgentError::CompactRecoveryExhausted { attempts: 2, .. })
         ),
         "思考草稿不得成为摘要：{result:?}"
     );

@@ -7,6 +7,7 @@ use crate::agent::events_v2::{ObserveEvent, RenderEvent, StateEvent};
 use crate::agent::stages::{append_messages_to_transcript, ReceiveInput, ReceiveOutput};
 use crate::session::{MessageKind, MessageSource, QueuedMessage, QueuedPayload};
 use peri_acp_types::event::ExecutorEvent;
+use peri_acp_types::session::MessageDisposition;
 
 fn synthetic_defer_text(message: &QueuedMessage) -> Option<String> {
     match (&message.kind, &message.payload) {
@@ -23,7 +24,29 @@ fn synthetic_defer_text(message: &QueuedMessage) -> Option<String> {
 /// 对 Defer 消息 emit `SyntheticUserMessage` 事件（TUI bridge 刷新 committed 视图用）。
 /// 消费后通过共享 helper `append_messages_to_transcript` 写入 Transcript。
 pub async fn run_receive(input: ReceiveInput) -> crate::error::AgentResult<ReceiveOutput> {
-    let consumed = input.context.session.queue.drain_all();
+    run_receive_with_budget(input, None).await
+}
+
+pub(super) async fn run_receive_with_budget(
+    input: ReceiveInput,
+    exhausted_after: Option<u64>,
+) -> crate::error::AgentResult<ReceiveOutput> {
+    let execution = input.context.session.turn.execution_binding();
+    let consumed = input.context.session.queue.drain_batch(64);
+    let stop_requested = consumed
+        .iter()
+        .any(|message| message.source == MessageSource::HookStopIntent);
+    let (deferred, consumed): (Vec<_>, Vec<_>) = consumed.into_iter().partition(|message| {
+        !stop_requested
+            && exhausted_after.is_some_and(|watermark| {
+                message.policy.ensures_processing()
+                    && message
+                        .admission_sequence
+                        .is_some_and(|sequence| sequence > watermark)
+            })
+    });
+    let budget_deferred_count = deferred.len();
+    input.context.session.queue.push_batch(deferred);
     let user_inputs: Vec<_> = consumed
         .iter()
         .filter(|message| message.source == MessageSource::UserInput)
@@ -41,7 +64,7 @@ pub async fn run_receive(input: ReceiveInput) -> crate::error::AgentResult<Recei
     let count = consumed.len();
     let wake_up_count = consumed
         .iter()
-        .filter(|message| message.kind.wakes_up())
+        .filter(|message| message.policy.disposition(&execution) == MessageDisposition::Process)
         .count();
 
     // emit MessageQueueDrained（langfuse v2 遥测）
@@ -70,9 +93,120 @@ pub async fn run_receive(input: ReceiveInput) -> crate::error::AgentResult<Recei
     }
 
     if count > 0 {
-        // 在写入 transcript 前，对 Defer 消息 emit SyntheticUserMessage
-        // （复制原 End 阶段 post-wake drain 的同模式 emit，让 TUI bridge 刷新 committed 视图）
-        for msg in &consumed {
+        for (index, msg) in consumed.iter().enumerate() {
+            if msg.policy.disposition(&execution) == MessageDisposition::Suppressed {
+                input.context.session.queue.suppress(msg.clone());
+                continue;
+            }
+            let mut newly_committed = true;
+            if let Some(delivery_id) = msg.delivery_id {
+                let QueuedPayload::SystemReminder(reminder) = &msg.payload else {
+                    input
+                        .context
+                        .session
+                        .queue
+                        .push_batch(consumed[index..].to_vec());
+                    return Err(anyhow::anyhow!("delivery ID requires a canonical reminder").into());
+                };
+                let (already_present, port) = {
+                    let transcript = input.context.session.transcript.read();
+                    let present = match transcript.get(delivery_id) {
+                        None => false,
+                        Some(crate::session::TranscriptEntry::Reminder {
+                            reminder: stored,
+                            ..
+                        }) if stored.as_reminder() == reminder.as_reminder() => true,
+                        Some(_) => {
+                            input
+                                .context
+                                .session
+                                .queue
+                                .push_batch(consumed[index..].to_vec());
+                            return Err(anyhow::anyhow!(
+                                "conflicting canonical terminal delivery ID"
+                            )
+                            .into());
+                        }
+                    };
+                    (present, transcript.idempotent_reminder_port())
+                };
+                if already_present {
+                    // 已安装（同一 ID 同内容）：不重复发射，也不重复安装。
+                    newly_committed = false;
+                } else if let Some((resources, thread_id, writer)) = port {
+                    let committed = async {
+                        if let Some(writer) = writer {
+                            crate::session::MessageTranscript::flush_via_tx(&writer).await?;
+                        }
+                        resources
+                            .append_reminder_if_absent(&thread_id, delivery_id, reminder)
+                            .await
+                            .map_err(anyhow::Error::from)
+                    }
+                    .await;
+                    match committed {
+                        // (a) 本次提交成功：安装并作为新交付发射。
+                        Ok(true) => {
+                            newly_committed = input
+                                .context
+                                .session
+                                .transcript
+                                .write()
+                                .mirror_committed_reminder(delivery_id, reminder.clone());
+                        }
+                        // 持久化事实已存在但热态没有（如 Full Compact 收缩释放了它）：
+                        // (b) 仍有效 → 补安装，不作为新交付发射；(c) 已排除 → 两者都不做。
+                        Ok(false) => {
+                            newly_committed = false;
+                            let flags = resources
+                                .load_message_flags(&thread_id, &[delivery_id])
+                                .await;
+                            let flags = match flags {
+                                Ok(flags) => flags,
+                                Err(error) => {
+                                    input
+                                        .context
+                                        .session
+                                        .queue
+                                        .push_batch(consumed[index..].to_vec());
+                                    return Err(anyhow::Error::from(error).into());
+                                }
+                            };
+                            // 该 ID 刚被证明已提交，缺席只表示后端没有记录排除事实；
+                            // 只有读到的 excluded 才阻止补安装（归档原文不得回灌热态）。
+                            if !flags.get(&delivery_id).is_some_and(|flags| flags.excluded) {
+                                input
+                                    .context
+                                    .session
+                                    .transcript
+                                    .write()
+                                    .mirror_committed_reminder(delivery_id, reminder.clone());
+                            }
+                        }
+                        Err(error) => {
+                            input
+                                .context
+                                .session
+                                .queue
+                                .push_batch(consumed[index..].to_vec());
+                            return Err(error.into());
+                        }
+                    }
+                } else {
+                    newly_committed = input
+                        .context
+                        .session
+                        .transcript
+                        .write()
+                        .mirror_committed_reminder(delivery_id, reminder.clone());
+                }
+            } else {
+                let mut transcript = input.context.session.transcript.write();
+                append_messages_to_transcript(&mut transcript, vec![msg.clone()]);
+            }
+            if !newly_committed {
+                continue;
+            }
             if let QueuedPayload::SystemReminder(reminder) = &msg.payload {
                 input
                     .context
@@ -81,7 +215,10 @@ pub async fn run_receive(input: ReceiveInput) -> crate::error::AgentResult<Recei
                     .emit_state(StateEvent::ProtocolEvent {
                         turn_id: input.context.turn_id(),
                         agent_id: input.context.session.agent_id,
-                        event: ExecutorEvent::SystemReminder(reminder.as_reminder().clone()),
+                        event: Box::new(ExecutorEvent::SystemReminder {
+                            reminder: reminder.as_reminder().clone(),
+                            source_agent_id: None,
+                        }),
                     });
             } else if let Some(text) = synthetic_defer_text(msg) {
                 input
@@ -95,10 +232,6 @@ pub async fn run_receive(input: ReceiveInput) -> crate::error::AgentResult<Recei
                     });
             }
         }
-
-        let mut transcript = input.context.session.transcript.write();
-        append_messages_to_transcript(&mut transcript, consumed);
-        drop(transcript);
         if let Some(mailbox) = &input.context.session.user_input_mailbox {
             let delivered = mailbox.mark_delivered(&user_ids);
             for (id, content) in user_inputs {
@@ -119,7 +252,7 @@ pub async fn run_receive(input: ReceiveInput) -> crate::error::AgentResult<Recei
             }
         }
         tracing::debug!(
-            turn_id = %input.context.session.turn.turn_id,
+            turn_id = %input.context.session.turn.turn_id(),
             count,
             "Receive 阶段消费消息"
         );
@@ -128,7 +261,10 @@ pub async fn run_receive(input: ReceiveInput) -> crate::error::AgentResult<Recei
     Ok(ReceiveOutput {
         consumed_count: count,
         wake_up_count,
+        budget_deferred_count,
         input_message_ids: user_ids,
+        // hook 的显式停止意图：本轮消费到就必须经 Receive 唯一退出口结束。
+        stop_requested,
     })
 }
 

@@ -13,15 +13,25 @@ use uuid::Uuid;
 
 use super::config::{DeviceConnection, SshConnection};
 use super::{HostError, HostResult};
-use crate::gateway::{GatewayError, GatewayResult, NativeSessionConnector, SessionConnector};
-use crate::identity::DeviceRecord;
+use crate::gateway::{
+    DeviceReachability, GatewayError, GatewayResult, NativeSessionConnector, SessionConnector,
+};
+use crate::identity::{ConnectionStore, DeviceRecord};
 use crate::state::FrozenSession;
 use crate::CloudAgent;
 
 pub(crate) struct Connections {
     native: Arc<NativeSessionConnector>,
     configured: HashMap<Uuid, DeviceConnection>,
+    connections: Option<ConnectionStore>,
     clients: HashMap<Uuid, tokio::sync::Mutex<Option<Arc<DeviceClient>>>>,
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
 }
 
 impl Connections {
@@ -33,6 +43,7 @@ impl Connections {
         model: Arc<dyn Model>,
         prompt: String,
         window: u32,
+        connections: Option<ConnectionStore>,
     ) -> HostResult<Arc<Self>> {
         let native = NativeSessionConnector::new(model, prompt, window)
             .map_err(|_| HostError::Configuration)?;
@@ -46,13 +57,41 @@ impl Connections {
                 .into_iter()
                 .map(|device| (device.device_id, device))
                 .collect(),
+            connections,
         }))
     }
 
     /// Offline devices do not prevent account/QQ startup. Existing clients are
     /// identity-verified again when selecting/restoring a frozen session.
     async fn client(&self, id: Uuid) -> GatewayResult<Arc<DeviceClient>> {
-        let config = self.configured.get(&id).ok_or(GatewayError::Connection)?;
+        // A live device-reported reverse tunnel takes precedence over static
+        // deployment configuration; static config remains the fallback for
+        // direct SSH or older executors.
+        let dynamic = match &self.connections {
+            Some(store) => store
+                .active(id, unix_now())
+                .await
+                .map_err(GatewayError::Identity)?,
+            None => None,
+        };
+        let dynamic_selected = dynamic.is_some();
+        let (endpoint, token_file, static_routes) = if let Some(connection) = dynamic {
+            (connection.endpoint, connection.token_path, None)
+        } else if let Some(config) = self.configured.get(&id) {
+            (
+                config.endpoint,
+                config.token_file.clone(),
+                Some(config.routes()),
+            )
+        } else {
+            if let Some(store) = &self.connections {
+                if store.exists(id).await.map_err(GatewayError::Identity)? {
+                    // The device is registered but its lease expired.
+                    return Err(GatewayError::Connection);
+                }
+            }
+            return Err(GatewayError::NotConfigured);
+        };
         let mut cached = self
             .clients
             .get(&id)
@@ -60,31 +99,58 @@ impl Connections {
             .lock()
             .await;
         if let Some(client) = cached.as_ref() {
-            client
-                .refresh_connection()
-                .await
-                .map_err(|_| GatewayError::Connection)?;
+            if dynamic_selected {
+                client
+                    .reconnect(endpoint)
+                    .await
+                    .map_err(|_| GatewayError::Connection)?;
+            } else {
+                client
+                    .refresh_connection()
+                    .await
+                    .map_err(|_| GatewayError::Connection)?;
+            }
             return Ok(client.clone());
         }
-        let metadata = tokio::fs::metadata(&config.token_file)
+        let missing = |dynamic: bool| {
+            if dynamic {
+                GatewayError::Connection
+            } else {
+                GatewayError::NotConfigured
+            }
+        };
+        let metadata = tokio::fs::metadata(&token_file)
             .await
-            .map_err(|_| GatewayError::Connection)?;
+            .map_err(|_| missing(dynamic_selected))?;
         if !metadata.is_file() || metadata.len() > 8192 {
-            return Err(GatewayError::Connection);
+            return Err(missing(dynamic_selected));
         }
-        let token = tokio::fs::read_to_string(&config.token_file)
+        let token = tokio::fs::read_to_string(&token_file)
             .await
-            .map_err(|_| GatewayError::Connection)?;
+            .map_err(|_| missing(dynamic_selected))?;
         let token = token.trim().to_owned();
         if token.is_empty() || token.len() > 8192 {
-            return Err(GatewayError::Connection);
+            return Err(missing(dynamic_selected));
         }
-        let client = DeviceClient::connect_routes(config.routes(), token, id)
-            .await
-            .map_err(|_| GatewayError::Connection)?;
+        let client = if let Some(routes) = static_routes {
+            DeviceClient::connect_routes(routes, token, id).await
+        } else {
+            DeviceClient::connect(endpoint, token, id).await
+        }
+        .map_err(|_| GatewayError::Connection)?;
         self.native.register_client(client.clone());
         *cached = Some(client.clone());
         Ok(client)
+    }
+
+    /// A bounded identity-verified probe. It reports configuration and transport
+    /// reachability only; it never authorizes a tool or claims a task was run.
+    async fn probe(&self, id: Uuid) -> DeviceReachability {
+        match tokio::time::timeout(Duration::from_millis(700), self.client(id)).await {
+            Ok(Ok(_)) => DeviceReachability::Online,
+            Ok(Err(GatewayError::NotConfigured)) => DeviceReachability::NotConfigured,
+            Ok(Err(_)) | Err(_) => DeviceReachability::Offline,
+        }
     }
 
     /// A deployment owns tunnel handles until runtime device cleanup is complete.
@@ -120,6 +186,12 @@ impl SessionConnector for Connections {
             return Err(GatewayError::Connection);
         }
         Ok(client.active_transport().await)
+    }
+    async fn reachability(&self, device: &DeviceRecord) -> DeviceReachability {
+        if device.revoked {
+            return DeviceReachability::Offline;
+        }
+        self.probe(device.id).await
     }
     async fn directories(
         &self,

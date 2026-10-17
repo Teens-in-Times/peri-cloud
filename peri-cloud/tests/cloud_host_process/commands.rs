@@ -112,7 +112,7 @@ async fn actual_host_exposes_native_registry_and_executes_context_commands_throu
                 &format!("/api/conversations/{session}/result"),
             )
             .await;
-        assert_eq!(result["turn_state"], "completed");
+        assert_eq!(result["turn_state"], "completed", "{result}");
     }
     let created = process
         .post(

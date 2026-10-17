@@ -4,18 +4,21 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use super::clock::WallClock;
+use super::connections::ConnectionStore;
 use super::crypto::{equal, hash, password_hash, secret, verify_password};
 use super::{
     Authenticated, DeviceRecord, IdentityClock, IdentityError, IdentityResult, LoginReceipt,
     Principal, RegistrationReceipt,
 };
 use crate::state::CloudJournal;
+use peri_acp_types::device_enrollment::{ConnectionReceipt, ConnectionReport};
 
 const BROWSER_LIFETIME: i64 = 12 * 60 * 60;
 
 pub struct IdentityService {
     pub(crate) local_instance: parking_lot::RwLock<Option<DeviceRecord>>,
     pub(crate) pool: SqlitePool,
+    connections: ConnectionStore,
     bootstrap_hash: String,
     dummy_password: String,
     pub(crate) password_gate: Arc<tokio::sync::Semaphore>,
@@ -39,6 +42,7 @@ impl IdentityService {
         }
         Ok(Arc::new(Self {
             local_instance: parking_lot::RwLock::new(None),
+            connections: ConnectionStore::new(journal.identity_pool(), journal.state_dir()),
             pool: journal.identity_pool(),
             bootstrap_hash: hash("bootstrap", bootstrap_token),
             dummy_password: password_hash(secret(), None).await?,
@@ -285,7 +289,12 @@ impl IdentityService {
             .bind(actor.principal.id.to_string())
             .execute(&mut *tx)
             .await?;
+        let token = self
+            .connections
+            .take_for_delete(&mut tx, device, actor.principal.id)
+            .await?;
         tx.commit().await?;
+        ConnectionStore::remove_token(token);
         Ok(())
     }
 
@@ -317,6 +326,27 @@ impl IdentityService {
 
     pub(crate) fn now(&self) -> i64 {
         self.clock.unix_seconds()
+    }
+
+    pub(crate) fn connection_store(&self) -> ConnectionStore {
+        self.connections.clone()
+    }
+
+    /// A device reports the loopback endpoint of its own reverse tunnel. The
+    /// authenticated device identity must match the reported device, and a
+    /// deployment-owned local instance never participates in this lease.
+    pub async fn register_connection(
+        &self,
+        actor: &Authenticated,
+        report: ConnectionReport,
+    ) -> IdentityResult<ConnectionReceipt> {
+        if actor.browser || actor.device_id != Some(report.device_id) {
+            return Err(IdentityError::Forbidden);
+        }
+        self.native_scope(actor).await?;
+        self.connections
+            .publish(actor.principal.id, report, self.now())
+            .await
     }
 }
 

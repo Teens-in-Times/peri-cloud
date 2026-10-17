@@ -2,7 +2,7 @@
 
 支持多个独立账号的云 Agent：推理循环在服务器，工具在各自选择的 Windows / Linux 实例上执行，官方 QQBot 与可选的个人 QQ / OneBot 是并存的聊天入口。服务器本地实例仅属于管理员。
 
-本项目基于 [Peri](https://github.com/KonghaYao/peri) 的 Rust Agent 核心，拆出原生执行器并加入账号、设备连接、网关和常驻服务。发布包不包含 TUI。保留依赖所需的编译期提示词与 workflow 资源。当前版本 `v0.6.1`，仍处于预览阶段。
+本项目基于 [Peri](https://github.com/KonghaYao/peri) 的 Rust Agent 核心，拆出原生执行器并加入账号、设备连接、网关和常驻服务。发布包不包含 TUI。保留依赖所需的编译期提示词与 workflow 资源。当前版本 `v0.7.0`（Peri v4 核心），仍处于预览阶段。
 
 ## 能做什么
 
@@ -37,10 +37,10 @@
 
 发布包包含 `peri-cloud-host`、`peri-executor`、许可证、配置示例和文档。配置示例中的域名、模型名称和设备 UUID 都是占位值，下载后需要自行配置。
 
-需要 Rust 1.99+、平台 C/C++ 编译工具和 OpenSSH 客户端。Windows 构建使用 MSVC；Linux 构建需要 C/C++ 编译器、CMake、pkg-config 等基础开发工具。
+需要 Rust 1.99+、平台 C/C++ 编译工具和 OpenSSH 客户端。Windows 构建使用 MSVC；Linux 构建需要 C/C++ 编译器、CMake、pkg-config 等基础开发工具。工作区固定 `rmcp` 版本并附带任务订阅补丁；使用包装脚本让 Cargo 应用该补丁。
 
 ```sh
-cargo build --release --locked -p peri-cloud --bin peri-cloud-host -p peri-executor --bin peri-executor
+./scripts/cargo-rmcp-patched.sh build --release --locked -p peri-cloud --bin peri-cloud-host -p peri-executor --bin peri-executor
 ```
 
 ## 开始使用
@@ -92,8 +92,9 @@ QQ 原生按钮是否可用取决于机器人平台权限。网关按平台实�
 核心验证命令：
 
 ```sh
-cargo test --locked -p peri-cloud -p peri-executor -p peri-remote-tools -p peri-tool-runtime -p peri-process
-cargo clippy --locked -p peri-cloud -p peri-executor --all-targets --no-deps -- -D warnings
+chcp 65001   # Windows：让 PowerShell 中文输出按 UTF-8 解码
+./scripts/cargo-rmcp-patched.sh test --locked -p peri-cloud -p peri-executor -p peri-remote-tools -p peri-tool-runtime -p peri-process
+./scripts/cargo-rmcp-patched.sh clippy --locked -p peri-cloud -p peri-executor --all-targets --no-deps -- -D warnings
 ```
 
 测试使用模拟模型与 QQ 服务，不需要真实 API 密钥。JS 执行及其他继承的扩展模块可能需要各自的额外运行环境；上述测试聚焦本项目交付的云端和设备执行链路。
@@ -113,7 +114,7 @@ cargo clippy --locked -p peri-cloud -p peri-executor --all-targets --no-deps -- 
 
 ## 来源与许可
 
-本发行版整体采用 AGPL-3.0-only。来自 Peri 的上游代码保留原 Apache-2.0 声明和[完整许可文本](licenses/Apache-2.0.txt)。源代码基于 Peri 提交 `d7ee444efe7a461b0696bd6c27c6c91f946fdec1`，新增云端、执行器、远程工具协议和共享工具运行库，并修改必要的依赖模块。QQ 官方网关实现参考独立项目 Prism 的适配协议；按钮行为参考 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的网关实现。
+本发行版整体采用 AGPL-3.0-only。来自 Peri 的上游代码保留原 Apache-2.0 声明和[完整许可文本](licenses/Apache-2.0.txt)。源代码基于 Peri 提交 `e1d1b9c034092e4e58c163f1a8e5005a1db5f68c`，新增云端、执行器、远程工具协议和共享工具运行库，并修改必要的依赖模块。叠加范围、逐文件清单和生产补丁见 [上游升级记录](docs/upstream/peri-e1d1b9c0.md)。QQ 官方网关实现参考独立项目 Prism 的适配协议；按钮行为参考 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的网关实现。
 
 参见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。第三方依赖保留各自许可证。公开仓库采用新的源码快照，未包含原开发目录的 Git 历史、个人配置、聊天记录、凭据或运行数据库。
 

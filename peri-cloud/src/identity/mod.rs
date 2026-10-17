@@ -4,6 +4,7 @@
 mod accounts;
 mod channel;
 mod clock;
+mod connections;
 mod crypto;
 mod instances;
 mod oauth;
@@ -14,6 +15,7 @@ mod types;
 mod web;
 
 pub use clock::IdentityClock;
+pub(crate) use connections::ConnectionStore;
 pub use peri_acp_types::device_enrollment::{
     DeviceRecord, NativeAuthorization, NativeTokens, RegistrationReceipt,
 };
@@ -24,6 +26,8 @@ pub use types::{Authenticated, ChannelIdentity, LoginReceipt, PairClaim, PairCod
 pub enum IdentityError {
     #[error("identity state is unavailable")]
     Database(#[from] sqlx::Error),
+    #[error("identity file storage is unavailable")]
+    Io(#[from] std::io::Error),
     #[error("identity record is invalid")]
     Encoding(#[from] serde_json::Error),
     #[error("identity credential is invalid or expired")]

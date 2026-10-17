@@ -37,6 +37,7 @@ pub struct AnthropicConfig {
     thinking_effort: String,
     enable_cache: bool,
     max_tokens: u32,
+    context_window: Option<u32>,
     runtime: ModelRuntimeConfig,
 }
 
@@ -52,6 +53,7 @@ impl AnthropicConfig {
             thinking_effort: "medium".into(),
             enable_cache: true,
             max_tokens: DEFAULT_MAX_TOKENS,
+            context_window: None,
             runtime: ModelRuntimeConfig::default(),
         }
     }
@@ -73,6 +75,12 @@ impl AnthropicConfig {
         self
     }
 
+    /// 写入装配处已解析的上下文窗口；不传即 `None`（未知，不代填）。
+    pub fn with_context_window(mut self, context_window: Option<u32>) -> Self {
+        self.context_window = context_window;
+        self
+    }
+
     pub fn with_runtime(mut self, runtime: ModelRuntimeConfig) -> Self {
         self.runtime = runtime;
         self
@@ -83,23 +91,17 @@ impl fmt::Debug for AnthropicConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AnthropicConfig")
-            .field("endpoint", &debug_endpoint_projection(&self.endpoint))
-            .field("api_key", &"[REDACTED]")
+            .field("endpoint", &self.endpoint)
+            .field("api_key", &self.api_key)
             .field("model", &self.model)
             .field("extended_thinking", &self.extended_thinking)
             .field("thinking_budget", &self.thinking_budget)
             .field("thinking_effort", &self.thinking_effort)
             .field("enable_cache", &self.enable_cache)
             .field("max_tokens", &self.max_tokens)
+            .field("context_window", &self.context_window)
             .field("runtime", &self.runtime)
             .finish()
-    }
-}
-
-fn debug_endpoint_projection(endpoint: &Url) -> String {
-    match endpoint.host() {
-        Some(host) => format!("{}://{host}/[REDACTED]", endpoint.scheme()),
-        None => format!("{}://[REDACTED]", endpoint.scheme()),
     }
 }
 
@@ -125,7 +127,10 @@ impl AnthropicModel {
     }
 
     #[cfg(test)]
-    fn with_transport(config: AnthropicConfig, transport: Arc<dyn HttpTransport>) -> Self {
+    pub(crate) fn with_transport(
+        config: AnthropicConfig,
+        transport: Arc<dyn HttpTransport>,
+    ) -> Self {
         Self {
             config,
             transport,
@@ -155,15 +160,39 @@ impl AnthropicModel {
         if let Some(session_id) = &built.session_id {
             request = request.header("x-session-id", session_id);
         }
-        request
-            .build()
-            .map(HttpRequest::new)
-            .map_err(|_| ModelError::protocol(crate::ProtocolErrorKind::Provider))
+        request.build().map(HttpRequest::new).map_err(|error| {
+            ModelError::protocol(crate::ProtocolErrorKind::Provider).with_error(&error)
+        })
     }
 }
 
 #[async_trait]
 impl crate::Model for AnthropicModel {
+    fn prepare_stream(&self, request: ModelRequest) -> ModelResult<crate::PreparedModelCall> {
+        let built = Arc::new(self.build_request(&request)?);
+        let checkpoint =
+            crate::protocol::prepared::checkpoint(PROVIDER_NAME, &built.endpoint, &built.body)?;
+        let client = self.client.clone();
+        let api_key = self.config.api_key.clone();
+        let cache_enabled = self.config.enable_cache;
+        let request_factory =
+            Arc::new(move || Self::native_http_request(&client, &api_key, cache_enabled, &built));
+        let runtime = self.config.runtime.clone();
+        let transport = Arc::clone(&self.transport);
+        Ok(crate::PreparedModelCall::new(
+            checkpoint,
+            move |cancellation| {
+                Ok(runtime_http_sse_stream(
+                    &runtime,
+                    cancellation,
+                    transport,
+                    request_factory,
+                    Arc::<str>::from(PROVIDER_NAME),
+                    stream::decoders(),
+                ))
+            },
+        ))
+    }
     fn capabilities(&self) -> ModelCapabilities {
         ModelCapabilities {
             supports_tools: true,
@@ -171,6 +200,17 @@ impl crate::Model for AnthropicModel {
             supports_vision: true,
             supports_streaming: true,
         }
+    }
+
+    /// provider 已解析的单次输出上限（`config.max_tokens`）。摘要器等派生请求
+    /// 只在两个来源一致时被允许沿用，不借助请求参数覆写它（H6）。
+    fn output_token_limit(&self) -> Option<u32> {
+        Some(self.config.max_tokens)
+    }
+
+    /// 装配处写入的已解析上下文窗口；未写入即未知。
+    fn context_window(&self) -> Option<u32> {
+        self.config.context_window
     }
 
     fn prepare_request(&self, request: &ModelRequest) -> ModelResult<PreparedModelRequest> {
@@ -207,3 +247,17 @@ impl crate::Model for AnthropicModel {
 #[cfg(test)]
 #[path = "mod_test.rs"]
 mod mod_test;
+
+#[cfg(test)]
+#[path = "config_test.rs"]
+mod config_test;
+#[cfg(test)]
+#[path = "stream_failure_test.rs"]
+mod stream_failure_test;
+#[cfg(test)]
+#[path = "stream_lifecycle_test.rs"]
+mod stream_lifecycle_test;
+
+#[cfg(test)]
+#[path = "diagnostic_test.rs"]
+mod diagnostic_test;

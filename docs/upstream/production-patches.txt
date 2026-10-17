@@ -3,10 +3,23 @@
 # byte-identical guarantee.  Paths not present in the manifest are reported
 # as notes, not failures.
 peri-acp-types/Cargo.toml
+peri-acp-types/src/error.rs
+peri-acp-types/src/interaction.rs
+peri-acp-types/src/interaction_test.rs
 peri-acp-types/src/lib.rs
+peri-acp-types/src/session.rs
 peri-agent/Cargo.toml
 peri-agent/src/agent/async_tasks/shell.rs
+peri-agent/src/agent/compact_v2/full.rs
+peri-agent/src/agent/model_bridge.rs
+peri-agent/src/agent/stages/tool_dispatch/execution.rs
+peri-agent/src/agent/stages/tool_dispatch/execution_test.rs
+peri-agent/src/session/turn.rs
+peri-agent/src/session/turn_test.rs
+peri-agent/src/session/transcript.rs
 peri-middlewares/Cargo.toml
+peri-middlewares/src/prompt_tool_name_lock_test.rs
+peri-middlewares/src/subagent/tool/subagent_lifecycle_test.rs
 peri-middlewares/src/tools/ask_user_tool.rs
 peri-middlewares/src/tools/ask_user_tool_test.rs
 peri-model/Cargo.toml

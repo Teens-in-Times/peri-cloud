@@ -40,3 +40,13 @@ fn recovery_and_running_are_not_terminal() {
     );
     assert!(JobStatus::Cancelled.is_terminal());
 }
+
+#[test]
+fn recovery_request_preserves_scope_and_rejects_override_fields() {
+    let request = serde_json::json!({"session_id":Uuid::new_v4(),"tool":"Write","note":"核实原设备进程和文件结果"});
+    let decoded: ResolveJob = serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), request);
+    let mut extra = request;
+    extra["status"] = serde_json::json!("completed");
+    assert!(serde_json::from_value::<ResolveJob>(extra).is_err());
+}

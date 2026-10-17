@@ -81,6 +81,16 @@ pub struct SubmitJob {
     pub input: Value,
 }
 
+/// Explicit operator attestation after inspecting the original device. Missing
+/// admissions are durably fenced so a delayed submit cannot run afterwards.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveJob {
+    pub session_id: Uuid,
+    pub tool: String,
+    pub note: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {

@@ -11,7 +11,7 @@ use std::{
     fs::{self, OpenOptions},
     path::PathBuf,
     sync::{Arc, OnceLock, Weak},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 
 use peri_acp_types::plugin::McpServerConfig;
@@ -70,7 +70,7 @@ pub(crate) struct McpResourceCache {
     mutex: Arc<tokio::sync::Mutex<()>>,
     recent_status: Arc<SharedStatuses>,
     active_versions: Arc<SharedVersions>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_root: Option<Arc<tempfile::TempDir>>,
 }
 
@@ -80,6 +80,16 @@ pub(crate) struct CacheTicket {
     method: &'static str,
     params: String,
     epoch: u64,
+}
+
+impl CacheTicket {
+    pub(crate) fn method(&self) -> &'static str {
+        self.method
+    }
+
+    pub(crate) fn params(&self) -> &str {
+        &self.params
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -104,7 +114,9 @@ impl McpResourceCache {
 
     /// 为 pool 测试提供独立的缓存根，避免相同 server/URI 的测试命中彼此
     /// 留下的持久化响应。目录的生命周期与缓存实例绑定。
-    #[cfg(test)]
+    ///
+    /// `test-support`：跨 crate 集成测试与 in-crate 测试共用同一夹具（生产构建不启用）。
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn isolated_for_test() -> Self {
         let test_root = Arc::new(tempfile::tempdir().expect("创建 MCP 测试缓存目录失败"));
         let mut cache = Self::from_root(test_root.path().to_path_buf());
@@ -121,7 +133,7 @@ impl McpResourceCache {
             mutex: Arc::new(tokio::sync::Mutex::new(())),
             recent_status,
             active_versions,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_root: None,
         }
     }
@@ -177,6 +189,7 @@ impl McpResourceCache {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn get<T: DeserializeOwned>(
         &self,
         origin: &str,
@@ -234,6 +247,7 @@ impl McpResourceCache {
         value
     }
 
+    #[cfg(test)]
     pub(crate) async fn get_json<T: DeserializeOwned>(
         &self,
         origin: &str,
@@ -279,6 +293,7 @@ impl McpResourceCache {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn put_ticket<T: Serialize>(
         &self,
         ticket: &CacheTicket,
@@ -371,6 +386,15 @@ impl McpResourceCache {
         drop(lock);
     }
 
+    // Emscripten has no blocking worker threads for the disk cache. Its virtual
+    // filesystem also does not persist across module instances, so cache misses
+    // should fall through to the live MCP server.
+    #[cfg(target_os = "emscripten")]
+    async fn lock(&self) -> Option<std::fs::File> {
+        None
+    }
+
+    #[cfg(not(target_os = "emscripten"))]
     async fn lock(&self) -> Option<std::fs::File> {
         let path = self.state_path.join("cache.lock");
         // root/state -> root：仅在 Unix 收紧缓存根到 0700，阻断其他 uid 进入，
@@ -502,7 +526,6 @@ pub(crate) fn cache_origin(server_name: &str, config: Option<&McpServerConfig>) 
                 config.command.as_deref(),
                 config.args.as_deref(),
                 env,
-                config.protocol_version,
             ))
             .unwrap_or_default()
         }
@@ -526,7 +549,7 @@ fn digest(input: &str) -> String {
 }
 
 fn now_ms() -> u128 {
-    SystemTime::now()
+    peri_time::now_wall()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()

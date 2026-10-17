@@ -1,52 +1,86 @@
 [workspace]
 members = [
+    "peri-config",
     "peri-acp-types",
     "peri-agent",
-    "peri-cloud",
-    "peri-executor",
-    "peri-js-runtime",
-    "peri-lsp",
     "peri-middlewares",
+    "mcp-packages/common",
+    "peri-mcp-core",
+    "mcp-packages/config",
+    "mcp-packages/credentials",
+    "mcp-packages/web",
+    "mcp-packages/artifact",
+    "mcp-packages/cron",
+    "mcp-packages/workspace",
+    "mcp-packages/workflow",
     "peri-model",
     "peri-process",
-    "peri-remote-tools",
     "peri-resources",
-    "peri-tool-runtime",
+    "peri-time",
+    "peri-js-runtime",
     "peri-workflow",
+    "peri-tool-runtime",
+    "peri-remote-tools",
+    "peri-executor",
+    "peri-cloud",
 ]
 resolver = "2"
 
 [workspace.package]
 license = "AGPL-3.0-only"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 
 [profile.release]
+# NOTE: "symbols" not "true" — Apple strip doesn't behave like GNU strip.
+#       "true" on macOS only strips debug info, leaving 8MB of symbol table.
 strip = "symbols"
 opt-level = "z"
 lto = true
 codegen-units = 1
 
+[profile.dev]
+debug = 1
+
+# Dependencies carry no debug info in dev; workspace members keep debug=1.
+[profile.dev.package."*"]
+debug = false
+
+# ============================================================================
+# Workspace-wide dependency declarations
+# Single source of truth — all crates reference via `workspace = true`.
+# ============================================================================
+
 [workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
+peri-config = { path = "peri-config" }
+peri-time = { path = "peri-time" }
+# --- Async runtime ---
+# Shared runtime baseline. The cloud host and executor use the full feature set,
+# which is a superset of the v4 core's minimum.
+tokio = { version = "=1.53.1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 async-trait = "0.1"
 
+# --- Serde ecosystem ---
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 
-reqwest = { version = "0.13", default-features = false, features = [
+# --- HTTP ---
+reqwest = { version = "=0.13.4", default-features = false, features = [
     "json",
     "rustls",
 ] }
 
+# --- Time ---
 chrono = { version = "0.4", features = ["serde"] }
 
+# --- Error handling ---
 anyhow = "1.0"
 thiserror = "2.0"
 
+# --- Logging ---
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = [
     "env-filter",
@@ -55,17 +89,32 @@ tracing-subscriber = { version = "0.3", features = [
 ] }
 tracing-appender = "0.2"
 
+# --- Utilities ---
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 parking_lot = "0.12"
 dirs-next = "2"
 url = "2"
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite"] }
 sysinfo = "0.39"
-lsp-types = "0.97"
 lru = "0.18"
 
+# --- MCP capability packages ---
+peri-mcp-common = { path = "mcp-packages/common" }
+peri-mcp-core = { path = "peri-mcp-core" }
+peri-mcp-config = { path = "mcp-packages/config" }
+peri-mcp-credentials = { path = "mcp-packages/credentials" }
+peri-mcp-web = { path = "mcp-packages/web" }
+peri-mcp-artifact = { path = "mcp-packages/artifact" }
+peri-mcp-cron = { path = "mcp-packages/cron" }
+peri-mcp-workspace = { path = "mcp-packages/workspace" }
+peri-mcp-workflow = { path = "mcp-packages/workflow" }
+# Apply patches/rmcp-3.5.0-task-subscriptions.patch via scripts/cargo-rmcp-patched.sh.
+rmcp = "=3.5.0"
+
+# --- Build ---
 tempfile = "3"
 
+# --- Allocator ---
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats", "use_std"] }
 tikv-jemalloc-sys = "0.6"
@@ -75,6 +124,5 @@ semver = "1"
 sha2 = "0.10"
 
 axum = { version = "0.8.9", features = ["ws"] }
-portable-pty = "0.9"
 tokio-tungstenite = "0.30"
 serial_test = { version = "4.0.1", features = ["async"] }
