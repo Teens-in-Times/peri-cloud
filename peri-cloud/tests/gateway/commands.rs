@@ -547,3 +547,35 @@ async fn native_feedback_channel_is_preserved_without_rewriting_system_prompt() 
         .any(|m| m["role"] == "system" && m.to_string().contains("REGISTERED_COMMAND_DONE")));
     f.finish().await;
 }
+
+#[tokio::test]
+async fn missing_native_handler_cannot_fall_through_to_model_at_runtime() {
+    let f = Fixture::new(vec![]).await;
+    f.pair().await;
+    f.select("select", 0).await;
+    let session = selected(&f).await;
+    let task = f
+        .c()
+        .runtime
+        .submit(peri_cloud::SubmitTurn {
+            principal_id: f.c().browser.principal().id,
+            session_id: session,
+            request_key: "missing-native-handler".into(),
+            prompt: peri_acp_types::messages::MessageContent::Text(
+                "/plugin:disconnected:command".into(),
+            ),
+            max_iterations: 8,
+        })
+        .await
+        .unwrap();
+    f.settled(session, task.turn_id).await;
+    let result = f
+        .c()
+        .journal
+        .turn(f.c().browser.principal().id, session, task.turn_id)
+        .await
+        .unwrap();
+    assert_eq!(result.state, TurnState::Failed);
+    assert!(f.script.requests.lock().is_empty());
+    f.finish().await;
+}

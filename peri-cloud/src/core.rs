@@ -269,6 +269,12 @@ impl CloudAgent {
                             ))
                         }
                     }
+                } else {
+                    return Ok(self.command_feedback(
+                        request,
+                        TurnStatus::Failed,
+                        "命令未注册或已断开，本次没有交给模型或自动重试。发送 /help 查看最新目录。",
+                    ));
                 }
             }
         }
