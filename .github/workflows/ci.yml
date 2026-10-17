@@ -43,6 +43,7 @@ jobs:
           npm ci --prefix scripts/portal-ui --ignore-scripts --no-audit --no-fund
           $env:NODE_PATH = Join-Path $pwd 'scripts/portal-ui/node_modules'
           node scripts/check-portal-ui.cjs
+          node scripts/check-model-ui.cjs
       - name: Cloud and executor regression tests
         if: runner.os == 'Windows'
         run: cargo +1.99.0 test --locked -p peri-cloud -p peri-executor -p peri-remote-tools -p peri-tool-runtime -p peri-process

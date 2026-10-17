@@ -2,12 +2,14 @@
 //! tool policy is owned by HTTP requests; deployment retains those lifecycles.
 
 mod access;
+mod aggregate;
 mod browser;
 mod conversations;
 mod interactions;
 mod native;
 mod personal;
 mod security;
+mod tasks;
 mod topology;
 mod workspaces;
 
@@ -154,8 +156,22 @@ fn build_router(portal: Portal) -> Router {
         .route("/", get(browser::page))
         .route("/portal.js", get(browser::javascript))
         .route("/workspace.js", get(topology::javascript))
+        .route("/models.js", get(aggregate::javascript))
         .route("/portal.css", get(browser::stylesheet))
         .route("/api/status", get(browser::status))
+        .route("/api/aggregate", get(aggregate::state))
+        .route("/api/aggregate/channels", get(aggregate::channels))
+        .route("/api/aggregate/groups", get(aggregate::groups))
+        .route("/api/aggregate/usage", get(aggregate::usage))
+        .route("/api/aggregate/audit", get(aggregate::audit))
+        .route(
+            "/api/aggregate/channel-command",
+            post(aggregate::channel_command).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/api/aggregate/model",
+            get(aggregate::selection).post(aggregate::choose),
+        )
         .route("/api/service/shutdown", post(interactions::shutdown))
         .route("/api/setup", post(browser::setup))
         .route("/api/login", post(browser::login))
@@ -187,6 +203,12 @@ fn build_router(portal: Portal) -> Router {
             post(topology::check_connection),
         )
         .route("/api/workspaces", get(workspaces::list))
+        .route("/api/workspaces/open", post(tasks::open))
+        .route(
+            "/api/conversations/{id}/tasks",
+            post(tasks::submit).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route("/api/conversations/{id}/cancel", post(tasks::cancel))
         .route("/api/conversations", get(conversations::list))
         .route("/api/conversations/{id}/result", get(conversations::result))
         .route("/api/instances/{id}/browse", post(workspaces::browse))

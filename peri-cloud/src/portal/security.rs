@@ -10,6 +10,8 @@ use crate::identity::{Authenticated, IdentityError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PortalError {
+    #[error("aggregate control failed")]
+    Aggregate(#[from] crate::aggregation::AggregateError),
     #[error("portal requires a valid HTTPS or literal loopback origin")]
     Configuration,
     #[error("invalid portal request")]
@@ -27,6 +29,32 @@ pub enum PortalError {
 impl IntoResponse for PortalError {
     fn into_response(self) -> Response {
         let (status, code) = match self {
+            Self::Aggregate(crate::aggregation::AggregateError::Identity(
+                IdentityError::Unauthorized,
+            )) => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            Self::Aggregate(
+                crate::aggregation::AggregateError::Identity(IdentityError::Forbidden)
+                | crate::aggregation::AggregateError::Ownership,
+            ) => (StatusCode::FORBIDDEN, "forbidden"),
+            Self::Aggregate(crate::aggregation::AggregateError::Invalid) => {
+                (StatusCode::BAD_REQUEST, "aggregate_invalid")
+            }
+            Self::Aggregate(crate::aggregation::AggregateError::Conflict) => {
+                (StatusCode::CONFLICT, "aggregate_conflict")
+            }
+            Self::Aggregate(crate::aggregation::AggregateError::Unknown) => {
+                (StatusCode::CONFLICT, "aggregate_unknown")
+            }
+            Self::Aggregate(crate::aggregation::AggregateError::Upstream(
+                "authentication_rejected",
+            )) => (StatusCode::BAD_GATEWAY, "aggregate_credentials"),
+            Self::Aggregate(crate::aggregation::AggregateError::Upstream(
+                "rate_limited" | "busy",
+            )) => (StatusCode::TOO_MANY_REQUESTS, "aggregate_rate_limited"),
+            Self::Aggregate(crate::aggregation::AggregateError::Upstream("operation_rejected")) => {
+                (StatusCode::BAD_GATEWAY, "aggregate_rejected")
+            }
+            Self::Aggregate(_) => (StatusCode::BAD_GATEWAY, "aggregate_unavailable"),
             Self::Model(crate::models::ModelConfigError::Invalid) => {
                 (StatusCode::BAD_REQUEST, "invalid_model")
             }

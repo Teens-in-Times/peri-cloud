@@ -89,8 +89,11 @@ pub(super) async fn model(
     let Some(models) = &portal.models else {
         return Ok(Json(json!({"enabled":false})));
     };
+    if models.aggregation().is_some() {
+        return Ok(Json(json!({"enabled":true,"aggregated":true})));
+    }
     Ok(Json(
-        json!({"enabled":true,"providers":models.providers(),"default_model":models.default_model(),"choice":models.choice(actor.principal().id).await?}),
+        json!({"enabled":true,"providers":models.providers(),"default_model":models.default_model(),"choice":models.choice(actor.principal().id).await?,"custom_endpoint_allowed":portal.identity.is_admin(&actor).await?}),
     ))
 }
 pub(super) async fn save_model(
@@ -99,6 +102,9 @@ pub(super) async fn save_model(
     Json(input): Json<crate::models::ModelUpdate>,
 ) -> Result<Json<Value>, PortalError> {
     let actor = security::browser(&portal, &headers, true).await?;
+    if input.api_base.is_some() || input.protocol.is_some() {
+        portal.identity.require_admin(&actor).await?;
+    }
     portal
         .models
         .as_ref()

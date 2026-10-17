@@ -6,6 +6,7 @@
   <title>Peri · 个人云 Agent</title>
   <link rel="stylesheet" href="/portal.css">
   <script src="/workspace.js" defer></script>
+  <script src="/models.js" defer></script>
   <script src="/portal.js" defer></script>
 </head>
 <body>
@@ -69,18 +70,18 @@
       </div>
     </section>
     <section id="account" hidden>
-      <div class="page-heading"><div><p class="eyebrow">PERI / CONTROL &amp; EXECUTION</p><h1 id="greeting">你的工作台</h1><p class="intro">从聊天交代任务，在你选择的设备上完成。</p></div><button id="refresh" class="quiet small">刷新工作台</button></div>
+      <div class="page-heading"><div><p class="eyebrow">PERI / CONTROL &amp; EXECUTION</p><h1 id="greeting">你的工作台</h1><p class="intro">从网页或聊天发起任务，在选定工作区执行。</p></div><button id="refresh" class="quiet small">刷新工作台</button></div>
       <section id="topology-panel" class="panel topology-panel" aria-labelledby="topology-title">
         <div class="section-heading"><h2 id="topology-title">一次任务怎样运行</h2><span class="pill">当前账号可见范围</span></div>
         <div class="topology-flow">
-          <div class="topology-node"><p class="node-label">01 / 聊天入口</p><h3>从这里交代任务</h3><div id="topology-entries"></div><a href="#connections" class="text-link">管理我的关联</a></div>
+          <div class="topology-node"><p class="node-label">01 / 交互入口</p><h3>从这里交代任务</h3><div id="topology-entries"></div><a href="#connections" class="text-link">管理我的关联</a></div>
           <div class="topology-node control-node"><p class="node-label">02 / 云端主控</p><h3 id="service-name">云端主控</h3><p id="service-origin" class="node-value"></p><p>Agent 推理 · 调度 · 状态保存</p><p id="topology-model" class="subtle">模型在主控调用</p><p id="service-version" class="subtle"></p></div>
           <div class="topology-node"><p class="node-label">03 / 执行设备</p><h3>工具在选定设备运行</h3><div id="topology-devices"></div><a href="#device-panel" class="text-link">查看与检查设备</a></div>
         </div>
         <p class="topology-caption">一个主控连接多个执行器。每条聊天会话选择自己的设备、工作区与权限；主控与执行器也可以位于同一台服务器。</p>
         <div class="overview" aria-label="账号资源"><span><strong id="channel-count">0</strong>个关联身份</span><span><strong id="device-count">0</strong>台已登记设备</span><span><strong id="session-count">0</strong>条当前会话</span></div>
       </section>
-      <section id="activity-panel" class="panel"><div class="section-heading"><h2>会话与任务</h2><span class="pill">与 QQ 同步</span></div><p class="subtle">工作区、工具权限、待办和结果都属于具体会话。修改一条会话不会改变其他聊天的执行目标。</p><div id="approval-panel"><div id="interactions" class="items"></div></div><div id="conversation-activity" class="conversation-list"></div></section>
+      <section id="activity-panel" class="panel"><div class="section-heading"><h2>会话与任务</h2><span class="pill">共享主控状态</span></div><p class="subtle">工作区、工具权限、待办和结果都属于具体会话。修改一条会话不会改变其他聊天的执行目标。</p><div id="approval-panel"><div id="interactions" class="items"></div></div><div id="conversation-activity" class="conversation-list"></div></section>
       <section id="device-panel" class="panel"><div class="section-heading"><h2>执行设备</h2><span class="pill">账号设备池</span></div><p class="subtle">这里管理设备本身和新会话使用的默认目录。连接检查只验证身份与通路，不执行任务；检查结果仅代表所示时刻。</p><div id="devices" class="device-grid"></div></section>
       <section id="connections" aria-labelledby="connections-title"><div class="section-heading"><h2 id="connections-title">聊天入口与我的关联</h2></div><p class="subtle">入口由云端主控接入，你的聊天身份通过关联后共用这个账号的设备。入口规则与账号关联分别管理。</p>
       <div class="connections-grid">
@@ -106,9 +107,11 @@
       </section>
       <section id="model-panel" class="panel" hidden>
         <div class="section-heading"><h2>模型与 API</h2><span id="model-current" class="pill"></span></div>
-        <p class="subtle">可使用服务默认模型，也可填写自己的供应商密钥与模型名称。密钥保存后不会回显；正在执行的任务保持原配置。</p>
+        <p id="legacy-model-intro" class="subtle">可使用服务默认模型，也可填写自己的供应商密钥与模型名称。密钥保存后不会回显；正在执行的任务保持原配置。</p>
+        <div id="aggregate-models" hidden></div>
         <form id="model-form">
           <label>供应商<select name="provider" required></select></label>
+          <fieldset id="custom-model-endpoint" hidden><legend>自定义直连（部署管理员）</legend><label>API 地址<input name="api_base" type="url" maxlength="4096" placeholder="OpenAI 填 /v1 基址；Anthropic 填服务根地址"></label><label>接口协议<select name="protocol"><option value="openai">OpenAI Chat Completions</option><option value="anthropic">Anthropic Messages</option></select></label><p class="subtle">直连模式不需要外部聚合服务。修改地址或协议时须重新填写密钥，避免将已有凭据发送到其他地址。</p></fieldset>
           <label>模型名称<input name="model" required maxlength="256" placeholder="供应商提供的模型 ID"></label>
           <label>API 密钥<input name="api_key" type="password" autocomplete="new-password" maxlength="8192" placeholder="首次配置或切换供应商时填写，留空保留已有密钥"></label>
           <div class="actions"><button id="model-reset" type="button" class="quiet">使用服务默认</button><button type="submit" class="primary">保存我的模型</button></div>

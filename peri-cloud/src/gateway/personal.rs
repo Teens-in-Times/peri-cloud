@@ -21,6 +21,42 @@ impl Gateway {
             _ => return Ok(None),
         };
         let rest = rest.trim();
+        if verb == "/模型" {
+            if let Some(aggregate) = self
+                .connector
+                .account_models()
+                .and_then(|m| m.aggregation())
+            {
+                if rest.is_empty() {
+                    return Ok(Some(DeliveryBody::Menu {
+                        card: self
+                            .aggregate_model_menu(message, principal, selected, 1)
+                            .await?,
+                    }));
+                }
+                let current = aggregate
+                    .selection(
+                        &crate::aggregation::ControlActor::Channel(&message.route.identity),
+                        selected,
+                    )
+                    .await
+                    .map_err(|_| GatewayError::Connection)?;
+                return Ok(Some(
+                    self.choose_aggregate_model(
+                        message,
+                        selected,
+                        if rest == "默认" {
+                            None
+                        } else {
+                            Some(rest.into())
+                        },
+                        current.revision,
+                    )
+                    .await?,
+                ));
+            }
+        }
+
         if verb == "/模型" && !rest.is_empty() {
             if rest.chars().any(char::is_whitespace) {
                 return Err(GatewayError::Invalid);
@@ -42,6 +78,7 @@ impl Gateway {
                         provider: choice.provider,
                         model: rest.into(),
                         api_key: None,
+                        ..Default::default()
                     },
                 )
                 .await
@@ -144,6 +181,17 @@ impl Gateway {
         section: &str,
         page: usize,
     ) -> GatewayResult<MenuCard> {
+        if section == "model"
+            && self
+                .connector
+                .account_models()
+                .and_then(|m| m.aggregation())
+                .is_some()
+        {
+            return self
+                .aggregate_model_menu(message, principal, selected, page)
+                .await;
+        }
         let mut choices = Vec::new();
         let (title,text)=match section {
             "home"=>("个人设置".to_owned(),"QQ 内可查看用量、管理记忆与偏好、切换已配置的个人模型。设置属于你的账号，在所有设备间共用，下一轮对话生效。\n\n/记住 内容：追加记忆\n/记忆 设置 内容：替换记忆\n/偏好 设置 内容：设置回答与工作偏好\n/记忆 清空 或 /偏好 清空：确认后清除\n/模型 模型名：使用已绑定的个人密钥切换模型".to_owned()),

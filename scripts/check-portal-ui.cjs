@@ -31,7 +31,7 @@ w.fetch = async (url, options) => {
   requests.push({url,options});
   if(url==='/api/status') return ok({initialized:true,csrf_cookie:'peri_csrf',service_control:true});
   if(url==='/api/account') return loggedIn ? ok(owner) : denied();
-  if(url==='/api/model') return ok({enabled:true,providers:[{id:'p',name:'Provider'}],choice:null,default_model:'model-fixture'});
+  if(url==='/api/model') return ok({enabled:true,providers:[{id:'p',name:'Provider'}],choice:null,default_model:'model-fixture',custom_endpoint_allowed:true});
   if(url==='/api/user-data') return {ok:false,status:503,json:async()=>({error:'identity_unavailable'})};
   if(url==='/api/workspaces') return ok(sessions);
   if(url==='/api/conversations') return ok(activities);
@@ -42,6 +42,7 @@ w.fetch = async (url, options) => {
 };
 w.document.cookie = 'peri_csrf=fixture';
 w.eval(fs.readFileSync(path.join(assets,'workspace.js'),'utf8'));
+w.eval(fs.readFileSync(path.join(assets,'models.js'),'utf8'));
 w.eval(fs.readFileSync(path.join(assets,'portal.js'),'utf8')+'\nwindow.fixture={renderAccount,refresh,clearPersonal};');
 (async()=>{
   await settle();
@@ -55,6 +56,11 @@ w.eval(fs.readFileSync(path.join(assets,'portal.js'),'utf8')+'\nwindow.fixture={
   assert.equal(byId('account').hidden,false,'settings failure must not log the user out');
   assert.equal(byId('settings-error').hidden,false);
   assert.equal(byId('service-name').textContent,'Tokyo control');
+  const modelForm=byId('model-form');modelForm.elements.provider.value='@custom';modelForm.elements.provider.dispatchEvent(new w.Event('change'));
+  assert.equal(byId('custom-model-endpoint').hidden,false);modelForm.elements.api_base.value='https://provider.example.test';modelForm.elements.protocol.value='anthropic';modelForm.elements.api_key.value='DIRECT_FIXTURE_KEY';
+  modelForm.dispatchEvent(new w.Event('submit',{cancelable:true}));await settle();
+  const configured=requests.filter(r=>r.url==='/api/model'&&r.options.method==='POST').map(r=>JSON.parse(r.options.body));assert.equal(configured[0].api_base,'https://provider.example.test');assert.equal(configured[0].protocol,'anthropic');
+  assert.equal(modelForm.elements.api_key.value,'');
   assert(byId('channels').textContent.includes('full-identity-'+malicious));
   assert.equal(byId('channels').querySelectorAll('img').length,0);
   assert.equal(requests.filter(r=>r.url.endsWith('/connection-check')).length,0,'enrollment is not a connection probe');

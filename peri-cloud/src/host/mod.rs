@@ -54,17 +54,37 @@ pub type HostResult<T> = Result<T, HostError>;
 pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()> {
     config.validate()?;
     let bootstrap = config::credential(&config.bootstrap_env)?;
-    let key = config::credential(&config.model.api_key_env)?;
+    let key = match &config.aggregation {
+        Some(aggregate) => read_secret(&aggregate.inference_key_file).await?,
+        None => config::credential(&config.model.api_key_env)?,
+    };
     let portal_config = PortalConfig::new(&config.public_origin)
         .map_err(|_| HostError::Configuration)?
         .with_service_name(config.display_name.as_deref());
-    let mut model = OpenAiConfig::new(config.model.api_base.clone(), key, &config.model.model)
+    let model_base = match &config.aggregation {
+        Some(a) => a.origin.join("v1").map_err(|_| HostError::Configuration)?,
+        None => config.model.api_base.clone(),
+    };
+    let mut model = OpenAiConfig::new(model_base, key.clone(), &config.model.model)
         .with_max_tokens(config.model.max_tokens)
         .with_thinking_enabled(config.model.thinking_enabled)
         .with_thinking_content(config.model.supports_thinking_content);
     if let Some(effort) = &config.model.reasoning_effort {
         model = model.with_reasoning_effort(effort);
     }
+    let model: Arc<dyn peri_model::Model> = if config.aggregation.is_none()
+        && config.model.protocol == crate::models::ModelProtocol::Anthropic
+    {
+        crate::models::direct_model(
+            config.model.protocol,
+            config.model.api_base.clone(),
+            key,
+            config.model.model.clone(),
+            config.model.max_tokens,
+        )
+    } else {
+        Arc::new(OpenAiModel::new(model))
+    };
     let qq = match &config.qq {
         Some(qq) => Some(
             QqAdapter::new(
@@ -119,6 +139,7 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
             id: "default".into(),
             name: "默认供应商（自有密钥）".into(),
             api_base: config.model.api_base.clone(),
+            protocol: config.model.protocol,
         },
     );
     let account_models = crate::models::AccountModels::new(
@@ -128,6 +149,19 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
         config.model.max_tokens,
     )
     .map_err(|_| HostError::Configuration)?;
+    if let Some(aggregate) = &config.aggregation {
+        let control = crate::aggregation::Aggregation::new(
+            aggregate,
+            read_secret(&aggregate.management_key_file).await?,
+            read_secret(&aggregate.inference_key_file).await?,
+            identity.clone(),
+            journal.clone(),
+            config.model.model.clone(),
+            config.model.max_tokens,
+        )
+        .map_err(|_| HostError::Configuration)?;
+        account_models.set_aggregation(control);
+    }
     let local = match &config.local_instance {
         Some(value) => Some(local::LocalExecutor::start(&config.state_dir, value).await?),
         None => None,
@@ -157,7 +191,7 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
     }
     let connector = connections::Connections::new(
         devices,
-        Arc::new(OpenAiModel::new(model)),
+        model,
         config.system_prompt,
         config.model.context_window,
     )?;
@@ -168,6 +202,7 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
         .iter()
         .map(|adapter| adapter.clone() as Arc<dyn MessageAdapter>)
         .collect();
+    adapters.push(Arc::new(crate::gateway::WebAdapter));
     if let Some(adapter) = &onebot {
         adapters.push(adapter.clone());
     }
@@ -180,6 +215,9 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
     )
     .await
     .map_err(|_| HostError::State)?;
+    gateway
+        .set_control_origin(&config.public_origin)
+        .map_err(|_| HostError::Configuration)?;
     let mut router = portal::router_for_host_with_models(
         identity,
         portal_config,
@@ -329,4 +367,21 @@ async fn request_deadline(request: Request, next: Next) -> Response {
         )
             .into_response(),
     }
+}
+
+async fn read_secret(path: &std::path::Path) -> HostResult<String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|_| HostError::Credential)?;
+    if !metadata.is_file() || metadata.len() > 8192 {
+        return Err(HostError::Credential);
+    }
+    let value = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|_| HostError::Credential)?;
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(HostError::Credential);
+    }
+    Ok(value.to_owned())
 }

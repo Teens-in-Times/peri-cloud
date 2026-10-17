@@ -32,6 +32,8 @@ impl QqAdapter {
             }
             // Do not drop websocket_once: it owns the heartbeat JoinHandle.
             let result = self.websocket_once(&gateway, &stop, &mut resume).await;
+            self.connected
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             if stop.is_cancelled() {
                 return Ok(());
             }
@@ -180,9 +182,13 @@ impl QqAdapter {
                         if kind == "READY" {
                             let session = payload["d"]["session_id"].as_str().filter(|value| !value.is_empty() && value.len() <= 256).ok_or(QqError::Event)?;
                             resume.session = Some(session.into());
+                            self.connected.store(true,std::sync::atomic::Ordering::SeqCst);
+                            self.last_connected.store(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64,std::sync::atomic::Ordering::SeqCst);
                             authenticated.cancel();
                             tracing::info!(component="qq_websocket", "QQ gateway ready");
                         } else if kind == "RESUMED" {
+                            self.connected.store(true,std::sync::atomic::Ordering::SeqCst);
+                            self.last_connected.store(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64,std::sync::atomic::Ordering::SeqCst);
                             authenticated.cancel();
                             tracing::info!(component="qq_websocket", "QQ gateway resumed");
                         } else {

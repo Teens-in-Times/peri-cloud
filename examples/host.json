@@ -4,6 +4,7 @@
   "public_origin": "http://127.0.0.1:47671",
   "bootstrap_env": "PERI_BOOTSTRAP_TOKEN",
   "model": {
+    "protocol": "openai",
     "api_base": "https://api.example.com/v1",
     "api_key_env": "PERI_MODEL_API_KEY",
     "model": "your-model-name",

@@ -20,7 +20,7 @@ env=os.environ.copy();env.update(FIXTURE_BOOTSTRAP='fixture-bootstrap-token-0000
 host=subprocess.Popen([str(binary/'peri-cloud-host'),'--config',str(root/'host.json')],env=env,cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 try:
     assert ready(origin+'/healthz').status==200
-    for name in ['portal.css','portal.js','workspace.js']:assert ready(origin+'/'+name).read()==(assets/name).read_bytes()
+    for name in ['portal.css','portal.js','workspace.js','models.js']:assert ready(origin+'/'+name).read()==(assets/name).read_bytes()
     cookies=http.cookiejar.CookieJar();client=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookies))
     def post(route,body,csrf=''):
         return client.open(urllib.request.Request(origin+route,data=json.dumps(body).encode(),headers={'Origin':origin,'Content-Type':'application/json','X-Peri-CSRF':csrf}),timeout=10)

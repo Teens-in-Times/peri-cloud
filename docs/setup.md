@@ -20,7 +20,7 @@ PERI_QQ_CLIENT_SECRET=<自己的 QQ 官方机器人密钥>
 
 初始化口令用于首次创建个人账号，不能放入公开配置或聊天消息。宿主启动仍需要该环境变量；账号创建后不能重复初始化。密钥只通过配置中的环境变量名引用。
 
-把模型 API 地址和模型名称换成自己的供应商配置。仅在供应商明确支持时打开 `supports_thinking_content`。不使用 QQ 时把 `qq` 设为 `null`，电脑账号和 OAuth 功能仍然保留。
+把模型 API 地址和模型名称换成自己的供应商配置。`model.protocol` 默认为 `openai`，也可选 `anthropic`；Anthropic 地址填服务根地址。部署管理员还可以在网页手填自己的地址、协议与 Key。外部聚合服务为可选集成，见 [控制接口与运维](control-operations.md)。仅在供应商明确支持时打开 `supports_thinking_content`。不使用 QQ 时把 `qq` 设为 `null`，电脑账号和 OAuth 功能仍然保留。
 
 ```sh
 peri-cloud-host --config /etc/peri-cloud/host.json --check-config

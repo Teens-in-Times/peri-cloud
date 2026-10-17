@@ -2,15 +2,16 @@
 
 支持多个独立账号的云 Agent：推理循环在服务器，工具在各自选择的 Windows / Linux 实例上执行，官方 QQBot 与可选的个人 QQ / OneBot 是并存的聊天入口。服务器本地实例仅属于管理员。
 
-本项目基于 [Peri](https://github.com/KonghaYao/peri) 的 Rust Agent 核心，拆出原生执行器并加入账号、设备连接、网关和常驻服务。发布包不包含 TUI。保留依赖所需的编译期提示词与 workflow 资源。当前版本 `v0.5.0`，仍处于预览阶段。
+本项目基于 [Peri](https://github.com/KonghaYao/peri) 的 Rust Agent 核心，拆出原生执行器并加入账号、设备连接、网关和常驻服务。发布包不包含 TUI。保留依赖所需的编译期提示词与 workflow 资源。当前版本 `v0.6.0`，仍处于预览阶段。
 
 ## 能做什么
 
-- 云端运行原有 Agent 推理循环；模型使用兼容 OpenAI Chat Completions 的接口。
+- 云端运行原有 Agent 推理循环；模型可直接使用 OpenAI Chat Completions 或 Anthropic Messages。外部 API 聚合服务是可选部署集成，不是 Peri 内置依赖。
 - 管理员通过一次性邀请创建成员账号。每人拥有独立的会话、审批、聊天关联、设备池、记忆和模型配置。
 - 每个用户可以绑定多个 QQ / 网关身份，共用自己的设备池；各聊天会话可独立选择实例与工作区。
 - 不同用户的任务可以并行；支持全局 / 每用户并发、每日对话和模型请求额度，以及任务时限。
-- 网页可设置个人回复偏好、长期记忆、供应商、模型 ID 和自有 API Key；密钥不回显、不进入工具参数。
+- 网页可设置个人回复偏好、长期记忆、模型；独立部署可填写自己的 URL、协议和 Key。可选对接既有 New API，统一渠道管理与调用出口；密钥不回显、不进入工具参数。
+- 网页与 QQ 共享会话、工作区、任务提交、取消、审批和结果；控制操作不需要先调用模型。
 - Windows 和 Linux 执行器提供 Read、Write、Edit、Glob、Grep、Bash，复用同一套工具代码。
 - 在个人电脑浏览器登录，使用 OAuth 授权码 + PKCE S256 绑定执行器；Windows 登录凭据使用 DPAPI，Linux 使用权限受限的文件。
 - 在网页生成五分钟有效的一次性口令，在 QQ 发送 `/绑定 口令`，再回到网页核对并确认聊天账号。
@@ -117,3 +118,5 @@ QQ 日常操作与交互审计：[QQ 优先交互说明](docs/qq-experience-audi
 网页信息层级：[运行拓扑与会话归属](docs/web-topology.md)。
 
 后续设计：[跨设备上下文、模型/API 与渐进式 Skill](docs/context-and-model-control-design-20261017.md)（方案，尚未实现）。
+
+架构升级与产品边界见 [实况审计与目标方案](docs/architecture-upgrade-20261017.md)，接口、独立部署及恢复见 [控制接口与运维](docs/control-operations.md)。

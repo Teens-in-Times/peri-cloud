@@ -21,6 +21,7 @@ pub struct HostConfig {
     pub public_origin: String,
     pub bootstrap_env: String,
     pub model: ModelConfig,
+    pub aggregation: Option<crate::aggregation::AggregationConfig>,
     #[serde(default)]
     pub model_providers: Vec<crate::models::ModelProvider>,
     #[serde(default)]
@@ -59,6 +60,8 @@ pub struct IsolatedInstanceConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
+    #[serde(default)]
+    pub protocol: crate::models::ModelProtocol,
     pub api_base: Url,
     pub api_key_env: String,
     pub model: String,
@@ -184,11 +187,36 @@ impl HostConfig {
                 local.workspace = directory.join(&local.workspace);
             }
         }
+        if let Some(aggregate) = &mut config.aggregation {
+            for file in [
+                &mut aggregate.management_key_file,
+                &mut aggregate.inference_key_file,
+            ] {
+                if file.is_relative() {
+                    *file = directory.join(&*file);
+                }
+            }
+        }
         config.validate()?;
         Ok(config)
     }
 
     pub fn validate(&self) -> HostResult<()> {
+        if self
+            .qq
+            .as_ref()
+            .is_some_and(|q| q.instance_id == crate::gateway::WEB_ADAPTER)
+            || self
+                .onebot
+                .as_ref()
+                .is_some_and(|q| q.instance_id == crate::gateway::WEB_ADAPTER)
+        {
+            return Err(HostError::Configuration);
+        }
+
+        if let Some(aggregate) = &self.aggregation {
+            aggregate.validate().map_err(|_| HostError::Configuration)?;
+        }
         if self.display_name.as_ref().is_some_and(|name| {
             name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control)
         }) {

@@ -10,6 +10,7 @@ window.WorkspaceView = (() => {
   let account = null;
   let hooks = null;
   let generation = 0;
+  let focusedSession = null;
   let deviceChecks = new Map();
   const gatewayName = id => (account.gateways || []).find(g => g.adapter === id)?.label || '聊天入口';
   const command = (label, task, className = 'quiet small') => {
@@ -17,7 +18,7 @@ window.WorkspaceView = (() => {
     button.addEventListener('click', () => task(button)); return button;
   };
   function clear() {
-    generation += 1; account = null; deviceChecks.clear();
+    generation += 1; account = null; focusedSession=null; deviceChecks.clear();
     for (const id of ['devices','channels','claims','conversation-activity','interactions','topology-entries','topology-devices']) get(id).replaceChildren();
     for (const id of ['device-count','channel-count','session-count','pending-count']) get(id).textContent = '0';
     for (const id of ['service-name','service-origin','service-version','topology-model','greeting','usage-summary','model-current']) get(id).textContent = '';
@@ -33,7 +34,10 @@ window.WorkspaceView = (() => {
     get('service-version').textContent = data.service?.version ? '主控版本 ' + data.service.version : '';
     const entries = get('topology-entries'); entries.replaceChildren();
     for (const gateway of data.gateways || []) {
-      const row = node('div', 'topology-entry'); row.append(node('strong','',gateway.label), node('span','subtle',gateway.linked_identities ? gateway.linked_identities + ' 个已关联身份' : '已配置 · 你尚未关联'));
+      const row = node('div', 'topology-entry'); row.append(node('strong','',gateway.label), node('span','subtle',gateway.adapter === '__peri_web' ? '使用当前网页登录身份' : gateway.linked_identities ? gateway.linked_identities + ' 个已关联身份' : '已配置 · 你尚未关联'));
+      const states={ready:'网关会话已就绪',disconnected:'连接未就绪',bridge_authenticated:'桥接连接已认证',browser_authenticated:'使用当前网页登录',unobserved:'尚无连接观测'};
+      row.append(node('span','subtle',states[gateway.connection_state]||'尚无连接观测'));
+      if(gateway.observed_at)row.append(node('span','subtle','最近就绪：'+new Date(gateway.observed_at*1000).toLocaleString()));
       entries.append(row);
     }
     if (!entries.children.length) entries.append(node('p','subtle','尚未关联聊天入口'));
@@ -82,6 +86,7 @@ window.WorkspaceView = (() => {
           }
           renderDevices();
         })));
+        actions.append(command('新建网页工作区',button=>hooks.action(button,()=>hooks.openBrowserWorkspace(device))));
         actions.append(command('浏览 / 默认目录', () => hooks.openInstanceWorkspace(device)));
         if (!device.is_local) actions.append(command('撤销', () => hooks.confirm('撤销设备连接？','撤销后需要重新登录才能继续使用。',device.name, () => hooks.api('/api/devices/' + device.id + '/revoke', {})), 'quiet danger small'));
       }
@@ -112,22 +117,35 @@ window.WorkspaceView = (() => {
       card.dataset.phase = activity?.phase || 'unknown';
       const header = node('div','section-heading');
       header.append(node('h3','',gatewayName(info.adapter)),node('span','phase-label',activity?.label || '状态暂不可用'));
-      card.append(header,node('p','conversation-source',info.adapter + ' · ' + info.conversation_id));
+      card.append(header);
+      const source=node('details','conversation-source');source.append(node('summary','',info.adapter==='__peri_web'?'网页独立工作区':'入口与会话标识'),node('p','workspace-path',info.adapter+' · '+info.conversation_id+' · '+id));card.append(source);
       const binding = node('dl','session-binding');
       for (const [label,value] of [['执行设备',info.device_name],['工作区',info.workspace],['工具权限',activity?.permission || '未载入']]) binding.append(node('dt','',label),node('dd','',value));
+      if(activity?.next_model)binding.append(node('dt','','后续任务模型'),node('dd','',activity.next_model));
+      if(activity?.turn_id)binding.append(node('dt','','本轮选择模型'),node('dd','',activity.turn_model||'未记录（旧任务或尚未开始）'));
       card.append(binding);
       const actions = node('div','device-actions');
+      const submit=command('配置并提交任务',()=>hooks.openTaskForm(info));
+      submit.disabled=activity?.phase!=='idle'||selection?.busy===true;
+      actions.append(submit);
+      if(activity?.turn_id && ['running','waiting_approval','waiting_answer','cancelling','needs_attention'].includes(activity.phase)){
+        const cancel=command('请求取消任务',()=>hooks.cancelTask(activity));cancel.disabled=activity.phase==='cancelling';actions.append(cancel);
+      }
       if (selection) {
         const change = command('切换这条会话的工作区', () => hooks.openWorkspace(selection));
         change.disabled = selection.busy || ['running','waiting_approval','waiting_answer','cancelling','needs_attention'].includes(activity?.phase);
         actions.append(change);
       }
+      if (account.service?.model_gateway) actions.append(command('选择这条会话的模型',button=>hooks.action(button,()=>hooks.openModelSelection(info))));
       if (activity?.has_result) actions.append(command('查看已保存结果', button => hooks.action(button, () => hooks.openSavedResult(id))));
       card.append(actions);
       for (const interaction of interactions.filter(i=>i.session_id===id)) card.append(interactionItem(interaction));
       root.append(card);
     }
-    if (!ids.length && activitiesResult.status === 'fulfilled' && workspacesResult.status === 'fulfilled') root.append(node('p','empty','还没有选定设备的聊天。在 QQ 发送“菜单”，选择设备后，会话会出现在这里。'));
+    if (!ids.length && activitiesResult.status === 'fulfilled' && workspacesResult.status === 'fulfilled') root.append(node('p','empty','还没有会话。到“执行设备”打开网页工作区，或在 QQ 发送“菜单”选择设备。'));
+    const requested=new URLSearchParams(window.location.search).get('session');
+    const selected=[...root.querySelectorAll('[data-session]')].find(card=>card.dataset.session===requested);
+    if(selected){selected.classList.add('selected-session');if(focusedSession!==requested){selected.scrollIntoView?.({block:'start'});focusedSession=requested;}}
     const orphans = interactions.filter(i=>!ids.includes(i.session_id));
     const urgent = get('interactions'); urgent.replaceChildren(...orphans.map(interactionItem));
     get('approval-panel').hidden = orphans.length === 0;

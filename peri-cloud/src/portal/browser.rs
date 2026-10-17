@@ -107,13 +107,13 @@ pub(super) async fn account(
         None => Vec::new(),
     };
     Ok(Json(json!({
-        "service": {"name":portal.config.service_name,"origin":portal.config.origin,"version":env!("CARGO_PKG_VERSION"),"agent_enabled":portal.gateway.is_some()},
+        "service": {"name":portal.config.service_name,"origin":portal.config.origin,"version":env!("CARGO_PKG_VERSION"),"agent_enabled":portal.gateway.is_some(),"model_gateway":portal.models.as_ref().and_then(|m|m.aggregation()).is_some()},
         "gateways": gateways,
         "principal": actor.principal(),
         "is_admin": portal.identity.is_admin(&actor).await?,
         "personal_data": portal.gateway.is_some(),
         "devices": portal.identity.devices(&actor).await?,
-        "channels": portal.identity.channels(&actor).await?,
+        "channels": portal.identity.channels(&actor).await?.into_iter().filter(|c|c.adapter_instance_id!=crate::gateway::WEB_ADAPTER).collect::<Vec<_>>(),
         "pending_pair_claims": portal.identity.pending_pair_claims(&actor).await?,
     })))
 }

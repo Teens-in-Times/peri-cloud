@@ -81,3 +81,15 @@ textarea,select{display:block;width:100%;margin-top:8px;padding:11px 12px;font:i
   .page-heading { flex-wrap: wrap; }
   #model-current { max-width: 100%; }
 }
+.model-section { border-top: 1px solid var(--line); margin-top: 22px; padding-top: 20px; }
+.model-section h3 { font-size: 20px; }
+.model-section form { max-width: 560px; }
+#aggregate-channels { display: grid; gap: 14px; margin: 20px 0; }
+#aggregate-channels h4 { margin: 0; font-size: 15px; font-weight: 500; overflow-wrap: anywhere; }
+#aggregate-usage { border-top: 1px solid var(--line); margin-top: 20px; padding-top: 15px; }
+.channel-form { white-space: normal; }
+.channel-form input[name=key] { font-family: ui-monospace, Consolas, monospace; }
+.route-hidden { display: none !important; }
+.selected-session { border-color: var(--accent); box-shadow: inset 3px 0 var(--accent); }
+.task-form { white-space: normal; }
+.task-form textarea { min-height: 150px; }

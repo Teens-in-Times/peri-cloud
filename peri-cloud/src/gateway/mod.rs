@@ -3,6 +3,8 @@
 
 pub mod access;
 mod broker;
+mod plain;
+pub(crate) use plain::plain_chat;
 mod connector;
 mod menu_store;
 pub(crate) mod menu_view;
@@ -10,10 +12,12 @@ mod router;
 pub(crate) mod store;
 mod topology;
 mod types;
+mod web_entry;
 pub use topology::GatewayView;
+pub(crate) use web_entry::{WebAdapter, WEB_ADAPTER};
 
 pub use connector::{NativeSessionConnector, SessionConnector};
-pub use router::{ConversationActivity, Gateway, SavedResultPage, WorkspaceSelection};
+pub use router::{ConversationActivity, Gateway, SavedResultPage, TaskReceipt, WorkspaceSelection};
 pub use types::{
     ChannelRoute, Delivery, DeliveryBody, DeliveryError, GatewayReceipt, InboundMessage,
     InteractionAction, InteractionCard, MenuButton, MenuCard, MessageAdapter, ReceiptState,

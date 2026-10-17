@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::broker::{InteractionHub, SessionBroker};
+use super::broker::{InteractionHub, SessionBroker, SessionOrigin};
 use super::store::GatewayStore;
 use super::{
     ChannelRoute, DeliveryBody, DeliveryError, GatewayError, GatewayReceipt, GatewayResult,
@@ -17,9 +17,14 @@ use super::{
 };
 use crate::identity::{DeviceRecord, IdentityError, IdentityService};
 use crate::state::StateError;
-use crate::{CloudRuntime, SubmitTurn};
+use crate::CloudRuntime;
 
-type Origins = HashMap<Uuid, Arc<RwLock<Option<String>>>>;
+#[path = "model_controls.rs"]
+mod model_controls;
+#[path = "task_control.rs"]
+mod task_control;
+pub use task_control::TaskReceipt;
+type Origins = HashMap<Uuid, Arc<RwLock<Option<SessionOrigin>>>>;
 #[path = "menus.rs"]
 mod menus;
 #[path = "workspaces.rs"]
@@ -54,9 +59,25 @@ pub struct Gateway {
     dispatch_gate: tokio::sync::Mutex<()>,
     pub(super) access_gate: tokio::sync::RwLock<()>,
     max_iterations: usize,
+    control_origin: RwLock<Option<url::Url>>,
 }
 
 impl Gateway {
+    /// Links carry resource IDs only; the destination repeats browser ownership checks.
+    pub fn set_control_origin(&self, origin: &str) -> GatewayResult<()> {
+        crate::portal::PortalConfig::new(origin).map_err(|_| GatewayError::Invalid)?;
+        *self.control_origin.write() = Some(origin.parse().map_err(|_| GatewayError::Invalid)?);
+        Ok(())
+    }
+    pub(super) fn control_link(&self, session: Option<Uuid>) -> Option<String> {
+        let mut url = self.control_origin.read().clone()?;
+        if let Some(session) = session {
+            url.query_pairs_mut()
+                .append_pair("session", &session.to_string());
+        }
+        url.set_fragment(Some("activity-panel"));
+        Some(url.into())
+    }
     pub(super) fn account_gate(&self, key: String) -> Arc<tokio::sync::Mutex<()>> {
         let mut gates = self.receive_gates.lock();
         gates.retain(|_, gate| gate.strong_count() > 0);
@@ -124,6 +145,7 @@ impl Gateway {
             dispatch_gate: tokio::sync::Mutex::new(()),
             access_gate: tokio::sync::RwLock::new(()),
             max_iterations,
+            control_origin: RwLock::new(None),
         }))
     }
 
@@ -503,7 +525,7 @@ impl Gateway {
                     self.hub.question_menu(&message.route, request).await?
                 } else {
                     if let Some(origin) = self.origins.read().get(&session) {
-                        *origin.write() = Some(message.event_id.clone());
+                        *origin.write() = Some(SessionOrigin::Platform(message.event_id.clone()));
                     }
                     self.hub
                         .question_text(
@@ -525,38 +547,25 @@ impl Gateway {
         if text.starts_with('/') {
             return Err(GatewayError::Invalid);
         }
-        if !state.execution_settled()
-            || self.runtime.journal().has_unconfirmed_turn(session).await?
-        {
-            return Err(GatewayError::Busy);
-        }
-        if !self.origins.read().contains_key(&session) {
-            let agent = self
-                .connector
-                .open(principal, device, Some(&state.frozen))
-                .await?;
-            self.attach(&message.route, principal, device, agent)
-                .await?;
-        }
+        self.ensure_task_session(&message.route, principal, device, &state)
+            .await?;
         let origin = self
             .origins
             .read()
             .get(&session)
             .cloned()
             .ok_or(GatewayError::RecoveryRequired)?;
-        *origin.write() = Some(message.event_id.clone());
+        *origin.write() = Some(SessionOrigin::Platform(message.event_id.clone()));
         self.store
             .stage(&message.key()?, principal, session)
             .await?;
         let turn = self
-            .runtime
-            .submit(SubmitTurn {
-                principal_id: principal,
-                session_id: session,
-                request_key: format!("gateway:{}", message.key()?),
-                prompt: MessageContent::Text(message.text.clone()),
-                max_iterations: self.max_iterations,
-            })
+            .submit_session_task(
+                principal,
+                session,
+                format!("gateway:{}", message.key()?),
+                MessageContent::Text(message.text.clone()),
+            )
             .await?;
         self.store.submitted(&message.key()?, turn.turn_id).await?;
         Ok(None)

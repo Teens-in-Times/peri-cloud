@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -79,6 +79,8 @@ pub struct QqAdapter {
     cached: Mutex<Option<CachedToken>>,
     refresh_gate: tokio::sync::Mutex<()>,
     native_rejected: AtomicBool,
+    pub(crate) connected: AtomicBool,
+    pub(crate) last_connected: AtomicI64,
 }
 
 impl QqAdapter {
@@ -119,6 +121,8 @@ impl QqAdapter {
             cached: Mutex::new(None),
             refresh_gate: tokio::sync::Mutex::new(()),
             native_rejected: AtomicBool::new(false),
+            connected: AtomicBool::new(false),
+            last_connected: AtomicI64::new(0),
         }))
     }
 
@@ -232,7 +236,7 @@ impl QqAdapter {
 
     fn payload(&self, delivery: &Delivery, native: bool) -> QqResult<Value> {
         let text = match &delivery.body {
-            DeliveryBody::Reply { reply } => reply.text.clone(),
+            DeliveryBody::Reply { reply } => crate::gateway::plain_chat(&reply.text),
             DeliveryBody::Notice { text } => text.clone(),
             DeliveryBody::Menu { card } => menu_text(
                 card,
@@ -378,6 +382,20 @@ impl MessageAdapter for QqAdapter {
     fn display_name(&self) -> &'static str {
         "官方 QQBot"
     }
+    fn connection_status(&self) -> (&'static str, Option<i64>) {
+        let last = self.last_connected.load(Ordering::SeqCst);
+        (
+            if self.connected.load(Ordering::SeqCst) {
+                "ready"
+            } else if last > 0 {
+                "disconnected"
+            } else {
+                "unobserved"
+            },
+            (last > 0).then_some(last),
+        )
+    }
+
     fn initial_access_policy(&self) -> crate::gateway::access::AccessPolicy {
         crate::gateway::access::AccessPolicy::open()
     }

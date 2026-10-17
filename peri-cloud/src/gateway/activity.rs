@@ -49,6 +49,8 @@ pub struct ConversationActivity {
     pub turn_id: Option<Uuid>,
     pub waiting_count: usize,
     pub has_result: bool,
+    pub next_model: Option<String>,
+    pub turn_model: Option<String>,
 }
 
 impl ConversationActivity {
@@ -140,6 +142,33 @@ impl Gateway {
             None if !state.execution_settled() => ActivityPhase::NeedsAttention,
             None => ActivityPhase::Idle,
         };
+        let next_model = if let Some(models) = self.connector.account_models() {
+            if let Some(aggregate) = models.aggregation() {
+                aggregate.current_model(principal, Some(session)).await.ok()
+            } else {
+                models
+                    .choice(principal)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|c| c.model)
+                    .or_else(|| Some(models.default_model().to_owned()))
+            }
+        } else {
+            None
+        };
+        let turn_model = if let Some(turn) = active.as_ref() {
+            sqlx::query_scalar::<_, String>(
+                "SELECT model FROM turn_models WHERE turn_id=? AND session_id=? AND principal=?",
+            )
+            .bind(turn.turn_id.to_string())
+            .bind(session.to_string())
+            .bind(principal.to_string())
+            .fetch_optional(&self.store.pool)
+            .await?
+        } else {
+            None
+        };
         Ok(ConversationActivity {
             adapter: route.identity.adapter_instance_id.clone(),
             session_id: session,
@@ -153,6 +182,8 @@ impl Gateway {
             turn_id: active.map(|t| t.turn_id),
             waiting_count: cards.len(),
             has_result: self.latest_result(route, principal).await?.is_some(),
+            next_model,
+            turn_model,
         })
     }
 
@@ -171,7 +202,7 @@ impl Gateway {
         turn: Option<Uuid>,
     ) -> GatewayResult<Option<(Uuid, Uuid)>> {
         let turn = turn.map(|t| t.to_string());
-        let row = sqlx::query("SELECT i.session_id,i.turn_id FROM gateway_inbox i JOIN cloud_turns t ON t.id=i.turn_id AND t.session_id=i.session_id JOIN cloud_sessions s ON s.id=i.session_id WHERE i.principal=? AND s.principal=? AND i.route_json=? AND t.state NOT IN ('queued','running') AND (? IS NULL OR i.turn_id=?) ORDER BY i.rowid DESC LIMIT 1")
+        let row = sqlx::query("WITH sources AS (SELECT principal,route_json,session_id,turn_id FROM gateway_inbox UNION ALL SELECT o.principal,json_extract(o.result_json,'$.route_json'),o.target,t.id FROM control_operations o JOIN cloud_turns t ON t.session_id=o.target AND t.request_key='web:'||o.id WHERE o.kind='task.submit') SELECT i.session_id,i.turn_id FROM sources i JOIN cloud_turns t ON t.id=i.turn_id AND t.session_id=i.session_id JOIN cloud_sessions s ON s.id=i.session_id WHERE i.principal=? AND s.principal=? AND i.route_json=? AND t.state NOT IN ('queued','running') AND (? IS NULL OR i.turn_id=?) ORDER BY t.rowid DESC LIMIT 1")
             .bind(principal.to_string()).bind(principal.to_string()).bind(serde_json::to_string(route)?)
             .bind(&turn).bind(&turn)
             .fetch_optional(&self.store.pool).await?;

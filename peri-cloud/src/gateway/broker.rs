@@ -201,6 +201,12 @@ impl InteractionHub {
     }
 }
 
+#[derive(Clone)]
+pub(crate) enum SessionOrigin {
+    Platform(String),
+    Browser,
+}
+
 pub(crate) struct SessionBroker {
     pub hub: Arc<InteractionHub>,
     pub route: ChannelRoute,
@@ -209,7 +215,7 @@ pub(crate) struct SessionBroker {
     pub device: Uuid,
     pub device_name: String,
     pub workspace: String,
-    pub origin: Arc<RwLock<Option<String>>>,
+    pub origin: Arc<RwLock<Option<SessionOrigin>>>,
 }
 
 struct RequestGuard {
@@ -226,7 +232,7 @@ impl Drop for RequestGuard {
 impl UserInteractionBroker for SessionBroker {
     async fn request(&self, context: InteractionContext) -> InteractionResponse {
         let fallback = || unavailable(&context);
-        let Some(parent) = self.origin.read().clone() else {
+        let Some(origin) = self.origin.read().clone() else {
             return fallback();
         };
         if !valid_context(&context) {
@@ -282,15 +288,20 @@ impl UserInteractionBroker for SessionBroker {
             hub: self.hub.clone(),
             request,
         };
-        let delivery = if matches!(context, InteractionContext::Questions { .. }) {
-            self.hub
-                .deliver_question(&self.route, &parent, principal, request, self.device)
-                .await
-        } else {
-            self.hub
-                .store
-                .interaction(&self.route, &parent, principal, card)
-                .await
+        let delivery = match origin {
+            SessionOrigin::Browser => Ok(()),
+            SessionOrigin::Platform(parent) => {
+                if matches!(context, InteractionContext::Questions { .. }) {
+                    self.hub
+                        .deliver_question(&self.route, &parent, principal, request, self.device)
+                        .await
+                } else {
+                    self.hub
+                        .store
+                        .interaction(&self.route, &parent, principal, card)
+                        .await
+                }
+            }
         };
         if delivery.is_err() {
             return fallback();

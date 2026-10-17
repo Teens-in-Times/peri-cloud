@@ -135,6 +135,22 @@ impl MessageAdapter for OneBotAdapter {
     fn display_name(&self) -> &'static str {
         "个人 QQ"
     }
+    fn connection_status(&self) -> (&'static str, Option<i64>) {
+        (
+            if self
+                .connection
+                .lock()
+                .as_ref()
+                .is_some_and(|c| !c.requests.is_closed())
+            {
+                "bridge_authenticated"
+            } else {
+                "disconnected"
+            },
+            None,
+        )
+    }
+
     fn instance_id(&self) -> &str {
         &self.instance
     }

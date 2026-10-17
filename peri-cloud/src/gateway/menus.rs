@@ -78,6 +78,19 @@ impl Gateway {
             .as_ref()
             .and_then(|s| devices.iter().find(|d| d.id == s.frozen.device_id));
         match action {
+            MenuAction::AggregateModels { page } => {
+                return Ok(DeliveryBody::Menu {
+                    card: self
+                        .aggregate_model_menu(message, principal, selected, page)
+                        .await?,
+                })
+            }
+            MenuAction::ChooseAggregateModel { model, revision } => {
+                return self
+                    .choose_aggregate_model(message, selected, model, revision)
+                    .await
+            }
+
             MenuAction::Access {
                 adapter,
                 section,
@@ -629,10 +642,15 @@ impl Gateway {
         message: &InboundMessage,
         principal: Uuid,
         title: String,
-        text: String,
+        mut text: String,
         choices: Vec<(String, MenuAction)>,
     ) -> GatewayResult<DeliveryBody> {
         let expected_session = self.store.selection(&message.route, principal).await?;
+        if matches!(title.as_str(), "云 Agent 菜单" | "任务状态" | "工作区") {
+            if let Some(url) = self.control_link(expected_session) {
+                text.push_str(&format!("\n复杂任务与完整状态（需登录）：{url}"));
+            }
+        }
         let expires_at = self.identity.now() + 240;
         if choices.len() > 15 {
             return Err(GatewayError::Invalid);

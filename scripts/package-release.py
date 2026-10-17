@@ -30,7 +30,7 @@ output.mkdir(parents=True, exist_ok=False)
 shared = {}
 tracked = subprocess.check_output([
     'git', 'ls-files', '-z', '--', 'README.md', 'LICENSE', 'NOTICE', 'AGENTS.md',
-    'docs', 'examples', 'licenses'], cwd=root).decode('utf-8').split('\0')
+    'docs', 'examples', 'licenses', 'scripts'], cwd=root).decode('utf-8').split('\0')
 for name in filter(None, tracked):
     shared[name] = (root / name).read_bytes()
 

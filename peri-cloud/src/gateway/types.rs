@@ -189,6 +189,10 @@ pub trait MessageAdapter: Send + Sync {
     fn display_name(&self) -> &'static str {
         "聊天入口"
     }
+    fn connection_status(&self) -> (&'static str, Option<i64>) {
+        ("unobserved", None)
+    }
+
     fn initial_access_policy(&self) -> super::access::AccessPolicy {
         super::access::AccessPolicy::default()
     }

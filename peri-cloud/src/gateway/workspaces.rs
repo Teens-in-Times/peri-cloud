@@ -103,6 +103,10 @@ impl Gateway {
             .await?;
         let frozen = agent.frozen_session(principal);
         self.attach(route, principal, device, agent).await?;
+        if let Some(old) = selected {
+            self.inherit_model_selection(principal, old, frozen.session_id)
+                .await?;
+        }
         self.store
             .select(route, principal, frozen.session_id)
             .await?;
@@ -274,10 +278,30 @@ impl Gateway {
             .journal()
             .set_permissions(principal, frozen.session_id, mode)
             .await?;
+        self.inherit_model_selection(principal, expected, frozen.session_id)
+            .await?;
         self.store
             .select(route, principal, frozen.session_id)
             .await?;
         Ok(frozen)
+    }
+    async fn inherit_model_selection(
+        &self,
+        principal: Uuid,
+        from: Uuid,
+        to: Uuid,
+    ) -> GatewayResult<()> {
+        if let Some(aggregate) = self
+            .connector
+            .account_models()
+            .and_then(|m| m.aggregation())
+        {
+            aggregate
+                .inherit_selection(principal, from, to)
+                .await
+                .map_err(|_| GatewayError::RecoveryRequired)?;
+        }
+        Ok(())
     }
 }
 

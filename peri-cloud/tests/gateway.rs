@@ -43,6 +43,8 @@ mod menu_detail_tests;
 mod menu_tests;
 #[path = "gateway/topology.rs"]
 mod topology_tests;
+#[path = "gateway/web_tasks.rs"]
+mod web_task_tests;
 #[path = "gateway/workspaces.rs"]
 mod workspace_tests;
 
@@ -142,6 +144,7 @@ impl CloudSide {
         connector: Arc<NativeSessionConnector>,
         adapter: Arc<Adapter>,
         initialize: bool,
+        web: bool,
     ) -> Self {
         let journal = Arc::new(CloudJournal::open(root).await.unwrap());
         let identity = IdentityService::with_clock(&journal, SETUP, clock)
@@ -159,15 +162,13 @@ impl CloudSide {
             .await
             .unwrap();
         let runtime = CloudRuntime::new(journal.clone());
-        let gateway = Gateway::new(
-            runtime.clone(),
-            identity.clone(),
-            connector,
-            vec![adapter],
-            8,
-        )
-        .await
-        .unwrap();
+        let mut adapters: Vec<Arc<dyn MessageAdapter>> = vec![adapter];
+        if web {
+            adapters.push(Arc::new(web_task_tests::WebEntry));
+        }
+        let gateway = Gateway::new(runtime.clone(), identity.clone(), connector, adapters, 8)
+            .await
+            .unwrap();
         Self {
             journal,
             identity,
@@ -207,6 +208,9 @@ struct Fixture {
 
 impl Fixture {
     async fn new(responses: Vec<String>) -> Self {
+        Self::new_for(responses, false).await
+    }
+    async fn new_for(responses: Vec<String>, web: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let stop = CancellationToken::new();
         let clock = Arc::new(Clock(AtomicI64::new(1_900_000_000)));
@@ -239,6 +243,7 @@ impl Fixture {
             connector.clone(),
             adapter.clone(),
             true,
+            web,
         )
         .await;
         let mut f = Self {
@@ -476,6 +481,7 @@ impl Fixture {
                 self.clock.clone(),
                 self.connector.clone(),
                 self.adapter.clone(),
+                false,
                 false,
             )
             .await,
@@ -960,6 +966,7 @@ async fn gateway_delivery_panic_keeps_health_failed_and_restart_preserves_unknow
             f.clock.clone(),
             f.connector.clone(),
             f.adapter.clone(),
+            false,
             false,
         )
         .await,

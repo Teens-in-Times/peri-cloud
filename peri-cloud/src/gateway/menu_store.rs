@@ -23,6 +23,13 @@ pub(super) enum MenuAction {
         revision: u64,
         list: super::access::AccessList,
     },
+    AggregateModels {
+        page: usize,
+    },
+    ChooseAggregateModel {
+        model: Option<String>,
+        revision: i64,
+    },
     Home,
     Personal {
         section: String,
@@ -90,7 +97,8 @@ impl MenuAction {
     pub fn mutates(&self) -> bool {
         matches!(
             self,
-            Self::AccessChange { .. }
+            Self::ChooseAggregateModel { .. }
+                | Self::AccessChange { .. }
                 | Self::AccessInput { .. }
                 | Self::Select { .. }
                 | Self::ClearPersonal { .. }

@@ -141,7 +141,12 @@ impl CloudAgent {
         };
         let inner = match &self.account_models {
             Some(models) => models
-                .resolve(principal, self.model.clone())
+                .resolve_for_turn(
+                    principal,
+                    self.session_id,
+                    request.turn_id,
+                    self.model.clone(),
+                )
                 .await
                 .map_err(|_| Error::AccountModel)?,
             None => self.model.clone(),

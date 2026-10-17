@@ -10,6 +10,8 @@ pub struct GatewayView {
     pub adapter: String,
     pub label: String,
     pub linked_identities: usize,
+    pub connection_state: String,
+    pub observed_at: Option<i64>,
 }
 
 impl Gateway {
@@ -28,6 +30,8 @@ impl Gateway {
                     adapter: id.clone(),
                     label: adapter.display_name().into(),
                     linked_identities: linked,
+                    connection_state: adapter.connection_status().0.into(),
+                    observed_at: adapter.connection_status().1,
                 })
             })
             .collect();

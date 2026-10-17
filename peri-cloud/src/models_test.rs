@@ -55,6 +55,20 @@ async fn users_resolve_their_own_model_and_key_and_keys_are_never_returned() {
         )
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    async fn native(
+        State(seen): State<ObservedRequests>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> ([(axum::http::HeaderName, &'static str); 1], String) {
+        seen.lock().push((
+            headers["x-api-key"].to_str().unwrap().into(),
+            body["model"].as_str().unwrap().into(),
+        ));
+        ([(axum::http::header::CONTENT_TYPE,"text/event-stream")],concat!(
+            "event: message_start\ndata: {\"message\":{\"id\":\"fixture\",\"usage\":{\"input_tokens\":1}}}\n\n",
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\ndata: {}\n\n").to_owned())
+    }
     let base: Url = format!("http://{}/v1", listener.local_addr().unwrap())
         .parse()
         .unwrap();
@@ -65,6 +79,7 @@ async fn users_resolve_their_own_model_and_key_and_keys_are_never_returned() {
             listener,
             Router::new()
                 .route("/v1/chat/completions", post(serve))
+                .route("/v1/messages", post(native))
                 .with_state(seen.clone()),
         )
         .with_graceful_shutdown(stopped.cancelled_owned())
@@ -76,6 +91,7 @@ async fn users_resolve_their_own_model_and_key_and_keys_are_never_returned() {
             id: "fixture".into(),
             name: "Fixture".into(),
             api_base: base.clone(),
+            protocol: ModelProtocol::default(),
         }],
         "default".into(),
         128,
@@ -92,6 +108,7 @@ async fn users_resolve_their_own_model_and_key_and_keys_are_never_returned() {
                     provider: "fixture".into(),
                     model: model.into(),
                     api_key: Some(key.into()),
+                    ..Default::default()
                 },
             )
             .await
@@ -103,7 +120,7 @@ async fn users_resolve_their_own_model_and_key_and_keys_are_never_returned() {
             "FALLBACK_KEY",
             "fallback",
         )));
-        let model = models.resolve(principal, fallback).await.unwrap();
+        let model = models.resolve(principal, None, fallback).await.unwrap();
         model
             .complete(
                 ModelRequest::new(vec![ModelMessage::user_text("hello")]),
@@ -125,7 +142,8 @@ async fn users_resolve_their_own_model_and_key_and_keys_are_never_returned() {
             ModelUpdate {
                 provider: "unknown".into(),
                 model: "x".into(),
-                api_key: Some("x".into())
+                api_key: Some("x".into()),
+                ..Default::default()
             }
         )
         .await
@@ -137,6 +155,7 @@ async fn users_resolve_their_own_model_and_key_and_keys_are_never_returned() {
                 provider: "fixture".into(),
                 model: "changed".into(),
                 api_key: None,
+                ..Default::default()
             },
         )
         .await
@@ -150,6 +169,72 @@ async fn users_resolve_their_own_model_and_key_and_keys_are_never_returned() {
     assert_eq!(
         models.choice(first.id).await.unwrap().unwrap().model,
         "owner-model"
+    );
+    let mut native_base = base.clone();
+    native_base.set_path("/");
+    for (protocol, url, key) in [
+        (ModelProtocol::Openai, base, "CUSTOM_OPENAI"),
+        (
+            ModelProtocol::Anthropic,
+            native_base.clone(),
+            "CUSTOM_ANTHROPIC",
+        ),
+    ] {
+        models
+            .save(
+                first.id,
+                ModelUpdate {
+                    provider: "@custom".into(),
+                    model: "custom-model".into(),
+                    api_key: Some(key.into()),
+                    api_base: Some(url),
+                    protocol: Some(protocol),
+                },
+            )
+            .await
+            .unwrap();
+        let model = models
+            .resolve(
+                first.id,
+                None,
+                Arc::new(OpenAiModel::new(OpenAiConfig::new(
+                    native_base.clone(),
+                    "unused",
+                    "unused",
+                ))),
+            )
+            .await
+            .unwrap();
+        model
+            .complete(
+                ModelRequest::new(vec![ModelMessage::user_text("fixture")]),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(seen.lock().last().unwrap().0.contains(key));
+        assert!(
+            !serde_json::to_string(&models.choice(first.id).await.unwrap())
+                .unwrap()
+                .contains(key)
+        );
+    }
+    let mut other = native_base;
+    other.set_path("/different");
+    assert!(
+        models
+            .save(
+                first.id,
+                ModelUpdate {
+                    provider: "@custom".into(),
+                    model: "custom-model".into(),
+                    api_base: Some(other),
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err(),
+        "changing endpoint must never silently forward the existing key"
     );
     stop.cancel();
     server.await.unwrap().unwrap();

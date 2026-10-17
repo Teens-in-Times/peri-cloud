@@ -650,6 +650,7 @@ async fn qq_switches_personal_model_without_accepting_or_displaying_credentials(
             id: "fixture".into(),
             name: "Fixture".into(),
             api_base: "http://127.0.0.1/v1".parse().unwrap(),
+            protocol: Default::default(),
         }],
         "service-model".into(),
         4096,
@@ -663,6 +664,7 @@ async fn qq_switches_personal_model_without_accepting_or_displaying_credentials(
                 provider: "fixture".into(),
                 model: "first-model".into(),
                 api_key: Some("PRIVATE_FIXTURE_API_KEY".into()),
+                ..Default::default()
             },
         )
         .await

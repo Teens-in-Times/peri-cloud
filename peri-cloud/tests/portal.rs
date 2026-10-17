@@ -576,3 +576,85 @@ async fn host_origin_ambiguous_cookie_and_extraction_failures_do_not_expose_cred
     );
     f.close().await;
 }
+
+#[tokio::test]
+async fn structured_controls_require_browser_authentication_and_csrf_even_without_models() {
+    let f = Fixture::new(true, false).await;
+    let id = Uuid::new_v4();
+    for path in [
+        "/api/aggregate",
+        "/api/aggregate/channels",
+        "/api/aggregate/groups",
+        "/api/aggregate/usage",
+        "/api/aggregate/audit",
+        "/api/aggregate/model",
+    ] {
+        assert_eq!(
+            f.get(path).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let (browser, _) = f.login().await;
+    for (path, body) in [
+        (
+            "/api/aggregate/model".to_owned(),
+            json!({"model":null,"revision":0}),
+        ),
+        (
+            "/api/workspaces/open".to_owned(),
+            json!({"request_id":id,"device_id":id,"workspace":null}),
+        ),
+        (
+            format!("/api/conversations/{id}/tasks"),
+            json!({"request_id":id,"confirmed":true,"prompt":"fixture"}),
+        ),
+        (
+            format!("/api/conversations/{id}/cancel"),
+            json!({"turn_id":id,"confirmed":true}),
+        ),
+        (
+            "/api/aggregate/channel-command".to_owned(),
+            json!({"request_id":id,"confirmed":true,"action":{"kind":"test","id":7,"model":null}}),
+        ),
+    ] {
+        assert_eq!(
+            f.post(&path).json(&body).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            f.post(&path)
+                .header("Cookie", &browser.cookies)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let owner_login = f.identity.login("owner", PASSWORD.into()).await.unwrap();
+    let owner_actor = f
+        .identity
+        .authenticate_browser(&owner_login.session_token)
+        .await
+        .unwrap();
+    let invite = f.identity.create_invite(&owner_actor).await.unwrap();
+    f.identity
+        .register_invited(&invite.code, "direct-guest", PASSWORD.into(), "Guest")
+        .await
+        .unwrap();
+    let login = f
+        .identity
+        .login("direct-guest", PASSWORD.into())
+        .await
+        .unwrap();
+    let guest = Browser {
+        cookies: format!(
+            "peri_session={}; peri_csrf={}",
+            login.session_token, login.csrf_token
+        ),
+        csrf: login.csrf_token,
+    };
+    assert_eq!(f.mutation("/api/model",&guest).json(&json!({"provider":"@custom","model":"fixture","api_base":"http://127.0.0.1:3000","protocol":"openai","api_key":"FIXTURE"})).send().await.unwrap().status(),StatusCode::FORBIDDEN);
+    f.close().await;
+}

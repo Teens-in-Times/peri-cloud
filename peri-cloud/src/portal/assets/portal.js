@@ -17,6 +17,13 @@ let inviteId = null;
 const errors = {
   account_limit: '个人数据超过服务限制，请缩短内容后再保存。',
   data_conflict: '记忆已由另一页面或 Agent 修改，请重新载入后合并你的修改。',
+  aggregate_invalid: '请检查协议、端点、模型、映射和分组。新增渠道需要密钥；新地址需要 HTTPS。',
+  aggregate_conflict: '配置已变更，请重新载入后编辑。',
+  aggregate_unknown: '操作结果待核实，请先检查渠道和操作记录；不要重复提交。',
+  aggregate_credentials: '聚合凭据被拒绝，请检查服务端管理或调用密钥。',
+  aggregate_rate_limited: '聚合请求已限流，请稍后重试。',
+  aggregate_rejected: 'New API 拒绝这项操作，请核对渠道配置和操作记录。',
+  aggregate_unavailable: 'New API 暂时无法完成请求，请检查聚合服务、管理凭据与参数。管理不需要调用模型。',
   invalid_model: '请检查模型名称；首次配置或切换供应商需要填写 API 密钥。',
   unauthorized: '登录信息无效或已过期，请重新登录。',
   forbidden: '当前账户无法完成这项操作。',
@@ -38,6 +45,15 @@ function show(view) {
   document.body.classList.toggle('workspace-mode', view === 'account');
   if (view !== visibleView) { window.scrollTo(0, 0); visibleView = view; }
 }
+function showSection() {
+  const panels=['topology-panel','activity-panel','device-panel','connections','account-settings','model-panel','admin-panel'];
+  let selected=window.location.hash.slice(1);
+  if(!panels.includes(selected)||byId(selected).hidden)selected='topology-panel';
+  for(const id of panels)byId(id).classList.toggle('route-hidden',id!==selected);
+  for(const link of byId('workspace-nav').querySelectorAll('a'))link.classList.toggle('active',link.hash==='#'+selected);
+}
+window.addEventListener('hashchange',()=>{showSection();window.scrollTo(0,0);});
+
 function notice(message) {
   for (const id of ['notice', 'confirmation-error']) {
     byId(id).textContent = message; byId(id).hidden = !message;
@@ -156,7 +172,7 @@ function renderAccount(data) {
   byId('pair-title').textContent = data.channels.length ? '让对话继续。' : '把聊天，接到工作台。';
   byId('pair-description').textContent = data.channels.length ? '聊天已经连接。你也可以关联其他账号，共用这个工作台。' : '关联你的 QQ 账号。之后，把想做的事直接告诉 Agent。';
   byId('pair-create').textContent = data.channels.length ? '关联其他账号' : '生成关联口令';
-  WorkspaceView.render(data, {api, action, confirm, openWorkspace, openInstanceWorkspace, openSavedResult, openInteraction});
+  WorkspaceView.render(data, {api, action, confirm, openWorkspace, openInstanceWorkspace, openSavedResult, openInteraction, openModelSelection:session=>ModelView.sessionModel(session), openTaskForm, cancelTask, openBrowserWorkspace});
   list('channels', data.channels, '还没有关联的聊天账号。', channel => item(
     (data.gateways || []).find(g => g.adapter === channel.adapter_instance_id)?.label || '聊天入口', channel.adapter_instance_id + '\n' + channel.external_user_id, '移除',
     () => confirm('移除聊天账号？', '这个聊天账号将无法再使用你的 Agent。电脑登录仍然保留。', channel.adapter_instance_id + '\n' + channel.external_user_id, () => api('/api/channels/revoke', channel)), true
@@ -167,7 +183,7 @@ function renderAccount(data) {
       () => api('/api/pairing/' + claim.claim_id + '/confirm', { allow: true }),
       () => api('/api/pairing/' + claim.claim_id + '/confirm', { allow: false }), '确认关联', '拒绝关联')
   ));
-  show('account');
+  show('account');showSection();
 }
 
 async function refresh() {
@@ -185,6 +201,7 @@ async function refresh() {
     ]);
     if (authEpoch !== epoch || !activeAccount || activeAccount.principal.id !== owner) return;
     WorkspaceView.sessions(...results.slice(0,3));
+    showSection();
     const personal = results[3].status === 'fulfilled' ? results[3].value : null;
     if (personal) {
       byId('usage-summary').textContent = '今日（UTC）：对话 ' + personal.usage.turns + ' / ' + personal.limits.daily_turns + '，模型请求 ' + personal.usage.model_requests + ' / ' + personal.limits.daily_model_requests + '；每人最多并行 ' + personal.limits.max_active_per_user + ' 个任务。';
@@ -254,12 +271,6 @@ function directoryPicker(instance, initial, history = []) {
       commands.append(button('选择此目录', async () => {
         input.value = listing.path; saved.value = '__manual__'; hint.textContent = '已选择：' + listing.path;
       }));
-      commands.append(button('设为设备默认', async () => {
-        const result = await api('/api/instances/' + instance.id + '/default-workspace', { workspace: listing.path });
-        instance.default_workspace = result.workspace;
-        saved.options[0].textContent = '此设备默认：' + result.workspace;
-        hint.textContent = '默认目录已保存，当前聊天会话不变。';
-      }));
       if (listing.next_offset !== null) commands.append(button('下一页目录', () => browse(listing.path, listing.next_offset)));
       if (offset) commands.append(button('第一页', () => browse(listing.path)));
     } catch (error) {
@@ -288,6 +299,32 @@ function openInstanceWorkspace(instance) {
   confirm('设备默认目录', instance.name + '。默认目录用于以后未指定路径的新会话，当前会话不变。', picker.root,
     () => api('/api/instances/' + instance.id + '/default-workspace', { workspace: picker.value() || instance.default_workspace }), undefined, '保存默认目录');
   picker.load();
+}
+
+function openBrowserWorkspace(device) {
+  const picker=directoryPicker(device,null);const request_id=crypto.randomUUID();
+  confirm('打开网页工作区',device.name+'。创建独立工作区与会话，使用默认工具权限；不会更改 QQ 会话的设备。',picker.root,async()=>{
+    const result=await api('/api/workspaces/open',{request_id,device_id:device.id,workspace:picker.value()});
+    window.history.replaceState(null,'','/?session='+encodeURIComponent(result.session_id)+'#activity-panel');
+  },undefined,'打开工作区');picker.load();
+}
+function openTaskForm(session) {
+  const form=document.createElement('form');form.className='task-form';
+  const label=document.createElement('label');label.textContent='任务目标与要求';
+  const input=document.createElement('textarea');input.rows=7;input.maxLength=32768;input.required=true;input.placeholder='说明目标、输入信息和需要遵守的限制。';label.append(input);form.append(label);
+  const hint=document.createElement('p');hint.className='subtle';hint.textContent='任务使用这条会话的工具权限；需要审批时将在待办中显示。提交后可关闭页面，任务仍由主控持有。';form.append(hint);
+  const request_id=crypto.randomUUID();
+  form.addEventListener('submit',event=>{event.preventDefault();byId('confirmation-allow').click();});
+  confirm('确认任务与执行目标',session.device_name+' · '+session.workspace+' · 会话 '+session.session_id,form,async()=>{
+    if(!form.reportValidity())throw new Error('请填写任务目标。');
+    await api('/api/conversations/'+session.session_id+'/tasks',{request_id,confirmed:true,prompt:input.value});
+    notice('任务已受理。状态、待办和结果会在这条会话中更新。');
+  },undefined,'确认提交任务');
+}
+function cancelTask(activity) {
+  confirm('请求取消这项任务？','取消请求不代表执行器已经停止，请继续检查任务状态。',activity.device_name+' · '+activity.workspace+' · '+activity.turn_id,async()=>{
+    await api('/api/conversations/'+activity.session_id+'/cancel',{turn_id:activity.turn_id,confirmed:true});
+  },undefined,'提交取消请求');
 }
 
 const toolLabels = { Read: '读取文件', Write: '写入文件', Edit: '编辑文件', Glob: '查找文件', Grep: '搜索内容', Bash: '运行命令' };
@@ -361,14 +398,15 @@ async function openSavedResult(session, page = 1, turn = null) {
   const result = await api('/api/conversations/' + encodeURIComponent(session) + '/result' + query);
   if (!result) { notice('这个聊天还没有已保存的任务结果。'); return; }
   const details = document.createElement('div');
-  const body = document.createElement('pre'); body.className = 'saved-result'; body.textContent = result.text;
+  const phase=document.createElement('p');phase.className='phase-label';phase.textContent='本轮状态：'+({completed:'对话已结束',interrupted:'已中断',failed:'任务失败',recovery_required:'结果待核实'}[result.turn_state]||result.turn_state);
+  const body = document.createElement('pre'); body.className = 'saved-result'; body.textContent = result.text || '本轮没有保存可展示的回复。请检查模型出口、执行设备和服务诊断。';
   const pager = document.createElement('div'); pager.className = 'actions';
   for (const [label, target] of [['上一页', page - 1], ['下一页', page + 1]]) {
     const button = document.createElement('button'); button.type = 'button'; button.className = 'quiet small'; button.textContent = label;
     button.disabled = target < 1 || target > result.page_count;
     button.addEventListener('click', () => action(button, () => openSavedResult(session, target, result.turn_id))); pager.append(button);
   }
-  details.append(body, pager);
+  details.append(phase, body, pager);
   confirm('已保存结果 · ' + result.page + ' / ' + result.page_count + ' 页',
     result.device_name + ' · ' + result.workspace + '。这里只查看已有结果。', details, undefined, undefined, '关闭', '返回', false);
 }
@@ -383,6 +421,7 @@ async function signIn(login, password) {
 
 function clearPersonal() {
   WorkspaceView.clear();
+  ModelView.clear();
   byId('gateway-policies').replaceChildren(); byId('gateway-panel').hidden = true;
   personalOwner = null; modelOwner = null; personalRevision = 0; inviteId = null;
   byId('personal-form').reset(); byId('model-form').reset();
@@ -410,12 +449,23 @@ async function loadModel() {
   byId('model-panel').hidden = !state.enabled;
   byId('model-nav').hidden = !state.enabled;
   if (!state.enabled) return;
+  if(state.aggregated){
+    try { await ModelView.load(owner,{api,action,confirm,owner:()=>activeAccount?.principal.id}); }
+    catch(error){modelOwner=null;throw error;}
+    return;
+  }
+  ModelView.clear();byId('model-form').hidden=false;byId('legacy-model-intro').hidden=false;
   const form = byId('model-form');
   form.elements.provider.replaceChildren(...state.providers.map(provider => {
     const option = document.createElement('option'); option.value = provider.id;
     option.textContent = provider.name; return option;
   }));
+  if(state.custom_endpoint_allowed){const option=document.createElement('option');option.value='@custom';option.textContent='自定义地址 / 协议';form.elements.provider.append(option);}
   form.elements.provider.value = state.choice ? state.choice.provider : state.providers[0].id;
+  const endpoint=byId('custom-model-endpoint');
+  const toggle=()=>{endpoint.hidden=form.elements.provider.value!=='@custom';form.elements.api_base.required=!endpoint.hidden;};
+  form.elements.provider.onchange=toggle;
+  form.elements.api_base.value=state.choice?.api_base||'';form.elements.protocol.value=state.choice?.protocol||'openai';toggle();
   form.elements.model.value = state.choice ? state.choice.model : state.default_model;
   form.elements.api_key.value = '';
   byId('model-current').textContent = state.choice ? state.choice.model + ' · 自有密钥' : state.default_model + ' · 服务默认';
@@ -434,7 +484,8 @@ byId('personal-reload').addEventListener('click', () => action(byId('personal-re
 byId('model-form').addEventListener('submit', event => {
   event.preventDefault(); const form = event.currentTarget;
   action(form.querySelector('button.primary'), async () => {
-    await api('/api/model', Object.fromEntries(new FormData(form)));
+    const fields=Object.fromEntries(new FormData(form));if(fields.provider!=='@custom'){delete fields.api_base;delete fields.protocol;}
+    await api('/api/model', fields);
     form.elements.api_key.value = ''; await loadModel(); notice('模型配置已保存，下轮对话生效。');
   });
 });

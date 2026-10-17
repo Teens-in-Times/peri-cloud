@@ -1,5 +1,6 @@
 //! Personal cloud agent host, independent of TUI and message channel.
 
+pub mod aggregation;
 mod assembly;
 mod core;
 pub mod gateway;

@@ -11,6 +11,7 @@ mod pairing;
 mod service;
 pub(crate) mod store;
 mod types;
+mod web;
 
 pub use clock::IdentityClock;
 pub use peri_acp_types::device_enrollment::{

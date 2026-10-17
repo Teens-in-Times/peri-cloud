@@ -5,7 +5,7 @@ use crate::gateway::{Delivery, DeliveryBody, DeliveryError};
 
 pub(super) fn payload(delivery: &Delivery) -> Result<(&'static str, Value), DeliveryError> {
     let text = match &delivery.body {
-        DeliveryBody::Reply { reply } => reply.text.clone(),
+        DeliveryBody::Reply { reply } => crate::gateway::plain_chat(&reply.text),
         DeliveryBody::Notice { text } => text.clone(),
         DeliveryBody::Menu { card } => {
             let page = crate::gateway::menu_view::page(card, delivery.delivery_id, 1)
