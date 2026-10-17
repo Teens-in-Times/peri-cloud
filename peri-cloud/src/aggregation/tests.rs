@@ -65,6 +65,7 @@ async fn respond(State(script): State<Arc<Script>>, request: Request) -> axum::r
         ("GET", "/api/channel/") => json!({"success":true,"data":{"items":[channel],"total":1}}),
         ("GET", "/api/channel/7") => json!({"success":true,"data":channel}),
         ("GET", "/api/group/") => json!({"success":true,"data":["default"]}),
+        ("GET", "/api/channel/test/7") => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         ("POST", "/api/channel/7/status") => {
             *script.status.lock() = script.calls.lock().last().unwrap().3["status"]
                 .as_i64()
@@ -401,6 +402,30 @@ async fn management_is_deterministic_redacted_owned_versioned_and_idempotent() {
             .count(),
         2,
         "unknown outcome must never replay"
+    );
+    let test_id = Uuid::new_v4();
+    let test = || ChannelCommand {
+        request_id: test_id,
+        confirmed: true,
+        action: ChannelAction::Test { id: 7, model: None },
+    };
+    assert!(matches!(
+        aggregate.channel_command(&owner_actor, test()).await,
+        Err(AggregateError::Unknown)
+    ));
+    assert!(matches!(
+        aggregate.channel_command(&owner_actor, test()).await,
+        Err(AggregateError::Unknown)
+    ));
+    assert_eq!(
+        script
+            .calls
+            .lock()
+            .iter()
+            .filter(|c| c.1 == "/api/channel/test/7")
+            .count(),
+        1,
+        "quota-consuming GET test must not be retried"
     );
     let audit = aggregate.audit(&owner_actor).await.unwrap().to_string();
     assert!(!audit.contains("FIXTURE"));

@@ -64,7 +64,8 @@ impl Client {
             .permits
             .try_acquire()
             .map_err(|_| AggregateError::Upstream("busy"))?;
-        let writing = method != Method::GET;
+        // New API's explicit test is a GET but can consume upstream quota.
+        let writing = method != Method::GET || path.starts_with("/api/channel/test/");
         let mut req = self
             .http
             .request(
@@ -96,7 +97,11 @@ impl Client {
             return Err(AggregateError::Upstream("redirect_rejected"));
         }
         if response.content_length().is_some_and(|n| n > 1024 * 1024) {
-            return Err(AggregateError::Upstream("response_too_large"));
+            return Err(if writing {
+                AggregateError::Unknown
+            } else {
+                AggregateError::Upstream("response_too_large")
+            });
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| {
@@ -107,7 +112,11 @@ impl Client {
             }
         })? {
             if bytes.len() + chunk.len() > 1024 * 1024 {
-                return Err(AggregateError::Upstream("response_too_large"));
+                return Err(if writing {
+                    AggregateError::Unknown
+                } else {
+                    AggregateError::Upstream("response_too_large")
+                });
             }
             bytes.extend_from_slice(&chunk);
         }
