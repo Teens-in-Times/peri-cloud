@@ -37,6 +37,7 @@ impl ActivityPhase {
 
 #[derive(Serialize)]
 pub struct ConversationActivity {
+    pub adapter: String,
     pub session_id: Uuid,
     pub device_id: Uuid,
     pub device_name: String,
@@ -140,6 +141,7 @@ impl Gateway {
             None => ActivityPhase::Idle,
         };
         Ok(ConversationActivity {
+            adapter: route.identity.adapter_instance_id.clone(),
             session_id: session,
             device_id: device.id,
             device_name: device.name.clone(),

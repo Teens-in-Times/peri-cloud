@@ -113,3 +113,7 @@ cargo clippy --locked -p peri-cloud -p peri-executor --all-targets --no-deps -- 
 参见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。第三方依赖保留各自许可证。公开仓库采用新的源码快照，未包含原开发目录的 Git 历史、个人配置、聊天记录、凭据或运行数据库。
 
 QQ 日常操作与交互审计：[QQ 优先交互说明](docs/qq-experience-audit-20261016.md)。
+
+网页信息层级：[运行拓扑与会话归属](docs/web-topology.md)。
+
+后续设计：[跨设备上下文、模型/API 与渐进式 Skill](docs/context-and-model-control-design-20261017.md)（方案，尚未实现）。

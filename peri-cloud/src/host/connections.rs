@@ -105,6 +105,16 @@ impl Connections {
 
 #[async_trait]
 impl SessionConnector for Connections {
+    async fn check_connection(&self, device: &DeviceRecord) -> GatewayResult<&'static str> {
+        if device.revoked {
+            return Err(GatewayError::Connection);
+        }
+        let client = self.client(device.id).await?;
+        if client.info().platform != device.platform {
+            return Err(GatewayError::Connection);
+        }
+        Ok(client.active_transport().await)
+    }
     async fn directories(
         &self,
         _principal: Uuid,

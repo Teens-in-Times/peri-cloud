@@ -16,6 +16,10 @@ use crate::CloudAgent;
 /// SSH login or bearer tokens. Existing frozen sessions must reopen unchanged.
 #[async_trait]
 pub trait SessionConnector: Send + Sync {
+    /// Read-only identity authentication, without opening a session or a job.
+    async fn check_connection(&self, _device: &DeviceRecord) -> GatewayResult<&'static str> {
+        Err(GatewayError::Connection)
+    }
     fn account_models(&self) -> Option<Arc<crate::models::AccountModels>> {
         None
     }
@@ -87,6 +91,22 @@ impl NativeSessionConnector {
 
 #[async_trait]
 impl SessionConnector for NativeSessionConnector {
+    async fn check_connection(&self, device: &DeviceRecord) -> GatewayResult<&'static str> {
+        let client = self
+            .clients
+            .read()
+            .get(&device.id)
+            .cloned()
+            .ok_or(GatewayError::Connection)?;
+        if device.revoked || client.info().platform != device.platform {
+            return Err(GatewayError::Connection);
+        }
+        client
+            .refresh_connection()
+            .await
+            .map_err(|_| GatewayError::Connection)?;
+        Ok(client.active_transport().await)
+    }
     fn account_models(&self) -> Option<Arc<crate::models::AccountModels>> {
         self.account_models.read().clone()
     }

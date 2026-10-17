@@ -44,7 +44,7 @@ struct Ownership {
 pub struct Gateway {
     runtime: Arc<CloudRuntime>,
     pub(super) identity: Arc<IdentityService>,
-    connector: Arc<dyn SessionConnector>,
+    pub(super) connector: Arc<dyn SessionConnector>,
     pub(super) adapters: HashMap<String, Arc<dyn MessageAdapter>>,
     pub(super) store: GatewayStore,
     hub: Arc<InteractionHub>,

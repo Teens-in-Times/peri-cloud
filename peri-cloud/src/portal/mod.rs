@@ -8,6 +8,7 @@ mod interactions;
 mod native;
 mod personal;
 mod security;
+mod topology;
 mod workspaces;
 
 use std::sync::Arc;
@@ -26,6 +27,7 @@ pub use security::PortalError;
 /// HTTPS is required except for literal loopback HTTP carried through SSH.
 #[derive(Clone)]
 pub struct PortalConfig {
+    pub(crate) service_name: String,
     pub(crate) origin: String,
     pub(crate) authority: String,
     pub(crate) secure: bool,
@@ -47,10 +49,18 @@ impl PortalConfig {
         }
         let origin = url.origin().ascii_serialization();
         Ok(Self {
+            service_name: "云端主控".into(),
             authority: origin.split_once("://").unwrap().1.to_owned(),
             origin,
             secure: url.scheme() == "https",
         })
+    }
+
+    pub fn with_service_name(mut self, name: Option<&str>) -> Self {
+        if let Some(name) = name {
+            self.service_name = name.to_owned();
+        }
+        self
     }
 
     pub(crate) fn session_cookie(&self) -> &'static str {
@@ -143,6 +153,7 @@ fn build_router(portal: Portal) -> Router {
     Router::new()
         .route("/", get(browser::page))
         .route("/portal.js", get(browser::javascript))
+        .route("/workspace.js", get(topology::javascript))
         .route("/portal.css", get(browser::stylesheet))
         .route("/api/status", get(browser::status))
         .route("/api/service/shutdown", post(interactions::shutdown))
@@ -171,6 +182,10 @@ fn build_router(portal: Portal) -> Router {
         .route("/api/model/reset", post(personal::reset_model))
         .route("/api/logout", post(browser::logout))
         .route("/api/account", get(browser::account))
+        .route(
+            "/api/instances/{id}/connection-check",
+            post(topology::check_connection),
+        )
         .route("/api/workspaces", get(workspaces::list))
         .route("/api/conversations", get(conversations::list))
         .route("/api/conversations/{id}/result", get(conversations::result))

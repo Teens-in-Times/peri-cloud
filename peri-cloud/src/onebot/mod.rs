@@ -132,6 +132,9 @@ impl OneBotAdapter {
 
 #[async_trait]
 impl MessageAdapter for OneBotAdapter {
+    fn display_name(&self) -> &'static str {
+        "个人 QQ"
+    }
     fn instance_id(&self) -> &str {
         &self.instance
     }

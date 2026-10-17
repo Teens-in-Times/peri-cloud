@@ -14,6 +14,8 @@ use crate::qq::{QqEndpoints, QqInteractionMode};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {
+    /// Human-readable control-plane label; never used as device identity.
+    pub display_name: Option<String>,
     pub state_dir: PathBuf,
     pub listen: SocketAddr,
     pub public_origin: String,
@@ -187,6 +189,11 @@ impl HostConfig {
     }
 
     pub fn validate(&self) -> HostResult<()> {
+        if self.display_name.as_ref().is_some_and(|name| {
+            name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control)
+        }) {
+            return Err(HostError::Configuration);
+        }
         if self.local_instance.is_some() && self.isolated_instance.is_some() {
             return Err(HostError::Configuration);
         }

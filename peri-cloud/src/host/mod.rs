@@ -55,8 +55,9 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
     config.validate()?;
     let bootstrap = config::credential(&config.bootstrap_env)?;
     let key = config::credential(&config.model.api_key_env)?;
-    let portal_config =
-        PortalConfig::new(&config.public_origin).map_err(|_| HostError::Configuration)?;
+    let portal_config = PortalConfig::new(&config.public_origin)
+        .map_err(|_| HostError::Configuration)?
+        .with_service_name(config.display_name.as_deref());
     let mut model = OpenAiConfig::new(config.model.api_base.clone(), key, &config.model.model)
         .with_max_tokens(config.model.max_tokens)
         .with_thinking_enabled(config.model.thinking_enabled)

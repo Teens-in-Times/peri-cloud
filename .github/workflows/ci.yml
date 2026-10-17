@@ -30,6 +30,19 @@ jobs:
       - name: Format
         if: runner.os == 'Windows'
         run: cargo +1.99.0 fmt --all -- --check
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: runner.os == 'Windows'
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: scripts/portal-ui/package-lock.json
+      - name: Portal DOM regression tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          npm ci --prefix scripts/portal-ui --ignore-scripts --no-audit --no-fund
+          $env:NODE_PATH = Join-Path $pwd 'scripts/portal-ui/node_modules'
+          node scripts/check-portal-ui.cjs
       - name: Cloud and executor regression tests
         if: runner.os == 'Windows'
         run: cargo +1.99.0 test --locked -p peri-cloud -p peri-executor -p peri-remote-tools -p peri-tool-runtime -p peri-process

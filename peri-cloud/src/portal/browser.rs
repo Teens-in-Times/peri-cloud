@@ -102,7 +102,13 @@ pub(super) async fn account(
     headers: HeaderMap,
 ) -> Result<Json<Value>, PortalError> {
     let actor = security::browser(&portal, &headers, false).await?;
+    let gateways = match &portal.gateway {
+        Some(gateway) => gateway.browser_gateways(&actor).await?,
+        None => Vec::new(),
+    };
     Ok(Json(json!({
+        "service": {"name":portal.config.service_name,"origin":portal.config.origin,"version":env!("CARGO_PKG_VERSION"),"agent_enabled":portal.gateway.is_some()},
+        "gateways": gateways,
         "principal": actor.principal(),
         "is_admin": portal.identity.is_admin(&actor).await?,
         "personal_data": portal.gateway.is_some(),

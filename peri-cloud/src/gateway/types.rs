@@ -186,6 +186,9 @@ pub enum DeliveryError {
 #[async_trait]
 pub trait MessageAdapter: Send + Sync {
     fn instance_id(&self) -> &str;
+    fn display_name(&self) -> &'static str {
+        "聊天入口"
+    }
     fn initial_access_policy(&self) -> super::access::AccessPolicy {
         super::access::AccessPolicy::default()
     }

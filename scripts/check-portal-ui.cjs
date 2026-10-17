@@ -1,0 +1,93 @@
+// Run with Node.js and jsdom on NODE_PATH. Exercises the actual embedded scripts.
+const fs = require('node:fs');
+const path = require('node:path');
+const assert = require('node:assert/strict');
+const {JSDOM} = require('jsdom');
+const assets = path.join(__dirname, '../peri-cloud/src/portal/assets');
+const dom = new JSDOM(fs.readFileSync(path.join(assets,'index.html'),'utf8'), {url:'http://127.0.0.1:8765',runScripts:'outside-only'});
+const w = dom.window;
+w.scrollTo = () => {}; w.setInterval = () => 0;
+w.HTMLDialogElement.prototype.showModal = function(){ this.open = true; };
+w.HTMLDialogElement.prototype.close = function(){ this.open = false; };
+const byId = id => w.document.getElementById(id);
+const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+const ok = value => ({ok:true,status:200,json:async()=>value});
+const denied = () => ({ok:false,status:401,json:async()=>({error:'unauthorized'})});
+const requests = [];
+let loggedIn = false;
+let delayedProbe = null;
+const malicious = '<img src=x onerror=alert(1)>';
+const owner = {
+  principal:{id:'owner',display_name:'Owner'},is_admin:true,personal_data:true,
+  service:{name:'Tokyo control',origin:'https://control.example',version:'fixture',agent_enabled:true},
+  gateways:[{adapter:'qq-fixture',label:'官方 QQBot',linked_identities:1}],
+  devices:[{id:'device-1',name:'Server B',platform:'linux',default_workspace:'/srv/project',is_local:true,revoked:false}],
+  channels:[{adapter_instance_id:'qq-fixture',external_user_id:'full-identity-'+malicious}],pending_pair_claims:[]
+};
+const sessions = [1,2].map(i=>({session_id:'session-'+i,device_id:'device-1',device_name:'Server B',platform:'linux',adapter:'qq-fixture',conversation_id:'group-'+i,workspace:'/srv/project-'+i,default_workspace:'/srv',known_workspaces:[],busy:false}));
+const activities = sessions.map(s=>({...s,phase:'idle',label:'空闲',permission:'默认',has_result:false}));
+const interactions = [{session_id:'session-2',request_id:'request-2',context:{kind:'Approval',items:[{}]}}];
+w.fetch = async (url, options) => {
+  requests.push({url,options});
+  if(url==='/api/status') return ok({initialized:true,csrf_cookie:'peri_csrf',service_control:true});
+  if(url==='/api/account') return loggedIn ? ok(owner) : denied();
+  if(url==='/api/model') return ok({enabled:true,providers:[{id:'p',name:'Provider'}],choice:null,default_model:'model-fixture'});
+  if(url==='/api/user-data') return {ok:false,status:503,json:async()=>({error:'identity_unavailable'})};
+  if(url==='/api/workspaces') return ok(sessions);
+  if(url==='/api/conversations') return ok(activities);
+  if(url==='/api/interactions') return ok(interactions);
+  if(url==='/api/logout') return ok({});
+  if(url.endsWith('/connection-check')) return delayedProbe ? delayedProbe : ok({device_id:'device-1',transport:'wireguard'});
+  throw new Error('Unexpected API: '+url);
+};
+w.document.cookie = 'peri_csrf=fixture';
+w.eval(fs.readFileSync(path.join(assets,'workspace.js'),'utf8'));
+w.eval(fs.readFileSync(path.join(assets,'portal.js'),'utf8')+'\nwindow.fixture={renderAccount,refresh,clearPersonal};');
+(async()=>{
+  await settle();
+  const ids = [...w.document.querySelectorAll('[id]')].map(n=>n.id);
+  assert.equal(new Set(ids).size,ids.length,'duplicate element IDs');
+  assert.equal(byId('model-panel').parentElement.id,'account');
+  assert.equal(byId('members-panel').parentElement.id,'admin-panel');
+  assert.equal(byId('personal-panel').parentElement.id,'account-settings');
+  for (const link of w.document.querySelectorAll('#workspace-nav a')) assert(byId(link.hash.slice(1)),'nav target exists');
+  loggedIn = true; await w.fixture.refresh();
+  assert.equal(byId('account').hidden,false,'settings failure must not log the user out');
+  assert.equal(byId('settings-error').hidden,false);
+  assert.equal(byId('service-name').textContent,'Tokyo control');
+  assert(byId('channels').textContent.includes('full-identity-'+malicious));
+  assert.equal(byId('channels').querySelectorAll('img').length,0);
+  assert.equal(requests.filter(r=>r.url.endsWith('/connection-check')).length,0,'enrollment is not a connection probe');
+  const details = byId('devices').querySelector('details'); details.open = true;
+  w.fixture.renderAccount(owner);
+  assert.equal(byId('devices').querySelector('details'),details,'polling must retain device details');
+  assert(details.open);
+  assert.equal(w.document.querySelectorAll('.conversation-card').length,2,'same device, distinct conversations');
+  assert.equal(w.document.querySelector('[data-session="session-1"] .session-interaction'),null);
+  assert(w.document.querySelector('[data-session="session-2"] .session-interaction'));
+  const view = w.WorkspaceView;
+  view.sessions({status:'rejected',reason:new Error('workspace unavailable')},{status:'fulfilled',value:activities},{status:'fulfilled',value:interactions});
+  assert.equal(w.document.querySelectorAll('.conversation-card').length,2,'partial failure keeps activity');
+  assert(byId('conversation-activity').textContent.includes('工作区操作未载入'));
+  const check = [...byId('devices').querySelectorAll('button')].find(b=>b.textContent==='检查连接');
+  check.click(); await settle();
+  assert(byId('devices').textContent.includes('已验证连接'));
+  assert(byId('devices').textContent.includes('WireGuard'));
+  assert.equal(byId('devices').querySelector('.connection-status').dataset.verified,'true');
+  let complete;
+  delayedProbe = new Promise(resolve => { complete = resolve; });
+  [...byId('devices').querySelectorAll('button')].find(b=>b.textContent==='检查连接').click();
+  await settle();
+  byId('logout').click(); await settle();
+  complete(ok({device_id:'device-1',transport:'wireguard'})); await settle();
+  assert.equal(byId('devices').children.length,0,'late probe must not restore logged-out data');
+  assert.equal(byId('conversation-activity').children.length,0);
+  assert.equal(byId('topology-entries').children.length,0);
+  assert.equal(byId('service-name').textContent,'');
+  assert.equal(byId('admin-panel').hidden,true);
+  w.fixture.renderAccount({...owner,principal:{id:'guest',display_name:'Guest'},is_admin:false,devices:[],channels:[],gateways:[]});
+  assert.equal(byId('admin-panel').hidden,true);
+  assert.equal(byId('admin-nav').hidden,true);
+  assert.equal(byId('service-controls').hidden,true);
+  console.log('PASS: topology, session ownership, partial failures, literal identities, explicit authenticated probes, logout races, member visibility');
+})().catch(error=>{ console.error(error); process.exitCode=1; }).finally(()=>w.close());

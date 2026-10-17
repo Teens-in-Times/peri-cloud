@@ -375,6 +375,9 @@ fn button(id: &str, label: &str, data: &str) -> Value {
 
 #[async_trait]
 impl MessageAdapter for QqAdapter {
+    fn display_name(&self) -> &'static str {
+        "官方 QQBot"
+    }
     fn initial_access_policy(&self) -> crate::gateway::access::AccessPolicy {
         crate::gateway::access::AccessPolicy::open()
     }

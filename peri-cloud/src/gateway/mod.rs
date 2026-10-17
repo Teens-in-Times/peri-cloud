@@ -8,7 +8,9 @@ mod menu_store;
 pub(crate) mod menu_view;
 mod router;
 pub(crate) mod store;
+mod topology;
 mod types;
+pub use topology::GatewayView;
 
 pub use connector::{NativeSessionConnector, SessionConnector};
 pub use router::{ConversationActivity, Gateway, SavedResultPage, WorkspaceSelection};

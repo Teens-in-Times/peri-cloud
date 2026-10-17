@@ -41,6 +41,8 @@ mod experience_tests;
 mod menu_detail_tests;
 #[path = "gateway/menus.rs"]
 mod menu_tests;
+#[path = "gateway/topology.rs"]
+mod topology_tests;
 #[path = "gateway/workspaces.rs"]
 mod workspace_tests;
 

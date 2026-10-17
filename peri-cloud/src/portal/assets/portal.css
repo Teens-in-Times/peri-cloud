@@ -22,3 +22,62 @@ textarea,select{display:block;width:100%;margin-top:8px;padding:11px 12px;font:i
 .question-option input { width: auto; margin-top: .25rem; flex: none; }
 .question-form textarea { width: 100%; }
 .saved-result { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 55vh; overflow-y: auto; }
+/* Account topology: entry -> cloud control -> execution devices. */
+.nav-count { margin-left: auto; font-size: 11px; color: var(--accent); }
+#account > section { scroll-margin-top: 100px; }
+.topology-flow { display: grid; grid-template-columns: 1fr 1.2fr 1fr; gap: 24px; margin: 24px 0; }
+.topology-node { position: relative; min-width: 0; padding: 20px; border: 1px solid var(--line); }
+.topology-node + .topology-node::before { content: '→'; position: absolute; left: -21px; top: 50%; transform: translateY(-50%); color: var(--accent); }
+.topology-node h3 { font-size: 19px; margin-bottom: 15px; }
+.topology-node p { margin-bottom: 8px; }
+.control-node { background: var(--wash); border-color: #ceb7a5; }
+.node-label { font-size: 10px; letter-spacing: 1px; color: var(--muted); }
+.node-value { font: 11px/1.8 ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+.topology-entry { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; overflow-wrap: anywhere; }
+.topology-entry strong { font-weight: 500; }
+.text-link { font-size: 11px; text-underline-offset: 4px; color: var(--accent); }
+.topology-caption { font-size: 12px; color: var(--muted); }
+.topology-panel .overview { margin: 20px 0 0; border-bottom: 0; }
+.topology-panel .overview > span { padding: 15px 12px; }
+.device-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.device-card, .conversation-card { min-width: 0; border: 1px solid var(--line); padding: 20px; }
+.device-card h3, .conversation-card h3 { font-size: 19px; margin: 0; overflow-wrap: anywhere; }
+.device-card .section-heading, .conversation-card .section-heading { margin-bottom: 12px; flex-wrap: wrap; gap: 10px; }
+.device-card .subtle { overflow-wrap: anywhere; }
+.device-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.device-actions button { white-space: normal; text-align: left; }
+.device-actions button:disabled { cursor: not-allowed; }
+.device-defaults, .device-identity { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.device-defaults summary, .device-identity summary { font-size: 11px; color: var(--muted); cursor: pointer; }
+.connection-status { font-size: 12px; }
+.connection-status[data-verified=true] { color: #476846; }
+.connection-status[data-verified=false], .load-error { color: #a24938; }
+.load-error { font-size: 12px; overflow-wrap: anywhere; }
+.conversation-list { display: grid; gap: 14px; }
+.conversation-source { font: 11px/1.8 ui-monospace, Consolas, monospace; overflow-wrap: anywhere; color: var(--muted); }
+.session-binding { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px 14px; font-size: 12px; margin: 16px 0; }
+.session-binding dt { color: var(--muted); }
+.session-binding dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.session-interaction { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; background: var(--wash); padding: 12px; margin-top: 12px; }
+#connections, #account-settings, #admin-panel { margin: 32px 0; }
+#connections > .section-heading, #account-settings > .section-heading, #admin-panel > .section-heading { margin-bottom: 10px; }
+#connections .connections-grid { margin-top: 20px; }
+#model-panel .section-heading { flex-wrap: wrap; gap: 12px; }
+@media (max-width: 1150px) {
+  .topology-flow { gap: 18px; }
+  .topology-node { padding: 14px; }
+  .topology-node + .topology-node::before { left: -17px; }
+  .device-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 800px) {
+  .topology-flow { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+  .topology-node + .topology-node::before { content: '↓'; left: 50%; top: -24px; transform: translateX(-50%); }
+}
+@media (max-width: 640px) {
+  html { scroll-padding-top: 125px; }
+  #account > section { scroll-margin-top: 125px; }
+  .device-card, .conversation-card { padding: 15px; }
+  .session-binding { grid-template-columns: 56px minmax(0, 1fr); gap: 8px; }
+  .page-heading { flex-wrap: wrap; }
+  #model-current { max-width: 100%; }
+}

@@ -11,6 +11,7 @@ let authorization = null;
 let visibleView = 'loading';
 let canStopService = false;
 let personalOwner = null;
+let modelOwner = null;
 let personalRevision = 0;
 let inviteId = null;
 const errors = {
@@ -128,18 +129,20 @@ byId('confirmation').addEventListener('cancel', () => { pendingDecision = null; 
 for (const link of byId('workspace-nav').querySelectorAll('a')) {
   link.addEventListener('click', () => {
     for (const sibling of byId('workspace-nav').querySelectorAll('a')) sibling.classList.toggle('active', sibling === link);
-    if (link.id === 'service-nav') byId('service-controls').open = true;
+    if (link.id === 'admin-nav') byId('admin-panel').hidden = false;
   });
 }
 
 function renderAccount(data) {
+  if (activeAccount && activeAccount.principal.id !== data.principal.id) { authEpoch += 1; clearPersonal(); }
   activeAccount = data;
   byId('logout').hidden = false;
   byId('service-controls').hidden = !canStopService || !data.is_admin;
-  byId('service-nav').hidden = !canStopService || !data.is_admin;
+  byId('admin-nav').hidden = !data.is_admin;
+  byId('admin-panel').hidden = !data.is_admin;
   byId('members-panel').hidden = !data.is_admin;
-  byId('members-nav').hidden = !data.is_admin;
-  byId('gateway-panel').hidden = !canStopService || !data.is_admin;
+
+  byId('gateway-panel').hidden = !data.service?.agent_enabled || !data.is_admin;
   if (!data.is_admin) byId('gateway-policies').replaceChildren();
   byId('personal-panel').hidden = !data.personal_data;
   if (authorization) {
@@ -153,13 +156,13 @@ function renderAccount(data) {
   byId('pair-title').textContent = data.channels.length ? '让对话继续。' : '把聊天，接到工作台。';
   byId('pair-description').textContent = data.channels.length ? '聊天已经连接。你也可以关联其他账号，共用这个工作台。' : '关联你的 QQ 账号。之后，把想做的事直接告诉 Agent。';
   byId('pair-create').textContent = data.channels.length ? '关联其他账号' : '生成关联口令';
-  list('devices', data.devices, '还没有登记的执行实例。', instanceItem);
+  WorkspaceView.render(data, {api, action, confirm, openWorkspace, openInstanceWorkspace, openSavedResult, openInteraction});
   list('channels', data.channels, '还没有关联的聊天账号。', channel => item(
-    channel.adapter_instance_id, shortIdentity(channel.external_user_id), '移除',
+    (data.gateways || []).find(g => g.adapter === channel.adapter_instance_id)?.label || '聊天入口', channel.adapter_instance_id + '\n' + channel.external_user_id, '移除',
     () => confirm('移除聊天账号？', '这个聊天账号将无法再使用你的 Agent。电脑登录仍然保留。', channel.adapter_instance_id + '\n' + channel.external_user_id, () => api('/api/channels/revoke', channel)), true
   ));
   list('claims', data.pending_pair_claims, '目前没有等待确认的请求。', claim => item(
-    '新的聊天账号关联', claim.identity.adapter_instance_id + ' · ' + shortIdentity(claim.identity.external_user_id), '查看并确认',
+    '新的聊天账号关联', claim.identity.adapter_instance_id + ' · ' + claim.identity.external_user_id, '查看并确认',
     () => confirm('确认关联这个聊天账号？', '关联后，这个账号可以选择并使用你的执行实例。请核对是不是你刚刚发送口令的账号。', claim.identity.adapter_instance_id + '\n' + claim.identity.external_user_id,
       () => api('/api/pairing/' + claim.claim_id + '/confirm', { allow: true }),
       () => api('/api/pairing/' + claim.claim_id + '/confirm', { allow: false }), '确认关联', '拒绝关联')
@@ -173,40 +176,25 @@ async function refresh() {
   refreshInFlight = epoch;
   try {
     renderAccount(await api('/api/account'));
-    if (activeAccount.personal_data) {
-      const personal = await api('/api/user-data');
-      byId('usage-summary').textContent = '今日（UTC）：对话 ' + personal.usage.turns + ' / ' + personal.limits.daily_turns + '；模型请求 ' + personal.usage.model_requests + ' / ' + personal.limits.daily_model_requests + '。每人最多并行 ' + personal.limits.max_active_per_user + ' 个任务。';
+    if (epoch !== authEpoch || authorization) return;
+    const owner = activeAccount.principal.id;
+    const results = await Promise.allSettled([
+      api('/api/workspaces'), api('/api/conversations'), api('/api/interactions'),
+      activeAccount.personal_data ? api('/api/user-data') : Promise.resolve(null),
+      modelOwner !== owner ? loadModel() : Promise.resolve()
+    ]);
+    if (authEpoch !== epoch || !activeAccount || activeAccount.principal.id !== owner) return;
+    WorkspaceView.sessions(...results.slice(0,3));
+    const personal = results[3].status === 'fulfilled' ? results[3].value : null;
+    if (personal) {
+      byId('usage-summary').textContent = '今日（UTC）：对话 ' + personal.usage.turns + ' / ' + personal.limits.daily_turns + '，模型请求 ' + personal.usage.model_requests + ' / ' + personal.limits.daily_model_requests + '；每人最多并行 ' + personal.limits.max_active_per_user + ' 个任务。';
       byId('personal-budget').textContent = '偏好与记忆合计最多 ' + personal.limits.max_user_data_bytes + ' 字节';
-      if (personalOwner !== activeAccount.principal.id) {
-        setPersonal(personal.data);
-        await loadModel();
-        personalOwner = activeAccount.principal.id;
-      }
+      if (personalOwner !== owner) { setPersonal(personal.data); personalOwner = owner; }
     }
-    const workspaces = await api('/api/workspaces');
-    const conversations = await api('/api/conversations');
-    list('conversation-activity', conversations, '还没有选定设备的聊天。先在 QQ 发送“菜单”选择设备。', conversation => {
-      const row = item(conversation.device_name + ' · ' + conversation.label,
-        shortIdentity(conversation.conversation_id) + '\n' + conversation.workspace + '\n权限：' + conversation.permission,
-        conversation.has_result ? '查看结果' : '', button => action(button, () => openSavedResult(conversation.session_id)));
-      row.dataset.phase = conversation.phase;
-      return row;
-    });
-    list('workspace-selections', workspaces, '还没有选择实例的聊天会话。在 QQ 发送“菜单”，点击选择实例即可。', selection => {
-      const row = item(selection.device_name + ' · ' + selection.adapter,
-        '会话 ' + shortIdentity(selection.conversation_id), '切换工作区', () => openWorkspace(selection));
-      const path = document.createElement('div'); path.className = 'workspace-path'; path.textContent = selection.workspace;
-      const status = document.createElement('p'); status.className = 'subtle'; status.textContent = selection.busy ? '任务运行中或执行结果待确认，暂时无法切换。' : '当前工作区 · 可以切换';
-      row.querySelector('.item-content').append(path, status);
-      row.querySelector('button').disabled = selection.busy;
-      return row;
-    });
-    const cards = await api('/api/interactions');
-    byId('pending-count').textContent = cards.length;
-    list('interactions', cards, '目前没有等待你处理的审批或问题。', card => item(
-      card.context.kind === 'Approval' ? '确认 ' + card.context.items.length + ' 项操作' : 'Agent 需要你的回答',
-      card.device_name + ' · ' + card.workspace, '查看', () => openInteraction(card)
-    ));
+    const settingsErrors = results.slice(3).flatMap(result => result.status === 'rejected' ? [result.reason.message] : []);
+    byId('settings-error').textContent = settingsErrors.join(' ');
+    byId('settings-error').hidden = settingsErrors.length === 0;
+    const cards = results[2].status === 'fulfilled' ? results[2].value : [];
     const requested = new URLSearchParams(window.location.search).get('approval');
     const card = cards.find(card => card.request_id === requested);
     if (card && !byId('confirmation').open && !authorization) {
@@ -214,10 +202,6 @@ async function refresh() {
     }
   }
   finally { if (refreshInFlight === epoch) refreshInFlight = null; }
-}
-
-function shortIdentity(value) {
-  const chars = Array.from(value); return chars.length > 18 ? chars.slice(0, 8).join('') + '…' + chars.slice(-6).join('') : value;
 }
 
 function directoryPicker(instance, initial, history = []) {
@@ -231,7 +215,7 @@ function directoryPicker(instance, initial, history = []) {
   };
   const label = element('label', '', '工作区目录');
   const saved = document.createElement('select'); saved.id = 'workspace-saved';
-  for (const [value,text] of [['', '默认（全局）：' + instance.default_workspace], ...history.map(p=>[p,p]), ['__manual__','指定其他目录…']]) {
+  for (const [value,text] of [['', '此设备默认：' + instance.default_workspace], ...history.map(p=>[p,p]), ['__manual__','指定其他目录…']]) {
     const option = document.createElement('option'); option.value = value; option.textContent = text; saved.append(option);
   }
   saved.value = history.includes(initial) ? initial : initial ? '__manual__' : '';
@@ -270,10 +254,10 @@ function directoryPicker(instance, initial, history = []) {
       commands.append(button('选择此目录', async () => {
         input.value = listing.path; saved.value = '__manual__'; hint.textContent = '已选择：' + listing.path;
       }));
-      commands.append(button('设为全局默认', async () => {
+      commands.append(button('设为设备默认', async () => {
         const result = await api('/api/instances/' + instance.id + '/default-workspace', { workspace: listing.path });
         instance.default_workspace = result.workspace;
-        saved.options[0].textContent = '默认（全局）：' + result.workspace;
+        saved.options[0].textContent = '此设备默认：' + result.workspace;
         hint.textContent = '默认目录已保存，当前聊天会话不变。';
       }));
       if (listing.next_offset !== null) commands.append(button('下一页目录', () => browse(listing.path, listing.next_offset)));
@@ -301,21 +285,9 @@ function openWorkspace(selection) {
 
 function openInstanceWorkspace(instance) {
   const picker = directoryPicker(instance, null);
-  confirm('实例默认工作区', instance.name + '。默认目录用于以后未指定路径的新会话，当前会话不变。', picker.root,
+  confirm('设备默认目录', instance.name + '。默认目录用于以后未指定路径的新会话，当前会话不变。', picker.root,
     () => api('/api/instances/' + instance.id + '/default-workspace', { workspace: picker.value() || instance.default_workspace }), undefined, '保存默认目录');
   picker.load();
-}
-
-function instanceItem(instance) {
-  const row = item(instance.name + (instance.revoked ? ' · 已撤销' : ''),
-    (instance.platform === 'windows' ? 'Windows' : 'Linux') + (instance.is_local ? ' · 管理员专用' : ' · 已登记执行器') + '\n默认（全局）：' + instance.default_workspace,
-    instance.revoked ? '' : '浏览 / 默认目录', () => openInstanceWorkspace(instance));
-  if (!instance.revoked && !instance.is_local) {
-    const revoke = document.createElement('button'); revoke.className = 'quiet danger small'; revoke.textContent = '撤销';
-    revoke.addEventListener('click', () => confirm('撤销实例连接？', '撤销后，该执行器需要重新登录。', instance.name, () => api('/api/devices/' + instance.id + '/revoke', {})));
-    row.querySelector('.item-title').append(revoke);
-  }
-  return row;
 }
 
 const toolLabels = { Read: '读取文件', Write: '写入文件', Edit: '编辑文件', Glob: '查找文件', Grep: '搜索内容', Bash: '运行命令' };
@@ -404,14 +376,15 @@ async function openSavedResult(session, page = 1, turn = null) {
 async function signIn(login, password) {
   authEpoch += 1; clearPersonal();
   await api('/api/login', { login, password });
-  personalOwner = null;
+  personalOwner = null; modelOwner = null;
   for (const form of [byId('login-form'), byId('setup-form'), byId('register-form')]) form.reset();
   await refresh();
 }
 
 function clearPersonal() {
+  WorkspaceView.clear();
   byId('gateway-policies').replaceChildren(); byId('gateway-panel').hidden = true;
-  personalOwner = null; personalRevision = 0; inviteId = null;
+  personalOwner = null; modelOwner = null; personalRevision = 0; inviteId = null;
   byId('personal-form').reset(); byId('model-form').reset();
   byId('invite-result').hidden = true; byId('invite-link').value = '';
   byId('pair-result').hidden = true; byId('pair-code').textContent = '';
@@ -429,8 +402,13 @@ function setPersonal(data) {
   byId('personal-form').elements.memory.value = data.memory;
 }
 async function loadModel() {
+  const owner = activeAccount?.principal.id;
+  const epoch = authEpoch;
   const state = await api('/api/model');
+  if (!owner || epoch !== authEpoch || activeAccount?.principal.id !== owner) return;
+  modelOwner = owner;
   byId('model-panel').hidden = !state.enabled;
+  byId('model-nav').hidden = !state.enabled;
   if (!state.enabled) return;
   const form = byId('model-form');
   form.elements.provider.replaceChildren(...state.providers.map(provider => {
@@ -441,6 +419,7 @@ async function loadModel() {
   form.elements.model.value = state.choice ? state.choice.model : state.default_model;
   form.elements.api_key.value = '';
   byId('model-current').textContent = state.choice ? state.choice.model + ' · 自有密钥' : state.default_model + ' · 服务默认';
+  byId('topology-model').textContent = '当前模型：' + (state.choice ? state.choice.model : state.default_model);
 }
 byId('personal-form').addEventListener('submit', event => {
   event.preventDefault(); const form = event.currentTarget;
