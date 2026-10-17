@@ -47,6 +47,24 @@ window.WorkspaceView = (() => {
     get('topology-model').textContent ||= '模型在主控调用';
     if (devicesChanged) renderDevices();
   }
+  function renameDevice(device) {
+    const root = node('div', '');
+    const label = node('label', '', '设备名称');
+    const input = document.createElement('input');
+    input.value = device.name; input.maxLength = 128; input.required = true;
+    label.append(input); root.append(label);
+    hooks.confirm('重命名设备', '云端名称用于聊天中的设备选择；执行器本地名称不会覆盖它。', root, async () => {
+      const name = input.value.trim();
+      if (!name) throw new Error('请输入设备名称。');
+      await hooks.api('/api/devices/' + device.id + '/rename', { name });
+    }, undefined, '保存');
+  }
+
+  function deleteDevice(device) {
+    hooks.confirm('删除设备记录？', '删除后这台设备不再出现在列表中；已保存的对话结果仍保留。设备上的执行器需要重新登录才能重新接入。', device.name,
+      () => hooks.api('/api/devices/' + device.id + '/delete', {}), undefined, '确认删除', '取消', true);
+  }
+
   function renderDevices() {
     const root = get('devices');
     const expanded = new Set([...root.querySelectorAll('details[open]')].map(detail => detail.parentElement.dataset.device + ':' + detail.className));
@@ -91,8 +109,12 @@ window.WorkspaceView = (() => {
         })));
         actions.append(command('新建网页工作区',button=>hooks.action(button,()=>hooks.openBrowserWorkspace(device))));
         actions.append(command('浏览 / 默认目录', () => hooks.openInstanceWorkspace(device)));
-        if (!device.is_local) actions.append(command('撤销', () => hooks.confirm('撤销设备连接？','撤销后需要重新登录才能继续使用。',device.name, () => hooks.api('/api/devices/' + device.id + '/revoke', {})), 'quiet danger small'));
+        if (!device.is_local) {
+          actions.append(command('重命名', () => renameDevice(device)));
+          actions.append(command('撤销', () => hooks.confirm('撤销设备连接？','撤销后需要重新登录才能继续使用。',device.name, () => hooks.api('/api/devices/' + device.id + '/revoke', {})), 'quiet danger small'));
+        }
       }
+      if (device.revoked && !device.is_local) actions.append(command('删除记录', () => deleteDevice(device), 'quiet danger small'));
       if (actions.firstElementChild) actions.firstElementChild.disabled = checked?.pending === true;
       const defaults = node('details','device-defaults'); defaults.append(node('summary','','新会话默认目录'),node('div','workspace-path',device.default_workspace));
       const identity = node('details','device-identity'); identity.append(node('summary','','设备标识'),node('div','workspace-path',device.id));

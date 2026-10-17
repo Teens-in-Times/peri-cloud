@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -372,5 +373,68 @@ async fn test_native_registration_failure_preserves_single_use_grant_for_retry()
     let receipt = client.register_saved().await.unwrap();
     assert_eq!(receipt.device.id, client.device().device_id);
     client.forget_local_login().await.unwrap();
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn connection_report_leases_loopback_endpoint_and_revocation_removes_token() {
+    let fixture = Fixture::new().await;
+    let device = tempfile::tempdir().unwrap();
+    let _executor = Executor::open(device.path(), "Report device")
+        .await
+        .unwrap();
+    let transport = std::fs::read_to_string(device.path().join("transport-token")).unwrap();
+    let client = LoginClient::new(&fixture.base, device.path(), "ignored-name", device.path())
+        .await
+        .unwrap();
+    let _cleanup = LoginCleanup(client.clone());
+    let pending = client.begin().await.unwrap();
+    fixture.consent(&pending, true).await;
+    let receipt = pending.finish(Duration::from_secs(2)).await.unwrap();
+
+    let endpoint: SocketAddr = "127.0.0.1:45678".parse().unwrap();
+    let report = client.report_connection(endpoint, 90).await.unwrap();
+    assert!(!report.connection_id.is_nil());
+    assert!(report.lease_expires_at > 0);
+
+    let db = fixture._root.path().join("cloud.sqlite");
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&db))
+            .await
+            .unwrap();
+    let (reported_endpoint, token_path): (String, String) =
+        sqlx::query_as("SELECT endpoint,token_path FROM device_connections WHERE device_id=?")
+            .bind(receipt.device.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reported_endpoint, endpoint.to_string());
+    assert_eq!(
+        std::fs::read_to_string(&token_path).unwrap().trim(),
+        transport.trim()
+    );
+
+    let response = fixture
+        .http
+        .post(format!(
+            "{}/api/devices/{}/revoke",
+            fixture.base, receipt.device.id
+        ))
+        .header("Origin", &fixture.base)
+        .header("Cookie", &fixture.cookies)
+        .header("X-Peri-CSRF", &fixture.csrf)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM device_connections WHERE device_id=?")
+            .bind(receipt.device.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+    assert!(!std::path::Path::new(&token_path).exists());
+    pool.close().await;
     fixture.close().await;
 }

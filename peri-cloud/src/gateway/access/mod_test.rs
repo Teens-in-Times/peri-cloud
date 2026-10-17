@@ -73,7 +73,7 @@ async fn schema_six_upgrade_keeps_account_data_and_adds_access_tables() {
         .fetch_one(&journal.identity_pool())
         .await
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert_eq!(
         journal.user_data(principal.id).await.unwrap().memory,
         "original memory"

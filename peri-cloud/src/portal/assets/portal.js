@@ -32,6 +32,7 @@ const errors = {
   stale_request: '这个请求已过期或已经处理，请刷新后查看。',
   access_conflict: '名单已被另一处修改，请载入最新名单后重试。',
   rate_limited: '操作过于频繁，请稍后再试。',
+  password_mismatch: '当前密码不正确。',
   invalid_request: '请检查填写的信息。',
   invalid_workspace: '请输入实例上的绝对路径，例如 Windows 的 C:\\Projects\\demo 或 Linux 的 /srv/demo。',
   workspace_busy: '当前任务仍在运行或执行结果未确认，请先等待完成，或在聊天中发送 /取消。',
@@ -49,7 +50,7 @@ function show(view) {
   if (view !== visibleView) { window.scrollTo(0, 0); visibleView = view; }
 }
 function showSection() {
-  const panels=['topology-panel','activity-panel','device-panel','connections','account-settings','model-panel','admin-panel'];
+  const panels=['topology-panel','web-chat','activity-panel','device-panel','connections','account-settings','model-panel','admin-panel'];
   let selected=window.location.hash.slice(1);
   if(!panels.includes(selected)||byId(selected).hidden)selected='topology-panel';
   for(const id of panels)byId(id).classList.toggle('route-hidden',id!==selected);
@@ -82,7 +83,7 @@ async function api(path, body) {
   const result = await response.json().catch(() => ({}));
   if (epoch !== authEpoch) throw new Error('登录账号已变更，请重新操作。');
   if (!response.ok) {
-    if (response.status === 401 && !['/api/login', '/api/setup', '/api/register'].includes(path)) {
+    if (response.status === 401 && !['/api/login', '/api/setup', '/api/register', '/api/recover'].includes(path)) {
       authEpoch += 1;
       clearPersonal(); activeAccount = null;
       byId('logout').hidden = true;
@@ -153,8 +154,13 @@ for (const link of byId('workspace-nav').querySelectorAll('a')) {
 }
 
 function renderAccount(data) {
-  if (activeAccount && activeAccount.principal.id !== data.principal.id) { authEpoch += 1; clearPersonal(); }
+  if (activeAccount && activeAccount.principal.id !== data.principal.id) {
+    authEpoch += 1; clearPersonal();
+    webCursor = 0; webRendered = 0; webDeviceSignature = '';
+    byId('web-messages').replaceChildren();
+  }
   activeAccount = data;
+  byId('web-chat').hidden = !data.service?.agent_enabled;
   byId('logout').hidden = false;
   byId('service-controls').hidden = !canStopService || !data.is_admin;
   byId('admin-nav').hidden = !data.is_admin;
@@ -164,6 +170,7 @@ function renderAccount(data) {
   byId('gateway-panel').hidden = !data.service?.agent_enabled || !data.is_admin;
   if (!data.is_admin) byId('gateway-policies').replaceChildren();
   byId('personal-panel').hidden = !data.personal_data;
+  byId('security-controls').hidden = false;
   if (authorization) {
     byId('consent-device').textContent = authorization.device_name;
     byId('consent-owner').textContent = data.principal.display_name;
@@ -570,12 +577,147 @@ for (const [id, allow] of [['consent-allow', true], ['consent-deny', false]]) {
   }));
 }
 
+byId('recover-open').addEventListener('click', () => {
+  byId('login-form').hidden = true; byId('recover-open').hidden = true;
+  byId('recover-form').hidden = false; byId('entry-title').textContent = '重置账户密码';
+  byId('recover-form').elements.bootstrap_token.focus();
+});
+byId('recover-cancel').addEventListener('click', () => {
+  byId('recover-form').hidden = true; byId('login-form').hidden = false;
+  byId('recover-open').hidden = false; byId('entry-title').textContent = '登录你的云 Agent';
+});
+byId('recover-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type=submit]');
+  const fields = Object.fromEntries(new FormData(form));
+  if (fields.new_password !== fields.new_password_confirm) { notice('两次输入的新密码不一致。'); return; }
+  delete fields.new_password_confirm;
+  action(button, async () => {
+    await api('/api/recover', fields);
+    form.reset(); form.hidden = true; byId('login-form').hidden = false;
+    byId('recover-open').hidden = false; byId('entry-title').textContent = '登录你的云 Agent';
+    notice('密码已重置，请使用新密码登录。');
+  });
+});
+byId('password-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type=submit]');
+  const fields = Object.fromEntries(new FormData(form));
+  if (fields.new_password !== fields.new_password_confirm) { notice('两次输入的新密码不一致。'); return; }
+  action(button, async () => {
+    await api('/api/account/password', { current_password: fields.current_password, new_password: fields.new_password });
+    form.reset(); notice('密码已更新，其他浏览器会话已退出。');
+  });
+});
+
+let webCursor = 0;
+let webRendered = 0;
+let webLoading = false;
+let webDeviceSignature = '';
+
+function webPhaseLabel(phase) {
+  return ({
+    running: '任务执行中', waiting_approval: '等待你审批', waiting_answer: '等待你回答',
+    cancelling: '正在取消', needs_attention: '结果待核实', idle: '可以继续对话'
+  })[phase] || '';
+}
+
+async function loadWebChat(reset) {
+  if (!activeAccount || !activeAccount.service?.agent_enabled || webLoading) return;
+  webLoading = true;
+  try {
+    const chat = await api('/api/web/chat' + (reset ? '' : '?after=' + webCursor));
+    renderWebChat(chat, reset);
+  } catch (error) {
+    byId('web-hint').textContent = error.message;
+  } finally {
+    webLoading = false;
+  }
+}
+
+function renderWebChat(chat, reset) {
+  byId('web-chat').hidden = false;
+  byId('web-phase').textContent = webPhaseLabel(chat.phase);
+  byId('web-hint').textContent = chat.needs_device
+    ? '请选择一个执行设备与目录。'
+    : (chat.device_name || '') + (chat.workspace ? ' · ' + chat.workspace : '');
+  const select = byId('web-device');
+  const signature = chat.devices.map(device => device.id + ':' + device.connection).join(',');
+  if (signature !== webDeviceSignature) {
+    webDeviceSignature = signature;
+    select.replaceChildren();
+    for (const device of chat.devices) {
+      const option = document.createElement('option');
+      option.value = device.id;
+      option.textContent = device.name + (device.connection === 'online' ? ' · 在线' : device.connection === 'offline' ? ' · 离线' : '');
+      select.append(option);
+    }
+    if (chat.device_id) select.value = chat.device_id;
+    byId('web-workspace').value = chat.workspace || (chat.devices[0]?.default_workspace || '');
+    select.disabled = !chat.devices.length;
+    byId('web-select').disabled = !chat.devices.length;
+  }
+  const log = byId('web-messages');
+  if (reset) { log.replaceChildren(); webRendered = 0; }
+  for (const message of chat.messages) {
+    if (message.seq <= webRendered) continue;
+    webRendered = message.seq;
+    const row = document.createElement('div');
+    row.className = 'web-message ' + message.role;
+    const meta = document.createElement('span');
+    meta.className = 'web-message-meta';
+    meta.textContent = message.role === 'user' ? '你' : message.role === 'assistant' ? 'Agent' : '系统';
+    const body = document.createElement('p');
+    body.textContent = message.text;
+    row.append(meta, body);
+    if (message.card) {
+      const hint = document.createElement('p');
+      hint.className = 'subtle';
+      hint.textContent = '审批 / 回答请在工作台处理。';
+      row.append(hint);
+    }
+    log.append(row);
+  }
+  webCursor = chat.cursor;
+  log.scrollTop = log.scrollHeight;
+}
+
+byId('web-select').addEventListener('click', () => {
+  const button = byId('web-select');
+  action(button, async () => {
+    const device_id = byId('web-device').value;
+    if (!device_id) throw new Error('请选择执行设备。');
+    await api('/api/web/chat/select', { device_id, workspace: byId('web-workspace').value });
+    await loadWebChat(true);
+  });
+});
+byId('web-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const input = byId('web-input');
+  const text = input.value.trim();
+  if (!text) return;
+  action(form.querySelector('button[type=submit]'), async () => {
+    await api('/api/web/chat/messages', { text });
+    input.value = '';
+    await loadWebChat(false);
+  });
+});
+setInterval(() => {
+  if (activeAccount && !document.hidden) loadWebChat(false);
+}, 2000);
+
 async function start() {
   const state = await api('/api/status'); csrfCookie = state.csrf_cookie;
   canStopService = state.service_control === true;
   byId('setup-form').hidden = state.initialized;
   byId('login-form').hidden = !state.initialized;
   byId('register-entry').hidden = !state.initialized;
+  byId('recover-open').hidden = !state.initialized;
+  byId('recover-form').hidden = true;
+  byId('security-controls').hidden = true;
   const invite = new URLSearchParams(window.location.hash.slice(1)).get('invite');
   if (invite && /^[a-f0-9]{64}$/.test(invite)) {
     byId('register-entry').open = true;

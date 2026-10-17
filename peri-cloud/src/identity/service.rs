@@ -40,6 +40,40 @@ impl IdentityService {
         if bootstrap_token.len() < 32 {
             return Err(IdentityError::Invalid);
         }
+        // Best-effort retention cleanup. Retired tokens reference grants, so
+        // they are removed before the expired grant rows.
+        let now = clock.unix_seconds();
+        let pool = journal.identity_pool();
+        if let Err(error) = sqlx::query("DELETE FROM native_codes WHERE expires_at<?")
+            .bind(now.saturating_sub(86_400))
+            .execute(&pool)
+            .await
+        {
+            tracing::warn!(component = "identity", %error, "could not prune expired native codes");
+        }
+        if let Err(error) = sqlx::query(
+            "DELETE FROM retired_refresh_tokens WHERE grant_id IN (SELECT id FROM native_grants WHERE refresh_expires<?)",
+        )
+        .bind(now.saturating_sub(30 * 86_400))
+        .execute(&pool)
+        .await
+        {
+            tracing::warn!(component = "identity", %error, "could not prune retired refresh tokens");
+        }
+        if let Err(error) = sqlx::query("DELETE FROM native_grants WHERE refresh_expires<?")
+            .bind(now.saturating_sub(30 * 86_400))
+            .execute(&pool)
+            .await
+        {
+            tracing::warn!(component = "identity", %error, "could not prune expired native grants");
+        }
+        if let Err(error) = sqlx::query("DELETE FROM pair_codes WHERE expires_at<?")
+            .bind(now.saturating_sub(86_400))
+            .execute(&pool)
+            .await
+        {
+            tracing::warn!(component = "identity", %error, "could not prune expired pair codes");
+        }
         Ok(Arc::new(Self {
             local_instance: parking_lot::RwLock::new(None),
             connections: ConnectionStore::new(journal.identity_pool(), journal.state_dir()),
@@ -296,6 +330,190 @@ impl IdentityService {
         tx.commit().await?;
         ConnectionStore::remove_token(token);
         Ok(())
+    }
+
+    /// Rename is cloud-owned metadata; a later executor registration must not
+    /// overwrite it.
+    pub async fn rename_device(
+        &self,
+        actor: &Authenticated,
+        device: Uuid,
+        name: &str,
+    ) -> IdentityResult<DeviceRecord> {
+        self.browser_scope(actor).await?;
+        let name = name.trim();
+        if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+            return Err(IdentityError::Invalid);
+        }
+        let mut tx = self.pool.begin().await?;
+        let row =
+            sqlx::query("SELECT record_json FROM identity_devices WHERE id=? AND principal=?")
+                .bind(device.to_string())
+                .bind(actor.principal.id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(IdentityError::Forbidden)?;
+        let mut record: DeviceRecord = serde_json::from_str(row.get("record_json"))?;
+        if record.is_local {
+            return Err(IdentityError::Forbidden);
+        }
+        record.name = name.to_owned();
+        sqlx::query("UPDATE identity_devices SET record_json=? WHERE id=?")
+            .bind(serde_json::to_string(&record)?)
+            .bind(device.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    /// Hard-delete only a revoked device record. Conversation history and saved
+    /// results stay readable; the executor must re-authorize to attach again.
+    pub async fn delete_device(&self, actor: &Authenticated, device: Uuid) -> IdentityResult<()> {
+        self.browser_scope(actor).await?;
+        let mut tx = self.pool.begin().await?;
+        let row =
+            sqlx::query("SELECT record_json FROM identity_devices WHERE id=? AND principal=?")
+                .bind(device.to_string())
+                .bind(actor.principal.id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(IdentityError::Forbidden)?;
+        let record: DeviceRecord = serde_json::from_str(row.get("record_json"))?;
+        if !record.revoked || record.is_local {
+            return Err(IdentityError::Invalid);
+        }
+        let token = self
+            .connections
+            .take_for_delete(&mut tx, device, actor.principal.id)
+            .await?;
+        sqlx::query("DELETE FROM retired_refresh_tokens WHERE grant_id IN (SELECT id FROM native_grants WHERE device_id=? AND principal=?)")
+            .bind(device.to_string())
+            .bind(actor.principal.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM native_grants WHERE device_id=? AND principal=?")
+            .bind(device.to_string())
+            .bind(actor.principal.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM native_codes WHERE device_id=? AND principal=?")
+            .bind(device.to_string())
+            .bind(actor.principal.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM instance_defaults WHERE principal=? AND device_id=?")
+            .bind(actor.principal.id.to_string())
+            .bind(device.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM identity_devices WHERE id=? AND principal=?")
+            .bind(device.to_string())
+            .bind(actor.principal.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        ConnectionStore::remove_token(token);
+        Ok(())
+    }
+
+    /// Change the password while signed in. Other browser sessions are closed;
+    /// device grants are account-owned and remain until explicitly revoked.
+    pub async fn change_password(
+        &self,
+        actor: &Authenticated,
+        current: String,
+        new: String,
+    ) -> IdentityResult<()> {
+        self.browser_scope(actor).await?;
+        if !(12..=1024).contains(&new.len()) || current.len() > 1024 {
+            return Err(IdentityError::Invalid);
+        }
+        self.rate_limit(&format!("password-change:{}", actor.principal.id), 5, 60)
+            .await?;
+        let permit = self
+            .password_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| IdentityError::Crypto)?;
+        let encoded = sqlx::query("SELECT password_hash FROM principals WHERE id=?")
+            .bind(actor.principal.id.to_string())
+            .fetch_one(&self.pool)
+            .await?
+            .get::<String, _>("password_hash");
+        if !verify_password(current, encoded, permit).await? {
+            return Err(IdentityError::PasswordMismatch);
+        }
+        let permit = self
+            .password_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| IdentityError::Crypto)?;
+        let encoded = password_hash(new, Some(permit)).await?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE principals SET password_hash=? WHERE id=?")
+            .bind(encoded)
+            .bind(actor.principal.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM browser_sessions WHERE principal=? AND token_hash<>?")
+            .bind(actor.principal.id.to_string())
+            .bind(&actor.credential_hash)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Operator recovery using the deployment bootstrap token. This is the
+    /// private deployment's root-of-trust reset path; it closes every browser
+    /// session but leaves device grants intact.
+    pub async fn reset_password(
+        &self,
+        bootstrap: &str,
+        login: &str,
+        new: String,
+    ) -> IdentityResult<Principal> {
+        if bootstrap.len() > 8192 || !equal(&self.bootstrap_hash, &hash("bootstrap", bootstrap)) {
+            return Err(IdentityError::Unauthorized);
+        }
+        if !self.initialized().await? {
+            return Err(IdentityError::Unauthorized);
+        }
+        if !(12..=1024).contains(&new.len()) {
+            return Err(IdentityError::Invalid);
+        }
+        self.rate_limit("recover", 4, 60).await?;
+        let normalized = normalized_login(login).map_err(|_| IdentityError::Unauthorized)?;
+        self.rate_limit(&format!("recover:{normalized}"), 4, 60)
+            .await?;
+        let permit = self
+            .password_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| IdentityError::Crypto)?;
+        let encoded = password_hash(new, Some(permit)).await?;
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT id,login,display_name FROM principals WHERE login=?")
+            .bind(&normalized)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(IdentityError::Unauthorized)?;
+        let principal = principal_from_row(&row)?;
+        sqlx::query("UPDATE principals SET password_hash=? WHERE id=?")
+            .bind(encoded)
+            .bind(principal.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM browser_sessions WHERE principal=?")
+            .bind(principal.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(principal)
     }
 
     pub(crate) async fn rate_limit(

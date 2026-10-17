@@ -14,7 +14,8 @@ use crate::CloudAgent;
 
 /// Deployment-observed transport state. Enrollment is never evidence of a
 /// live executor; `NotConfigured` and `Offline` stay distinct.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeviceReachability {
     #[default]
     Unknown,

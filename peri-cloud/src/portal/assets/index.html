@@ -20,12 +20,13 @@
   <nav id="workspace-nav" class="workspace-nav" aria-label="工作台导航" hidden>
     <p class="nav-caption">我的工作台</p>
     <a href="#topology-panel" class="active"><span class="nav-index">01</span>运行拓扑</a>
-    <a href="#activity-panel"><span class="nav-index">02</span>会话与任务<span id="pending-count" class="nav-count">0</span></a>
-    <a href="#device-panel"><span class="nav-index">03</span>执行设备</a>
-    <a href="#connections"><span class="nav-index">04</span>聊天入口</a>
-    <a href="#account-settings"><span class="nav-index">05</span>我的设置</a>
-    <a id="model-nav" href="#model-panel" hidden><span class="nav-index">06</span>模型与 API</a>
-    <a id="admin-nav" href="#admin-panel" hidden><span class="nav-index">07</span>服务管理</a>
+    <a href="#web-chat"><span class="nav-index">02</span>对话</a>
+    <a href="#activity-panel"><span class="nav-index">03</span>会话与任务<span id="pending-count" class="nav-count">0</span></a>
+    <a href="#device-panel"><span class="nav-index">04</span>执行设备</a>
+    <a href="#connections"><span class="nav-index">05</span>聊天入口</a>
+    <a href="#account-settings"><span class="nav-index">06</span>我的设置</a>
+    <a id="model-nav" href="#model-panel" hidden><span class="nav-index">07</span>模型与 API</a>
+    <a id="admin-nav" href="#admin-panel" hidden><span class="nav-index">08</span>服务管理</a>
     <p class="nav-note">聊天把任务交给主控。<br>主控在选定设备执行工具。</p>
   </nav>
   <main>
@@ -40,6 +41,15 @@
         <label>用户名<input name="login" autocomplete="username" required maxlength="64" placeholder="你的用户名"></label>
         <label>密码<input name="password" type="password" autocomplete="current-password" required maxlength="1024" placeholder="输入你的密码"></label>
         <button type="submit" class="primary">进入工作台</button>
+      </form>
+      <button id="recover-open" type="button" class="quiet small entry-link" hidden>忘记密码？</button>
+      <form id="recover-form" class="panel" hidden>
+        <label>初始化口令<input name="bootstrap_token" type="password" autocomplete="off" required minlength="32" maxlength="8192" placeholder="部署时设置的初始化口令"></label>
+        <label>用户名<input name="login" autocomplete="username" required maxlength="64" placeholder="你的用户名"></label>
+        <label>新密码<input name="new_password" type="password" autocomplete="new-password" required minlength="12" maxlength="1024" placeholder="至少 12 个字符"></label>
+        <label>确认新密码<input name="new_password_confirm" type="password" autocomplete="new-password" required minlength="12" maxlength="1024" placeholder="再输入一次新密码"></label>
+        <button type="submit" class="primary">重置密码</button>
+        <button id="recover-cancel" type="button" class="quiet">返回登录</button>
       </form>
       <details id="register-entry" class="panel" hidden><summary>持有邀请口令？创建自己的账号</summary>
         <form id="register-form">
@@ -81,6 +91,17 @@
         <p class="topology-caption">一个主控连接多个执行器。每条聊天会话选择自己的设备、工作区与权限；主控与执行器也可以位于同一台服务器。</p>
         <div class="overview" aria-label="账号资源"><span><strong id="channel-count">0</strong>个关联身份</span><span><strong id="device-count">0</strong>台已登记设备</span><span><strong id="session-count">0</strong>条当前会话</span></div>
       </section>
+      <section id="web-chat" class="panel" hidden>
+        <div class="section-heading"><h2>和 Agent 对话</h2><span id="web-phase" class="pill"></span></div>
+        <p id="web-hint" class="subtle"></p>
+        <div class="web-chat-controls">
+          <label>执行设备<select id="web-device"></select></label>
+          <label>工作目录<input id="web-workspace" maxlength="4096"></label>
+          <button id="web-select" type="button" class="quiet small">使用这个设备与目录</button>
+        </div>
+        <div id="web-messages" class="web-messages" role="log" aria-live="polite"></div>
+        <form id="web-form"><label>消息<textarea id="web-input" rows="3" maxlength="32768" required placeholder="直接交代任务。审批仍由右侧工作台处理。"></textarea></label><div class="actions"><button type="submit" class="primary">发送</button></div></form>
+      </section>
       <section id="activity-panel" class="panel"><div class="section-heading"><h2>会话与任务</h2><span class="pill">共享主控状态</span></div><p class="subtle">工作区、工具权限、待办和结果都属于具体会话。修改一条会话不会改变其他聊天的执行目标。</p><div id="approval-panel"><div id="interactions" class="items"></div></div><div id="conversation-activity" class="conversation-list"></div></section>
       <section id="device-panel" class="panel"><div class="section-heading"><h2>执行设备</h2><span class="pill">账号设备池</span></div><p class="subtle">这里管理设备本身和新会话使用的默认目录。连接检查只验证身份与通路，不执行任务；检查结果仅代表所示时刻。</p><div id="devices" class="device-grid"></div></section>
       <section id="connections" aria-labelledby="connections-title"><div class="section-heading"><h2 id="connections-title">聊天入口与我的关联</h2></div><p class="subtle">入口由云端主控接入，你的聊天身份通过关联后共用这个账号的设备。入口规则与账号关联分别管理。</p>
@@ -104,6 +125,7 @@
         <p id="settings-error" class="load-error" role="status" hidden></p>
         <p id="usage-summary" class="subtle"></p>
       </section>
+      <details id="security-controls" class="panel" hidden><summary>账户安全</summary><form id="password-form" class="password-form"><p class="subtle">修改后其他浏览器会话会退出；已授权设备不受影响。</p><label>当前密码<input name="current_password" type="password" autocomplete="current-password" required maxlength="1024"></label><label>新密码<input name="new_password" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label><label>确认新密码<input name="new_password_confirm" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label><button type="submit" class="quiet small">修改密码</button></form></details>
       </section>
       <section id="model-panel" class="panel" hidden>
         <div class="section-heading"><h2>模型与 API</h2><span id="model-current" class="pill"></span></div>

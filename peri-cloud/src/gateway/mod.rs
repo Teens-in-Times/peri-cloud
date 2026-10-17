@@ -12,13 +12,17 @@ mod router;
 pub(crate) mod store;
 mod topology;
 mod types;
+mod web_chat;
 mod web_entry;
 pub use topology::GatewayView;
-pub(crate) use web_entry::{WebAdapter, WEB_ADAPTER};
+pub use web_chat::{WebChat, WebDevice, WebMessage, WebSendResult};
+pub use web_entry::WebAdapter;
+pub(crate) use web_entry::WEB_ADAPTER;
 
 pub use connector::{DeviceReachability, NativeSessionConnector, SessionConnector};
 pub use router::{
-    CommandReceipt, ConversationActivity, Gateway, SavedResultPage, TaskReceipt, WorkspaceSelection,
+    ActivityPhase, CommandReceipt, ConversationActivity, Gateway, SavedResultPage, TaskReceipt,
+    WorkspaceSelection,
 };
 pub use types::{
     ChannelRoute, Delivery, DeliveryBody, DeliveryError, GatewayReceipt, InboundMessage,

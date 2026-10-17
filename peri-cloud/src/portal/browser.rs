@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{security, Portal, PortalError};
-use crate::identity::ChannelIdentity;
+use crate::identity::{ChannelIdentity, DeviceRecord};
 
 pub(super) async fn page() -> Html<&'static str> {
     Html(include_str!("assets/index.html"))
@@ -131,6 +131,78 @@ pub(super) async fn revoke_device(
 ) -> Result<Json<Value>, PortalError> {
     let actor = security::browser(&portal, &headers, true).await?;
     portal.identity.revoke_device(&actor, id).await?;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ChangePassword {
+    current_password: String,
+    new_password: String,
+}
+
+pub(super) async fn change_password(
+    State(portal): State<Portal>,
+    headers: HeaderMap,
+    Json(input): Json<ChangePassword>,
+) -> Result<Json<Value>, PortalError> {
+    let actor = security::browser(&portal, &headers, true).await?;
+    portal
+        .identity
+        .change_password(&actor, input.current_password, input.new_password)
+        .await?;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Recover {
+    bootstrap_token: String,
+    login: String,
+    new_password: String,
+}
+
+/// Operator password recovery. The deployment bootstrap token is the private
+/// root of trust; no public email or reset link is exposed.
+pub(super) async fn recover(
+    State(portal): State<Portal>,
+    Json(input): Json<Recover>,
+) -> Result<Json<Value>, PortalError> {
+    let principal = portal
+        .identity
+        .reset_password(&input.bootstrap_token, &input.login, input.new_password)
+        .await?;
+    Ok(Json(json!({"principal": principal})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RenameDevice {
+    name: String,
+}
+
+pub(super) async fn rename_device(
+    State(portal): State<Portal>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(input): Json<RenameDevice>,
+) -> Result<Json<DeviceRecord>, PortalError> {
+    let actor = security::browser(&portal, &headers, true).await?;
+    Ok(Json(
+        portal
+            .identity
+            .rename_device(&actor, id, &input.name)
+            .await?,
+    ))
+}
+
+pub(super) async fn delete_device(
+    State(portal): State<Portal>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, PortalError> {
+    let actor = security::browser(&portal, &headers, true).await?;
+    portal.identity.delete_device(&actor, id).await?;
     Ok(Json(json!({"ok": true})))
 }
 

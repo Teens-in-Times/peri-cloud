@@ -1,19 +1,5 @@
 use super::*;
 
-pub(super) struct WebEntry;
-#[async_trait]
-impl MessageAdapter for WebEntry {
-    fn instance_id(&self) -> &str {
-        "__peri_web"
-    }
-    fn initial_access_policy(&self) -> peri_cloud::gateway::access::AccessPolicy {
-        peri_cloud::gateway::access::AccessPolicy::open()
-    }
-    async fn deliver(&self, _: &Delivery) -> Result<(), DeliveryError> {
-        panic!("browser tasks must not fabricate platform delivery")
-    }
-}
-
 #[tokio::test]
 async fn browser_and_chat_share_task_admission_approval_results_and_idempotence() {
     let f = Fixture::new_for(

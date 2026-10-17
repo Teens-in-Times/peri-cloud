@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 use peri_cloud::gateway::{
     ChannelRoute, Delivery, DeliveryBody, DeliveryError, Gateway, GatewayError, InboundMessage,
     InteractionAction, InteractionCard, MessageAdapter, NativeSessionConnector, ReceiptState,
+    WebAdapter,
 };
 use peri_cloud::identity::{
     Authenticated, ChannelIdentity, DeviceRecord, IdentityClock, IdentityError, IdentityService,
@@ -166,7 +167,7 @@ impl CloudSide {
         let runtime = CloudRuntime::new(journal.clone());
         let mut adapters: Vec<Arc<dyn MessageAdapter>> = vec![adapter];
         if web {
-            adapters.push(Arc::new(web_task_tests::WebEntry));
+            adapters.push(Arc::new(WebAdapter::from_journal(&journal)));
         }
         let gateway = Gateway::new(runtime.clone(), identity.clone(), connector, adapters, 8)
             .await
@@ -986,5 +987,54 @@ async fn gateway_delivery_panic_keeps_health_failed_and_restart_preserves_unknow
         .unwrap();
     f.c().gateway.dispatch().await.unwrap();
     assert_eq!(f.adapter.attempts.lock().len(), 2, "恢复后允许新的独立消息");
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn web_chat_persists_user_and_assistant_messages_and_advances_the_cursor() {
+    let f = Fixture::new_for(vec![answer("WEB_ASSISTANT_REPLY")], true).await;
+    let device = f.devices[0].id;
+    let session = f
+        .c()
+        .gateway
+        .web_select(&f.c().browser, Some(device), None)
+        .await
+        .unwrap();
+    let sent = f
+        .c()
+        .gateway
+        .web_send(&f.c().browser, "WEB_USER_MESSAGE")
+        .await
+        .unwrap();
+    assert_eq!(sent.receipt.session_id, Some(session));
+    f.settled(session, sent.receipt.turn_id.unwrap()).await;
+
+    let mut projected = None;
+    for _ in 0..200 {
+        f.c().gateway.dispatch().await.unwrap();
+        let current = f.c().gateway.web_chat(&f.c().browser, None).await.unwrap();
+        if current.messages.iter().any(|message| {
+            message.role == "assistant" && message.text.contains("WEB_ASSISTANT_REPLY")
+        }) {
+            projected = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let chat = projected.expect("Web chat must project the assistant reply");
+    assert!(chat.messages.iter().any(|message| message.role == "user"
+        && message.text == "WEB_USER_MESSAGE"
+        && message.state == "accepted"));
+    assert_eq!(chat.session_id, Some(session));
+    assert_eq!(chat.device_id, Some(device));
+
+    let next = f
+        .c()
+        .gateway
+        .web_chat(&f.c().browser, Some(chat.cursor))
+        .await
+        .unwrap();
+    assert!(next.messages.is_empty(), "cursor must not replay history");
+    assert_eq!(next.cursor, chat.cursor);
     f.finish().await;
 }

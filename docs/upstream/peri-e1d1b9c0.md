@@ -183,4 +183,4 @@ peri-workflow/Cargo.toml
 
 `docs/upstream/peri-e1d1b9c0.manifest` 记录叠加范围内每个文件的上游 blob 哈希；`scripts/check-upstream.py` 校验本发行文件。允许清单内的生产补丁漂移，其余文件必须与上游一致。
 
-Phase 1 叠加后校验结果：1264 个上游文件，1244 个与上游一致，20 个为允许清单内的生产补丁，0 缺失、0 未声明漂移。CI 在 Windows 任务执行 `python scripts/check-upstream.py`。
+Phase 1 叠加后校验结果：1264 个上游文件，1241 个与上游一致，23 个为允许清单内的生产补丁，0 缺失、0 未声明漂移。CI 在 Windows 任务执行 `python scripts/check-upstream.py`。

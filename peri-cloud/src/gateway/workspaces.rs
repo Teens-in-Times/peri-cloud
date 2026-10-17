@@ -74,7 +74,7 @@ impl Gateway {
             .await?;
         Ok(listing.path)
     }
-    pub(super) async fn select_instance(
+    pub(crate) async fn select_instance(
         &self,
         route: &ChannelRoute,
         principal: Uuid,

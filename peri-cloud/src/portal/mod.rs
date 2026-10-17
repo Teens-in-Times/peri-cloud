@@ -12,6 +12,7 @@ mod personal;
 mod security;
 mod tasks;
 mod topology;
+mod web;
 mod workspaces;
 
 use std::sync::Arc;
@@ -214,6 +215,12 @@ fn build_router(portal: Portal) -> Router {
         .route("/api/conversations/{id}/commands", post(commands::execute))
         .route("/api/conversations", get(conversations::list))
         .route("/api/conversations/{id}/result", get(conversations::result))
+        .route("/api/web/chat", get(web::chat))
+        .route("/api/web/chat/select", post(web::select))
+        .route(
+            "/api/web/chat/messages",
+            post(web::send).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/api/instances/{id}/browse", post(workspaces::browse))
         .route(
             "/api/instances/{id}/default-workspace",
@@ -226,6 +233,10 @@ fn build_router(portal: Portal) -> Router {
             post(interactions::respond),
         )
         .route("/api/devices/{id}/revoke", post(browser::revoke_device))
+        .route("/api/devices/{id}/rename", post(browser::rename_device))
+        .route("/api/devices/{id}/delete", post(browser::delete_device))
+        .route("/api/account/password", post(browser::change_password))
+        .route("/api/recover", post(browser::recover))
         .route("/api/pairing/code", post(browser::pair_code))
         .route("/api/pairing/{id}/confirm", post(browser::confirm_pair))
         .route("/api/channels/revoke", post(browser::revoke_channel))

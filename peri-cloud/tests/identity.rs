@@ -90,6 +90,32 @@ impl Fixture {
             .await
             .unwrap()
     }
+
+    async fn register(
+        &self,
+        device: Uuid,
+        tokens: &peri_cloud::identity::NativeTokens,
+    ) -> DeviceRecord {
+        let actor = self
+            .identity
+            .authenticate_native(&tokens.access_token)
+            .await
+            .unwrap();
+        let record = DeviceRecord {
+            id: device,
+            name: "Personal PC".into(),
+            platform: "windows".into(),
+            default_workspace: "G:\\Project".into(),
+            connection_id: None,
+            is_local: false,
+            revoked: false,
+        };
+        self.identity
+            .register_device(&actor, record.clone())
+            .await
+            .unwrap();
+        record
+    }
 }
 
 fn code(redirect: &str) -> String {
@@ -745,5 +771,99 @@ async fn pairing_attempt_limit_is_scoped_to_sender_and_expiry_does_not_bind_iden
         f.identity.resolve_channel(&claim.identity).await,
         Err(IdentityError::Unauthorized)
     ));
+    f.journal.close().await;
+}
+
+#[tokio::test]
+async fn device_lifecycle_rename_delete_and_ownership_are_enforced() {
+    let f = Fixture::new().await;
+    let device = Uuid::new_v4();
+    let tokens = f.grant(device).await;
+    f.register(device, &tokens).await;
+    let renamed = f
+        .identity
+        .rename_device(&f.browser, device, "Renamed")
+        .await
+        .unwrap();
+    assert_eq!(renamed.name, "Renamed");
+    assert!(matches!(
+        f.identity.rename_device(&f.browser, device, "  ").await,
+        Err(IdentityError::Invalid)
+    ));
+    assert!(matches!(
+        f.identity.delete_device(&f.browser, device).await,
+        Err(IdentityError::Invalid)
+    ));
+    f.identity.revoke_device(&f.browser, device).await.unwrap();
+    f.identity.delete_device(&f.browser, device).await.unwrap();
+    assert!(f
+        .identity
+        .devices(&f.browser)
+        .await
+        .unwrap()
+        .iter()
+        .all(|record| record.id != device));
+    assert!(matches!(
+        f.identity.authenticate_native(&tokens.access_token).await,
+        Err(IdentityError::Unauthorized)
+    ));
+    f.journal.close().await;
+}
+
+#[tokio::test]
+async fn password_change_and_bootstrap_reset_close_sessions_but_keep_device_grants() {
+    let f = Fixture::new().await;
+    let device = Uuid::new_v4();
+    let tokens = f.grant(device).await;
+    f.register(device, &tokens).await;
+    let second = f.identity.login("owner", PASSWORD.into()).await.unwrap();
+    assert!(matches!(
+        f.identity
+            .change_password(
+                &f.browser,
+                "wrong-password".into(),
+                "new-password-123".into()
+            )
+            .await,
+        Err(IdentityError::PasswordMismatch)
+    ));
+    f.identity
+        .change_password(&f.browser, PASSWORD.into(), "new-password-123".into())
+        .await
+        .unwrap();
+    assert!(f
+        .identity
+        .authenticate_browser(&second.session_token)
+        .await
+        .is_err());
+    assert!(f
+        .identity
+        .authenticate_browser(&f.browser_token)
+        .await
+        .is_ok());
+    assert!(f
+        .identity
+        .authenticate_native(&tokens.access_token)
+        .await
+        .is_ok());
+    f.identity
+        .reset_password(SETUP, "owner", "reset-password-123".into())
+        .await
+        .unwrap();
+    assert!(f
+        .identity
+        .authenticate_browser(&f.browser_token)
+        .await
+        .is_err());
+    assert!(f
+        .identity
+        .authenticate_native(&tokens.access_token)
+        .await
+        .is_ok());
+    assert!(f
+        .identity
+        .login("owner", "reset-password-123".into())
+        .await
+        .is_ok());
     f.journal.close().await;
 }

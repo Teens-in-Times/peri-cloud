@@ -39,7 +39,7 @@ mod workspaces;
 pub use workspaces::WorkspaceSelection;
 #[path = "activity.rs"]
 pub(super) mod activity;
-pub use activity::{ConversationActivity, SavedResultPage};
+pub use activity::{ActivityPhase, ConversationActivity, SavedResultPage};
 #[path = "controls.rs"]
 mod controls;
 #[path = "personal.rs"]
@@ -54,7 +54,7 @@ struct Ownership {
 /// abort its admissions, selection changes or delivery. Drain this owner before
 /// CloudRuntime shutdown closes the shared journal.
 pub struct Gateway {
-    runtime: Arc<CloudRuntime>,
+    pub(super) runtime: Arc<CloudRuntime>,
     pub(super) identity: Arc<IdentityService>,
     pub(super) connector: Arc<dyn SessionConnector>,
     pub(super) adapters: HashMap<String, Arc<dyn MessageAdapter>>,

@@ -36,6 +36,8 @@ pub enum IdentityError {
     Forbidden,
     #[error("identity input is invalid")]
     Invalid,
+    #[error("current password does not match")]
+    PasswordMismatch,
     #[error("cloud account has already been initialized")]
     AlreadyInitialized,
     #[error("identity is already associated with another account")]

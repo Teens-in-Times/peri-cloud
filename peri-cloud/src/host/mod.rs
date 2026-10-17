@@ -203,7 +203,9 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
         .iter()
         .map(|adapter| adapter.clone() as Arc<dyn MessageAdapter>)
         .collect();
-    adapters.push(Arc::new(crate::gateway::WebAdapter));
+    adapters.push(Arc::new(crate::gateway::WebAdapter::from_journal(
+        runtime.journal(),
+    )));
     if let Some(adapter) = &onebot {
         adapters.push(adapter.clone());
     }

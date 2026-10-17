@@ -107,6 +107,9 @@ impl IntoResponse for PortalError {
             Self::Identity(IdentityError::RateLimited) => {
                 (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
             }
+            Self::Identity(IdentityError::PasswordMismatch) => {
+                (StatusCode::BAD_REQUEST, "password_mismatch")
+            }
             Self::Identity(IdentityError::Stale) => (StatusCode::CONFLICT, "stale_request"),
             Self::Identity(
                 IdentityError::AlreadyInitialized | IdentityError::OwnershipConflict,

@@ -17,6 +17,7 @@ peri-agent/src/agent/stages/tool_dispatch/execution_test.rs
 peri-agent/src/session/turn.rs
 peri-agent/src/session/turn_test.rs
 peri-agent/src/session/transcript.rs
+peri-agent/src/session/transcript_persistence_test.rs
 peri-middlewares/Cargo.toml
 peri-middlewares/src/prompt_tool_name_lock_test.rs
 peri-middlewares/src/subagent/tool/subagent_lifecycle_test.rs
