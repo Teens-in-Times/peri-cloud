@@ -45,18 +45,32 @@ async fn schema_six_upgrade_keeps_account_data_and_adds_access_tables() {
         )
         .await
         .unwrap();
-    let data = crate::state::UserData {
-        revision: 0,
-        instructions: "original preference".into(),
-        memory: "original memory".into(),
-    };
-    journal.user_data(principal.id).await.unwrap();
     journal
-        .save_user_data(principal.id, data, 8192)
+        .save_preferences(
+            principal.id,
+            crate::state::UserPreferences {
+                revision: 0,
+                instructions: "original preference".into(),
+            },
+        )
         .await
         .unwrap();
     let pool = journal.identity_pool();
     for statement in [
+        "DROP TABLE memory_session_audience", "DROP TABLE memory_fts",
+        "DROP TABLE memory_audit",
+        "DROP TABLE memory_items",
+        "DROP TABLE memory_accounts",
+        "CREATE TABLE user_data (principal TEXT PRIMARY KEY REFERENCES principals(id),revision INTEGER NOT NULL,instructions TEXT NOT NULL,memory TEXT NOT NULL)",
+        "INSERT INTO user_data SELECT principal,revision,instructions,'' FROM user_preferences",
+        "DROP TABLE user_preferences",
+        "DROP TABLE scheduled_admissions",
+        "DROP TABLE scheduled_tasks",
+        "DROP TABLE scheduled_contact_policy",
+        "DROP TABLE scheduler_occurrences",
+        "DROP TABLE scheduler_plans",
+        "DROP TABLE scheduler_commands",
+        "DROP TABLE scheduler_metadata",
         "DROP TABLE gateway_access_inputs",
         "DROP TABLE gateway_access_audit",
         "DROP TABLE gateway_access_policies",
@@ -64,6 +78,10 @@ async fn schema_six_upgrade_keeps_account_data_and_adds_access_tables() {
     ] {
         sqlx::query(statement).execute(&pool).await.unwrap();
     }
+    sqlx::query("UPDATE user_data SET memory='original memory'")
+        .execute(&pool)
+        .await
+        .unwrap();
     drop(identity);
     journal.close().await;
     drop(journal);
@@ -73,9 +91,15 @@ async fn schema_six_upgrade_keeps_account_data_and_adds_access_tables() {
         .fetch_one(&journal.identity_pool())
         .await
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 15);
     assert_eq!(
-        journal.user_data(principal.id).await.unwrap().memory,
+        crate::memory::MemoryStore::new(&journal, principal.id, 65536)
+            .list("", 0, 5)
+            .await
+            .unwrap()
+            .items[0]
+            .value
+            .content,
         "original memory"
     );
     let (tables,): (i64,) = sqlx::query_as(

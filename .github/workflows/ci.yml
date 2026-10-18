@@ -44,19 +44,21 @@ jobs:
           npm ci --prefix scripts/portal-ui --ignore-scripts --no-audit --no-fund
           $env:NODE_PATH = Join-Path $pwd 'scripts/portal-ui/node_modules'
           node scripts/check-portal-ui.cjs
+          node scripts/check-scheduler-ui.cjs
+          node scripts/check-memory-ui.cjs
           node scripts/check-model-ui.cjs
       - name: Upstream provenance
         if: runner.os == 'Windows'
         run: python scripts/check-upstream.py
       - name: Cloud and executor regression tests
         if: runner.os == 'Windows'
-        run: bash ./scripts/cargo-rmcp-patched.sh test --locked -p peri-cloud -p peri-executor -p peri-remote-tools -p peri-tool-runtime -p peri-process -- --test-threads=1
+        run: bash ./scripts/cargo-rmcp-patched.sh test --locked -p peri-scheduler -p peri-cloud -p peri-executor -p peri-remote-tools -p peri-tool-runtime -p peri-process -- --test-threads=1
       - name: Peri v4 core regression tests
         if: runner.os == 'Windows'
         run: bash ./scripts/cargo-rmcp-patched.sh test --locked -p peri-acp-types -p peri-agent -p peri-middlewares -p peri-config -p peri-mcp-core -p peri-resources -p peri-workflow -p peri-js-runtime -- --test-threads=1
       - name: Clippy
         if: runner.os == 'Windows'
-        run: bash ./scripts/cargo-rmcp-patched.sh clippy --locked -p peri-cloud -p peri-executor --all-targets --no-deps -- -D warnings
+        run: bash ./scripts/cargo-rmcp-patched.sh clippy --locked -p peri-scheduler -p peri-cloud -p peri-executor --all-targets --no-deps -- -D warnings
       - name: Build optimized binaries
         run: bash ./scripts/cargo-rmcp-patched.sh build --release --locked -p peri-cloud --bin peri-cloud-host -p peri-executor --bin peri-executor
       - name: Preserve verified native binaries

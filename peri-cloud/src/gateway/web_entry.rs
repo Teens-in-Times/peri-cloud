@@ -71,6 +71,26 @@ impl WebAdapter {
 
 #[async_trait]
 impl MessageAdapter for WebAdapter {
+    fn conversation_scope(
+        &self,
+        route: &crate::gateway::ChannelRoute,
+    ) -> super::access::ConversationScope {
+        if route.identity.adapter_instance_id == WEB_ADAPTER
+            && Uuid::parse_str(&route.identity.external_user_id).is_ok()
+            && (route.conversation_id == super::web_chat::WEB_CONVERSATION
+                || route
+                    .conversation_id
+                    .strip_prefix("workspace:")
+                    .is_some_and(|id| Uuid::parse_str(id).is_ok()))
+        {
+            super::access::ConversationScope::Private
+        } else {
+            super::access::ConversationScope::Unknown
+        }
+    }
+    fn supports_proactive(&self) -> bool {
+        true
+    }
     fn instance_id(&self) -> &str {
         WEB_ADAPTER
     }

@@ -110,8 +110,7 @@ async fn menus_discover_new_directories_set_defaults_and_keep_frozen_sessions() 
             .await
             .unwrap()
             .frozen
-            .binding
-            .workspace,
+            .workspace(),
         old.workspace
     );
     f.restart().await;

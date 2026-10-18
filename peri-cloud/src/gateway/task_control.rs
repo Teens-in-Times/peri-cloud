@@ -34,12 +34,25 @@ impl Gateway {
         {
             return Err(GatewayError::Busy);
         }
-        if !self.origins.read().contains_key(&session) {
-            let agent = self
+        if !self.origins.read().contains_key(&session) || !self.runtime.has_device_session(session)
+        {
+            let agent = match self
                 .connector
                 .open(principal, device, Some(&state.frozen))
-                .await?;
-            self.attach(route, principal, device, agent).await?;
+                .await
+            {
+                Ok(agent) => {
+                    self.attach(route, principal, device, agent).await?;
+                    return Ok(());
+                }
+                Err(GatewayError::Connection | GatewayError::NotConfigured) => {
+                    self.connector
+                        .open_conversation(principal, &state.frozen)
+                        .await?
+                }
+                Err(error) => return Err(error),
+            };
+            self.attach_conversation(route, principal, agent).await?;
         }
         Ok(())
     }
@@ -151,12 +164,23 @@ impl Gateway {
         }
         let (_, devices) = self.identity.channel_devices(&route.identity).await?;
         let state = self.journal().session(principal, session).await?;
-        let device = devices
-            .iter()
-            .find(|d| d.id == state.frozen.device_id)
-            .ok_or(IdentityError::Forbidden)?;
-        self.ensure_task_session(&route, principal, device, &state)
-            .await?;
+        if state.frozen.device_id.is_none() {
+            if !state.execution_settled() || self.journal().has_unconfirmed_turn(session).await? {
+                return Err(GatewayError::Busy);
+            }
+            let agent = self
+                .connector
+                .open_conversation(principal, &state.frozen)
+                .await?;
+            self.attach_conversation(&route, principal, agent).await?;
+        } else {
+            let device = devices
+                .iter()
+                .find(|d| Some(d.id) == state.frozen.device_id)
+                .ok_or(IdentityError::Forbidden)?;
+            self.ensure_task_session(&route, principal, device, &state)
+                .await?;
+        }
         sqlx::query("INSERT INTO control_operations(id,principal,kind,target,request_hash,state,result_json,created_at) VALUES(?,?,'task.submit',?,?,'pending',?,?)")
             .bind(request.to_string()).bind(principal.to_string()).bind(session.to_string()).bind(fingerprint)
             .bind(serde_json::json!({"route_json":serde_json::to_string(&route)?}).to_string()).bind(self.identity.now()).execute(&self.store.pool).await?;
@@ -270,12 +294,12 @@ impl Gateway {
             .ok_or(IdentityError::Forbidden)?;
         if let Some(session) = self.store.selection(&route, principal).await? {
             let state = self.journal().session(principal, session).await?;
-            if state.frozen.device_id != device_id {
+            if state.frozen.device_id != Some(device_id) {
                 return Err(StateError::InvocationConflict.into());
             }
             if workspace
                 .as_ref()
-                .is_some_and(|w| w != &state.frozen.binding.workspace)
+                .is_some_and(|w| w != &state.frozen.workspace())
             {
                 return Err(StateError::InvocationConflict.into());
             }

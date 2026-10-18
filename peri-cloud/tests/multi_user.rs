@@ -122,8 +122,12 @@ impl Fixture {
             release: tokio::sync::Semaphore::new(0),
             prompts: Mutex::new(Vec::new()),
         });
+        // This fixture releases exactly one inference per task. Leave room for
+        // the installed tool catalog so automatic compact does not consume the
+        // semaphore permits intended for the concurrency/quota assertions.
         let connector =
-            NativeSessionConnector::new(model.clone(), "fixture cloud rules".into(), 8192).unwrap();
+            NativeSessionConnector::new(model.clone(), "fixture cloud rules".into(), 32768)
+                .unwrap();
         connector.register_client(client);
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
@@ -198,7 +202,18 @@ impl Fixture {
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "waiting for {state:?}: {error}; model calls={}, request sizes={:?}",
+                self.model.calls.load(Ordering::SeqCst),
+                self.model
+                    .prompts
+                    .lock()
+                    .iter()
+                    .map(String::len)
+                    .collect::<Vec<_>>()
+            )
+        });
     }
     async fn finish(self) {
         assert!(

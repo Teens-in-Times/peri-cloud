@@ -137,7 +137,7 @@ mod tests {
             request_id: Uuid::nil(),
             turn_id: Uuid::nil(),
             session_id: Uuid::nil(),
-            device_id: Uuid::nil(),
+            device_id: Some(Uuid::nil()),
             device_name: "Workstation".into(),
             workspace: "/workspace".into(),
             expires_at: 1900000300,

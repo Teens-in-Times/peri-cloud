@@ -14,6 +14,9 @@ pub struct ExecutorInfo {
     pub device_name: String,
     pub platform: String,
     pub version: String,
+    /// Additive feature identifiers. Older executors omit this field.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -139,6 +142,44 @@ pub struct JobSnapshot {
 pub struct JobReceipt {
     pub created: bool,
     pub job: JobSnapshot,
+}
+
+/// Feature advertised by executors that expose the binding-scoped workspace
+/// read endpoints. The cloud denies the capability when it is absent instead
+/// of probing endpoints that older executors do not serve.
+pub const WORKSPACE_READ_FEATURE: &str = "workspace-read@1";
+
+/// One workspace file returned by the device. `path` is workspace-relative and
+/// always uses `/`; `digest` is `sha256:<64 lowercase hex>` over the bytes read.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceFile {
+    pub path: String,
+    pub content: String,
+    pub digest: String,
+}
+
+/// Project instruction candidates resolved on the device. `main` is the first
+/// non-blank of `AGENTS.md`, `CLAUDE.md`, `.claude/AGENTS.md`; `local` is
+/// `CLAUDE.local.md`. `@import` expansion is not performed by this endpoint.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WorkspaceInstructions {
+    pub main: Option<WorkspaceFile>,
+    pub local: Option<WorkspaceFile>,
+}
+
+/// `SKILL.md` paths found under `<workspace>/.claude/skills`, sorted.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WorkspaceSkills {
+    pub paths: Vec<String>,
+    pub truncated: bool,
+}
+
+/// Read one already-discoverable skill entry. The executor re-validates that
+/// the path is under `.claude/skills` and is named `SKILL.md`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReadRequest {
+    pub path: String,
 }
 
 #[cfg(test)]

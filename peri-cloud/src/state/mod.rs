@@ -1,16 +1,20 @@
 //! Durable cloud session and turn journal. No transport credentials live here.
 
 mod journal;
+mod scheduled;
 mod schema;
+pub(crate) use scheduled::ScheduledAdmission;
+pub(crate) mod preferences;
 mod types;
-pub(crate) mod userdata;
 
 pub use journal::CloudJournal;
+pub use preferences::{UserPreferences, UserUsage};
 pub use types::{Admission, FrozenSession, SessionState, TurnRecord, TurnState};
-pub use userdata::{UserData, UserUsage};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
+    #[error(transparent)]
+    Scheduler(#[from] peri_scheduler::Error),
     #[error("account resource limit reached")]
     Limit,
     #[error("cloud state is unavailable")]

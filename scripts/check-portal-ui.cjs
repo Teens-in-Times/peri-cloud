@@ -32,9 +32,11 @@ w.fetch = async (url, options) => {
   if(url==='/api/status') return ok({initialized:true,csrf_cookie:'peri_csrf',service_control:true});
   if(url==='/api/account') return loggedIn ? ok(owner) : denied();
   if(url==='/api/model') return ok({enabled:true,providers:[{id:'p',name:'Provider'}],choice:null,default_model:'model-fixture',custom_endpoint_allowed:true});
-  if(url==='/api/user-data') return {ok:false,status:503,json:async()=>({error:'identity_unavailable'})};
+  if(url==='/api/preferences') return {ok:false,status:503,json:async()=>({error:'identity_unavailable'})};
+  if(url.startsWith('/api/memories')) return ok({page:{generation:0,total:0,used_bytes:0,items:[],has_more:false},max_bytes:65536});
   if(url==='/api/workspaces') return ok(sessions);
   if(url==='/api/conversations') return ok(activities);
+  if(url==='/api/schedules') return ok([]);
   if(url==='/api/interactions') return ok(interactions);
   if(url==='/api/logout') return ok({});
   if(url.endsWith('/connection-check')) return delayedProbe ? delayedProbe : ok({device_id:'device-1',transport:'wireguard'});
@@ -43,6 +45,7 @@ w.fetch = async (url, options) => {
 w.document.cookie = 'peri_csrf=fixture';
 w.eval(fs.readFileSync(path.join(assets,'workspace.js'),'utf8'));
 w.eval(fs.readFileSync(path.join(assets,'models.js'),'utf8'));
+w.eval(fs.readFileSync(path.join(assets,'memory.js'),'utf8'));
 w.eval(fs.readFileSync(path.join(assets,'portal.js'),'utf8')+'\nwindow.fixture={renderAccount,refresh,clearPersonal};');
 (async()=>{
   await settle();

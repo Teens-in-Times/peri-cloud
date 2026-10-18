@@ -143,10 +143,15 @@ impl InteractionHub {
         principal: Uuid,
         card: &InteractionCard,
     ) -> GatewayResult<()> {
-        let (resolved, _) = self
-            .identity
-            .channel_device(&route.identity, card.device_id)
-            .await?;
+        let resolved = match card.device_id {
+            Some(device) => {
+                self.identity
+                    .channel_device(&route.identity, device)
+                    .await?
+                    .0
+            }
+            None => self.identity.resolve_channel(&route.identity).await?,
+        };
         if principal != resolved
             || self.store.selection(route, principal).await? != Some(card.session_id)
         {
@@ -205,6 +210,7 @@ impl InteractionHub {
 #[derive(Clone)]
 pub(crate) enum SessionOrigin {
     Platform(String),
+    Scheduled(String),
     Browser,
 }
 
@@ -213,7 +219,7 @@ pub(crate) struct SessionBroker {
     pub route: ChannelRoute,
     pub principal: Uuid,
     pub session: Uuid,
-    pub device: Uuid,
+    pub device: Option<Uuid>,
     pub device_name: String,
     pub workspace: String,
     pub origin: Arc<RwLock<Option<SessionOrigin>>>,
@@ -249,12 +255,21 @@ impl UserInteractionBroker for SessionBroker {
         if !valid_context(&context) {
             return fallback();
         }
-        let Ok((principal, _)) = self
-            .hub
-            .identity
-            .channel_device(&self.route.identity, self.device)
-            .await
-        else {
+        let resolved = match self.device {
+            Some(device) => self
+                .hub
+                .identity
+                .channel_device(&self.route.identity, device)
+                .await
+                .map(|(principal, _)| principal),
+            None => {
+                self.hub
+                    .identity
+                    .resolve_channel(&self.route.identity)
+                    .await
+            }
+        };
+        let Ok(principal) = resolved else {
             return fallback();
         };
         if principal != self.principal {
@@ -304,10 +319,31 @@ impl UserInteractionBroker for SessionBroker {
         };
         let delivery = match origin {
             SessionOrigin::Browser => Ok(()),
+            SessionOrigin::Scheduled(parent) => {
+                async {
+                    let mut tx = self.hub.store.pool.begin().await?;
+                    super::store::enqueue(
+                        &mut tx,
+                        &format!("interaction:{request}"),
+                        &self.route,
+                        (&parent, super::ReplyKind::Proactive),
+                        super::DeliveryBody::Interaction { card },
+                        Some(principal),
+                        self.device,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    Ok(())
+                }
+                .await
+            }
             SessionOrigin::Platform(parent) => {
-                if matches!(context, InteractionContext::Questions { .. }) {
+                if let Some(device) = self
+                    .device
+                    .filter(|_| matches!(context, InteractionContext::Questions { .. }))
+                {
                     self.hub
-                        .deliver_question(&self.route, &parent, principal, request, self.device)
+                        .deliver_question(&self.route, &parent, principal, request, device)
                         .await
                 } else {
                     self.hub

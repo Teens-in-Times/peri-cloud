@@ -195,9 +195,9 @@ impl GatewayStore {
         let mut paths = Vec::new();
         for row in rows {
             let state: crate::state::SessionState = serde_json::from_str(row.get("state_json"))?;
-            if state.frozen.device_id == device && !paths.contains(&state.frozen.binding.workspace)
+            if state.frozen.device_id == Some(device) && !paths.contains(&state.frozen.workspace())
             {
-                paths.push(state.frozen.binding.workspace);
+                paths.push(state.frozen.workspace());
             }
         }
         Ok(paths)
@@ -268,7 +268,7 @@ impl GatewayStore {
             (parent, ReplyKind::Message),
             DeliveryBody::Interaction { card: card.clone() },
             Some(principal),
-            Some(card.device_id),
+            card.device_id,
         )
         .await?;
         tx.commit().await?;
@@ -321,7 +321,7 @@ impl GatewayStore {
         &self,
         pending: &PendingTurn,
         turn: &TurnRecord,
-        device: Uuid,
+        device: Option<Uuid>,
     ) -> GatewayResult<()> {
         if matches!(turn.state, TurnState::Queued | TurnState::Running) {
             return Ok(());
@@ -337,7 +337,7 @@ impl GatewayStore {
                 (&pending.event_id, ReplyKind::Message),
                 DeliveryBody::Reply { reply: preview },
                 Some(pending.principal),
-                Some(device),
+                device,
             )
             .await?;
         }
@@ -359,7 +359,7 @@ impl GatewayStore {
                 (&pending.event_id, ReplyKind::Message),
                 DeliveryBody::Notice { text: text.into() },
                 Some(pending.principal),
-                Some(device),
+                device,
             )
             .await?;
         }
@@ -404,7 +404,7 @@ impl GatewayStore {
     }
 }
 
-async fn enqueue(
+pub(crate) async fn enqueue(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     key: &str,
     route: &ChannelRoute,

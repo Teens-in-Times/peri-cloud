@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="/portal.css">
   <script src="/workspace.js" defer></script>
   <script src="/models.js" defer></script>
+  <script src="/memory.js" defer></script>
   <script src="/portal.js" defer></script>
 </head>
 <body>
@@ -102,7 +103,7 @@
         <div id="web-messages" class="web-messages" role="log" aria-live="polite"></div>
         <form id="web-form"><label>消息<textarea id="web-input" rows="3" maxlength="32768" required placeholder="直接交代任务。审批仍由右侧工作台处理。"></textarea></label><div class="actions"><button type="submit" class="primary">发送</button></div></form>
       </section>
-      <section id="activity-panel" class="panel"><div class="section-heading"><h2>会话与任务</h2><span class="pill">共享主控状态</span></div><p class="subtle">工作区、工具权限、待办和结果都属于具体会话。修改一条会话不会改变其他聊天的执行目标。</p><div id="approval-panel"><div id="interactions" class="items"></div></div><div id="conversation-activity" class="conversation-list"></div></section>
+      <section id="activity-panel" class="panel"><div class="section-heading"><h2>会话与任务</h2><span class="pill">共享主控状态</span></div><p class="subtle">工作区、工具权限、待办和结果都属于具体会话。修改一条会话不会改变其他聊天的执行目标。</p><div id="approval-panel"><div id="interactions" class="items"></div></div><div id="conversation-activity" class="conversation-list"></div><details class="panel"><summary>主动聊天与定时任务</summary><p class="subtle">让助手按约定时间来问候你，或处理指定任务。主动聊天无需电脑在线；设备任务沿用会话工具权限。暂停或删除只停止后续触发，取消正在运行的任务请用上方任务操作。</p><button id="schedule-create" type="button" class="quiet small">安排一次问候或任务</button><button id="schedule-policy" type="button" class="quiet small">主动联系设置</button><div id="schedule-list" class="conversation-list"></div></details></section>
       <section id="device-panel" class="panel"><div class="section-heading"><h2>执行设备</h2><span class="pill">账号设备池</span></div><p class="subtle">这里管理设备本身和新会话使用的默认目录。连接检查只验证身份与通路，不执行任务；检查结果仅代表所示时刻。</p><div id="devices" class="device-grid"></div></section>
       <section id="connections" aria-labelledby="connections-title"><div class="section-heading"><h2 id="connections-title">聊天入口与我的关联</h2></div><p class="subtle">入口由云端主控接入，你的聊天身份通过关联后共用这个账号的设备。入口规则与账号关联分别管理。</p>
       <div class="connections-grid">
@@ -115,15 +116,28 @@
       </section>
       <section id="account-settings" aria-labelledby="settings-title"><div class="section-heading"><h2 id="settings-title">我的设置</h2><span class="pill">随账号保留</span></div><p class="subtle">偏好与记忆属于你的账号，换设备后仍使用同一套设置。</p>
       <section id="personal-panel" class="panel" hidden>
-        <div class="section-heading"><h2>个人记忆与偏好</h2><button id="personal-reload" class="quiet small">重新载入</button></div>
+        <div class="section-heading"><h2>回复偏好</h2><button id="personal-reload" class="quiet small">重新载入</button></div>
         <p class="subtle">只供你的 Agent 使用，切换实例时仍然保留。修改后从下一轮对话生效。</p>
         <form id="personal-form">
-          <label>回复偏好<textarea name="instructions" rows="3" maxlength="8192" placeholder="例如：用中文回复，先给结论。"></textarea></label>
-          <label>长期记忆<textarea name="memory" rows="6" maxlength="8192" placeholder="希望 Agent 记住的事实。也可以在聊天中让它记住或忘记。"></textarea></label>
-          <div class="actions"><span id="personal-budget" class="subtle"></span><button type="submit" class="primary">保存个人上下文</button></div>
+          <label>回复偏好<textarea name="instructions" rows="3" maxlength="4096" placeholder="例如：用中文回复，先给结论。"></textarea></label>
+          <div class="actions"><span id="personal-budget" class="subtle"></span><button type="submit" class="primary">保存回复偏好</button></div>
         </form>
         <p id="settings-error" class="load-error" role="status" hidden></p>
         <p id="usage-summary" class="subtle"></p>
+        <hr>
+        <div class="section-heading"><h2>我的记忆</h2><button id="memory-reload" class="quiet small">刷新记忆</button></div>
+        <p class="subtle">逐条保存事实与决定。仅私聊和已登录网页可用，置顶资料在预算内进入每轮上下文，其余按需检索。过期资料仍可在此更正或忘记。</p>
+        <label>记忆范围<select id="memory-scope"><option value="user">我的资料</option><option value="fleet">我的设备池</option></select></label>
+        <p id="memory-summary" class="subtle"></p><p id="memory-error" class="load-error" role="status"></p>
+        <form id="memory-search"><label>搜索记忆<input name="query" maxlength="512" placeholder="中文、设备别名、路径或编号"></label><button id="memory-search-button" type="submit" class="quiet small">搜索</button></form>
+        <div id="memory-list" class="items"></div><div class="actions"><button id="memory-prev" class="quiet small" disabled>上一页</button><button id="memory-next" class="quiet small" disabled>下一页</button></div>
+        <h3 id="memory-edit-title">添加一条记忆</h3>
+        <form id="memory-form"><label>内容<textarea name="content" rows="3" required maxlength="8192" placeholder="例如：测试服务器叫小蓝。请勿保存密钥。"></textarea></label>
+          <label>类型<select name="kind"><option value="fact">事实</option><option value="decision">决定</option></select></label>
+          <label><input name="pinned" type="checkbox">置顶，在上下文预算内常驻</label>
+          <label>有效至（当地时间，留空为永久）<input name="valid_until" type="datetime-local"></label>
+          <div class="actions"><button id="memory-cancel-edit" type="button" class="quiet small" hidden>取消更正</button><button id="memory-save" type="submit" class="primary">保存记忆</button></div>
+        </form>
       </section>
       <details id="security-controls" class="panel" hidden><summary>账户安全</summary><form id="password-form" class="password-form"><p class="subtle">修改后其他浏览器会话会退出；已授权设备不受影响。</p><label>当前密码<input name="current_password" type="password" autocomplete="current-password" required maxlength="1024"></label><label>新密码<input name="new_password" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label><label>确认新密码<input name="new_password_confirm" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label><button type="submit" class="quiet small">修改密码</button></form></details>
       </section>

@@ -167,14 +167,12 @@ async fn local_instance_works_without_native_oauth_and_uses_same_approval_and_re
             StatusCode::FORBIDDEN
         );
     }
-    let memory:Value = client.post(format!("{base}/api/user-data")).header("Origin",&base).header("Cookie",&guest_cookie).header("X-Peri-CSRF",guest_csrf).json(&json!({"revision":0,"instructions":"GUEST_ONLY_PREFERENCE","memory":"GUEST_ONLY_MEMORY"})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
-    assert_eq!(memory["memory"], "GUEST_ONLY_MEMORY");
-    // JSON escaping can exceed the ordinary 16 KiB request cap even when the
-    // decoded personal context is within its 8 KiB account quota.
-    let escaped = json!({"revision":1,"instructions":"","memory":"\n".repeat(8192)});
+    let memory:Value = client.post(format!("{base}/api/memories")).header("Origin",&base).header("Cookie",&guest_cookie).header("X-Peri-CSRF",guest_csrf).json(&json!({"request_id":Uuid::new_v4(),"generation":0,"value":{"content":"GUEST_ONLY_MEMORY","kind":"fact","pinned":false,"valid_until":null}})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(memory["content"], "GUEST_ONLY_MEMORY");
+    let escaped = json!({"request_id":Uuid::new_v4(),"generation":1,"value":{"content":"\\".repeat(8192),"kind":"fact","pinned":false,"valid_until":null}});
     assert!(serde_json::to_vec(&escaped).unwrap().len() > 16 * 1024);
     client
-        .post(format!("{base}/api/user-data"))
+        .post(format!("{base}/api/memories"))
         .header("Origin", &base)
         .header("Cookie", &guest_cookie)
         .header("X-Peri-CSRF", guest_csrf)
@@ -185,8 +183,8 @@ async fn local_instance_works_without_native_oauth_and_uses_same_approval_and_re
         .error_for_status()
         .unwrap();
     assert_eq!(
-        first.get(&client, &account, "/api/user-data").await["data"]["memory"],
-        ""
+        first.get(&client, &account, "/api/memories").await["page"]["total"],
+        0
     );
     let model_body =
         json!({"provider":"default","model":"guest-model","api_key":"GUEST_WRITE_ONLY_KEY"});

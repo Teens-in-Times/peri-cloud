@@ -6,10 +6,9 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct UserData {
+pub struct UserPreferences {
     pub revision: u64,
     pub instructions: String,
-    pub memory: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -48,44 +47,40 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 }
 
 impl CloudJournal {
-    pub async fn user_data(&self, principal: Uuid) -> StateResult<UserData> {
+    pub async fn preferences(&self, principal: Uuid) -> StateResult<UserPreferences> {
         let row =
-            sqlx::query("SELECT revision,instructions,memory FROM user_data WHERE principal=?")
+            sqlx::query("SELECT revision,instructions FROM user_preferences WHERE principal=?")
                 .bind(principal.to_string())
                 .fetch_optional(&self.identity_pool())
                 .await?;
         Ok(row
-            .map(|r| UserData {
+            .map(|r| UserPreferences {
                 revision: r.get::<i64, _>("revision") as u64,
                 instructions: r.get("instructions"),
-                memory: r.get("memory"),
             })
             .unwrap_or_default())
     }
 
-    pub async fn save_user_data(
+    pub async fn save_preferences(
         &self,
         principal: Uuid,
-        data: UserData,
-        max_bytes: usize,
-    ) -> StateResult<UserData> {
-        if data.instructions.len() + data.memory.len() > max_bytes
-            || data.revision >= i64::MAX as u64
-        {
+        data: UserPreferences,
+    ) -> StateResult<UserPreferences> {
+        if data.instructions.len() > 4096 || data.revision >= i64::MAX as u64 {
             return Err(StateError::Limit);
         }
         let pool = self.identity_pool();
         let mut tx = pool.begin().await?;
-        sqlx::query("INSERT OR IGNORE INTO user_data(principal,revision,instructions,memory) VALUES(?,0,'','')")
+        sqlx::query("INSERT OR IGNORE INTO user_preferences(principal,revision,instructions) VALUES(?,0,'')")
             .bind(principal.to_string()).execute(&mut *tx).await?;
-        let changed = sqlx::query("UPDATE user_data SET revision=revision+1,instructions=?,memory=? WHERE principal=? AND revision=?")
-            .bind(&data.instructions).bind(&data.memory).bind(principal.to_string()).bind(data.revision as i64)
+        let changed = sqlx::query("UPDATE user_preferences SET revision=revision+1,instructions=? WHERE principal=? AND revision=?")
+            .bind(&data.instructions).bind(principal.to_string()).bind(data.revision as i64)
             .execute(&mut *tx).await?.rows_affected();
         if changed != 1 {
             return Err(StateError::InvocationConflict);
         }
         tx.commit().await?;
-        Ok(UserData {
+        Ok(UserPreferences {
             revision: data.revision + 1,
             ..data
         })

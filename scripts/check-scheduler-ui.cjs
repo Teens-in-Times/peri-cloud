@@ -1,0 +1,43 @@
+// Exercise actual schedule forms and payloads; no production service is called.
+const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
+const {JSDOM}=require('jsdom');
+const assets=path.join(__dirname,'../peri-cloud/src/portal/assets');
+const dom=new JSDOM(fs.readFileSync(path.join(assets,'index.html'),'utf8'),{url:'http://127.0.0.1:8765',runScripts:'outside-only'});
+const w=dom.window,doc=w.document,get=id=>doc.getElementById(id),calls=[],dialogs=[];
+const policy={revision:3,enabled:true,timezone:'UTC',start_hour:8,end_hour:22,daily_limit:20};
+let delayedPolicy=null;
+const hooks={confirm:(title,description,body,submit)=>dialogs.push({title,description,body,submit}),api:async(url,body)=>{
+  calls.push({url,body});if(url==='/api/schedules/contact-policy'&&!body)return delayedPolicy||policy;return {};
+},action:async(_,task)=>task(),openSavedResult:()=>{}};
+const owner={principal:{id:'owner'},devices:[],gateways:[{adapter:'personal',label:'个人号',linked_identities:1}],service:{}};
+const cloud={session_id:'cloud-session',device_id:null,device_name:'云端对话',adapter:'personal',conversation_id:'private:123',workspace:'',phase:'idle',label:'空闲',permission:'默认',has_result:false};
+const fulfilled=value=>({status:'fulfilled',value});
+const control=(body,label)=>[...body.querySelectorAll('label')].find(e=>e.firstChild.textContent.startsWith(label)).querySelector('input,select,textarea');
+const clickText=(root,text)=>[...root.querySelectorAll('button')].find(e=>e.textContent===text).click();
+const settle=()=>new Promise(resolve=>setTimeout(resolve,10));
+w.eval(fs.readFileSync(path.join(assets,'workspace.js'),'utf8'));
+(async()=>{
+  w.WorkspaceView.render(owner,hooks);w.WorkspaceView.sessions(fulfilled([]),fulfilled([cloud]),fulfilled([]));w.WorkspaceView.schedules(fulfilled([]));
+  assert.equal(get('schedule-create').disabled,false,'cloud-only conversation can create a schedule');
+  get('schedule-create').click();let dialog=dialogs.pop();
+  const kind=control(dialog.body,'时间安排');kind.value='interval';kind.dispatchEvent(new w.Event('change'));
+  control(dialog.body,'五段 cron').value='3600';control(dialog.body,'cron 使用').value='2026-10-19T06:00:00';
+  await assert.rejects(()=>dialog.submit(),/带时区/);
+  control(dialog.body,'cron 使用').value='2026-10-19T06:00:00Z';
+  await dialog.submit();let last=calls.pop();
+  assert.equal(last.url,'/api/schedules');assert.equal(last.body.confirmed,true);assert.equal(last.body.schedule.session_id,'cloud-session');
+  assert.deepEqual(JSON.parse(JSON.stringify(last.body.schedule.timing)),{kind:'interval',anchor:1792389600,every_seconds:3600});
+  assert(!Object.hasOwn(last.body.schedule,'owner'));assert(!Object.hasOwn(last.body.schedule,'device_id'));
+  const malicious='<img src=x onerror=alert(1)>';
+  const task={id:'schedule-id',session_id:'original-session',title:malicious,prompt:malicious,mode:'conversation',notify:'always',binding:'chat',device_id:null,workspace:'',timing:{kind:'cron',expression:'0 14 * * *',timezone:'Asia/Shanghai'},revision:7,enabled:true,next_fire:1792389600,notification:'push'};
+  w.WorkspaceView.schedules(fulfilled([task]));assert.equal(get('schedule-list').querySelectorAll('img').length,0);assert(get('schedule-list').textContent.includes(malicious));
+  clickText(get('schedule-list'),'编辑内容与时间');dialog=dialogs.pop();
+  assert.equal(control(dialog.body,'聊天目标').disabled,true);assert.equal(control(dialog.body,'任务类型').disabled,true);
+  control(dialog.body,'名称').value='updated';const editKind=control(dialog.body,'时间安排');editKind.value='after';editKind.dispatchEvent(new w.Event('change'));control(dialog.body,'五段 cron').value='120';
+  await dialog.submit();last=calls.pop();assert.equal(last.url,'/api/schedules/schedule-id/edit');assert.equal(last.body.edit.revision,7);assert.equal(last.body.edit.title,'updated');assert.equal(last.body.edit.timing.seconds,120);assert(!Object.hasOwn(last.body.edit,'session_id'));
+  get('schedule-policy').click();await settle();dialog=dialogs.pop();assert.equal(dialog.title,'主动联系设置');
+  control(dialog.body,'允许主动聊天').checked=false;await dialog.submit();last=calls.pop();assert.equal(last.url,'/api/schedules/contact-policy');assert.equal(last.body.policy.revision,3);assert.equal(last.body.policy.enabled,false);
+  let release;delayedPolicy=new Promise(resolve=>release=resolve);get('schedule-policy').click();w.WorkspaceView.clear();release(policy);await settle();assert.equal(dialogs.length,0,'late policy response cannot reopen private settings after logout');
+  assert.equal(get('schedule-list').children.length,0);assert.equal(get('schedule-create').onclick,null);assert.equal(get('schedule-policy').onclick,null);
+  console.log('PASS: cloud-only schedule forms, anchored interval creation, immutable edit target, versioned optout, literal task content, logout race');
+})().catch(error=>{console.error(error);process.exitCode=1;}).finally(()=>w.close());

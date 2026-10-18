@@ -23,7 +23,7 @@ fn delivery() -> Delivery {
                 request_id: Uuid::new_v4(),
                 turn_id: Uuid::new_v4(),
                 session_id: Uuid::new_v4(),
-                device_id: Uuid::new_v4(),
+                device_id: Some(Uuid::new_v4()),
                 device_name: "Windows PC".into(),
                 workspace: "G:\\Project".into(),
                 expires_at: 1900000300,

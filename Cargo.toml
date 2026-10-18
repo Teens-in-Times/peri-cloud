@@ -23,6 +23,7 @@ members = [
     "peri-remote-tools",
     "peri-executor",
     "peri-cloud",
+    "peri-scheduler",
 ]
 resolver = "2"
 

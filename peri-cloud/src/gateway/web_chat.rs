@@ -223,21 +223,21 @@ impl Gateway {
         if let Some(session) = selected {
             let state = self.runtime.journal().session(principal, session).await?;
             let current = state.frozen.device_id;
-            let available = available.iter().find(|device| device.id == current);
+            let available = available.iter().find(|device| Some(device.id) == current);
             session_id = Some(session);
-            device_id = Some(current);
-            device_name = Some(
+            device_id = current;
+            device_name = current.map(|_| {
                 available
                     .map(|device| device.name.clone())
-                    .unwrap_or_else(|| "已撤销设备".into()),
-            );
-            workspace = Some(state.frozen.binding.workspace.clone());
+                    .unwrap_or_else(|| "已撤销设备".into())
+            });
+            workspace = Some(state.frozen.workspace().clone());
             let activity = self.browser_activity(actor).await?;
             phase = activity
                 .iter()
                 .find(|entry| entry.session_id == session)
                 .map(|entry| entry.phase);
-            needs_device = available.is_none();
+            needs_device = current.is_some() && available.is_none();
         }
         Ok(WebChat {
             conversation_id: route.conversation_id,
@@ -298,13 +298,16 @@ impl Gateway {
         let selected = self.store.selection(&route, principal).await?;
         if let Some(session) = selected {
             let state = self.runtime.journal().session(principal, session).await?;
-            if !devices
-                .iter()
-                .any(|device| device.id == state.frozen.device_id && !device.revoked)
+            if state.frozen.device_id.is_some()
+                && !devices
+                    .iter()
+                    .any(|device| Some(device.id) == state.frozen.device_id && !device.revoked)
             {
                 return Err(GatewayError::Invalid);
             }
-        } else if devices.iter().filter(|device| !device.revoked).count() != 1 {
+        } else if !devices.is_empty()
+            && devices.iter().filter(|device| !device.revoked).count() != 1
+        {
             return Err(GatewayError::Invalid);
         }
         let message = InboundMessage {

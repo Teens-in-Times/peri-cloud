@@ -45,7 +45,7 @@ impl CloudJournal {
         let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
-        if !matches!(version, 0..=9) {
+        if !matches!(version, 0..=15) {
             return Err(StateError::Version);
         }
         super::schema::reject_foreign(&pool, version).await?;
@@ -63,10 +63,14 @@ impl CloudJournal {
         }
         crate::identity::store::migrate(&pool).await?;
         crate::gateway::store::migrate(&pool).await?;
-        super::userdata::migrate(&pool).await?;
+        super::preferences::migrate(&pool).await?;
         crate::gateway::access::migrate(&pool).await?;
         crate::aggregation::migrate(&pool).await?;
         super::schema::migrate(&pool).await?;
+        crate::scheduler::migrate(&pool).await?;
+        crate::memory::migrate(&pool).await?;
+        crate::goal::migrate(&pool).await?;
+        crate::mcp::migrate(&pool).await?;
         let journal = Self {
             pool,
             root: root.to_owned(),
@@ -106,6 +110,9 @@ impl CloudJournal {
         frozen: FrozenSession,
         mode: PermissionMode,
     ) -> StateResult<SessionState> {
+        if frozen.device_id.is_some() != frozen.binding.is_some() {
+            return Err(StateError::BindingConflict);
+        }
         let state = SessionState {
             frozen: frozen.clone(),
             permission_mode: mode as u8,
@@ -113,6 +120,7 @@ impl CloudJournal {
             history_flags: Default::default(),
             unsettled_jobs: Some(Vec::new()),
             revision: 0,
+            context_generation: 0,
         };
         sqlx::query("INSERT OR IGNORE INTO cloud_sessions(id,principal,state_json) VALUES(?,?,?)")
             .bind(frozen.session_id.to_string())
@@ -184,10 +192,53 @@ impl CloudJournal {
         prompt: MessageContent,
         daily_limit: u32,
     ) -> StateResult<Admission> {
+        self.admit_with_schedule(
+            principal,
+            session_id,
+            request_key,
+            prompt,
+            daily_limit,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn admit_with_schedule(
+        &self,
+        principal: Uuid,
+        session_id: Uuid,
+        request_key: String,
+        prompt: MessageContent,
+        daily_limit: u32,
+        scheduled: Option<super::ScheduledAdmission>,
+    ) -> StateResult<Admission> {
         if request_key.is_empty() || request_key.len() > 512 {
             return Err(StateError::InvocationConflict);
         }
         let mut tx = self.pool.begin().await?;
+        if let Some(scheduled) = &scheduled {
+            let row=sqlx::query("SELECT a.request_hash,t.record_json,s.state_json FROM scheduled_admissions a JOIN cloud_turns t ON t.id=a.turn_id JOIN cloud_sessions s ON s.id=t.session_id AND s.principal=a.owner WHERE a.owner=? AND a.occurrence_id=?")
+                .bind(principal.to_string()).bind(scheduled.occurrence_id.to_string()).fetch_optional(&mut *tx).await?;
+            if let Some(row) = row {
+                if row.get::<String, _>("request_hash") != scheduled.request_hash {
+                    return Err(StateError::InvocationConflict);
+                }
+                let turn = serde_json::from_str(row.get("record_json"))?;
+                let session = serde_json::from_str(row.get("state_json"))?;
+                tx.commit().await?;
+                return Ok(Admission {
+                    created: false,
+                    turn,
+                    session,
+                });
+            }
+            let day_start = scheduled.admitted_at.div_euclid(86400) * 86400;
+            let (used,):(i64,)=sqlx::query_as("SELECT COUNT(*) FROM scheduled_admissions WHERE owner=? AND admitted_at>=? AND admitted_at<?")
+                .bind(principal.to_string()).bind(day_start).bind(day_start+86400).fetch_one(&mut *tx).await?;
+            if used >= i64::from(scheduled.daily_limit) {
+                return Err(StateError::Limit);
+            }
+        }
         let row = sqlx::query("SELECT principal,state_json FROM cloud_sessions WHERE id=?")
             .bind(session_id.to_string())
             .fetch_optional(&mut *tx)
@@ -221,7 +272,7 @@ impl CloudJournal {
             return Err(StateError::Busy);
         }
         session.permissions()?;
-        let day = super::userdata::usage_day();
+        let day = super::preferences::usage_day();
         sqlx::query("INSERT OR IGNORE INTO user_usage(principal,day) VALUES(?,?)")
             .bind(principal.to_string())
             .bind(day)
@@ -253,6 +304,12 @@ impl CloudJournal {
         sqlx::query("INSERT INTO cloud_turns(id,session_id,request_key,state,record_json) VALUES(?,?,?,?,?)")
             .bind(turn.turn_id.to_string()).bind(session_id.to_string()).bind(&turn.request_key)
             .bind("queued").bind(serde_json::to_string(&turn)?).execute(&mut *tx).await?;
+        if let Some(scheduled) = scheduled {
+            sqlx::query("INSERT INTO scheduled_admissions(owner,occurrence_id,request_hash,session_id,turn_id,context_generation,route_json,request_key,admitted_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+                .bind(principal.to_string()).bind(scheduled.occurrence_id.to_string()).bind(scheduled.request_hash)
+                .bind(session_id.to_string()).bind(turn.turn_id.to_string()).bind(session.context_generation as i64)
+                .bind(scheduled.route_json).bind(&turn.request_key).bind(scheduled.admitted_at).bind(scheduled.expires_at).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(Admission {
             created: true,
@@ -407,6 +464,10 @@ impl CloudJournal {
         session.history_flags = result.history_flags.clone();
         session.unsettled_jobs = result.unsettled_jobs.clone();
         session.revision += 1;
+        if matches!(&turn.prompt, MessageContent::Text(text) if matches!(text.trim(),"/clear"|"/core:clear") || text.trim().starts_with("/rewind ") || text.trim().starts_with("/core:rewind "))
+        {
+            session.context_generation += 1;
+        }
         turn.state = result.status.into();
         turn.replies = result.replies.clone();
         update_turn(&mut tx, &turn).await?;
@@ -448,10 +509,9 @@ impl CloudJournal {
         if session.revision != expected_revision || active != 0 {
             return Err(StateError::TransitionConflict);
         }
-        if jobs
-            .iter()
-            .any(|job| job.session_id != session.frozen.binding.session_id)
-        {
+        if jobs.iter().any(|job| {
+            Some(job.session_id) != session.frozen.binding.as_ref().map(|b| b.session_id)
+        }) {
             return Err(StateError::BindingConflict);
         }
         session.unsettled_jobs = Some(

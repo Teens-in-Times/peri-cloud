@@ -24,7 +24,7 @@
 
 密钥不回显，不进入聊天、工具参数或诊断输出。当前保存于受保护的 SQLite 状态目录中，数据库及备份应按凭据保护；尚未提供专用密钥库或字段加密。
 
-网页支持个人回复偏好和长期记忆；聊天也可让 Agent 用 `ReadMemory`、`WriteMemory` 更新记忆，写入遵循原会话权限。revision 防止网页和 Agent 并行修改时相互覆盖。
+网页和 QQ 提供独立回复偏好与个人条目记忆。模型通过固定搜索/读取/新增/更正/遗忘工具使用资料，变更遵守原会话权限与条目 CAS；私人资料不进入群聊。详见 [记忆系统](memory.md)。
 
 ## 额度
 
@@ -38,7 +38,7 @@
   "daily_model_requests": 1000,
   "max_turn_seconds": 600,
   "max_prompt_bytes": 65536,
-  "max_user_data_bytes": 8192
+  "max_memory_bytes": 65536
 }
 ```
 

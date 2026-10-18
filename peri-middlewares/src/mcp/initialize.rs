@@ -263,6 +263,22 @@ impl McpClientPool {
         Self::initialize_config(pool, cwd, config, Default::default(), status_tx, None).await;
     }
 
+    /// Initialize only session-declared servers, without reading host config
+    /// files or builtin instances. Account-scoped deployments use this so a
+    /// session's MCP surface is exactly what its authenticated owner supplied.
+    pub async fn run_initialize_session_only(
+        pool: Arc<Self>,
+        cwd: &Path,
+        status_tx: tokio::sync::watch::Sender<McpInitStatus>,
+    ) {
+        pool.seal_builtin_context();
+        let config = super::config::McpConfigFile {
+            mcp_servers: pool.session_servers.get().cloned().unwrap_or_default(),
+            mcp_cache: None,
+        };
+        Self::initialize_config(pool, cwd, config, Default::default(), status_tx, None).await;
+    }
+
     pub async fn run_initialize(
         pool: Arc<Self>,
         cwd: &Path,

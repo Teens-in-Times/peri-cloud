@@ -14,15 +14,15 @@ fn binding(principal: Uuid) -> FrozenSession {
     FrozenSession {
         session_id: Uuid::new_v4(),
         principal_id: principal,
-        device_id: Uuid::new_v4(),
-        binding: SessionBinding {
+        device_id: Some(Uuid::new_v4()),
+        binding: Some(SessionBinding {
             session_id: Uuid::new_v4(),
             workspace: "/bound-device/project".into(),
             workspace_identity: WorkspaceIdentity {
                 device: 1,
                 inode: 2,
             },
-        },
+        }),
         system_prompt: "cloud frozen prompt".into(),
         context_window: 128_000,
     }
@@ -47,7 +47,7 @@ async fn principal_binding_request_identity_and_exclusive_owner_are_preserved() 
         Err(StateError::Forbidden)
     ));
     let mut moved = frozen.clone();
-    moved.binding.workspace_identity.inode += 1;
+    moved.binding.as_mut().unwrap().workspace_identity.inode += 1;
     assert!(matches!(
         journal.bind(moved, PermissionMode::Default).await,
         Err(StateError::BindingConflict)
@@ -370,6 +370,24 @@ async fn schema_eight_migrates_to_nine_and_preserves_rows() {
         .execute(&pool)
         .await
         .unwrap();
+    for sql in [
+        "DROP TABLE memory_session_audience", "DROP TABLE memory_fts",
+        "DROP TABLE memory_audit",
+        "DROP TABLE memory_items",
+        "DROP TABLE memory_accounts",
+        "CREATE TABLE user_data (principal TEXT PRIMARY KEY REFERENCES principals(id),revision INTEGER NOT NULL,instructions TEXT NOT NULL,memory TEXT NOT NULL)",
+        "INSERT INTO user_data SELECT principal,revision,instructions,'' FROM user_preferences",
+        "DROP TABLE user_preferences",
+        "DROP TABLE IF EXISTS scheduled_admissions",
+        "DROP TABLE IF EXISTS scheduled_tasks",
+        "DROP TABLE IF EXISTS scheduled_contact_policy",
+        "DROP TABLE IF EXISTS scheduler_occurrences",
+        "DROP TABLE IF EXISTS scheduler_plans",
+        "DROP TABLE IF EXISTS scheduler_commands",
+        "DROP TABLE IF EXISTS scheduler_metadata",
+    ] {
+        sqlx::query(sql).execute(&pool).await.unwrap();
+    }
     sqlx::query("PRAGMA user_version = 8")
         .execute(&pool)
         .await
@@ -388,7 +406,7 @@ async fn schema_eight_migrates_to_nine_and_preserves_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 15);
     let (application_id,): (i64,) = sqlx::query_as("PRAGMA application_id")
         .fetch_one(&pool)
         .await
@@ -420,7 +438,7 @@ async fn schema_eight_migrates_to_nine_and_preserves_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 15);
     pool.close().await;
     journal.close().await;
 }

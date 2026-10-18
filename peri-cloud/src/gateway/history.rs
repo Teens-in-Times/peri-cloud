@@ -45,6 +45,16 @@ impl Gateway {
             let (_, devices) = self.identity.channel_devices(&route.identity).await?;
             let old = self.journal().session(principal, current).await?;
             let state = self.journal().session(principal, target).await?;
+            if !crate::memory::context::can_attach(
+                self.journal(),
+                principal,
+                target,
+                self.private_memory_route(route),
+            )
+            .await?
+            {
+                return Err(GatewayError::PrivateHistory);
+            }
             if [current, target]
                 .iter()
                 .any(|id| self.runtime.status().active_sessions.contains(id))
@@ -55,29 +65,28 @@ impl Gateway {
             {
                 return Err(GatewayError::Busy);
             }
+            if state.frozen.device_id.is_none() {
+                let agent = self
+                    .connector
+                    .open_conversation(principal, &state.frozen)
+                    .await?;
+                self.attach_conversation(route, principal, agent).await?;
+                self.store.select(route, principal, target).await?;
+                return Ok(format!(
+                    "已恢复云端会话：{target}。原历史、权限与模型选择保留。"
+                ));
+            }
             let device = devices
                 .iter()
-                .find(|d| d.id == state.frozen.device_id && !d.revoked)
+                .find(|d| Some(d.id) == state.frozen.device_id && !d.revoked)
                 .ok_or(IdentityError::Forbidden)?;
             let agent = self
                 .connector
                 .open(principal, device, Some(&state.frozen))
                 .await?;
-            let origin = Arc::new(RwLock::new(None));
-            let broker = Arc::new(SessionBroker {
-                hub: self.hub.clone(),
-                route: route.clone(),
-                principal,
-                session: target,
-                device: device.id,
-                device_name: device.name.clone(),
-                workspace: state.frozen.binding.workspace.clone(),
-                origin: origin.clone(),
-            });
-            self.runtime.rebind_idle(principal, agent, broker).await?;
-            self.origins.write().insert(target, origin);
+            self.attach(route, principal, device, agent).await?;
             self.store.select(route, principal, target).await?;
-            return Ok(format!("已恢复会话：{target}\n设备：{}\n目录：{}\n沿用该会话已保存的上下文、权限和模型选择；不会重新执行历史工具。",device.name,state.frozen.binding.workspace));
+            return Ok(format!("已恢复会话：{target}\n设备：{}\n目录：{}\n沿用该会话已保存的上下文、权限和模型选择；不会重新执行历史工具。",device.name,state.frozen.workspace()));
         }
         if args == "messages" || args.starts_with("messages ") {
             let page = args.strip_prefix("messages").unwrap().trim();
@@ -115,8 +124,8 @@ impl Gateway {
         if page == 0 {
             return Err(GatewayError::Invalid);
         }
-        let rows=sqlx::query("SELECT state_json FROM cloud_sessions WHERE principal=? ORDER BY rowid DESC LIMIT 7 OFFSET ?")
-            .bind(principal.to_string()).bind(i64::try_from((page-1).saturating_mul(6)).map_err(|_|GatewayError::Invalid)?).fetch_all(&self.store.pool).await?;
+        let rows=sqlx::query("SELECT s.state_json FROM cloud_sessions s LEFT JOIN memory_session_audience a ON a.session_id=s.id WHERE s.principal=? AND (? OR a.private_memory=0) ORDER BY s.rowid DESC LIMIT 7 OFFSET ?")
+            .bind(principal.to_string()).bind(self.private_memory_route(route)).bind(i64::try_from((page-1).saturating_mul(6)).map_err(|_|GatewayError::Invalid)?).fetch_all(&self.store.pool).await?;
         let mut output = format!("我的历史会话 · 第 {page} 页\n");
         for row in rows.iter().take(6) {
             let state: SessionState = serde_json::from_str(row.get("state_json"))?;
@@ -128,8 +137,12 @@ impl Gateway {
                 } else {
                     ""
                 },
-                state.frozen.device_id,
-                state.frozen.binding.workspace
+                state
+                    .frozen
+                    .device_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "云端对话".into()),
+                state.frozen.workspace()
             ));
         }
         if rows.len() > 6 {

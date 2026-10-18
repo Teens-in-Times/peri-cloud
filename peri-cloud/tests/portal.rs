@@ -588,6 +588,8 @@ async fn structured_controls_require_browser_authentication_and_csrf_even_withou
         "/api/aggregate/usage",
         "/api/aggregate/audit",
         "/api/aggregate/model",
+        "/api/schedules",
+        "/api/schedules/contact-policy",
     ] {
         assert_eq!(
             f.get(path).send().await.unwrap().status(),
@@ -596,6 +598,22 @@ async fn structured_controls_require_browser_authentication_and_csrf_even_withou
     }
     let (browser, _) = f.login().await;
     for (path, body) in [
+        (
+            "/api/schedules".to_owned(),
+            json!({"confirmed":true,"schedule":{"request_id":id,"session_id":id,"title":"greeting","prompt":"hello","timing":{"kind":"after","seconds":60}}}),
+        ),
+        (
+            format!("/api/schedules/{id}/actions"),
+            json!({"confirmed":true,"revision":1,"action":"pause"}),
+        ),
+        (
+            format!("/api/schedules/{id}/edit"),
+            json!({"confirmed":true,"edit":{"request_id":id,"revision":1,"title":"greeting","prompt":"hello","timing":{"kind":"after","seconds":60},"notify":"always","enabled":true}}),
+        ),
+        (
+            "/api/schedules/contact-policy".to_owned(),
+            json!({"confirmed":true,"policy":{"revision":0,"enabled":false,"timezone":"UTC","start_hour":8,"end_hour":22,"daily_limit":20}}),
+        ),
         (
             "/api/aggregate/model".to_owned(),
             json!({"model":null,"revision":0}),

@@ -203,7 +203,7 @@ async fn invites_are_one_time_expiring_admin_only_and_accounts_keep_separate_cha
 
 #[tokio::test]
 async fn personal_context_is_account_scoped_and_concurrent_edits_do_not_overwrite() {
-    use peri_cloud::state::{StateError, UserData};
+    use peri_cloud::state::{StateError, UserPreferences};
     let f = Fixture::new().await;
     let invite = f.identity.create_invite(&f.browser).await.unwrap();
     let guest = f
@@ -214,42 +214,39 @@ async fn personal_context_is_account_scoped_and_concurrent_edits_do_not_overwrit
     let owner = f.browser.principal().id;
     let data = f
         .journal
-        .save_user_data(
+        .save_preferences(
             owner,
-            UserData {
+            UserPreferences {
                 revision: 0,
                 instructions: "OWNER_PREFERENCES".into(),
-                memory: "OWNER_MEMORY".into(),
             },
-            8192,
         )
         .await
         .unwrap();
     assert_eq!(data.revision, 1);
     assert_eq!(
-        f.journal.user_data(guest.id).await.unwrap(),
-        UserData::default()
+        f.journal.preferences(guest.id).await.unwrap(),
+        UserPreferences::default()
     );
     assert!(matches!(
         f.journal
-            .save_user_data(owner, UserData::default(), 8192)
+            .save_preferences(owner, UserPreferences::default())
             .await,
         Err(StateError::InvocationConflict)
     ));
     assert!(matches!(
         f.journal
-            .save_user_data(
+            .save_preferences(
                 guest.id,
-                UserData {
-                    memory: "x".repeat(8193),
+                UserPreferences {
+                    instructions: "x".repeat(4097),
                     ..Default::default()
                 },
-                8192
             )
             .await,
         Err(StateError::Limit)
     ));
-    assert_eq!(f.journal.user_data(owner).await.unwrap(), data);
+    assert_eq!(f.journal.preferences(owner).await.unwrap(), data);
     f.journal.close().await;
 }
 

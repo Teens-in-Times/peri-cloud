@@ -32,6 +32,12 @@ pub use types::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
+    #[error("private or legacy conversation history cannot enter a shared conversation")]
+    PrivateHistory,
+    #[error(transparent)]
+    Memory(#[from] crate::memory::MemoryError),
+    #[error(transparent)]
+    Schedule(#[from] crate::scheduler::ScheduleError),
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityError),
     #[error(transparent)]

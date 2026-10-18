@@ -23,6 +23,10 @@ impl Gateway {
             ("new", "当前设备和目录开启新会话"),
             ("help", "完整命令帮助"),
             ("pwd", "会话和工作区信息"),
+            (
+                "schedule",
+                "持久定时任务：一次、周期、暂停、恢复、删除与触发记录",
+            ),
         ] {
             if catalog
                 .iter()
@@ -176,8 +180,10 @@ impl Gateway {
         let (_, devices) = self.identity.channel_devices(&route.identity).await?;
         let device = devices
             .iter()
-            .find(|d| d.id == state.frozen.device_id)
-            .ok_or(IdentityError::Forbidden)?;
+            .find(|d| Some(d.id) == state.frozen.device_id);
+        if state.frozen.device_id.is_some() && device.is_none() {
+            return Err(IdentityError::Forbidden.into());
+        }
         let interactive = match text {
             "/模型" => Some("model-panel"),
             "/设置" | "/记忆" | "/用量" => Some("account-settings"),
@@ -195,6 +201,8 @@ impl Gateway {
             || text == "/pwd"
             || text == "/状态"
             || text == "/取消"
+            || text == "/定时"
+            || text.starts_with("/定时 ")
             || text == "/threads"
             || text.starts_with("/threads ")
             || text.starts_with("/resume ")
@@ -214,9 +222,12 @@ impl Gateway {
                 "此命令是原生界面的交互面板。继续使用同一后端的结构化入口：{}",
                 link.unwrap_or_else(|| format!("工作台 #{section}"))
             ))
+        } else if text == "/定时" || text.starts_with("/定时 ") {
+            self.schedule_command(&route, principal, Some(session), text, request.to_string())
+                .await
         } else if text == "/状态" {
             Ok(self
-                .activity(&route, principal, device, &state)
+                .conversation_activity(&route, principal, device, &state)
                 .await?
                 .text())
         } else if text == "/取消" {
@@ -229,14 +240,23 @@ impl Gateway {
                 Ok("没有正在运行的云任务。".into())
             }
         } else if text == "/new" {
-            self.new_chat_session(&route, principal, device, session)
-                .await
+            match device {
+                Some(device) => {
+                    self.new_chat_session(&route, principal, device, session)
+                        .await
+                }
+                None => self
+                    .new_cloud_conversation(&route, principal, session)
+                    .await
+                    .map(|id| format!("已开始空白云端会话：{id}。")),
+            }
         } else if text == "/help" || text.starts_with("/help ") {
             Ok(self.command_help(text.strip_prefix("/help").unwrap().trim()))
         } else if text == "/pwd" {
             Ok(format!(
                 "会话：{session}\n设备：{}\n目录：{}",
-                device.name, state.frozen.binding.workspace
+                device.map(|d| d.name.as_str()).unwrap_or("云端对话"),
+                state.frozen.workspace()
             ))
         } else if let Some(reason) = self.unavailable_command(text) {
             Ok(reason)

@@ -417,6 +417,7 @@ impl MessageAdapter for QqAdapter {
     }
     async fn deliver(&self, delivery: &Delivery) -> Result<(), DeliveryError> {
         if delivery.route.identity.adapter_instance_id != self.instance
+            || delivery.reply_kind == crate::gateway::ReplyKind::Proactive
             || delivery.message_sequence == 0
         {
             return Err(DeliveryError::Rejected);

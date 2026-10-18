@@ -39,7 +39,7 @@ impl ActivityPhase {
 pub struct ConversationActivity {
     pub adapter: String,
     pub session_id: Uuid,
-    pub device_id: Uuid,
+    pub device_id: Option<Uuid>,
     pub device_name: String,
     pub conversation_id: String,
     pub workspace: String,
@@ -109,6 +109,16 @@ impl Gateway {
         device: &DeviceRecord,
         state: &SessionState,
     ) -> GatewayResult<ConversationActivity> {
+        self.conversation_activity(route, principal, Some(device), state)
+            .await
+    }
+    pub(super) async fn conversation_activity(
+        &self,
+        route: &ChannelRoute,
+        principal: Uuid,
+        device: Option<&DeviceRecord>,
+        state: &SessionState,
+    ) -> GatewayResult<ConversationActivity> {
         let session = state.frozen.session_id;
         let active = self
             .runtime
@@ -172,10 +182,12 @@ impl Gateway {
         Ok(ConversationActivity {
             adapter: route.identity.adapter_instance_id.clone(),
             session_id: session,
-            device_id: device.id,
-            device_name: device.name.clone(),
+            device_id: device.map(|d| d.id),
+            device_name: device
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "云端对话".into()),
             conversation_id: route.conversation_id.clone(),
-            workspace: state.frozen.binding.workspace.clone(),
+            workspace: state.frozen.workspace().clone(),
             permission: super::permission_label(state.permissions()?).into(),
             phase,
             label: phase.label().into(),
@@ -202,7 +214,7 @@ impl Gateway {
         turn: Option<Uuid>,
     ) -> GatewayResult<Option<(Uuid, Uuid)>> {
         let turn = turn.map(|t| t.to_string());
-        let row = sqlx::query("WITH sources AS (SELECT principal,route_json,session_id,turn_id FROM gateway_inbox UNION ALL SELECT o.principal,json_extract(o.result_json,'$.route_json'),o.target,t.id FROM control_operations o JOIN cloud_turns t ON t.session_id=o.target AND t.request_key='web:'||o.id WHERE o.kind='task.submit') SELECT i.session_id,i.turn_id FROM sources i JOIN cloud_turns t ON t.id=i.turn_id AND t.session_id=i.session_id JOIN cloud_sessions s ON s.id=i.session_id WHERE i.principal=? AND s.principal=? AND i.route_json=? AND t.state NOT IN ('queued','running') AND (? IS NULL OR i.turn_id=?) ORDER BY t.rowid DESC LIMIT 1")
+        let row = sqlx::query("WITH sources AS (SELECT principal,route_json,session_id,turn_id FROM gateway_inbox UNION ALL SELECT owner,route_json,session_id,turn_id FROM scheduled_admissions UNION ALL SELECT o.principal,json_extract(o.result_json,'$.route_json'),o.target,t.id FROM control_operations o JOIN cloud_turns t ON t.session_id=o.target AND t.request_key='web:'||o.id WHERE o.kind='task.submit') SELECT i.session_id,i.turn_id FROM sources i JOIN cloud_turns t ON t.id=i.turn_id AND t.session_id=i.session_id JOIN cloud_sessions s ON s.id=i.session_id WHERE i.principal=? AND s.principal=? AND i.route_json=? AND t.state NOT IN ('queued','running') AND (? IS NULL OR i.turn_id=?) ORDER BY t.rowid DESC LIMIT 1")
             .bind(principal.to_string()).bind(principal.to_string()).bind(serde_json::to_string(route)?)
             .bind(&turn).bind(&turn)
             .fetch_optional(&self.store.pool).await?;
@@ -236,8 +248,10 @@ impl Gateway {
         let state = self.runtime.journal().session(principal, session).await?;
         let device = devices
             .iter()
-            .find(|d| d.id == state.frozen.device_id && !d.revoked)
-            .ok_or(IdentityError::Forbidden)?;
+            .find(|d| Some(d.id) == state.frozen.device_id && !d.revoked);
+        if state.frozen.device_id.is_some() && device.is_none() {
+            return Err(IdentityError::Forbidden.into());
+        }
         let turn = self
             .runtime
             .journal()
@@ -253,8 +267,10 @@ impl Gateway {
         Ok(Some(SavedResultPage {
             session_id: session,
             turn_id: turn.turn_id,
-            device_name: device.name.clone(),
-            workspace: state.frozen.binding.workspace,
+            device_name: device
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "云端对话".into()),
+            workspace: state.frozen.workspace(),
             page,
             page_count,
             text,
@@ -279,9 +295,16 @@ impl Gateway {
                 continue;
             }
             let state = self.runtime.journal().session(principal, session).await?;
+            if state.frozen.device_id.is_none() {
+                result.push(
+                    self.conversation_activity(&route, principal, None, &state)
+                        .await?,
+                );
+                continue;
+            }
             if let Some(device) = devices
                 .iter()
-                .find(|d| d.id == state.frozen.device_id && !d.revoked)
+                .find(|d| Some(d.id) == state.frozen.device_id && !d.revoked)
             {
                 result.push(self.activity(&route, principal, device, &state).await?);
             }

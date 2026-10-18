@@ -21,6 +21,12 @@ pub fn router(executor: Arc<Executor>) -> Router {
         .route("/v1/sessions/{id}", put(bind_session))
         .route("/v1/sessions/{id}/tools", get(tools))
         .route("/v1/sessions/{id}/jobs", get(session_jobs))
+        .route(
+            "/v1/sessions/{id}/workspace/instructions",
+            get(workspace_instructions),
+        )
+        .route("/v1/sessions/{id}/workspace/skills", get(workspace_skills))
+        .route("/v1/sessions/{id}/workspace/read", post(workspace_read))
         .route("/v1/jobs", post(submit))
         .route("/v1/jobs/{id}", get(job))
         .route("/v1/jobs/{id}/cancel", post(cancel))
@@ -111,6 +117,28 @@ async fn session_jobs(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<JobSnapshot>>, Error> {
     Ok(Json(executor.session_jobs(id).await?))
+}
+
+async fn workspace_instructions(
+    State(executor): State<Arc<Executor>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<WorkspaceInstructions>, Error> {
+    Ok(Json(executor.workspace_instructions(id).await?))
+}
+
+async fn workspace_skills(
+    State(executor): State<Arc<Executor>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<WorkspaceSkills>, Error> {
+    Ok(Json(executor.workspace_skills(id).await?))
+}
+
+async fn workspace_read(
+    State(executor): State<Arc<Executor>>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<WorkspaceReadRequest>,
+) -> Result<Json<WorkspaceFile>, Error> {
+    Ok(Json(executor.workspace_read(id, request).await?))
 }
 
 impl IntoResponse for Error {

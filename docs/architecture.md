@@ -24,7 +24,8 @@ flowchart LR
 
 | 模块 | 职责 |
 | --- | --- |
-| peri-cloud | 云端推理宿主、身份、账号网页、可选网关、持久化调度 |
+| peri-cloud | 云端推理宿主、身份、账号网页、可选网关、计划任务应用适配 |
+| peri-scheduler | 独立时间模型、原子触发与持久派发恢复；不依赖 Agent、记忆、设备或 QQ |
 | peri-executor | 原生工具执行、任务日志、本机 OAuth 登录、设备发起的 SSH 隧道 |
 | peri-remote-tools | 云端的原生远程工具协议与分派 |
 | peri-tool-runtime | 两端共享的文件与 Shell 工具实现 |
@@ -91,7 +92,7 @@ SQLite 日志记录入站消息、会话、云任务、审批、执行器任务�
 
 个人供应商由部署者列出，用户只提交供应商 ID、模型 ID 和密钥。每轮快照自己的模型和个人上下文，修改从下一轮生效。密钥只保存在受保护的云端状态目录，不回显、不进入工具参数；数据库和备份属于敏感材料。
 
-云端 `ReadMemory`、`WriteMemory` 绑定当前账号，版本号避免覆盖并行修改。写入继续经过现有 Peri 权限中间件，执行器不另加权限层。偏好与记忆合计限长，当前不执行记忆检索。
+云端记忆以账号条目为真值，偏好单独保存。固定 SearchMemory/GetMemory/AddMemory/UpdateMemory/ForgetMemory 工具绑定可信账号和经核验的范围；逐条 CAS 和账号 generation 防止覆盖与旧请求复活。FTS5 使用应用层中文单字/双字与 ASCII 词元，精确子串补充短词与路径查询。正文、索引和无正文审计在同一事务变更，遗忘保留 tombstone。写入继续经过现有 PermissionMiddleware。私聊与认证网页才注入个人资料，私人或旧版会话不能恢复到群聊；定时回合只读当前记忆。容量、迁移与 API 见 [记忆系统](memory.md)。
 
 ## 消息与工具扩展
 
@@ -101,7 +102,15 @@ SQLite 日志记录入站消息、会话、云任务、审批、执行器任务�
 
 菜单视图从完整 MenuCard 生成分页正文，按钮标签仅是入口，不承载完整名称的唯一副本。分页固定持久发件 ID，通过当前账号与精确聊天路由读取，不刷新、消费或恢复操作令牌；过期菜单仍可查看文字，但操作继续受原有过期、会话和提问版本检查约束。
 
-远程工具协议为其他工具留有扩展空间，当前注册核心读写、编辑、文件查找、内容搜索和 Shell；个人文本记忆在云端处理。检索式记忆后端及 Wake-on-LAN 节点尚未交付。
+远程工具协议为其他工具留有扩展空间，当前注册核心读写、编辑、文件查找、内容搜索和 Shell；个人条目记忆及中文检索在云端处理。USER/FLEET/DEVICE_ENV 范围记忆、版本化模型帧及隐私上下文隔离复用云端账号权限；独立项目授权、后台提炼及 Wake-on-LAN 节点尚未交付。
+
+## 设备工作区与云端能力装配
+
+云端 Agent 继续使用 Peri v4 的中间件链，但只装配能在认证边界内工作的槽位。Web 搜索/抓取由部署环境显式配置端点后启用，沿用 WebSearch/WebFetch 的审批规则；TodoWrite 只维护会话计划，不引入第二个 UI。Goal 以会话为单例持久化在 CloudJournal（schema 14），由 deferred `goal` 工具创建、完成、阻塞或清除，ToolSearch 负责发现与执行。
+
+设备绑定时，执行器提供只读工作区接口：项目指令候选（`AGENTS.md` → `CLAUDE.md` → `.claude/AGENTS.md`，另加 `CLAUDE.local.md`）、`.claude/skills` 下的 `SKILL.md` 目录，以及按已发现项读取正文。接口沿用现有 Bearer 认证，复核会话绑定与工作区身份，只接受工作区相对路径并拒绝符号链接、父目录逃逸和越界；云端不读取主控文件系统。指令按会话冻结；技能工具按需从同一设备读取正文，加载技能不授予执行权限。当前不展开 `CLAUDE.md` 的 `@import`，技能只覆盖项目 `.claude/skills`。
+
+MCP 服务按账号保存在 CloudJournal（schema 15），每个会话的池只含该账号启用的服务，不读取主控配置文件、builtin 实例或 stdio。`/mcp` 只接受公网 HTTPS 端点，拒绝 URL 凭据、查询参数、回环/内网/保留地址，HTTP 重定向一律不跟随；不保存 MCP 凭据，因此当前不支持需要 OAuth 或自定义头的服务。MCP 工具保留 `mcp__` 前缀审批，`ExecuteExtraTool` 在派发前解析真实目标，包装工具不能绕过审批。
 
 ## 网关访问控制
 
@@ -110,3 +119,13 @@ SQLite 日志记录入站消息、会话、云任务、审批、执行器任务�
 ## 原生命令控制面
 
 原生 CommandRegistry/CommandHandler 契约由服务器组合根装配，QQ 与认证 HTTP 共享会话执行能力；目录明确区分 available、limited、adapted、unavailable。耗时命令继续由 Runtime 持有，历史与 flags 经原 Journal 原子结算。clear/rewind 不依赖模型可用性；compact 复用 Agent 的摘要生成逻辑，不在主控读取远程 cwd。具体协议、兼容范围和扩展方式见 [QQ CLI 命令](qq-cli-commands.md)。
+
+## 调度与主动聊天
+
+调度库通过 `Scheduler::apply / inspect / run` 提供托管入口，`Clock`、`SchedulerStore` 与 `TaskDispatcher` 是替换端口。CloudJournal 的唯一进程所有者提供内嵌 SQLite 连接；调度元数据使用独立 `scheduler_metadata`，不修改宿主 `user_version`。云端 schema 11 增加任务引用、全局受理映射和联系设置；旧 schema 10 工作稿保持 `LegacyFrozenSession` 绑定，不静默拓展授权范围。
+
+Schedule、Occurrence、Runtime Turn 与 Delivery 分开记录。云端先查询 `(owner, occurrence_id)` 原受理映射，再为新触发解析当前会话；映射、轮次与额度原子提交。受理未知先查原回执，执行未知继续占用会话；发送未知沿用原发件箱且不重投。
+
+聊天任务绑定已授权的聊天路由，设备任务冻结原会话、设备和工作区。`FrozenSession.device_id` 和 `binding` 同时为空表示明确的云端对话，两者必须成对存在或成对缺省。纯聊天继续使用原 Runtime、个人偏好、条目记忆快照和 PermissionMiddleware，能力表不含设备工具；设备恢复后可重新装配原设备能力。聊天消息投递前复核账号、路由、联系设置、有效期与 `context_generation`；清空或回退上下文使旧代次未发消息失效。
+
+独立二进制提供规则检查与触发时间预览；常驻远程调度宿主尚未启用，需另行验收认证受理协议、唯一状态所有权及迁移流程。见 [调度器运行与接口](scheduler.md)。

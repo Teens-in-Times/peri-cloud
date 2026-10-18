@@ -182,6 +182,35 @@ impl Executor {
         self.store.session_jobs(id).await
     }
 
+    /// Binding-scoped project instructions. The workspace identity is checked
+    /// again so a replaced/moved directory cannot serve different content.
+    pub async fn workspace_instructions(&self, id: Uuid) -> Result<WorkspaceInstructions> {
+        let workspace = self.workspace_root(id).await?;
+        tokio::task::spawn_blocking(move || crate::workspace::instructions(&workspace)).await?
+    }
+
+    pub async fn workspace_skills(&self, id: Uuid) -> Result<WorkspaceSkills> {
+        let workspace = self.workspace_root(id).await?;
+        Ok(tokio::task::spawn_blocking(move || crate::workspace::skills(&workspace)).await?)
+    }
+
+    pub async fn workspace_read(
+        &self,
+        id: Uuid,
+        request: WorkspaceReadRequest,
+    ) -> Result<WorkspaceFile> {
+        let workspace = self.workspace_root(id).await?;
+        tokio::task::spawn_blocking(move || crate::workspace::read_skill(&workspace, &request.path))
+            .await?
+    }
+
+    async fn workspace_root(&self, id: Uuid) -> Result<String> {
+        self.ensure_open()?;
+        let tools = self.session_tools(id).await?;
+        crate::workspace::verify(&tools.binding).await?;
+        Ok(tools.binding.workspace.clone())
+    }
+
     pub async fn cancel(&self, id: Uuid) -> Result<JobSnapshot> {
         let _gate = self.admission.lock().await;
         let job = self.store.job(id).await?;

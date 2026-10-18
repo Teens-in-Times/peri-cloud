@@ -76,7 +76,7 @@ impl Gateway {
         };
         let current = state
             .as_ref()
-            .and_then(|s| devices.iter().find(|d| d.id == s.frozen.device_id));
+            .and_then(|s| devices.iter().find(|d| Some(d.id) == s.frozen.device_id));
         match action {
             MenuAction::Commands => return Ok(self.command_help("").into()),
             MenuAction::AggregateModels { page } => {
@@ -126,11 +126,21 @@ impl Gateway {
                         .await?,
                 })
             }
-            MenuAction::ClearPersonal { field, revision } => {
+            MenuAction::ClearPreferences { revision } => {
+                return Ok(self.clear_preferences(principal, revision).await?.into())
+            }
+            MenuAction::MemoryChange { change } => {
                 return Ok(self
-                    .clear_personal(principal, &field, revision)
+                    .apply_memory_change(&message.route, principal, change)
                     .await?
-                    .into())
+                    .into());
+            }
+            MenuAction::MemoryPage { scope, page } => {
+                return Ok(DeliveryBody::Menu {
+                    card: self
+                        .memory_scope_menu(message, principal, selected, page, scope)
+                        .await?,
+                });
             }
             MenuAction::QuestionPage {
                 request,
@@ -284,11 +294,9 @@ impl Gateway {
                     .known_workspaces(principal, device.id)
                     .await?
                     .into_iter()
-                    .filter(|p| {
-                        *p != state.frozen.binding.workspace && *p != device.default_workspace
-                    })
+                    .filter(|p| *p != state.frozen.workspace() && *p != device.default_workspace)
                     .collect();
-                text = format!("设备：{}\n当前：{}\n默认（全局）：{}\n\n历史工作区第 {}/{} 页，共 {} 个。\n可直接使用默认目录，或浏览实例上的文件夹。切换后开始新会话，保留当前权限与旧历史。",device.name,state.frozen.binding.workspace,device.default_workspace,offset / 6 + 1, paths.len().div_ceil(6).max(1),paths.len());
+                text = format!("设备：{}\n当前：{}\n默认（全局）：{}\n\n历史工作区第 {}/{} 页，共 {} 个。\n可直接使用默认目录，或浏览实例上的文件夹。切换后开始新会话，保留当前权限与旧历史。",device.name,state.frozen.workspace(),device.default_workspace,offset / 6 + 1, paths.len().div_ceil(6).max(1),paths.len());
                 choices.push((
                     "使用默认工作区".into(),
                     MenuAction::Select {
@@ -300,7 +308,7 @@ impl Gateway {
                     "浏览当前目录".into(),
                     MenuAction::Browse {
                         device: device.id,
-                        path: Some(state.frozen.binding.workspace.clone()),
+                        path: Some(state.frozen.workspace().clone()),
                         offset: 0,
                     },
                 ));
@@ -533,7 +541,8 @@ impl Gateway {
                 title = "设备与工作区已就绪".into();
                 text = format!(
                     "设备：{}\n工作区：{}\n现在直接发送任务即可。",
-                    device.name, frozen.binding.workspace
+                    device.name,
+                    frozen.workspace()
                 );
                 choices.extend([
                     ("选择工作区".into(), MenuAction::Workspaces),

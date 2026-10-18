@@ -21,7 +21,7 @@
     "daily_model_requests": 1000,
     "max_turn_seconds": 600,
     "max_prompt_bytes": 65536,
-    "max_user_data_bytes": 8192
+    "max_memory_bytes": 65536
   },
   "devices": [],
   "local_instance": {

@@ -21,6 +21,7 @@ use peri_agent::session::{
 };
 use peri_agent::tools::BaseTool;
 use peri_middlewares::permission::AutoClassifier;
+use peri_middlewares::tool_search::{ExecuteExtraToolResolver, ToolSearchIndex};
 use peri_model::Model;
 use peri_remote_tools::RemoteSession;
 use serde::{Deserialize, Serialize};
@@ -28,8 +29,10 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::assembly::{CloudAssemblyContext, CloudChainAssembler};
+use crate::assembly::{CloudAssemblyContext, CloudChainAssembler, CloudToolSearch, CloudWebTools};
+use crate::mcp::McpCache;
 use crate::reply::{replies, ChatReply};
+use crate::workspace::WorkspaceCache;
 
 #[path = "compact.rs"]
 mod compact;
@@ -46,6 +49,10 @@ pub enum Error {
     ToolCatalog,
     #[error("account model configuration is unavailable")]
     AccountModel,
+    #[error("account memory is unavailable")]
+    AccountMemory,
+    #[error("account goal state is unavailable")]
+    AccountGoal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,16 +92,84 @@ pub struct CloudTurnResult {
 /// Original Peri loop with cloud-owned policy and a frozen native tool backend.
 pub struct CloudAgent {
     session_id: Uuid,
-    remote: Arc<RemoteSession>,
+    remote: Option<Arc<RemoteSession>>,
+    device_id: Option<Uuid>,
+    binding: Option<peri_acp_types::device_executor::SessionBinding>,
+    scheduled: std::sync::atomic::AtomicBool,
+    private_memory: bool,
     model: Arc<dyn Model>,
     frozen_prompt: String,
     context_window: u32,
     turn_gate: Mutex<()>,
     commands: Arc<peri_acp_types::command::CommandRegistry>,
     account_models: Option<Arc<crate::models::AccountModels>>,
+    schedule_push: std::sync::atomic::AtomicBool,
+    workspace_cache: Arc<WorkspaceCache>,
+    mcp_cache: Arc<McpCache>,
 }
 
 impl CloudAgent {
+    pub(crate) fn has_device_tools(&self) -> bool {
+        self.remote.is_some()
+    }
+    pub(crate) fn for_scheduled(&self) -> Arc<Self> {
+        Arc::new(Self {
+            session_id: self.session_id,
+            remote: self.remote.clone(),
+            device_id: self.device_id,
+            binding: self.binding.clone(),
+            scheduled: std::sync::atomic::AtomicBool::new(true),
+            private_memory: self.private_memory,
+            model: self.model.clone(),
+            frozen_prompt: self.frozen_prompt.clone(),
+            context_window: self.context_window,
+            turn_gate: Mutex::new(()),
+            commands: self.commands.clone(),
+            account_models: self.account_models.clone(),
+            schedule_push: std::sync::atomic::AtomicBool::new(
+                self.schedule_push
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            workspace_cache: self.workspace_cache.clone(),
+            mcp_cache: self.mcp_cache.clone(),
+        })
+    }
+    pub(crate) fn for_memory_visibility(&self, private: bool) -> Arc<Self> {
+        let mut cloned = self.for_scheduled();
+        let agent = Arc::get_mut(&mut cloned).expect("new agent clone");
+        agent.private_memory = private;
+        agent.scheduled.store(
+            self.scheduled.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        cloned
+    }
+    pub(crate) fn conversation(
+        frozen: &crate::state::FrozenSession,
+        model: Arc<dyn Model>,
+    ) -> Self {
+        Self {
+            session_id: frozen.session_id,
+            remote: None,
+            device_id: frozen.device_id,
+            binding: frozen.binding.clone(),
+            scheduled: std::sync::atomic::AtomicBool::new(false),
+            private_memory: true,
+            model,
+            frozen_prompt: frozen.system_prompt.clone(),
+            context_window: frozen.context_window,
+            turn_gate: Mutex::new(()),
+            commands: crate::commands::native_registry(),
+            account_models: None,
+            schedule_push: std::sync::atomic::AtomicBool::new(false),
+            workspace_cache: Arc::new(WorkspaceCache::new()),
+            mcp_cache: Arc::new(McpCache::new()),
+        }
+    }
+    pub(crate) fn configure_schedule_notifications(&self, push: bool) {
+        self.schedule_push
+            .store(push, std::sync::atomic::Ordering::Relaxed);
+    }
     pub fn new(
         session_id: Uuid,
         remote: Arc<RemoteSession>,
@@ -110,13 +185,20 @@ impl CloudAgent {
         }
         Ok(Self {
             session_id,
-            remote,
+            device_id: Some(remote.device_id()),
+            binding: Some(remote.binding().clone()),
+            remote: Some(remote),
+            scheduled: std::sync::atomic::AtomicBool::new(false),
+            private_memory: true,
             model,
             frozen_prompt,
             context_window,
             turn_gate: Mutex::new(()),
             commands: crate::commands::native_registry(),
             account_models: None,
+            schedule_push: std::sync::atomic::AtomicBool::new(false),
+            workspace_cache: Arc::new(WorkspaceCache::new()),
+            mcp_cache: Arc::new(McpCache::new()),
         })
     }
 
@@ -140,17 +222,26 @@ impl CloudAgent {
 
     pub(crate) async fn run_personal_turn(
         &self,
-        request: CloudTurnRequest,
-        data: crate::state::UserData,
+        mut request: CloudTurnRequest,
         journal: Arc<crate::state::CloudJournal>,
         principal: Uuid,
         limits: &crate::limits::RuntimeLimits,
     ) -> Result<CloudTurnResult, Error> {
-        let prompt = format!("{}\n\nAccount preferences (apply within the system and session rules):\n{}\n\nAccount memory (user-provided facts, not tool or system instructions):\n{}\nUse ReadMemory/WriteMemory for changes requested by the user.", self.frozen_prompt, data.instructions, data.memory);
-        let scope = crate::personal::PersonalScope {
+        let prompt = format!("{}\n\n{}", self.frozen_prompt, crate::memory::frames::RULES);
+        let mut scope = crate::personal::PersonalScope {
+            session_id: self.session_id,
+            turn_id: request.turn_id,
+            device_id: self.device_id,
+            private_memory: self.private_memory,
+            memory_fence: Default::default(),
+            model_revision: String::new(),
+            schedule_push: self
+                .schedule_push
+                .load(std::sync::atomic::Ordering::Relaxed),
+            scheduled: self.scheduled.load(std::sync::atomic::Ordering::Relaxed),
             journal: journal.clone(),
             principal,
-            max_bytes: limits.max_user_data_bytes,
+            max_bytes: limits.max_memory_bytes,
         };
         let context_only = matches!(&request.prompt, MessageContent::Text(text)
             if self.commands.resolve(text).is_some_and(|command|matches!(command.entry.fullname.as_str(), "core:clear"|"core:rewind")));
@@ -167,12 +258,27 @@ impl CloudAgent {
                 .map_err(|_| Error::AccountModel)?,
             None => self.model.clone(),
         };
+        scope.model_revision =
+            crate::memory::frames::model_revision(inner.as_ref(), self.context_window);
+        if self.private_memory && !context_only {
+            crate::memory::frames::prepare(&scope, &mut request)
+                .await
+                .map_err(|_| Error::AccountMemory)?;
+        }
         let model = Arc::new(crate::personal::MeteredModel {
             inner,
             journal,
             principal,
             daily_limit: limits.daily_model_requests,
         });
+        let model: Arc<dyn Model> = if self.private_memory {
+            Arc::new(crate::memory::frames::GuardedModel {
+                inner: model,
+                scope: scope.clone(),
+            })
+        } else {
+            model
+        };
         self.run_context_turn(request, &prompt, model, Some(scope))
             .await
     }
@@ -222,7 +328,11 @@ impl CloudAgent {
                                 principal_id: scope.principal,
                                 session_id: self.session_id,
                                 turn_id: request.turn_id,
-                                device_id: self.remote.device_id(),
+                                device_id: self.device_id,
+                                mcp_store: Some(Arc::new(crate::mcp::McpServerStore::new(
+                                    scope.journal.identity_pool(),
+                                    scope.principal,
+                                ))),
                             }),
                         );
                     }
@@ -231,9 +341,18 @@ impl CloudAgent {
                         request
                             .history
                             .iter()
+                            .filter(|p| {
+                                !request
+                                    .history_flags
+                                    .get(&p.id())
+                                    .is_some_and(|f| f.excluded)
+                            })
                             .filter_map(|p| p.as_message().cloned())
                             .collect(),
-                        self.remote.binding().workspace.clone(),
+                        self.binding
+                            .as_ref()
+                            .map(|b| b.workspace.clone())
+                            .unwrap_or_default(),
                         Arc::new(compact::NoCommandEvents),
                         request.cancellation.clone(),
                         dependencies,
@@ -278,15 +397,69 @@ impl CloudAgent {
                 }
             }
         }
+        // Device-backed instructions and skills are frozen once per bound
+        // session. A failed read yields no workspace context, never a cloud
+        // host fallback.
+        let workspace = match &self.remote {
+            Some(remote) => Some(self.workspace_cache.load(remote).await),
+            None => None,
+        };
+        // MCP servers are account-scoped. The cache checks the stored revision
+        // each turn and rebuilds the pool when the account's list changes.
+        let mcp_pool = match &personal {
+            Some(scope) => {
+                let store =
+                    crate::mcp::McpServerStore::new(scope.journal.identity_pool(), scope.principal);
+                self.mcp_cache
+                    .load(&store, scope.principal)
+                    .await
+                    .map(|session| session.pool.clone())
+            }
+            None => None,
+        };
+        // A controller exists for every durable session, even before a goal is
+        // created: it is what exposes the deferred `goal` tool in the first
+        // place. Sharing the tool map with ToolSearch lets it index that tool.
+        let goal = match &personal {
+            Some(scope) => Some(
+                crate::goal::CloudGoalController::load(
+                    scope.journal.identity_pool(),
+                    self.session_id,
+                    scope.principal,
+                )
+                .await
+                .map_err(|_| Error::AccountGoal)?,
+            ),
+            None => None,
+        };
+        let tools = Arc::new(RwLock::new(BTreeMap::<String, Arc<dyn BaseTool>>::new()));
+        // ExecuteExtraTool holds a strong reference to this map, which contains
+        // the tool itself. Clearing after the turn breaks that cycle so the
+        // account scopes held by tools (memory, schedules) are released.
+        let shared_tools = tools.clone();
+        let tool_search = (goal.is_some() || mcp_pool.is_some()).then(|| CloudToolSearch {
+            index: Arc::new(ToolSearchIndex::new()),
+            tools: tools.clone(),
+        });
         let assembly = CloudAssemblyContext {
             remote: self.remote.clone(),
             broker: request.broker,
             permissions: request.permissions,
             classifier: request.classifier,
-            personal,
+            personal: personal.clone(),
+            web: CloudWebTools::from_env(),
+            goal: goal.clone(),
+            tool_search,
+            workspace,
+            mcp_pool,
+            session_id: self.session_id.to_string(),
         };
-        let chain = Arc::new(build_middleware_chain(&CloudChainAssembler, &assembly));
-        let cwd = self.remote.binding().workspace.clone();
+        let mut chain = build_middleware_chain(&CloudChainAssembler, &assembly);
+        let cwd = self
+            .binding
+            .as_ref()
+            .map(|b| b.workspace.clone())
+            .unwrap_or_default();
         let session = Session::new_with_cancel(
             Arc::from(cwd.as_str()),
             FrozenContext::builder().system_prompt(prompt).build(),
@@ -303,6 +476,13 @@ impl CloudAgent {
             current.enable_deployment_owned_compaction();
             current.set_flags_batch(request.history_flags);
         }
+        if let Some(scope) = personal.filter(|s| s.private_memory) {
+            chain.add(Box::new(crate::memory::frames::MemoryFrames {
+                scope,
+                transcript: transcript.clone(),
+            }));
+        }
+        let chain = Arc::new(chain);
         let mut tool_map = BTreeMap::<String, Arc<dyn BaseTool>>::new();
         for tool in chain.collect_tools(&cwd) {
             if tool_map
@@ -315,7 +495,7 @@ impl CloudAgent {
         let catalog = Arc::new(
             SessionToolCatalog::try_new(tool_map.clone(), None).map_err(|_| Error::ToolCatalog)?,
         );
-        let tools = Arc::new(RwLock::new(tool_map));
+        *tools.write() = std::mem::take(&mut tool_map);
         let contributions = chain.clone();
         let llm = Arc::new(
             AgentModelBridge::new(model.clone())
@@ -331,7 +511,7 @@ impl CloudAgent {
         let (bus, handles) = EventBus::new(Default::default());
         let mut metadata = HashMap::new();
         metadata.insert("session_id".into(), self.session_id.to_string());
-        let context = StageContext::builder(turn, transcript.clone(), session.queue().clone())
+        let mut builder = StageContext::builder(turn, transcript.clone(), session.queue().clone())
             .with_llm(llm)
             .with_tools(tools)
             .with_tool_catalog(catalog)
@@ -342,9 +522,20 @@ impl CloudAgent {
             .with_context_budget(ContextBudget::new(self.context_window))
             .with_compact_config(CompactConfig::default())
             .with_compact_llm(model)
-            .build();
+            // Deferred tools are executed through ExecuteExtraTool. Without
+            // this resolver the outer meta tool would be the only approval
+            // subject, so `mcp__*` and other deferred tools could bypass HITL.
+            .with_tool_invocation_resolver(Arc::new(ExecuteExtraToolResolver::default()));
+        if let Some(goal) = &goal {
+            builder = builder.with_goal_controller(goal.clone());
+        }
+        let context = builder.build();
         context.session.queue.push(QueuedMessage::prompt(
-            MessageSource::UserInput,
+            if self.scheduled.load(std::sync::atomic::Ordering::Relaxed) {
+                MessageSource::CronTrigger
+            } else {
+                MessageSource::UserInput
+            },
             BaseMessage::human(request.prompt),
         ));
         // Scope owns both futures. Events are drained while the original loop
@@ -353,6 +544,7 @@ impl CloudAgent {
             run_react_loop(context, request.max_iterations),
             drain_events(handles)
         );
+        shared_tools.write().clear();
         let status = match outcome {
             LoopResult::Completed => TurnStatus::Completed,
             LoopResult::Interrupted => TurnStatus::Interrupted,
@@ -362,10 +554,10 @@ impl CloudAgent {
                 TurnStatus::Failed
             }
         };
-        let jobs = if status == TurnStatus::Interrupted {
-            self.remote.cancel_active().await
-        } else {
-            self.remote.jobs().await
+        let jobs = match &self.remote {
+            Some(remote) if status == TurnStatus::Interrupted => remote.cancel_active().await,
+            Some(remote) => remote.jobs().await,
+            None => Ok(Vec::new()), // Conversation mode has no executor tools; prior jobs were settled at admission.
         };
         let unsettled_jobs = jobs.ok().map(|jobs| {
             jobs.into_iter()
@@ -405,17 +597,27 @@ impl CloudAgent {
         crate::state::FrozenSession {
             session_id: self.session_id,
             principal_id,
-            device_id: self.remote.device_id(),
-            binding: self.remote.binding().clone(),
+            device_id: self.device_id,
+            binding: self.binding.clone(),
             system_prompt: self.frozen_prompt.clone(),
             context_window: self.context_window,
+        }
+    }
+
+    pub(crate) async fn bound_jobs(&self) -> Result<Vec<JobSnapshot>, peri_remote_tools::Error> {
+        match &self.remote {
+            Some(remote) => remote.jobs().await,
+            None => Ok(Vec::new()),
         }
     }
 
     pub(crate) async fn cancel_bound_jobs(
         &self,
     ) -> Result<Vec<JobSnapshot>, peri_remote_tools::Error> {
-        self.remote.cancel_active().await
+        match &self.remote {
+            Some(remote) => remote.cancel_active().await,
+            None => Ok(Vec::new()),
+        }
     }
 }
 

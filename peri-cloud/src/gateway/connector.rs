@@ -48,6 +48,17 @@ impl DeviceReachability {
 /// SSH login or bearer tokens. Existing frozen sessions must reopen unchanged.
 #[async_trait]
 pub trait SessionConnector: Send + Sync {
+    async fn new_conversation(&self, _principal: Uuid) -> GatewayResult<Arc<CloudAgent>> {
+        Err(GatewayError::Connection)
+    }
+    /// Reuse an already-authorized frozen identity without touching its executor.
+    async fn open_conversation(
+        &self,
+        _principal: Uuid,
+        _frozen: &FrozenSession,
+    ) -> GatewayResult<Arc<CloudAgent>> {
+        Err(GatewayError::Connection)
+    }
     fn command_registry(&self) -> Option<Arc<peri_acp_types::command::CommandRegistry>> {
         None
     }
@@ -138,6 +149,35 @@ impl NativeSessionConnector {
 
 #[async_trait]
 impl SessionConnector for NativeSessionConnector {
+    async fn new_conversation(&self, principal: Uuid) -> GatewayResult<Arc<CloudAgent>> {
+        self.open_conversation(
+            principal,
+            &FrozenSession {
+                session_id: Uuid::new_v4(),
+                principal_id: principal,
+                device_id: None,
+                binding: None,
+                system_prompt: self.system_prompt.clone(),
+                context_window: self.context_window,
+            },
+        )
+        .await
+    }
+    async fn open_conversation(
+        &self,
+        principal: Uuid,
+        frozen: &FrozenSession,
+    ) -> GatewayResult<Arc<CloudAgent>> {
+        if principal != frozen.principal_id {
+            return Err(crate::identity::IdentityError::Forbidden.into());
+        }
+        let mut agent = CloudAgent::conversation(frozen, self.model.clone())
+            .with_commands(self.commands.clone());
+        if let Some(models) = self.account_models.read().clone() {
+            agent = agent.with_account_models(models);
+        }
+        Ok(Arc::new(agent))
+    }
     fn command_registry(&self) -> Option<Arc<peri_acp_types::command::CommandRegistry>> {
         Some(self.commands.clone())
     }
@@ -203,13 +243,17 @@ impl SessionConnector for NativeSessionConnector {
             return Err(GatewayError::Connection);
         }
         let (session_id, executor_id, workspace, prompt, window) = match previous {
-            Some(frozen) if frozen.principal_id == principal && frozen.device_id == device.id => (
-                frozen.session_id,
-                frozen.binding.session_id,
-                frozen.binding.workspace.clone(),
-                frozen.system_prompt.clone(),
-                frozen.context_window,
-            ),
+            Some(frozen)
+                if frozen.principal_id == principal && frozen.device_id == Some(device.id) =>
+            {
+                (
+                    frozen.session_id,
+                    frozen.device_binding()?.session_id,
+                    frozen.workspace(),
+                    frozen.system_prompt.clone(),
+                    frozen.context_window,
+                )
+            }
             Some(_) => return Err(GatewayError::Connection),
             None => (
                 Uuid::new_v4(),

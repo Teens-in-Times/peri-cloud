@@ -10,8 +10,9 @@ impl CloudAgent {
         let mut transcript = MessageTranscript::new().with_own_payloads(request.history);
         transcript.set_flags_batch(request.history_flags);
         let before = transcript.visible_messages().len();
-        let empty = transcript.entries().iter().all(|entry| {
+        let empty = transcript.canonical_payloads().iter().all(|entry| {
             transcript.flags(entry.id()).excluded
+                || crate::memory::frames::is_frame(entry)
                 || matches!(entry.as_message(), Some(BaseMessage::System { .. }))
         });
         let (status, text) = if empty {
@@ -81,7 +82,7 @@ impl CloudAgent {
             .iter()
             .map(|payload| (payload.id(), transcript.flags(payload.id())))
             .collect();
-        let unsettled_jobs = self.remote.jobs().await.ok().map(|jobs| {
+        let unsettled_jobs = self.bound_jobs().await.ok().map(|jobs| {
             jobs.into_iter()
                 .filter(|job| {
                     !job.status.is_terminal() || job.status == JobStatus::RecoveryRequired

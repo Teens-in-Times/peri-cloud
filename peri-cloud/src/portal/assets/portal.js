@@ -15,8 +15,18 @@ let modelOwner = null;
 let personalRevision = 0;
 let inviteId = null;
 const errors = {
+  private_history: '该会话含私人资料或来源尚未分类。群聊请使用 /new 开始空白会话。',
+  invalid_memory: '请检查正文和有效期。单条最多 8192 字节，搜索最多 512 字节。',
+  memory_conflict: '记忆已更改，请刷新后核对最新版本；你的草稿仍保留。',
+  memory_limit: '记忆容量或条目数达到上限，请更正或忘记不再需要的资料。',
+  memory_not_found: '这条记忆已不存在或不属于当前账号。',
+  memory_unavailable: '暂时无法读取记忆，请稍后刷新核实。',
+  invalid_schedule: '请检查任务内容、五段 cron 和 IANA 时区；一次性时间必须含时区并晚于现在。',
+  schedule_conflict: '定时任务已更新，请刷新列表后操作。',
+  schedule_limit: '最多保存 20 个定时任务，请先删除不再需要的任务。',
+  schedule_unavailable: '暂时无法读取定时任务，请稍后刷新核实。',
   account_limit: '个人数据超过服务限制，请缩短内容后再保存。',
-  data_conflict: '记忆已由另一页面或 Agent 修改，请重新载入后合并你的修改。',
+  data_conflict: '回复偏好已由另一页面修改，请重新载入后合并你的修改。',
   aggregate_invalid: '请检查协议、端点、模型、映射和分组。新增渠道需要密钥；新地址需要 HTTPS，更换端点须重填密钥。',
   aggregate_conflict: '配置已变更，请重新载入后编辑。',
   aggregate_unknown: '操作结果待核实，请先检查渠道和操作记录；不要重复提交。',
@@ -206,16 +216,19 @@ async function refresh() {
     const owner = activeAccount.principal.id;
     const results = await Promise.allSettled([
       api('/api/workspaces'), api('/api/conversations'), api('/api/interactions'),
-      activeAccount.personal_data ? api('/api/user-data') : Promise.resolve(null),
-      modelOwner !== owner ? loadModel() : Promise.resolve()
+      activeAccount.personal_data ? api('/api/preferences') : Promise.resolve(null),
+      modelOwner !== owner ? loadModel() : Promise.resolve(),
+      api('/api/schedules'),
+      activeAccount.personal_data ? MemoryView.load(owner,{api,action,confirm,owner:()=>activeAccount?.principal.id}) : Promise.resolve()
     ]);
     if (authEpoch !== epoch || !activeAccount || activeAccount.principal.id !== owner) return;
     WorkspaceView.sessions(...results.slice(0,3));
+    WorkspaceView.schedules(results[5]);
     showSection();
     const personal = results[3].status === 'fulfilled' ? results[3].value : null;
     if (personal) {
       byId('usage-summary').textContent = '今日（UTC）：对话 ' + personal.usage.turns + ' / ' + personal.limits.daily_turns + '，模型请求 ' + personal.usage.model_requests + ' / ' + personal.limits.daily_model_requests + '；每人最多并行 ' + personal.limits.max_active_per_user + ' 个任务。';
-      byId('personal-budget').textContent = '偏好与记忆合计最多 ' + personal.limits.max_user_data_bytes + ' 字节';
+      byId('personal-budget').textContent = '回复偏好最多 4096 字节；记忆单独管理';
       if (personalOwner !== owner) { setPersonal(personal.data); personalOwner = owner; }
     }
     const settingsErrors = results.slice(3).flatMap(result => result.status === 'rejected' ? [result.reason.message] : []);
@@ -436,6 +449,7 @@ async function signIn(login, password) {
 }
 
 function clearPersonal() {
+  MemoryView.clear();
   WorkspaceView.clear();
   ModelView.clear();
   byId('gateway-policies').replaceChildren(); byId('gateway-panel').hidden = true;
@@ -454,7 +468,6 @@ function clearPersonal() {
 function setPersonal(data) {
   personalRevision = data.revision;
   byId('personal-form').elements.instructions.value = data.instructions;
-  byId('personal-form').elements.memory.value = data.memory;
 }
 async function loadModel() {
   const owner = activeAccount?.principal.id;
@@ -490,12 +503,12 @@ async function loadModel() {
 byId('personal-form').addEventListener('submit', event => {
   event.preventDefault(); const form = event.currentTarget;
   action(form.querySelector('button'), async () => {
-    const result = await api('/api/user-data', {revision:personalRevision, instructions:form.elements.instructions.value, memory:form.elements.memory.value});
-    setPersonal(result); notice('个人上下文已保存，下轮对话生效。');
+    const result = await api('/api/preferences', {revision:personalRevision, instructions:form.elements.instructions.value});
+    setPersonal(result); notice('回复偏好已保存，下轮对话生效。');
   });
 });
 byId('personal-reload').addEventListener('click', () => action(byId('personal-reload'), async () => {
-  setPersonal((await api('/api/user-data')).data); notice('已载入最新记忆。');
+  setPersonal((await api('/api/preferences')).data); notice('已载入最新偏好。');
 }));
 byId('model-form').addEventListener('submit', event => {
   event.preventDefault(); const form = event.currentTarget;

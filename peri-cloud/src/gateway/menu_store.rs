@@ -36,9 +36,15 @@ pub(super) enum MenuAction {
         section: String,
         page: usize,
     },
-    ClearPersonal {
-        field: String,
+    ClearPreferences {
         revision: u64,
+    },
+    MemoryChange {
+        change: super::router::memory::MemoryChange,
+    },
+    MemoryPage {
+        scope: crate::memory::MemoryScope,
+        page: usize,
     },
     Instances {
         offset: usize,
@@ -102,7 +108,8 @@ impl MenuAction {
                 | Self::AccessChange { .. }
                 | Self::AccessInput { .. }
                 | Self::Select { .. }
-                | Self::ClearPersonal { .. }
+                | Self::ClearPreferences { .. }
+                | Self::MemoryChange { .. }
                 | Self::SetDefault { .. }
                 | Self::SetPermission { .. }
                 | Self::Cancel

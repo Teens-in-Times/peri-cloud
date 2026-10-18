@@ -10,7 +10,7 @@ pub struct RuntimeLimits {
     pub daily_model_requests: u32,
     pub max_turn_seconds: u64,
     pub max_prompt_bytes: usize,
-    pub max_user_data_bytes: usize,
+    pub max_memory_bytes: usize,
 }
 
 impl Default for RuntimeLimits {
@@ -22,7 +22,7 @@ impl Default for RuntimeLimits {
             daily_model_requests: 1000,
             max_turn_seconds: 600,
             max_prompt_bytes: 65536,
-            max_user_data_bytes: 8192,
+            max_memory_bytes: 65536,
         }
     }
 }
@@ -35,6 +35,6 @@ impl RuntimeLimits {
             && (1..=1000000).contains(&self.daily_model_requests)
             && (1..=86400).contains(&self.max_turn_seconds)
             && (256..=1048576).contains(&self.max_prompt_bytes)
-            && (256..=8192).contains(&self.max_user_data_bytes)
+            && (256..=1048576).contains(&self.max_memory_bytes)
     }
 }

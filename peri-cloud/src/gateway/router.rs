@@ -42,8 +42,14 @@ pub(super) mod activity;
 pub use activity::{ActivityPhase, ConversationActivity, SavedResultPage};
 #[path = "controls.rs"]
 mod controls;
+#[path = "conversation.rs"]
+mod conversation;
+#[path = "memory.rs"]
+pub(super) mod memory;
 #[path = "personal.rs"]
 mod personal;
+#[path = "schedules.rs"]
+mod schedules;
 struct Ownership {
     closing: bool,
     unconfirmed: bool,
@@ -64,6 +70,7 @@ pub struct Gateway {
     owner: Mutex<Ownership>,
     receive_gates: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     dispatch_gate: tokio::sync::Mutex<()>,
+    scheduler: peri_scheduler::Scheduler,
     pub(super) access_gate: tokio::sync::RwLock<()>,
     max_iterations: usize,
     control_origin: RwLock<Option<url::Url>>,
@@ -124,6 +131,8 @@ impl Gateway {
         }
         let store = GatewayStore::new(runtime.journal());
         store.recover().await?;
+        let schedule_store = Arc::new(crate::scheduler::ScheduleStore::new(runtime.journal()).core);
+        schedule_store.recover_owned().await?;
         for (id, adapter) in &mapped {
             store
                 .seed_access(id, adapter.initial_access_policy())
@@ -135,7 +144,12 @@ impl Gateway {
             Arc::downgrade(&runtime),
             store.clone(),
         );
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|owner| Self {
+            scheduler: schedules::worker::build(
+                owner.clone(),
+                identity.clone(),
+                schedule_store.clone(),
+            ),
             runtime,
             identity,
             connector,
@@ -270,6 +284,7 @@ impl Gateway {
                     return self.store.receipt(&receipt.event_key).await;
                 }
                 let text = match error {
+                    GatewayError::PrivateHistory => "该会话可能含有私人资料，不能放入群聊。请发送 /new 开始空白群会话，原历史仍在私人入口保留。",
                     GatewayError::State(StateError::Limit) | GatewayError::Runtime(crate::RuntimeError::State(StateError::Limit)) => "当前并发或今日额度已达上限，请稍后重试；可在网页查看自己的用量。",
                     GatewayError::Identity(IdentityError::Unauthorized | IdentityError::Forbidden) => "请先在电脑登录并生成关联口令，然后发送 /绑定 口令；也请检查账号或实例是否已撤销。",
                     GatewayError::Identity(IdentityError::RateLimited) => "请求过于频繁，请稍后重试。",
@@ -277,7 +292,10 @@ impl Gateway {
                     GatewayError::Connection => "无法建立工作区连接；请检查执行器、SSH 连接，以及路径是否是实例上存在且可访问的目录。",
                     GatewayError::Invalid => "参数不正确。发送 /help 查看命令，或发送“菜单”打开操作卡片。",
                     GatewayError::StaleInteraction => "卡片已过期、已使用或会话已改变。提问可发送 /问题 重开，其他操作发送“菜单”。",
-                    GatewayError::State(StateError::InvocationConflict) => "内容已被另一处修改，本次确认未生效。请查看最新内容后重新操作。",
+                    GatewayError::Memory(crate::memory::MemoryError::Conflict) | GatewayError::State(StateError::InvocationConflict) => "内容已被另一处修改，本次确认未生效。请查看最新内容后重新操作。",
+                    GatewayError::Memory(crate::memory::MemoryError::Limit) => "记忆容量已满或单条超过 8192 字节，请更正或忘记不再需要的资料。",
+                    GatewayError::Memory(crate::memory::MemoryError::NotFound) => "记忆不存在、已过期或无权读取，请重新查看 /记忆。",
+                    GatewayError::Memory(crate::memory::MemoryError::Forbidden) => "记忆范围不可用或未授权。设备范围需使用本人未撤销的设备；项目资料尚未开放。",
                     _ => "这次请求未能完成，请检查云服务状态。没有自动重试执行。",
                 };
                 self.store.notice(&message, text.into(), None).await?;
@@ -356,6 +374,14 @@ impl Gateway {
             .channel_devices(&message.route.identity)
             .await?;
         let selected = self.store.selection(&message.route, principal).await?;
+        if text == "/定时" || text.starts_with("/定时 ") {
+            return Ok(Some((
+                self.schedule_command(&message.route, principal, selected, text, message.key()?)
+                    .await?
+                    .into(),
+                Some(principal),
+            )));
+        }
         if let Some(body) = self.access_command(message, principal).await? {
             return Ok(Some((body, Some(principal))));
         }
@@ -475,12 +501,21 @@ impl Gateway {
             return Ok(Some((
                 format!(
                     "已连接设备：{}\n工作区：{}\n可直接发送任务，或发送“菜单”选择目录与权限。",
-                    device.name, frozen.binding.workspace
+                    device.name,
+                    frozen.workspace()
                 )
                 .into(),
                 Some(principal),
             )));
         }
+        let selected = if selected.is_none() && devices.is_empty() {
+            Some(
+                self.ensure_cloud_conversation(&message.route, principal)
+                    .await?,
+            )
+        } else {
+            selected
+        };
         let Some(session) = selected else {
             return Ok(Some((
                 self.menu_route(
@@ -495,9 +530,15 @@ impl Gateway {
             )));
         };
         let state = self.runtime.journal().session(principal, session).await?;
+        if let Some(body) = self.route_question_input(message, session).await? {
+            return Ok(Some((body, Some(principal))));
+        }
+        if state.frozen.device_id.is_none() {
+            return self.route_cloud_message(message, principal, state).await;
+        }
         let device = devices
             .iter()
-            .find(|device| device.id == state.frozen.device_id)
+            .find(|device| Some(device.id) == state.frozen.device_id)
             .ok_or(IdentityError::Forbidden)?;
         if text == "/new" {
             let body = self
@@ -511,7 +552,7 @@ impl Gateway {
                     "当前会话：{}\n设备：{}\n目录：{}\n权限：{}",
                     session,
                     device.name,
-                    state.frozen.binding.workspace,
+                    state.frozen.workspace(),
                     permission_label(state.permissions()?)
                 )
                 .into(),
@@ -537,7 +578,7 @@ impl Gateway {
             return Ok(Some((
                 format!(
                     "已切换工作区：{}\n已开始新会话，保留当前权限设置。旧会话历史已保存。",
-                    frozen.binding.workspace
+                    frozen.workspace()
                 )
                 .into(),
                 Some(principal),
@@ -588,35 +629,6 @@ impl Gateway {
                 Some(principal),
             )));
         }
-        if text == "/问题"
-            || text == "/回答"
-            || text.starts_with("/回答 ")
-            || !text.starts_with('/')
-        {
-            if let Some(request) = self.hub.current_question(&message.route).await? {
-                let card = if matches!(text, "/问题" | "/回答") {
-                    self.hub.question_menu(&message.route, request).await?
-                } else {
-                    if let Some(origin) = self.origins.read().get(&session) {
-                        *origin.write() = Some(SessionOrigin::Platform(message.event_id.clone()));
-                    }
-                    self.hub
-                        .question_text(
-                            &message.route,
-                            request,
-                            text.strip_prefix("/回答 ").unwrap_or(text),
-                        )
-                        .await?
-                };
-                return Ok(Some((DeliveryBody::Menu { card }, Some(principal))));
-            }
-            if text.starts_with("/回答") || text == "/问题" {
-                return Ok(Some((
-                    "当前没有等待回答的问题。可直接发送任务，或用 /状态 查看进度。".into(),
-                    Some(principal),
-                )));
-            }
-        }
         if text.starts_with('/')
             && !self
                 .connector
@@ -659,22 +671,64 @@ impl Gateway {
         device: &DeviceRecord,
         agent: Arc<crate::CloudAgent>,
     ) -> GatewayResult<()> {
+        self.attach_origin(route, principal, Some(device), agent)
+            .await
+    }
+    async fn attach_conversation(
+        &self,
+        route: &ChannelRoute,
+        principal: Uuid,
+        agent: Arc<crate::CloudAgent>,
+    ) -> GatewayResult<()> {
+        self.attach_origin(route, principal, None, agent).await
+    }
+    async fn attach_origin(
+        &self,
+        route: &ChannelRoute,
+        principal: Uuid,
+        device: Option<&DeviceRecord>,
+        agent: Arc<crate::CloudAgent>,
+    ) -> GatewayResult<()> {
+        let private = self.private_memory_route(route);
+        let agent = agent.for_memory_visibility(private);
         let frozen = agent.frozen_session(principal);
+        if !crate::memory::context::can_attach(
+            self.journal(),
+            principal,
+            frozen.session_id,
+            private,
+        )
+        .await?
+        {
+            return Err(GatewayError::PrivateHistory);
+        }
+        agent.configure_schedule_notifications(
+            self.adapters
+                .get(&route.identity.adapter_instance_id)
+                .is_some_and(|a| a.supports_proactive()),
+        );
         let origin = Arc::new(RwLock::new(None));
         let broker = Arc::new(SessionBroker {
             hub: self.hub.clone(),
             route: route.clone(),
             principal,
             session: frozen.session_id,
-            device: device.id,
-            device_name: device.name.clone(),
-            workspace: frozen.binding.workspace,
+            device: device.map(|d| d.id),
+            device_name: device
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "云端对话".into()),
+            workspace: frozen.workspace(),
             origin: origin.clone(),
         });
-        self.runtime
-            .attach(principal, agent, PermissionMode::Default, broker, None)
-            .await?;
+        if self.origins.read().contains_key(&frozen.session_id) {
+            self.runtime.rebind_idle(principal, agent, broker).await?;
+        } else {
+            self.runtime
+                .attach(principal, agent, PermissionMode::Default, broker, None)
+                .await?;
+        }
         self.origins.write().insert(frozen.session_id, origin);
+        crate::memory::context::record(self.journal(), frozen.session_id, private).await?;
         Ok(())
     }
 
@@ -768,6 +822,7 @@ impl Gateway {
 
     async fn dispatch_owned(&self) -> GatewayResult<()> {
         let _gate = self.dispatch_gate.lock().await;
+        self.project_schedules().await?;
         for pending in self.store.pending_turns().await? {
             let turn = self
                 .runtime
@@ -784,6 +839,13 @@ impl Gateway {
                 .await?;
         }
         for pending in self.store.ready().await? {
+            let account_gate = pending
+                .principal
+                .map(|principal| self.account_gate(principal.to_string()));
+            let account_guard = match &account_gate {
+                Some(gate) => Some(gate.lock().await),
+                None => None,
+            };
             let _policy_read = self.access_gate.read().await;
             let Some(adapter) = self
                 .adapters
@@ -824,7 +886,11 @@ impl Gateway {
                 },
                 _ => true,
             };
-            if !authorized || !live || !self.route_allowed(&pending.delivery.route).await? {
+            if !authorized
+                || !live
+                || !self.route_allowed(&pending.delivery.route).await?
+                || !self.scheduled_delivery_current(&pending.key).await?
+            {
                 if let DeliveryBody::Interaction { card } = &pending.delivery.body {
                     self.hub.invalidate(card.request_id);
                 }
@@ -834,6 +900,7 @@ impl Gateway {
             if !self.store.begin_send(&pending.key).await? {
                 continue;
             }
+            drop(account_guard);
             let state = match adapter.deliver(&pending.delivery).await {
                 Ok(()) => "delivered",
                 Err(DeliveryError::Rejected) => {
@@ -846,6 +913,7 @@ impl Gateway {
             };
             self.store.delivered(&pending.key, state).await?;
         }
+        self.settle_schedule_deliveries().await?;
         Ok(())
     }
 

@@ -86,7 +86,7 @@ impl Gateway {
         validate_path(&device.platform, path)?;
         if let Some(old) = selected {
             let state = self.runtime.journal().session(principal, old).await?;
-            if state.frozen.device_id == device.id {
+            if state.frozen.device_id == Some(device.id) {
                 return self
                     .change_workspace(route, principal, device, old, path)
                     .await;
@@ -132,7 +132,10 @@ impl Gateway {
                 continue;
             }
             let state = self.runtime.journal().session(principal, session).await?;
-            let Some(device) = devices.iter().find(|d| d.id == state.frozen.device_id) else {
+            let Some(device) = devices
+                .iter()
+                .find(|d| Some(d.id) == state.frozen.device_id)
+            else {
                 continue;
             };
             // Only executor-verified bindings are saved choices. Registration
@@ -147,7 +150,7 @@ impl Gateway {
                 platform: device.platform.clone(),
                 adapter: route.identity.adapter_instance_id,
                 conversation_id: route.conversation_id,
-                workspace: state.frozen.binding.workspace,
+                workspace: state.frozen.workspace(),
                 default_workspace: device.default_workspace.clone(),
                 instance_kind: if device.is_local {
                     "local"
@@ -228,7 +231,7 @@ impl Gateway {
         let state = self.runtime.journal().session(principal, expected).await?;
         let device = devices
             .iter()
-            .find(|d| d.id == state.frozen.device_id)
+            .find(|d| Some(d.id) == state.frozen.device_id)
             .ok_or(IdentityError::Forbidden)?;
         let workspace = if workspace.is_empty() {
             &device.default_workspace
@@ -263,7 +266,7 @@ impl Gateway {
         {
             return Err(GatewayError::Busy);
         }
-        if workspace == state.frozen.binding.workspace {
+        if workspace == state.frozen.workspace() {
             return Ok(state.frozen);
         }
         let agent = self

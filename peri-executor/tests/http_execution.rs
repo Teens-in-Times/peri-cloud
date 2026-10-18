@@ -428,3 +428,98 @@ async fn replaced_workspace_is_rejected_without_writing_to_the_replacement() {
     assert!(!bound.join("side-effect").exists());
     h.close().await;
 }
+
+#[tokio::test]
+async fn workspace_reads_are_session_scoped_and_reject_escapes() {
+    let h = Harness::new().await;
+    std::fs::write(h.workspace.path().join("AGENTS.md"), "project rules").unwrap();
+    let skill_dir = h.workspace.path().join(".claude/skills/review");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"), "skill body").unwrap();
+
+    let instructions: WorkspaceInstructions = h
+        .client
+        .get(format!(
+            "{}/v1/sessions/{}/workspace/instructions",
+            h.base, h.session
+        ))
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(instructions.main.unwrap().content, "project rules");
+
+    let skills: WorkspaceSkills = h
+        .client
+        .get(format!(
+            "{}/v1/sessions/{}/workspace/skills",
+            h.base, h.session
+        ))
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        skills.paths,
+        vec![".claude/skills/review/SKILL.md".to_string()]
+    );
+
+    let file: WorkspaceFile = h
+        .client
+        .post(format!(
+            "{}/v1/sessions/{}/workspace/read",
+            h.base, h.session
+        ))
+        .bearer_auth(&h.token)
+        .json(&WorkspaceReadRequest {
+            path: ".claude/skills/review/SKILL.md".into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(file.content, "skill body");
+    assert!(file.digest.starts_with("sha256:"));
+
+    let escape = h
+        .client
+        .post(format!(
+            "{}/v1/sessions/{}/workspace/read",
+            h.base, h.session
+        ))
+        .bearer_auth(&h.token)
+        .json(&WorkspaceReadRequest {
+            path: ".claude/skills/../../SKILL.md".into(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(escape.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let anonymous = h
+        .client
+        .get(format!(
+            "{}/v1/sessions/{}/workspace/instructions",
+            h.base, h.session
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    h.close().await;
+}

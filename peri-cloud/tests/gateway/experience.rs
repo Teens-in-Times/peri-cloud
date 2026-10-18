@@ -1,6 +1,6 @@
 use super::*;
 
-fn question(multi: bool) -> String {
+pub(super) fn question(multi: bool) -> String {
     let delta = json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"fixture-question","type":"function","function":{"name":"AskUserQuestion","arguments":json!({"questions":[{"question":"要检查哪个服务？","header":"服务","options":[{"label":"A","description":"资源情况"},{"label":"B","description":"网络流量"}],"multiSelect":multi}]}).to_string()}}]},"finish_reason":"tool_calls"}]});
     format!("data: {delta}\n\ndata: [DONE]\n\n")
 }
@@ -571,71 +571,130 @@ async fn qq_approval_detail_is_read_only_and_text_allow_is_exactly_once() {
 }
 
 #[tokio::test]
-async fn qq_personal_settings_share_portal_data_and_stale_clear_cannot_erase_updates() {
+async fn qq_memory_items_require_confirmation_and_stale_forgetting_cannot_erase_corrections() {
+    use peri_cloud::memory::{MemorySource, MemoryStore};
     let f = Fixture::new(Vec::new()).await;
     f.pair().await;
     let settings = qq_menu(&f, "personal-menu", "/设置").await;
     assert_eq!(settings.buttons.len(), 4);
+    let store = MemoryStore::new(&f.c().journal, f.c().browser.principal().id, 65536);
+    let pending = qq_menu(&f, "remember", "/记住 生产环境先只读查看").await;
+    assert_eq!(store.list("", 0, 5).await.unwrap().total, 0);
     f.c()
         .gateway
-        .receive(f.message("remember", "/记住 生产环境先只读查看"))
+        .receive(f.message(
+            "confirm-memory",
+            &format!("/卡片 {}", button(&pending, "确认保存")),
+        ))
         .await
         .unwrap();
+    let saved = store.list("", 0, 5).await.unwrap().items.remove(0);
+    assert_eq!(saved.value.content, "生产环境先只读查看");
+    assert_eq!(saved.source.kind, "qq");
+    let alias = qq_menu(&f, "memory-alias", "/memory").await;
+    assert!(alias.text.contains("生产环境先只读查看"));
     f.c()
         .gateway
         .receive(f.message("preferences", "/偏好 设置 用中文，先给结论"))
         .await
         .unwrap();
-    let saved = f
-        .c()
-        .journal
-        .user_data(f.c().browser.principal().id)
+    let pending = qq_menu(&f, "forget-confirm", &format!("/记忆 忘记 {}", saved.id)).await;
+    let mut updated = saved.value.clone();
+    updated.content = "网页的新记录".into();
+    store
+        .update(saved.id, 1, updated, MemorySource::web())
         .await
         .unwrap();
-    assert_eq!(saved.memory, "生产环境先只读查看");
-    assert_eq!(saved.instructions, "用中文，先给结论");
-    let prompt = qq_menu(&f, "clear-confirm", "/记忆 清空").await;
-    let old = button(&prompt, "确认清空");
-    let mut updated = saved;
-    updated.memory.push_str("\n网页的新记录");
-    f.c()
-        .journal
-        .save_user_data(f.c().browser.principal().id, updated, 8192)
-        .await
-        .unwrap();
-    f.c()
-        .gateway
-        .receive(f.message("stale-clear", &format!("/卡片 {old}")))
-        .await
-        .unwrap();
-    let updated = f
-        .c()
-        .journal
-        .user_data(f.c().browser.principal().id)
-        .await
-        .unwrap();
-    assert!(updated.memory.contains("网页的新记录"));
-    let memory = qq_menu(&f, "memory-view", "/记忆").await;
-    assert!(memory.text.contains("网页的新记录"));
-    let prompt = qq_menu(&f, "fresh-clear", "/记忆 清空").await;
     f.c()
         .gateway
         .receive(f.message(
-            "confirmed-clear",
-            &format!("/卡片 {}", button(&prompt, "确认清空")),
+            "stale-forget",
+            &format!("/卡片 {}", button(&pending, "确认保存")),
         ))
         .await
         .unwrap();
-    let updated = f
-        .c()
-        .journal
-        .user_data(f.c().browser.principal().id)
+    assert_eq!(
+        store.get(saved.id).await.unwrap().value.content,
+        "网页的新记录"
+    );
+    let memory = qq_menu(&f, "memory-view", "/记忆").await;
+    assert!(memory.text.contains("网页的新记录"));
+    let pending = qq_menu(&f, "fresh-forget", &format!("/记忆 忘记 {}", saved.id)).await;
+    f.c()
+        .gateway
+        .receive(f.message(
+            "fresh-confirm",
+            &format!("/卡片 {}", button(&pending, "确认保存")),
+        ))
         .await
         .unwrap();
-    assert!(updated.memory.is_empty());
-    assert_eq!(updated.instructions, "用中文，先给结论");
+    assert_eq!(store.list("", 0, 5).await.unwrap().total, 0);
+    assert_eq!(
+        f.c()
+            .journal
+            .preferences(f.c().browser.principal().id)
+            .await
+            .unwrap()
+            .instructions,
+        "用中文，先给结论"
+    );
     let usage = qq_menu(&f, "usage-view", "/用量").await;
     assert!(usage.text.contains("模型请求：0"));
+    assert!(f.script.requests.lock().is_empty());
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn qq_memory_confirmations_keep_the_selected_scope() {
+    use peri_cloud::memory::{MemoryScope, MemoryStore};
+    let f = Fixture::new(Vec::new()).await;
+    f.pair().await;
+    let device = f.devices[0].id;
+    for (key, command) in [
+        (
+            "fleet",
+            "/记住 设备池 FLEET_ONLY_MEMORY_MARKER_731".to_owned(),
+        ),
+        ("device", format!("/记住 设备 {device} Python 3.12")),
+    ] {
+        let pending = qq_menu(&f, key, &command).await;
+        f.c()
+            .gateway
+            .receive(f.message(
+                &format!("confirm-{key}"),
+                &format!("/卡片 {}", button(&pending, "确认保存")),
+            ))
+            .await
+            .unwrap();
+    }
+    let store = MemoryStore::new(&f.c().journal, f.c().browser.principal().id, 65536);
+    assert!(store.list("", 0, 5).await.unwrap().items.is_empty());
+    assert_eq!(
+        store
+            .clone()
+            .scoped(MemoryScope::Fleet)
+            .list("", 0, 5)
+            .await
+            .unwrap()
+            .items[0]
+            .value
+            .content,
+        "FLEET_ONLY_MEMORY_MARKER_731"
+    );
+    assert_eq!(
+        store
+            .scoped(MemoryScope::DeviceEnv { device_id: device })
+            .list("", 0, 5)
+            .await
+            .unwrap()
+            .items[0]
+            .value
+            .content,
+        "Python 3.12"
+    );
+    let list = qq_menu(&f, "device-scope-list", &format!("/记忆 设备 {device}")).await;
+    assert!(list.text.contains("Python 3.12"));
+    assert!(!list.text.contains("FLEET_ONLY_MEMORY_MARKER_731"));
     assert!(f.script.requests.lock().is_empty());
     f.finish().await;
 }

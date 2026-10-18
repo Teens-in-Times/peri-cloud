@@ -243,6 +243,9 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
     let tunnel_stop = CancellationToken::new();
     let tunnels = connector.tunnels(tunnel_stop.clone());
     let mut workers = JoinSet::new();
+    let cancelled = stop.clone();
+    let scheduler = gateway.clone();
+    workers.spawn(async move { ("scheduler", schedule(scheduler, cancelled).await) });
     if let (Some(adapter), Some(listener)) = (onebot, onebot_listener) {
         let gateway = gateway.clone();
         let cancelled = stop.clone();
@@ -351,6 +354,19 @@ async fn dispatch(gateway: Arc<Gateway>, stop: CancellationToken) -> HostResult<
     loop {
         tokio::select! { biased; _ = stop.cancelled() => return Ok(()), _ = interval.tick() => () }
         gateway.dispatch().await.map_err(|_| HostError::Worker)?;
+    }
+}
+
+async fn schedule(gateway: Arc<Gateway>, stop: CancellationToken) -> HostResult<()> {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! { biased; _=stop.cancelled()=>return Ok(()), _=interval.tick()=>() }
+        // Finish this deployment-owned batch before shutdown drains Gateway.
+        gateway
+            .schedule_tick()
+            .await
+            .map_err(|_| HostError::Worker)?;
     }
 }
 

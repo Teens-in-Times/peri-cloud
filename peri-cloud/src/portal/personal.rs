@@ -1,5 +1,5 @@
 use super::{security, Portal, PortalError};
-use crate::state::UserData;
+use crate::state::UserPreferences;
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -58,25 +58,21 @@ pub(super) async fn read(
     let actor = security::browser(&portal, &headers, false).await?;
     let gateway = portal.gateway.as_ref().ok_or(PortalError::Invalid)?;
     Ok(Json(
-        json!({"data":gateway.journal().user_data(actor.principal().id).await?,
+        json!({"data":gateway.journal().preferences(actor.principal().id).await?,
         "usage":gateway.journal().user_usage(actor.principal().id).await?,"limits":gateway.limits()}),
     ))
 }
 pub(super) async fn save(
     State(portal): State<Portal>,
     headers: HeaderMap,
-    Json(input): Json<UserData>,
-) -> Result<Json<UserData>, PortalError> {
+    Json(input): Json<UserPreferences>,
+) -> Result<Json<UserPreferences>, PortalError> {
     let actor = security::browser(&portal, &headers, true).await?;
     let gateway = portal.gateway.as_ref().ok_or(PortalError::Invalid)?;
     Ok(Json(
         gateway
             .journal()
-            .save_user_data(
-                actor.principal().id,
-                input,
-                gateway.limits().max_user_data_bytes,
-            )
+            .save_preferences(actor.principal().id, input)
             .await?,
     ))
 }

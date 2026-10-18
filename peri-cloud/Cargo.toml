@@ -9,9 +9,11 @@ license = "AGPL-3.0-only"
 peri-agent = { path = "../peri-agent" }
 peri-acp-types = { path = "../peri-acp-types" }
 peri-middlewares = { path = "../peri-middlewares" }
+peri-mcp-web = { path = "../mcp-packages/web" }
 peri-model = { path = "../peri-model" }
 peri-remote-tools = { path = "../peri-remote-tools" }
 peri-executor = { path = "../peri-executor" }
+peri-scheduler = { path = "../peri-scheduler" }
 async-trait.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
@@ -34,6 +36,8 @@ reqwest.workspace = true
 futures.workspace = true
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
 ed25519-dalek = "3.0"
+chrono.workspace = true
+chrono-tz = "0.10"
 
 [[bin]]
 name = "peri-account-portal"

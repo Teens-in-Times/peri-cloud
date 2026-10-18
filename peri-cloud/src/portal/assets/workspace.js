@@ -12,12 +12,14 @@ window.WorkspaceView = (() => {
   let generation = 0;
   let focusedSession = null;
   let deviceChecks = new Map();
+  let scheduleSessions = [];
   const gatewayName = id => (account.gateways || []).find(g => g.adapter === id)?.label || '聊天入口';
   const command = (label, task, className = 'quiet small') => {
     const button = node('button', className, label); button.type = 'button';
     button.addEventListener('click', () => task(button)); return button;
   };
   function clear() {
+    scheduleSessions = []; get('schedule-list').replaceChildren(); get('schedule-create').onclick = null; get('schedule-policy').onclick = null;
     generation += 1; account = null; focusedSession=null; deviceChecks.clear();
     for (const id of ['devices','channels','claims','conversation-activity','interactions','topology-entries','topology-devices']) get(id).replaceChildren();
     for (const id of ['device-count','channel-count','session-count','pending-count']) get(id).textContent = '0';
@@ -128,6 +130,7 @@ window.WorkspaceView = (() => {
   function sessions(workspacesResult, activitiesResult, interactionsResult) {
     const workspaces = workspacesResult.status === 'fulfilled' ? workspacesResult.value : [];
     const activities = activitiesResult.status === 'fulfilled' ? activitiesResult.value : [];
+    scheduleSessions = [...activities, ...workspaces.filter(w=>!activities.some(a=>a.session_id===w.session_id))];
     const interactions = interactionsResult.status === 'fulfilled' ? interactionsResult.value : [];
     const root = get('conversation-activity'); root.replaceChildren();
     failure(root,'会话状态',activitiesResult); failure(root,'工作区操作',workspacesResult); failure(root,'待办',interactionsResult);
@@ -181,5 +184,81 @@ window.WorkspaceView = (() => {
     row.append(node('span','',card.context.kind === 'Approval' ? '等待确认 ' + count + ' 项操作' : '等待你的回答'),command('查看并处理', () => hooks.openInteraction(card)));
     return row;
   }
-  return {render,sessions,clear};
+  function schedules(result) {
+    const root=get('schedule-list'); root.replaceChildren();
+    get('schedule-create').onclick=()=>createSchedule();
+    get('schedule-policy').onclick=()=>contactPolicy();
+    get('schedule-create').disabled=!scheduleSessions.length;
+    if (result.status==='rejected') { failure(root,'定时任务',result); return; }
+    const owner=account?.principal.id;
+    for (const task of result.value) {
+      const card=node('article','conversation-card');
+      card.append(node('h3','',task.title),node('p','subtle',task.enabled?'已启用':'暂停或已结束'));
+      const timing=task.timing.kind==='once'?task.timing.at:task.timing.kind==='cron'?task.timing.expression+' · '+task.timing.timezone:task.timing.kind==='interval'?'固定间隔 '+task.timing.every_seconds+' 秒':'延迟 '+task.timing.seconds+' 秒';
+      card.append(node('p','',timing),node('p','subtle','下次：'+(task.next_fire?new Date(task.next_fire*1000).toLocaleString():'无')),
+        node('p','subtle',(task.mode==='conversation'?'主动聊天 · 无需执行器在线':'设备任务 · 沿用会话审批')+' · '+(task.notification==='push'?'可主动通知':'工作台收件箱，此入口不支持主动推送')));
+      const details=node('details',''); details.append(node('summary','','完整任务与目标'),node('pre','workspace-path',task.prompt+'\n绑定 '+(task.binding==='chat'?'跟随此聊天的当前会话':task.binding==='device'?'冻结设备会话':'旧版冻结会话')+'\n创建会话 '+task.session_id+'\n设备 '+(task.device_id||'无设备约束')+'\n目录 '+(task.workspace||'无')+'\n任务 '+task.id+' · 版本 '+task.revision)); card.append(details);
+      const actions=node('div','device-actions');
+      actions.append(command('编辑内容与时间',()=>createSchedule(task)));
+      for (const [label,operation] of [[task.enabled?'暂停':'恢复',task.enabled?'pause':'resume'],['删除','delete']]) {
+        actions.append(command(label,()=>hooks.confirm(label+'定时任务？','后续触发将按这次修改生效；已开始的任务仍需单独取消。',task.title+'\n'+task.prompt+'\n'+task.session_id,()=>hooks.api('/api/schedules/'+task.id+'/actions',{confirmed:true,revision:task.revision,action:operation}))));
+      }
+      actions.append(command('触发与送达记录',button=>hooks.action(button,async()=>{
+        const rows=await hooks.api('/api/schedules/'+task.id+'/runs');
+        if(account?.principal.id!==owner)return;
+        const content=node('div','');
+        for(const run of rows){
+          const row=node('div','item');row.append(node('p','',new Date(run.scheduled_at*1000).toLocaleString()+' · 执行 '+run.state+' · 投递 '+run.delivery_state),node('p','subtle',run.reason||''));
+          if(run.turn_id)row.append(command('查看本次结果',()=>hooks.openSavedResult(run.session_id||task.session_id,1,run.turn_id)));
+          content.append(row);
+        }
+        if(!rows.length)content.append(node('p','','尚未触发。'));
+        hooks.confirm('触发记录',task.title,content,async()=>{},undefined,'关闭');
+      })));
+      card.append(actions);root.append(card);
+    }
+    if(!result.value.length)root.append(node('p','empty','还没有定时任务。也可以在个人 QQ 中说“每天下午两点来问候我”。'));
+  }
+  function createSchedule(task=null) {
+    const root=node('div','');
+    const field=(label,tag,value)=>{const wrap=node('label','',label);const input=document.createElement(tag);input.value=value??'';wrap.append(input);root.append(wrap);return input;};
+    const target=field('聊天目标（设备任务冻结当前选择）','select');
+    for(const session of scheduleSessions){const option=node('option','',gatewayName(session.adapter)+' · '+session.device_name+' · '+(session.workspace||'云端对话'));option.value=session.session_id;target.append(option);}
+    if(task){if(![...target.options].some(o=>o.value===task.session_id)){const option=node('option','','原授权目标 '+task.session_id);option.value=task.session_id;target.append(option);}target.value=task.session_id;target.disabled=true;}
+    const title=field('名称','input',task?.title||'下午的问候');title.maxLength=128;
+    const prompt=field('希望助手做什么','textarea',task?.prompt||'自然地向我说下午好，关心一下我今天的心情。简短、可爱一点，问一个轻松的问题。');prompt.rows=4;prompt.maxLength=8192;
+    const kind=field('时间安排','select');for(const [value,label] of [['cron','周期 cron'],['once','仅一次'],['after','从现在延迟'],['interval','固定间隔']]){const option=node('option','',label);option.value=value;kind.append(option);}kind.value=task?.timing.kind||'cron';
+    const time=field('五段 cron / RFC3339 时间 / 延迟或间隔秒数','input',task?.timing.kind==='once'?task.timing.at:task?.timing.kind==='interval'?task.timing.every_seconds:task?.timing.kind==='after'?task.timing.seconds:task?.timing.expression||'0 14 * * *');
+    const timezone=field('cron 使用 IANA 时区；固定间隔填写 UTC 锚点（RFC3339）','input',task?.timing.kind==='interval'?new Date(task.timing.anchor*1000).toISOString():task?.timing.timezone||Intl.DateTimeFormat().resolvedOptions().timeZone||'Asia/Shanghai');
+    kind.onchange=()=>{if(kind.value==='after')time.value='3600';if(kind.value==='interval'){time.value='3600';timezone.value=new Date(Date.now()+60000).toISOString();}if(kind.value==='once')time.value=new Date(Date.now()+3600000).toISOString();if(kind.value==='cron'){time.value='0 14 * * *';timezone.value=Intl.DateTimeFormat().resolvedOptions().timeZone||'Asia/Shanghai';}};
+    const mode=field('任务类型','select');for(const [value,label] of [['conversation','主动聊天（无需电脑在线）'],['task','操作设备（沿用工具审批）']]){const option=node('option','',label);option.value=value;mode.append(option);}mode.value=task?.mode||'conversation';mode.disabled=!!task;
+    const notify=field('通知方式','select');for(const [value,label] of [['always','按明确约定发送'],['when_useful','在联系窗口内，由助手判断是否需要发送']]){const option=node('option','',label);option.value=value;notify.append(option);}notify.value=task?.notify||'always';
+    const enabled=task?field('保存后启用','input'):null;if(enabled){enabled.type='checkbox';enabled.checked=task.enabled;}
+    const request_id=crypto.randomUUID();
+    hooks.confirm(task?'编辑定时任务':'安排主动聊天或任务','主动聊天跟随原聊天；设备任务保留冻结目标。明确约定的时间不受自动关怀窗口限制，关闭主动联系会阻止聊天问候。',root,async()=>{
+      if(!title.value.trim()||!prompt.value.trim())throw new Error('请填写名称和任务内容。');
+      let timing;
+      if(kind.value==='once')timing={kind:'once',at:time.value.trim()};
+      else if(kind.value==='after')timing={kind:'after',seconds:Number(time.value)};
+      else if(kind.value==='interval'){const anchorText=timezone.value.trim();const anchor=Date.parse(anchorText);if(!/[tT].*(?:[zZ]|[+-]\d{2}:\d{2})$/.test(anchorText)||!Number.isFinite(anchor))throw new Error('请填写带时区的固定间隔锚点。');timing={kind:'interval',anchor:Math.floor(anchor/1000),every_seconds:Number(time.value)};}
+      else timing={kind:'cron',expression:time.value.trim(),timezone:timezone.value.trim()};
+      const content={request_id,title:title.value.trim(),prompt:prompt.value.trim(),timing,notify:notify.value};
+      if(task)await hooks.api('/api/schedules/'+task.id+'/edit',{confirmed:true,edit:{...content,revision:task.revision,enabled:enabled.checked}});
+      else await hooks.api('/api/schedules',{confirmed:true,schedule:{...content,session_id:target.value,mode:mode.value}});
+    },undefined,task?'保存修改':'创建任务');
+  }
+  async function contactPolicy() {
+    const owner=account?.principal.id;
+    const policy=await hooks.api('/api/schedules/contact-policy');
+    if(account?.principal.id!==owner)return;
+    const root=node('div','');
+    const field=(label,type,value)=>{const wrap=node('label','',label);const input=document.createElement('input');input.type=type;if(type==='checkbox')input.checked=value;else input.value=value;wrap.append(input);root.append(wrap);return input;};
+    const enabled=field('允许主动聊天','checkbox',policy.enabled);
+    const timezone=field('自动关怀窗口的 IANA 时区','text',policy.timezone);
+    const start=field('窗口开始小时（0–23）','number',policy.start_hour);start.min=0;start.max=23;
+    const end=field('窗口结束小时（1–24，可跨夜）','number',policy.end_hour);end.min=1;end.max=24;
+    const limit=field('每日后台任务上限（0–100）','number',policy.daily_limit);limit.min=0;limit.max=100;
+    hooks.confirm('主动联系设置','窗口用于“由助手判断”的关怀；你明确约定的问候按约定时间发送。关闭主动聊天后，未发送的问候也会重新检查并被抑制。',root,()=>hooks.api('/api/schedules/contact-policy',{confirmed:true,policy:{...policy,enabled:enabled.checked,timezone:timezone.value.trim(),start_hour:Number(start.value),end_hour:Number(end.value),daily_limit:Number(limit.value)}}),undefined,'保存设置');
+  }
+  return {render,sessions,schedules,clear};
 })();

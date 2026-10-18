@@ -11,6 +11,7 @@ QQ 使用原生 Slash 命令，不把管理命令交给模型猜测。官方 QQB
 | `/clear`、`/cls`、`/reset`、`/core:clear` | 清空当前可见上下文，保留同一会话、设备、目录、权限、模型和原始记录；不调用模型 |
 | `/rewind 消息ID --no-revert-files`、`/undo ...` | 回退上下文到该用户消息之前；不修改文件。原始消息和历史任务回执保留 |
 | `/loop 目标`、`/core:loop 目标` | 使用原生目标注入语义进入 Agent 循环，仍受现有迭代、时限、并发、额度及工具审批限制 |
+| `/mcp list`、`/mcp add <名称> <https://...>`、`/mcp remove <名称>`、`/mcp enable\|disable <名称>` | 管理本账号的 MCP 服务。只接受公网 HTTPS 端点（拒绝本机/内网/保留地址、URL 凭据和查询参数），不保存凭据；MCP 工具名为 `mcp__<名称>__*`，调用仍走审批。配置在下一轮对话生效 |
 | `/history [页码]`、`/threads`、`/his` | 分页列出本账号历史会话 |
 | `/history messages [页码]` | 查看当前会话用户消息 ID，供 rewind 使用 |
 | `/resume 会话ID` | 验证账号、设备和空闲状态后恢复历史会话，沿用该会话保存的权限与模型；不重新运行工具 |
@@ -33,7 +34,7 @@ QQ 命令需要是平台实际投递的文字消息。官方机器人若把 `/..
 
 ## 原生 CLI 的真实兼容范围
 
-源项目的 Agent 核心注册了 `core:compact`、`core:clear`、`core:rewind`、`core:loop`；`/new` 是本云端新增会话控制。底层继续使用 `peri_acp_types::command::{CommandRegistry, CommandHandler, CommandOutcome, ArgsSchema}`，支持完整名称、别名和参数校验。
+源项目的 Agent 核心注册了 `core:compact`、`core:clear`、`core:rewind`、`core:loop`；`/new` 与 `/mcp` 是本云端新增的会话与账号 MCP 控制入口。底层继续使用 `peri_acp_types::command::{CommandRegistry, CommandHandler, CommandOutcome, ArgsSchema}`，支持完整名称、别名和参数校验。
 
 CloudJournal 是云端历史的权威：摘要生成复用原生 Agent 实现，历史与 flags 在原轮次 settlement 的 SQLite 事务一起提交，不给远程路径套上云主机本地的 SessionResources。compact 不从云主控 cwd 重新读取文件或 Skill，不运行工具。clear/rewind 保留 canonical 原文，通过排除标志改变下一次模型输入；旧任务结果不改写。
 
@@ -42,7 +43,7 @@ CloudJournal 是云端历史的权威：摘要生成复用原生 Agent 实现，
 源项目的 `ui:` 命令是 TUI 的本地面板，不是可在 Agent 中直接执行的 Shell：
 
 - 已有云端对应能力的 model、login、config、threads/history/resume/his、status、memory、tasks、setup 映射到现有 QQ 控制或结构化 Web 页面。
-- agent、hooks、mcp、plugin、cron-list、betas、workflows 的云管理服务目前没有装配；全部名称在目录中公开，执行返回 unavailable/unsupported 及原因。
+- agent、hooks、plugin、cron-list、betas、workflows 的云管理服务目前没有装配；全部名称在目录中公开，执行返回 unavailable/unsupported 及原因。MCP 的云端子集由 `/mcp` 提供（账号级 HTTPS 服务），`ui:mcp` TUI 面板仍不可用。
 - theme 属于本地终端显示，QQ 无此渲染能力。
 
 这些不可用条目不是成功的占位实现，不能把“接口已经开放”表述为全部 TUI 后台能力已经移植。动态 Skill/MCP 命令只有在相应服务实际发现并登记 handler 后才可执行，不任意透传未知 slash 文本到模型。

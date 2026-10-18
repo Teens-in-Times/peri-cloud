@@ -10,6 +10,8 @@ use crate::identity::{Authenticated, IdentityError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PortalError {
+    #[error("memory request failed")]
+    Memory(#[from] crate::memory::MemoryError),
     #[error("aggregate control failed")]
     Aggregate(#[from] crate::aggregation::AggregateError),
     #[error("portal requires a valid HTTPS or literal loopback origin")]
@@ -29,6 +31,38 @@ pub enum PortalError {
 impl IntoResponse for PortalError {
     fn into_response(self) -> Response {
         let (status, code) = match self {
+            Self::Memory(crate::memory::MemoryError::Forbidden) => {
+                (StatusCode::FORBIDDEN, "memory_scope_forbidden")
+            }
+            Self::Interaction(crate::gateway::GatewayError::PrivateHistory) => {
+                (StatusCode::FORBIDDEN, "private_history")
+            }
+            Self::Memory(crate::memory::MemoryError::Invalid) => {
+                (StatusCode::BAD_REQUEST, "invalid_memory")
+            }
+            Self::Memory(crate::memory::MemoryError::Conflict) => {
+                (StatusCode::CONFLICT, "memory_conflict")
+            }
+            Self::Memory(crate::memory::MemoryError::NotFound) => {
+                (StatusCode::NOT_FOUND, "memory_not_found")
+            }
+            Self::Memory(crate::memory::MemoryError::Limit) => {
+                (StatusCode::TOO_MANY_REQUESTS, "memory_limit")
+            }
+            Self::Memory(_) => (StatusCode::SERVICE_UNAVAILABLE, "memory_unavailable"),
+            Self::Interaction(crate::gateway::GatewayError::Schedule(error)) => match error {
+                crate::scheduler::ScheduleError::Invalid(_) => {
+                    (StatusCode::BAD_REQUEST, "invalid_schedule")
+                }
+                crate::scheduler::ScheduleError::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
+                crate::scheduler::ScheduleError::Conflict => {
+                    (StatusCode::CONFLICT, "schedule_conflict")
+                }
+                crate::scheduler::ScheduleError::Limit => {
+                    (StatusCode::TOO_MANY_REQUESTS, "schedule_limit")
+                }
+                _ => (StatusCode::SERVICE_UNAVAILABLE, "schedule_unavailable"),
+            },
             Self::Aggregate(crate::aggregation::AggregateError::Identity(
                 IdentityError::Unauthorized,
             )) => (StatusCode::UNAUTHORIZED, "unauthorized"),
@@ -286,6 +320,11 @@ mod tests {
     #[tokio::test]
     async fn task_outcome_errors_remain_distinct_from_identity_outages() {
         for (error, status, code) in [
+            (
+                crate::gateway::GatewayError::PrivateHistory,
+                StatusCode::FORBIDDEN,
+                "private_history",
+            ),
             (
                 crate::gateway::GatewayError::RecoveryRequired,
                 StatusCode::CONFLICT,

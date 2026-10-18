@@ -7,8 +7,10 @@ mod browser;
 mod commands;
 mod conversations;
 mod interactions;
+mod memory;
 mod native;
 mod personal;
+mod schedules;
 mod security;
 mod tasks;
 mod topology;
@@ -165,8 +167,32 @@ pub fn router_for_host_with_models(
 
 fn build_router(portal: Portal) -> Router {
     Router::new()
+        .route(
+            "/api/schedules",
+            get(schedules::list).post(schedules::create),
+        )
+        .route("/api/schedules/{id}/actions", post(schedules::change))
+        .route("/api/schedules/{id}/edit", post(schedules::edit))
+        .route("/api/schedules/{id}/runs", get(schedules::runs))
+        .route(
+            "/api/schedules/contact-policy",
+            get(schedules::contact_policy).post(schedules::save_contact_policy),
+        )
         .route("/", get(browser::page))
         .route("/portal.js", get(browser::javascript))
+        .route("/memory.js", get(memory::javascript))
+        .route(
+            "/api/memories",
+            get(memory::list)
+                .post(memory::add)
+                .layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route("/api/memories/{id}", get(memory::get))
+        .route(
+            "/api/memories/{id}/edit",
+            post(memory::edit).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route("/api/memories/{id}/forget", post(memory::forget))
         .route("/workspace.js", get(topology::javascript))
         .route("/models.js", get(aggregate::javascript))
         .route("/portal.css", get(browser::stylesheet))
@@ -198,7 +224,7 @@ fn build_router(portal: Portal) -> Router {
             post(personal::revoke_invite),
         )
         .route(
-            "/api/user-data",
+            "/api/preferences",
             get(personal::read)
                 .post(personal::save)
                 .layer(DefaultBodyLimit::max(64 * 1024)),

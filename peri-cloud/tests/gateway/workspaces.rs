@@ -55,8 +55,7 @@ async fn workspace_switch_preserves_permissions_freezes_history_and_survives_res
             .await
             .unwrap()
             .frozen
-            .binding
-            .workspace,
+            .workspace(),
         old.workspace
     );
     assert!(matches!(

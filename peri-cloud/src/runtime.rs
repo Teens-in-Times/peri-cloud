@@ -111,6 +111,13 @@ impl CloudRuntime {
     pub fn limits(&self) -> &crate::limits::RuntimeLimits {
         &self.limits
     }
+    pub(crate) fn has_active_for(&self, principal: Uuid) -> bool {
+        self.ownership
+            .lock()
+            .tasks
+            .values()
+            .any(|task| task.principal_id == principal && !task.handle.is_finished())
+    }
 
     pub async fn attach(
         &self,
@@ -203,6 +210,29 @@ impl CloudRuntime {
     }
 
     pub async fn submit(self: &Arc<Self>, request: SubmitTurn) -> Result<TurnRecord, RuntimeError> {
+        self.submit_using(request, None, None).await
+    }
+    pub(crate) fn has_device_session(&self, session: Uuid) -> bool {
+        self.sessions
+            .read()
+            .get(&session)
+            .is_some_and(|s| s.agent.has_device_tools())
+    }
+    pub(crate) async fn submit_scheduled(
+        self: &Arc<Self>,
+        request: SubmitTurn,
+        agent: Arc<CloudAgent>,
+        admission: crate::state::ScheduledAdmission,
+    ) -> Result<TurnRecord, RuntimeError> {
+        self.submit_using(request, Some(agent), Some(admission))
+            .await
+    }
+    async fn submit_using(
+        self: &Arc<Self>,
+        request: SubmitTurn,
+        scheduled: Option<Arc<CloudAgent>>,
+        admission: Option<crate::state::ScheduledAdmission>,
+    ) -> Result<TurnRecord, RuntimeError> {
         if request.max_iterations == 0 {
             return Err(RuntimeError::InvalidIterationLimit);
         }
@@ -216,6 +246,21 @@ impl CloudRuntime {
         if live.principal_id != request.principal_id {
             return Err(StateError::Forbidden.into());
         }
+        let live = if let Some(agent) = scheduled {
+            if agent.frozen_session(request.principal_id)
+                != live.agent.frozen_session(request.principal_id)
+            {
+                return Err(StateError::BindingConflict.into());
+            }
+            Arc::new(LiveSession {
+                principal_id: live.principal_id,
+                agent,
+                broker: live.broker.clone(),
+                classifier: live.classifier.clone(),
+            })
+        } else {
+            live
+        };
         if serde_json::to_vec(&request.prompt)
             .map_err(StateError::from)?
             .len()
@@ -266,7 +311,7 @@ impl CloudRuntime {
             // admission is deployment-owned before its first database await.
             let handle = tokio::spawn(async move {
                 runtime
-                    .run_owned(task_id, live, request, cancel, sender)
+                    .run_owned(task_id, live, request, cancel, sender, admission)
                     .await
             });
             owner.tasks.insert(
@@ -316,15 +361,17 @@ impl CloudRuntime {
         request: SubmitTurn,
         cancellation: CancellationToken,
         receipt: oneshot::Sender<Result<TurnRecord, RuntimeError>>,
+        scheduled: Option<crate::state::ScheduledAdmission>,
     ) -> Result<(), RuntimeError> {
         let admission = match self
             .journal
-            .admit_limited(
+            .admit_with_schedule(
                 request.principal_id,
                 request.session_id,
                 request.request_key,
                 request.prompt,
                 self.limits.daily_turns,
+                scheduled,
             )
             .await
         {
@@ -358,7 +405,6 @@ impl CloudRuntime {
         {
             cancellation.cancel();
         }
-        let personal = self.journal.user_data(request.principal_id).await?;
         let timer_cancel = cancellation.clone();
         let seconds = self.limits.max_turn_seconds;
         let timer = tokio::spawn(async move {
@@ -381,7 +427,6 @@ impl CloudRuntime {
             .agent
             .run_personal_turn(
                 run,
-                personal,
                 self.journal.clone(),
                 request.principal_id,
                 &self.limits,

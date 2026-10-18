@@ -19,13 +19,20 @@ impl Gateway {
             return Err(GatewayError::Invalid);
         }
         let card = self.hub.card_by_code(&message.route, words[1]).await?;
-        if self
-            .identity
-            .channel_device(&message.route.identity, card.device_id)
-            .await?
-            .0
-            != principal
-        {
+        let owner = match card.device_id {
+            Some(device) => {
+                self.identity
+                    .channel_device(&message.route.identity, device)
+                    .await?
+                    .0
+            }
+            None => {
+                self.identity
+                    .resolve_channel(&message.route.identity)
+                    .await?
+            }
+        };
+        if owner != principal {
             return Err(IdentityError::Forbidden.into());
         }
         if *verb == "/详情" {

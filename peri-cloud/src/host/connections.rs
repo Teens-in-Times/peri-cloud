@@ -171,6 +171,16 @@ impl Connections {
 
 #[async_trait]
 impl SessionConnector for Connections {
+    async fn new_conversation(&self, principal: Uuid) -> GatewayResult<Arc<CloudAgent>> {
+        self.native.new_conversation(principal).await
+    }
+    async fn open_conversation(
+        &self,
+        principal: Uuid,
+        frozen: &FrozenSession,
+    ) -> GatewayResult<Arc<CloudAgent>> {
+        self.native.open_conversation(principal, frozen).await
+    }
     fn command_registry(&self) -> Option<Arc<peri_acp_types::command::CommandRegistry>> {
         self.native.command_registry()
     }

@@ -39,6 +39,17 @@ where
     .await
 }
 
+/// MCP endpoints are configured origins. Following an HTTP redirect would let
+/// a public endpoint steer the cloud host or device at a private target after
+/// admission, so redirects are never followed. A server that redirects must be
+/// configured with its final HTTPS URL.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("default MCP HTTP client must build")
+}
+
 pub(crate) fn build_http_transport(
     url: &str,
     headers: &HashMap<String, String>,
@@ -64,7 +75,7 @@ pub(crate) fn build_http_transport(
     if !custom_headers.is_empty() {
         config = config.custom_headers(custom_headers);
     }
-    rmcp::transport::StreamableHttpClientTransport::with_client(reqwest::Client::new(), config)
+    rmcp::transport::StreamableHttpClientTransport::with_client(http_client(), config)
 }
 
 pub(crate) fn build_authed_transport(
@@ -95,7 +106,7 @@ pub(crate) fn build_authed_transport(
     if !custom_headers.is_empty() {
         config = config.custom_headers(custom_headers);
     }
-    let auth_client = rmcp::transport::auth::AuthClient::new(reqwest::Client::new(), auth_manager);
+    let auth_client = rmcp::transport::auth::AuthClient::new(http_client(), auth_manager);
     rmcp::transport::StreamableHttpClientTransport::with_client(auth_client, config)
 }
 

@@ -50,6 +50,8 @@ pub enum ReplyKind {
     #[default]
     Message,
     Event,
+    /// No preceding platform message. Only adapters advertising support may send.
+    Proactive,
 }
 
 impl ReplyKind {
@@ -119,7 +121,7 @@ pub struct InteractionCard {
     pub request_id: Uuid,
     pub turn_id: Uuid,
     pub session_id: Uuid,
-    pub device_id: Uuid,
+    pub device_id: Option<Uuid>,
     pub device_name: String,
     pub workspace: String,
     pub expires_at: i64,
@@ -185,6 +187,9 @@ pub enum DeliveryError {
 
 #[async_trait]
 pub trait MessageAdapter: Send + Sync {
+    fn supports_proactive(&self) -> bool {
+        false
+    }
     fn instance_id(&self) -> &str;
     fn display_name(&self) -> &'static str {
         "聊天入口"

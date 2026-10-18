@@ -13,10 +13,27 @@ use crate::{ChatReply, TurnStatus};
 pub struct FrozenSession {
     pub session_id: Uuid,
     pub principal_id: Uuid,
-    pub device_id: Uuid,
-    pub binding: SessionBinding,
+    pub device_id: Option<Uuid>,
+    pub binding: Option<SessionBinding>,
     pub system_prompt: String,
     pub context_window: u32,
+}
+
+impl FrozenSession {
+    pub fn workspace(&self) -> String {
+        self.binding
+            .as_ref()
+            .map(|b| b.workspace.clone())
+            .unwrap_or_default()
+    }
+    pub fn device(&self) -> super::StateResult<Uuid> {
+        self.device_id.ok_or(super::StateError::BindingConflict)
+    }
+    pub fn device_binding(&self) -> super::StateResult<&SessionBinding> {
+        self.binding
+            .as_ref()
+            .ok_or(super::StateError::BindingConflict)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -29,6 +46,8 @@ pub struct SessionState {
     /// None means executor state has not been confirmed after a turn/restart.
     pub unsettled_jobs: Option<Vec<JobSnapshot>>,
     pub revision: u64,
+    #[serde(default)]
+    pub context_generation: u64,
 }
 
 impl SessionState {

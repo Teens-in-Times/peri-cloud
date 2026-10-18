@@ -94,6 +94,26 @@ impl RemoteSession {
         self.client.info().device_id
     }
 
+    pub fn supports_workspace_read(&self) -> bool {
+        self.client.supports_workspace_read()
+    }
+
+    pub async fn workspace_instructions(&self) -> Result<WorkspaceInstructions> {
+        self.client
+            .workspace_instructions(self.binding.session_id)
+            .await
+    }
+
+    pub async fn workspace_skills(&self) -> Result<WorkspaceSkills> {
+        self.client.workspace_skills(self.binding.session_id).await
+    }
+
+    pub async fn workspace_read(&self, path: &str) -> Result<WorkspaceFile> {
+        self.client
+            .workspace_read(self.binding.session_id, path)
+            .await
+    }
+
     /// Request cancellation for this frozen session, preserving uncertainty.
     pub async fn cancel_active(&self) -> Result<Vec<JobSnapshot>> {
         for job in self.jobs().await? {

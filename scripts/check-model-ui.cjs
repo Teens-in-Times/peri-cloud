@@ -14,7 +14,8 @@ w.fetch=async(url,options)=>{
  calls.push({url,body:options.body?JSON.parse(options.body):null});
  if(url==='/api/status')return ok({initialized:true,service_control:true,csrf_cookie:'peri_csrf'});
  if(url==='/api/account')return ok(owner);
- if(url==='/api/user-data')return ok({data:{instructions:'',memory:'',revision:0},usage:{turns:0,model_requests:0},limits:{daily_turns:10,daily_model_requests:10,max_active_per_user:1,max_user_data_bytes:8192}});
+ if(url==='/api/preferences')return ok({data:{instructions:'',revision:0},usage:{turns:0,model_requests:0},limits:{daily_turns:10,daily_model_requests:10,max_active_per_user:1,max_memory_bytes:65536}});
+ if(url.startsWith('/api/memories'))return ok({page:{generation:0,total:0,used_bytes:0,items:[],has_more:false},max_bytes:65536});
  if(url==='/api/model')return ok({enabled:true,aggregated:true});
  if(url==='/api/aggregate')return ok({enabled:true,admin:true,selection:{model:selectedModel,revision:selectedModel?1:0},models:['model-a','model-b'],default_model:'model-a',inference_base:'http://127.0.0.1:3000/v1'});
  if(url.startsWith('/api/aggregate/channels?'))return ok({items:[channel],total:1,page:0});
@@ -29,7 +30,7 @@ w.fetch=async(url,options)=>{
  throw new Error('Unexpected endpoint '+url);
 };
 w.document.cookie='peri_csrf=fixture';
-for(const name of ['workspace.js','models.js','portal.js'])w.eval(fs.readFileSync(path.join(assets,name),'utf8'));
+for(const name of ['workspace.js','models.js','memory.js','portal.js'])w.eval(fs.readFileSync(path.join(assets,name),'utf8'));
 (async()=>{
  await settle();
  assert.equal(get('model-form').hidden,true,'central mode must not collect separate per-user upstream keys');

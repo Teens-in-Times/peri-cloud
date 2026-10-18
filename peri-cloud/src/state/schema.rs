@@ -40,7 +40,7 @@ pub(crate) async fn reject_foreign(pool: &SqlitePool, version: i64) -> StateResu
     {
         return Err(StateError::ForeignSchema);
     }
-    if (6..=9).contains(&version) {
+    if (6..=15).contains(&version) {
         let standalone_markers =
             has_table(pool, "web_messages").await? || has_table(pool, "device_connections").await?;
         if standalone_markers && !has_table(pool, "user_models").await? {
@@ -51,6 +51,38 @@ pub(crate) async fn reject_foreign(pool: &SqlitePool, version: i64) -> StateResu
         && (!has_table(pool, "user_models").await?
             || !has_table(pool, "device_connections").await?
             || !has_table(pool, "web_messages").await?)
+    {
+        return Err(StateError::ForeignSchema);
+    }
+    if version == 10
+        && (!has_table(pool, "cloud_schedules").await?
+            || !has_table(pool, "cloud_schedule_runs").await?)
+    {
+        return Err(StateError::ForeignSchema);
+    }
+    if version >= 11
+        && (!has_table(pool, "scheduled_tasks").await?
+            || !has_table(pool, "scheduled_admissions").await?
+            || !has_table(pool, "scheduler_metadata").await?)
+    {
+        return Err(StateError::ForeignSchema);
+    }
+    if version >= 12
+        && (!has_table(pool, "memory_items").await?
+            || !has_table(pool, "memory_fts").await?
+            || !has_table(pool, "user_preferences").await?
+            || !has_table(pool, "memory_accounts").await?
+            || !has_table(pool, "memory_audit").await?
+            || !has_table(pool, "memory_session_audience").await?)
+    {
+        return Err(StateError::ForeignSchema);
+    }
+    if version >= 14 && !has_table(pool, "cloud_goals").await? {
+        return Err(StateError::ForeignSchema);
+    }
+    if version >= 15
+        && (!has_table(pool, "cloud_mcp_servers").await?
+            || !has_table(pool, "cloud_mcp_meta").await?)
     {
         return Err(StateError::ForeignSchema);
     }

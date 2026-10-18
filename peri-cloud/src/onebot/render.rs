@@ -40,29 +40,38 @@ pub(super) fn payload(delivery: &Delivery) -> Result<(&'static str, Value), Deli
         .filter(|n| *n > 0)
         .ok_or(DeliveryError::Rejected)?;
     let mut segments = Vec::new();
-    // Reply IDs originate in our own normalized event identity.
-    if let Some(id) = delivery
-        .in_reply_to
-        .rsplit(':')
-        .next()
-        .and_then(|s| s.parse::<i64>().ok())
-    {
-        segments.push(json!({"type":"reply","data":{"id":id.to_string()}}));
+    // Group replies quote the triggering message so the answer stays anchored in
+    // a busy thread. Private chats send a standalone message: a reply segment
+    // there turns every answer into a quote bubble under the user's message.
+    let group = delivery.route.conversation_id.strip_prefix("group:");
+    if group.is_some() {
+        // Reply IDs originate in our own normalized event identity.
+        if let Some(id) = (delivery.reply_kind != crate::gateway::ReplyKind::Proactive)
+            .then(|| {
+                delivery
+                    .in_reply_to
+                    .rsplit(':')
+                    .next()
+                    .and_then(|s| s.parse::<i64>().ok())
+            })
+            .flatten()
+        {
+            segments.push(json!({"type":"reply","data":{"id":id.to_string()}}));
+        }
     }
-    let (action, mut params) =
-        if let Some(group) = delivery.route.conversation_id.strip_prefix("group:") {
-            let group: i64 = group
-                .parse()
-                .ok()
-                .filter(|n| *n > 0)
-                .ok_or(DeliveryError::Rejected)?;
-            segments.push(json!({"type":"at","data":{"qq":user.to_string()}}));
-            ("send_group_msg", json!({"group_id":group}))
-        } else if delivery.route.conversation_id == format!("private:{user}") {
-            ("send_private_msg", json!({"user_id":user}))
-        } else {
-            return Err(DeliveryError::Rejected);
-        };
+    let (action, mut params) = if let Some(group) = group {
+        let group: i64 = group
+            .parse()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or(DeliveryError::Rejected)?;
+        segments.push(json!({"type":"at","data":{"qq":user.to_string()}}));
+        ("send_group_msg", json!({"group_id":group}))
+    } else if delivery.route.conversation_id == format!("private:{user}") {
+        ("send_private_msg", json!({"user_id":user}))
+    } else {
+        return Err(DeliveryError::Rejected);
+    };
     // Text segments prevent model or tool text from becoming executable CQ codes.
     segments.push(json!({"type":"text","data":{"text":text}}));
     params["message"] = Value::Array(segments);
@@ -75,3 +84,7 @@ fn line(value: &str) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "render_test.rs"]
+mod tests;

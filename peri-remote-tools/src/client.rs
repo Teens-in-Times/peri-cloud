@@ -120,6 +120,43 @@ impl DeviceClient {
             .await
     }
 
+    /// Older executors do not serve the workspace-read endpoints; callers must
+    /// treat the capability as absent rather than probing and retrying.
+    pub fn supports_workspace_read(&self) -> bool {
+        self.device
+            .features
+            .iter()
+            .any(|feature| feature == WORKSPACE_READ_FEATURE)
+    }
+
+    pub async fn workspace_instructions(&self, id: Uuid) -> Result<WorkspaceInstructions> {
+        self.request(
+            Method::GET,
+            &format!("/v1/sessions/{id}/workspace/instructions"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn workspace_skills(&self, id: Uuid) -> Result<WorkspaceSkills> {
+        self.request(
+            Method::GET,
+            &format!("/v1/sessions/{id}/workspace/skills"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn workspace_read(&self, id: Uuid, path: &str) -> Result<WorkspaceFile> {
+        let body = serde_json::json!({ "path": path });
+        self.request(
+            Method::POST,
+            &format!("/v1/sessions/{id}/workspace/read"),
+            Some(body),
+        )
+        .await
+    }
+
     pub async fn submit(&self, request: &SubmitJob) -> Result<JobReceipt> {
         let body = serde_json::to_value(request).map_err(|_| Error::Protocol)?;
         let receipt: JobReceipt = self.request(Method::POST, "/v1/jobs", Some(body)).await?;

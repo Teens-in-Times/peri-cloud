@@ -878,3 +878,19 @@ async fn system_requirement_is_discovered_before_gated_ordinary_server() {
 
 #[path = "initialize_builtin_test.rs"]
 mod builtin_initialization_tests;
+
+#[tokio::test]
+async fn session_only_initialization_does_not_read_host_config_or_builtins() {
+    let pool = Arc::new(McpClientPool::new_pending());
+    pool.set_builtin_available(false).unwrap();
+    pool.set_stdio_available(false).unwrap();
+    let (status_tx, status_rx) = tokio::sync::watch::channel(McpInitStatus::Pending);
+
+    McpClientPool::run_initialize_session_only(pool.clone(), Path::new("."), status_tx).await;
+
+    assert!(matches!(
+        *status_rx.borrow(),
+        McpInitStatus::Ready { total: 0 }
+    ));
+    assert!(pool.configs.read().is_empty());
+}

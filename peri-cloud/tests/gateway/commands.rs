@@ -39,10 +39,7 @@ async fn new_keeps_device_directory_permissions_history_and_deduplicates() {
     assert_eq!(new, selected(&f).await);
     let after = state(&f, new).await;
     assert!(after.history.is_empty());
-    assert_eq!(
-        before.frozen.binding.workspace,
-        after.frozen.binding.workspace
-    );
+    assert_eq!(before.frozen.workspace(), after.frozen.workspace());
     assert_eq!(before.permission_mode, after.permission_mode);
     assert_eq!(state(&f, old).await.history.len(), before.history.len());
     assert_eq!(f.script.requests.lock().len(), 1);
@@ -257,14 +254,17 @@ async fn formal_command_api_checks_owner_deduplicates_new_and_exposes_true_capab
         .any(|c| c.name == "core:compact" && c.availability == "available"));
     assert!(catalog
         .iter()
-        .any(|c| c.name == "ui:mcp" && c.availability == "unavailable"));
+        .any(|c| c.name == "core:mcp" && c.availability == "available"));
+    assert!(catalog
+        .iter()
+        .any(|c| c.name == "ui:hooks" && c.availability == "unavailable"));
     let disabled = c
         .gateway
         .execute_browser_command(
             &c.browser,
             receipt.session_id,
             Uuid::new_v4(),
-            "/ui:mcp".into(),
+            "/ui:hooks".into(),
         )
         .await
         .unwrap();
@@ -288,6 +288,9 @@ impl peri_acp_types::command::CommandHandler for RegisteredCommand {
             .dep::<peri_cloud::commands::CloudCommandScope>()
             .expect("authenticated scope");
         assert_eq!(scope.session_id.to_string(), context.session_id);
+        assert!(!serde_json::to_string(&context.history)
+            .unwrap()
+            .contains("FORGOTTEN_COMMAND_SECRET"));
         if self.wait {
             context.cancel_token.cancelled().await;
         }
@@ -309,6 +312,52 @@ impl peri_acp_types::command::CommandHandler for RegisteredCommand {
             }),
         })
     }
+}
+#[tokio::test]
+async fn native_handlers_cannot_reintroduce_history_before_the_privacy_cutoff() {
+    use peri_cloud::memory::{MemoryContent, MemoryKind, MemorySource, MemoryStore};
+    let f = Fixture::new(vec![answer("FORGOTTEN_COMMAND_SECRET")]).await;
+    f.pair().await;
+    f.select("select", 0).await;
+    let store = MemoryStore::new(&f.c().journal, f.c().browser.principal().id, 65536);
+    let fact = store
+        .add(
+            Uuid::new_v4(),
+            0,
+            MemoryContent {
+                content: "FORGOTTEN_COMMAND_SECRET".into(),
+                kind: MemoryKind::Fact,
+                pinned: true,
+                valid_until: None,
+            },
+            MemorySource::web(),
+        )
+        .await
+        .unwrap();
+    let first = command(&f, "first", "read my fact").await;
+    f.settled(first.session_id.unwrap(), first.turn_id.unwrap())
+        .await;
+    store.forget(fact.id, 1, MemorySource::web()).await.unwrap();
+    f.connector
+        .register_command(registered("privacy-probe", false))
+        .unwrap();
+    let probe = command(&f, "probe", "/plugin:fixture:privacy-probe").await;
+    let session = probe.session_id.unwrap();
+    f.settled(session, probe.turn_id.unwrap()).await;
+    let result = f
+        .c()
+        .journal
+        .turn(
+            f.c().browser.principal().id,
+            session,
+            probe.turn_id.unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.state, TurnState::Completed);
+    assert_eq!(result.replies[0].text, "REGISTERED_COMMAND_DONE");
+    assert_eq!(f.script.requests.lock().len(), 1);
+    f.finish().await;
 }
 fn registered(name: &str, wait: bool) -> peri_acp_types::command::command_route::RouteEntry {
     use peri_acp_types::command::command_route::*;
@@ -504,16 +553,16 @@ async fn registered_ui_handler_replaces_unavailable_projection_and_unknown_comma
     f.pair().await;
     f.select("select", 0).await;
     command(&f, "unknown", "/compcat").await;
-    let mut entry = registered("mcp", false);
-    entry.fullname = "ui:mcp".into();
+    let mut entry = registered("hooks", false);
+    entry.fullname = "ui:hooks".into();
     entry.provenance.source = peri_acp_types::command::command_route::CommandSource::Ui;
     f.connector.register_command(entry).unwrap();
     let catalog = f.c().gateway.command_catalog();
-    assert_eq!(catalog.iter().filter(|c| c.name == "ui:mcp").count(), 1);
+    assert_eq!(catalog.iter().filter(|c| c.name == "ui:hooks").count(), 1);
     assert!(catalog
         .iter()
-        .any(|c| c.name == "ui:mcp" && c.availability == "available"));
-    let task = command(&f, "ui-command", "/ui:mcp").await;
+        .any(|c| c.name == "ui:hooks" && c.availability == "available"));
+    let task = command(&f, "ui-command", "/ui:hooks").await;
     f.settled(task.session_id.unwrap(), task.turn_id.unwrap())
         .await;
     assert!(f.script.requests.lock().is_empty());

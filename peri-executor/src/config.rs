@@ -10,7 +10,11 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{Error, Result};
-use peri_acp_types::device_executor::{ExecutorInfo, PROTOCOL_VERSION};
+use peri_acp_types::device_executor::{ExecutorInfo, PROTOCOL_VERSION, WORKSPACE_READ_FEATURE};
+
+fn features() -> Vec<String> {
+    vec![WORKSPACE_READ_FEATURE.to_owned()]
+}
 
 #[derive(Serialize, Deserialize)]
 struct DeviceIdentity {
@@ -36,6 +40,7 @@ impl DeviceConfig {
                 device_name: identity.name,
                 platform: std::env::consts::OS.into(),
                 version: env!("CARGO_PKG_VERSION").into(),
+                features: features(),
             });
         }
         Ok(Self::open(root, name)?.info)
@@ -85,6 +90,7 @@ impl DeviceConfig {
                 device_name: identity.name,
                 platform: std::env::consts::OS.into(),
                 version: env!("CARGO_PKG_VERSION").into(),
+                features: features(),
             },
             secret_hash: Sha256::digest(secret.as_bytes()).into(),
             state_owner: Arc::new(lock),

@@ -132,6 +132,9 @@ impl OneBotAdapter {
 
 #[async_trait]
 impl MessageAdapter for OneBotAdapter {
+    fn supports_proactive(&self) -> bool {
+        true
+    }
     fn display_name(&self) -> &'static str {
         "个人 QQ"
     }

@@ -261,15 +261,15 @@ async fn management_is_deterministic_redacted_owned_versioned_and_idempotent() {
             crate::state::FrozenSession {
                 session_id: session,
                 principal_id: owner.id,
-                device_id: Uuid::new_v4(),
-                binding: peri_acp_types::device_executor::SessionBinding {
+                device_id: Some(Uuid::new_v4()),
+                binding: Some(peri_acp_types::device_executor::SessionBinding {
                     session_id: Uuid::new_v4(),
                     workspace: "/".into(),
                     workspace_identity: peri_acp_types::device_executor::WorkspaceIdentity {
                         device: 1,
                         inode: 1,
                     },
-                },
+                }),
                 system_prompt: "fixture".into(),
                 context_window: 128000,
             },
