@@ -19,6 +19,10 @@ peri-agent/src/session/turn_test.rs
 peri-agent/src/session/transcript.rs
 peri-agent/src/session/transcript_persistence_test.rs
 peri-middlewares/Cargo.toml
+peri-middlewares/src/mcp/client/transport.rs
+peri-middlewares/src/mcp/client/transport_test.rs
+peri-middlewares/src/mcp/initialize.rs
+peri-middlewares/src/mcp/initialize_test.rs
 peri-middlewares/src/prompt_tool_name_lock_test.rs
 peri-middlewares/src/subagent/tool/subagent_lifecycle_test.rs
 peri-middlewares/src/tools/ask_user_tool.rs
