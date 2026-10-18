@@ -32,7 +32,7 @@ flowchart LR
 
 | 项目 | 已核实情况 |
 | --- | --- |
-| 站点 | 根域名 `claudeoutofdario.icu` 是现有 Meridian/New API；`www.claudeoutofdario.icu` 反代 Peri。复用现有 TLS 与 Nginx，不替换根站业务 |
+| 站点 | 根域名 `claudeoutofdario.icu` 是现有 Meridian/New API；`peri.claudeoutofdario.icu` 反代 Peri（2026-10-18 起，原 `www` 入口停用）。复用现有 TLS 与 Nginx，不替换根站业务 |
 | Peri 主控 | 东京 systemd `peri-cloud`，账号 peri-cloud；监听回环 47671；OneBot 47672；已有独立 SQLite 和备份路径 |
 | 执行器 | 东京与北京宿主机 root；Windows 当前用户。设备身份和目录独立于网页入口；连接支持 WireGuard 与 SSH 保留通路 |
 | New API | 容器 `meridian-portal-new-api-1`，回环 3000，镜像 `meridian-newapi:receipt-0fcb40c55006` |

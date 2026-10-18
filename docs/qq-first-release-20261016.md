@@ -1,6 +1,6 @@
 # QQ 优先交互：本批上线与验证
 
-2026-10-16 21:55（北京时间）已部署至 [东京生产入口](https://www.claudeoutofdario.icu/)。
+2026-10-16 21:55（北京时间）已部署至 [东京生产入口](https://peri.claudeoutofdario.icu/)。
 
 - 源码基线：独立 peri-cloud v0.4.0，`7b797fdbab8246feb293fae20872c1f5b93de285`，叠加先前 WireGuard/SSH 连接改动和本批 QQ 交互改动。
 - 云端二进制 SHA-256：`bcc7cd495e5bf75249e7b7e20740ea03febc36e64922f81fd94e5de83bcef4c7`。

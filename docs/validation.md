@@ -10,6 +10,8 @@
 - Windows 执行器恢复上报：`device_connections` 出现 `feac1160-16b6-4fa3-a4d5-c89de5785190`，endpoint `127.0.0.1:44371`，租约按 30 秒续期；宿主到该回环端点的 TCP 连接成功。
 - 首次上报的阻塞来自旧版 guard 403 时执行器已把本地凭据标记为 `refresh_pending`；该标志按设计会阻止后续刷新。清标记前已备份本地 DPAPI vault，仅重置该布尔值，未读取或改写任何令牌；刷新随后成功。
 - 执行器与东京/北京静态连接未替换：v0.7.0 执行器已含上报代码，本次只升级宿主。
+- 2026-10-18 门户迁移：新增 `peri.claudeoutofdario.icu` A 记录与 Let's Encrypt 证书，nginx 反向代理到回环 47671，`public_origin` 切换为新域名；新域名门户与 `/healthz` 返回 200，旧 `www` 返回 403；切换后设备租约继续续期，QQ/OneBot 重新认证。
+- Windows 执行器的 `executor.json` 登录地址同步改为新域名；回环上报路径不受影响。
 
 ## v0.7.0 升级准备（2026-10-18）
 
