@@ -1,0 +1,111 @@
+/* Behavioral checks for editable drafts, traceable sources and offline round trips. */
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
+const {TextEncoder,TextDecoder}=require('node:util');
+let JSDOM,VirtualConsole;
+try{({JSDOM,VirtualConsole}=require(path.resolve(__dirname,'../../../scripts/portal-ui/node_modules/jsdom')));}
+catch{({JSDOM,VirtualConsole}=require(path.resolve(__dirname,'../../../target/research/board-dom-check/node_modules/jsdom')));}
+const html=fs.readFileSync(path.join(__dirname,'index.html'),'utf8');
+function mount(source=html,saved={}){
+  const errors=[],vc=new VirtualConsole();vc.on('jsdomError',e=>errors.push(e.message));
+  const dom=new JSDOM(source,{runScripts:'dangerously',url:'http://127.0.0.1/peri-workbench/index.html',virtualConsole:vc,beforeParse(w){
+    w.TextEncoder=TextEncoder;w.TextDecoder=TextDecoder;w.URL.createObjectURL=()=> 'blob:test';w.URL.revokeObjectURL=()=>{};
+    w.ResizeObserver=class{observe(){}disconnect(){}};
+    Object.defineProperty(w.HTMLElement.prototype,'getBoundingClientRect',{value(){return {x:0,y:0,left:0,top:0,right:1200,bottom:720,width:1200,height:720};}});
+    for(const [key,value]of Object.entries(saved))w.localStorage.setItem(key,value);
+  }});
+  if(errors.length)throw new Error(errors.join('\n'));
+  assert.ok(dom.window.PeriWorkbench,'application initialized');
+  return {dom,w:dom.window,d:dom.window.document,app:dom.window.PeriWorkbench,errors};
+}
+const c=mount(),{$:unused}=c;
+const $=id=>c.d.getElementById(id),click=id=>$(id).click();
+const pointer=(target,type,x,y)=>target.dispatchEvent(new c.w.MouseEvent(type,{bubbles:true,button:0,clientX:x,clientY:y}));
+const form=()=> $('node-form').dispatchEvent(new c.w.Event('submit',{bubbles:true,cancelable:true}));
+const change=id=>$(id).dispatchEvent(new c.w.Event('change',{bubbles:true}));
+const input=(id,text)=>{$(id).focus();$(id).value=text;$(id).dispatchEvent(new c.w.Event('input',{bubbles:true}));$(id).blur();};
+function current(){const s=c.app.getState();return s.boards.find(b=>b.id===s.ui.board);}
+const ids=Array.from(c.d.querySelectorAll('[id]'),e=>e.id);assert.equal(new Set(ids).size,ids.length,'unique HTML IDs');
+assert.equal(c.app.getState().boards.length,5);assert.equal(current().id,'mine');assert.equal(c.errors.length,0);
+const report={boards:c.app.getState().boards.map(b=>({id:b.id,nodes:b.nodes.length,edges:b.edges.length})),checks:[]};
+const freshState=c.app.getState();
+for(const id of ['target','mine']){
+  const plan=freshState.boards.find(b=>b.id===id),baseline=freshState.boards.find(b=>b.id==='peri');
+  assert.equal(plan.planRevision,2);
+  for(const n of baseline.nodes)assert.ok(plan.nodes.some(p=>(p.baselineRefs||[]).includes(n.id)),'plan includes '+n.id);
+  for(const e of baseline.edges)assert.ok(plan.edges.some(p=>p.baselineEdgeRef===e.id),'plan includes original relationship '+e.id);
+  assert.ok(plan.nodes.some(n=>n.integration==='reuse'&&n.status==='implemented'));
+  assert.ok(plan.nodes.some(n=>n.integration==='extend'&&n.status==='proposal'));
+  assert.ok(plan.nodes.some(n=>n.integration==='new'&&n.status==='proposal'));
+  for(let i=0;i<plan.nodes.length;i++)for(let j=i+1;j<plan.nodes.length;j++){const a=plan.nodes[i],b=plan.nodes[j];assert.equal(a.x<b.x+218&&a.x+218>b.x&&a.y<b.y+118&&a.y+118>b.y,false,'default modules overlap: '+a.id+' / '+b.id);}
+}
+$('lens').value='baseline';change('lens');assert.equal(c.app.canvas.visible().length,26);
+c.app.select('node','base-workspace');assert.ok($('baseline-info').textContent.includes('当前实现'));assert.ok($('baseline-info').textContent.includes('Skill'));
+$('lens').value='overview';change('lens');
+report.checks.push('all current modules and relations integrated; existing/new lenses; current duties inspectable');
+for(const source of Object.values(c.w.PERI_DATA.sources))if(!/^https?:/.test(source.url))assert.ok(fs.existsSync(path.resolve(__dirname,source.url.split('#')[0])),source.url);
+report.checks.push('source files resolve; five distinct evidence scopes');
+const first=current().nodes[0],group=c.d.querySelector('[data-node="'+first.id+'"]');
+pointer(group,'pointerdown',100,150);pointer($('canvas'),'pointermove',145,175);pointer($('canvas'),'pointerup',145,175);
+assert.notEqual(current().nodes[0].x,first.x,'drag updates world coordinates');
+c.app.travel('undo');assert.equal(current().nodes[0].x,first.x);c.app.travel('redo');
+report.checks.push('drag, undo and redo');
+c.app.select('node',first.id);$('edit-title').value='<img src=x onerror=alert(1)>';$('edit-details').value='我的修改\n保留原循环与权限';form();
+assert.equal(current().nodes[0].status,'draft');assert.equal(c.d.querySelectorAll('img').length,0);assert.ok(c.d.querySelector('[data-node="'+first.id+'"]').textContent.includes('<img'));
+report.checks.push('editable duties; changed evidence marked draft; escaped text');
+let before=current().nodes.length;click('add-note');assert.equal(current().nodes.length,before+1);assert.equal(current().nodes.at(-1).kind,'note');
+c.app.travel('undo');assert.equal(current().nodes.length,before);
+const a=current().nodes[0],b=current().nodes.at(-1);c.app.canvas.setMode('connect');
+pointer(c.d.querySelector('[data-node="'+a.id+'"]'),'pointerdown',20,20);
+$('object-picker').value='node:'+b.id;change('object-picker');
+pointer(c.d.querySelector('[data-node="'+b.id+'"]'),'pointerdown',30,30);
+assert.ok(current().edges.some(e=>e.from===a.id&&e.to===b.id));click('reverse-edge');assert.ok(current().edges.some(e=>e.from===b.id&&e.to===a.id));
+report.checks.push('notes, connecting and reverse direction');
+c.app.canvas.setMode('pen');pointer($('canvas'),'pointerdown',130,180);pointer($('canvas'),'pointermove',150,200);pointer($('canvas'),'pointermove',180,220);pointer($('canvas'),'pointerup',180,220);
+assert.equal(current().strokes.length,1);assert.ok(current().strokes[0].points.length>=3);
+c.app.canvas.setMode('erase');pointer($('canvas'),'pointerdown',150,200);pointer($('canvas'),'pointerup',150,200);assert.equal(current().strokes.length,0);c.app.travel('undo');assert.equal(current().strokes.length,1);
+report.checks.push('freehand drawing, eraser and undo');
+c.d.querySelector('[data-page="prompts"]').click();input('prompt-editor','主助手草案\n<script>alert("x")</script>\n派发后继续聊天。');input('prompt-notes','子 Agent 不必周期汇报。');
+c.d.querySelector('[data-page="decisions"]').click();const decision=c.d.querySelector('.decision-card textarea');decision.focus();decision.value='任务都在云端；本地仅执行器。';decision.dispatchEvent(new c.w.Event('input',{bubbles:true}));decision.blur();
+c.d.querySelector('[data-page="sources"]').click();$('rounds').value='7';change('rounds');$('round-unit').value='main';change('round-unit');
+assert.equal(c.app.getState().config.rounds,7);assert.ok(c.app.getState().prompts.main.includes('派发后继续聊天'));assert.ok(c.app.getState().promptNotes.main.includes('不必周期汇报'));
+report.checks.push('prompt, notes, decision and draft parameter editing');
+const json=c.app.exportJSON(),exported=c.app.exportHTML(),roundtrip=mount(exported);
+assert.equal(roundtrip.app.getState().prompts.main,c.app.getState().prompts.main);assert.equal(roundtrip.app.getState().boards[4].strokes.length,1);assert.equal(roundtrip.d.querySelectorAll('img').length,0);assert.equal(roundtrip.errors.length,0);assert.notEqual(roundtrip.app.getState().workspaceId,c.app.getState().workspaceId);
+assert.ok(exported.includes('\\u003cscript>'),'snapshot escapes script terminators');
+roundtrip.dom.window.close();report.checks.push('standalone edited HTML preserves drawings, prompts and notes without execution');
+const beforeImport=c.app.exportJSON();c.app.importText(json);assert.equal(c.app.getState().config.rounds,7);c.app.travel('undo');assert.equal(c.app.exportJSON(),beforeImport);
+assert.throws(()=>c.app.importText(JSON.stringify({format:'peri-design-workbench',version:2,boards:[{id:'bad',nodes:[{id:'x',title:'bad',x:null,y:1}],edges:[]}]})));
+assert.equal(c.app.exportJSON(),beforeImport,'invalid import leaves current draft intact');
+const legacy={format:'peri-grok-board',version:1,board:{id:'old',title:'旧画板',nodes:[{id:'old-node',title:'原画板',summary:'',details:'保留旧版',x:0,y:0,status:'draft',kind:'module'}],edges:[]}};
+c.app.importText(JSON.stringify(legacy));assert.equal(c.app.getState().boards.length,6);assert.equal(current().nodes[0].details,'保留旧版');c.app.travel('undo');
+report.checks.push('JSON round trip, atomic validation, legacy import and import undo');
+c.app.saveNow();assert.equal(c.app.isSaveFailed(),false);const state=c.app.getState(),key='peri-design-workbench:'+state.workspaceId,stored=c.w.localStorage.getItem(key),restored=mount(html,{[key]:stored});
+assert.equal(restored.app.getState().prompts.main,state.prompts.main);restored.dom.window.close();
+const fallback=mount(html,{[key]:'{broken',[key+':backup']:stored});assert.equal(fallback.app.getState().config.rounds,7);assert.ok(fallback.d.getElementById('notice').textContent.includes('备份'));fallback.dom.window.close();
+report.checks.push('browser persistence and corrupt-primary backup recovery');
+const legacyState=JSON.parse(JSON.stringify(freshState));
+legacyState.boards=legacyState.boards.map(b=>c.w.PERI_DATA.previousPlans[b.id]?JSON.parse(JSON.stringify(c.w.PERI_DATA.previousPlans[b.id])):b);
+const legacyMine=legacyState.boards.find(b=>b.id==='mine'),oldMain=legacyMine.nodes.find(n=>n.id==='t-main');
+legacyMine.title='我的保留方案';oldMain.title='我的助手';oldMain.details='保留我写的职责';oldMain.x=777;oldMain.y=48;oldMain.status='draft';
+legacyMine.nodes=legacyMine.nodes.filter(n=>n.id!=='t-cache');legacyMine.edges=legacyMine.edges.filter(e=>e.from!=='t-cache'&&e.to!=='t-cache'&&e.id!=='edge-1');
+legacyMine.edges.find(e=>e.id==='edge-2').label='保留我改的关系';
+legacyMine.nodes.push({id:'user-note',title:'我的便签',summary:'不要覆盖',details:'自定义内容',x:450,y:1400,w:218,h:118,source:'',lenses:['overview'],status:'draft',area:'logical',kind:'note'});
+legacyMine.edges.push({id:'custom-edge',from:'t-main',to:'user-note',label:'我的关系',style:'dashed'});
+legacyMine.strokes=[{id:'my-stroke',lens:'overview',color:'red',width:3,points:[{x:12,y:44},{x:88,y:99}]}];
+legacyState.prompts.main='保留自定义提示词';legacyState.promptNotes.worker='保留提示词批注';legacyState.config.rounds=11;
+const legacyJSON=JSON.stringify(legacyState),legacyKey='peri-design-workbench:'+legacyState.workspaceId,upgraded=mount(html,{[legacyKey]:legacyJSON}),upgradedState=upgraded.app.getState(),upgradedMine=upgradedState.boards.find(b=>b.id==='mine');
+assert.equal(upgradedMine.planRevision,2);assert.equal(upgradedMine.title,'我的保留方案');
+assert.equal(upgradedMine.nodes.find(n=>n.id==='t-main').title,'我的助手');assert.equal(upgradedMine.nodes.find(n=>n.id==='t-main').details,'保留我写的职责');assert.equal(upgradedMine.nodes.find(n=>n.id==='t-main').x,777);
+assert.equal(upgradedMine.nodes.some(n=>n.id==='t-cache'),false);assert.equal(upgradedMine.edges.some(e=>e.from==='t-main'&&e.to==='t-host'),false);
+assert.equal(upgradedMine.edges.find(e=>e.id==='edge-2').label,'保留我改的关系');assert.ok(upgradedMine.edges.some(e=>e.id==='custom-edge'));assert.ok(upgradedMine.nodes.some(n=>n.id==='user-note'));
+assert.equal(JSON.stringify(upgradedMine.strokes),JSON.stringify(legacyMine.strokes));assert.equal(upgradedState.prompts.main,'保留自定义提示词');assert.equal(upgradedState.promptNotes.worker,'保留提示词批注');assert.equal(upgradedState.config.rounds,11);
+assert.equal(upgraded.w.localStorage.getItem(legacyKey+':backup'),legacyJSON,'pre-upgrade draft is backed up');
+for(const b of upgradedState.boards)assert.equal(new Set(b.nodes.map(n=>n.id)).size,b.nodes.length);
+const secondUpgrade=upgraded.w.PERI_DATA.upgradeWorkspace(upgradedState);assert.equal(secondUpgrade.upgraded.length,0,'upgrade is idempotent');
+upgraded.app.select('node','base-portal');upgraded.app.removeSelected();upgraded.app.saveNow();const afterDeletion=upgraded.app.exportJSON();upgraded.dom.window.close();
+const reopened=mount(html,{[legacyKey]:afterDeletion});assert.equal(reopened.app.getState().boards.find(b=>b.id==='mine').nodes.some(n=>n.id==='base-portal'),false);reopened.dom.window.close();
+c.app.importText(legacyJSON);assert.equal(c.app.getState().boards.find(b=>b.id==='mine').planRevision,2);assert.equal(c.app.getState().prompts.main,'保留自定义提示词');c.app.travel('undo');
+report.checks.push('old browser drafts/imports upgraded without losing edits, drawing, deletions, notes or custom objects; backup and idempotence');
+assert.ok(c.app.markdown().includes('保留原循环与权限'));assert.ok(!/<script[^>]+src=/i.test(html));
+report.bytes=Buffer.byteLength(html);report.lines=html.split('\n').length;assert.ok(report.lines<1000);assert.ok(report.bytes<1024*1024);
+assert.equal(c.errors.length,0);c.dom.window.close();console.log(JSON.stringify(report,null,2));

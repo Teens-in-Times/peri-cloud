@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="Peri 与 Grok 架构设计工作台：可编辑拓扑、会话成果与角色提示词。">
+  <title>Peri / Grok · 个人助手设计工作台</title>
+  <style>/*__STYLES__*/</style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <a class="brand" href="#topology"><span class="brand-mark">p</span><span>Peri<span class="brand-sub">设计工作台 / 2026.10.18</span></span></a>
+      <div class="sidebar-label">工作区</div>
+      <nav class="primary-nav" aria-label="工作区视图">
+        <button data-page="topology" aria-current="page"><span>01</span>功能拓扑</button>
+        <button data-page="decisions"><span>02</span>会话成果</button>
+        <button data-page="prompts"><span>03</span>提示词工作室</button>
+        <button data-page="sources"><span>04</span>来源与边界</button>
+      </nav>
+      <div class="sidebar-label">拓扑画板</div>
+      <div id="boards" class="board-list"></div>
+      <div class="sidebar-bottom">
+        <span class="live-dot"></span>本地设计 · 新方案未实施
+        <label class="theme-label">外观<select id="theme" aria-label="外观"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label>
+        <a href="decisions.md" target="_blank" rel="noopener">打开会话记录 ↗</a>
+      </div>
+    </aside>
+    <main>
+      <header class="topbar"><div><div class="eyebrow">PERSONAL AGENT / ARCHITECTURE LAB</div><h1 id="page-title">功能拓扑</h1></div><div class="top-actions"><span id="save-state" role="status">正在准备</span><button id="undo">撤销</button><button id="redo">重做</button><button id="open-export" class="primary">保存 / 导入</button></div></header>
+      <section id="page-topology" class="page">
+        <div class="board-header"><div><h2 id="board-title"></h2><p id="board-caption"></p></div><div class="board-header-actions"><button id="arrange-board">分区排版为副本</button><button id="copy-board">复制此图为草稿</button><button id="copy-discussion">复制讨论稿</button></div></div>
+        <div class="canvas-toolbar" role="toolbar" aria-label="拓扑编辑">
+          <div class="tool-group" id="modes"><button data-mode="select" aria-pressed="true">移动 / 选择</button><button data-mode="connect" aria-pressed="false">连线</button><button data-mode="pen" aria-pressed="false">画笔</button><button data-mode="erase" aria-pressed="false">擦画线</button></div>
+          <div class="tool-group"><button id="add-node">＋模块</button><button id="add-note">＋便签</button><button id="delete">删除选中</button></div>
+          <label>领域<select id="lens" aria-label="选择功能领域"></select></label>
+          <label>分区<select id="layout-group" aria-label="聚焦功能分区"><option value="">全部分区</option></select></label>
+          <label class="pen-options" hidden>颜色<select id="pen-color"><option value="amber">琥珀</option><option value="blue">蓝色</option><option value="red">红色</option><option value="ink">文字色</option></select></label>
+          <label class="pen-options" hidden>粗细<input id="pen-width" type="range" min="2" max="10" value="3" aria-label="画笔粗细"></label>
+        </div>
+        <div class="canvas-wrap" id="canvas-wrap">
+          <div class="canvas-stage" id="stage"><svg id="canvas" aria-label="可移动、连线与自由涂画的架构图" role="img"></svg></div>
+          <div class="canvas-hint" id="canvas-hint">拖动节点；拖动空白平移；滚轮平移，Ctrl / ⌘ + 滚轮缩放。</div>
+          <div class="zoom-controls"><button id="zoom-out" aria-label="缩小">−</button><span id="zoom">100%</span><button id="zoom-in" aria-label="放大">＋</button><button id="fit">全图</button><button id="actual">100%</button></div>
+          <aside id="inspector" class="inspector" hidden aria-label="编辑选中对象">
+            <div class="inspector-header"><h3 id="selection-title">编辑模块</h3><button id="close-inspector" aria-label="关闭属性">×</button></div>
+            <form id="node-form">
+              <label>名称 / 连线文字<input id="edit-title" maxlength="100" required></label>
+              <div id="node-fields">
+                <label>图上摘要<textarea id="edit-summary" maxlength="160" rows="2"></textarea></label>
+                <label>职责、边界与涂改笔记<textarea id="edit-details" maxlength="12000" rows="8"></textarea></label>
+                <label>状态<select id="edit-status"></select></label>
+                <label>方案构成<select id="edit-integration"><option value="">未标注</option><option value="reuse">沿用现有</option><option value="extend">扩展现有</option><option value="new">新增设计</option></select></label>
+                <label>归属<select id="edit-area"><option value="cloud">云端</option><option value="local">本地执行器 / 工作环境</option><option value="external">用户 / 外部入口</option><option value="logical">逻辑对象</option><option value="unknown">部署未知</option></select></label>
+                <label>类别<select id="edit-kind"><option value="module">模块</option><option value="note">便签</option></select></label>
+                <label>功能领域（可多选）<select id="edit-lens" multiple size="4"></select></label>
+              </div>
+              <label id="edge-fields" hidden>关系样式<select id="edit-style"><option value="solid">实线</option><option value="dashed">虚线</option></select></label>
+              <div id="selected-source" class="source-note"></div>
+              <div id="baseline-info" class="baseline-info" hidden></div>
+              <div class="form-actions"><button type="submit" class="primary">应用修改</button><button type="button" id="copy-node">加入我的草稿</button><button type="button" id="reverse-edge" hidden>反转方向</button></div>
+            </form>
+          </aside>
+        </div>
+        <div class="canvas-footer"><span id="graph-count"></span><label>跳转<select id="object-picker" aria-label="跳转到模块或连线"></select></label><span class="legend"><i class="solid"></i>现有 / 有证据关系 <i class="dashed"></i>方案 / 未确认关系</span></div>
+        <div class="help-row">方案已合并现有实现：沿用现有 / 扩展现有 / 新增设计。领域可选“方案内 · 现有基础”。选中模块可对照当前职责并直接修改。</div>
+      </section>
+      <section id="page-decisions" class="page document-page" hidden>
+        <div class="section-heading"><div><h2>把讨论留住</h2><p>明确方向、待定参数和保留选项分别标记。这里的修改也会保存到工作台。</p></div><button id="add-decision">＋设计决定</button></div>
+        <div id="decision-list" class="decision-list"></div>
+      </section>
+      <section id="page-prompts" class="page document-page" hidden>
+        <div class="section-heading"><div><h2>角色行为，逐句推敲</h2><p>讨论稿 v0.1 · 候选工具尚未接入生产。编辑不会修改运行中的 Agent。</p></div><button id="download-prompt">导出当前提示词</button></div>
+        <div class="prompt-layout"><div class="prompt-main"><div id="prompt-tabs" class="prompt-tabs" role="group" aria-label="提示词角色"></div><label class="sr-only" for="prompt-editor">提示词正文</label><textarea id="prompt-editor" spellcheck="false"></textarea><div class="prompt-footer"><span id="prompt-count"></span><span>正文自动保存；工具能力仍以宿主实际装配为准。</span></div></div>
+          <aside class="prompt-review"><h3>行为验收</h3><p>选一个场景，对照提示词检查。此处是人工检视，不调用模型。</p><label>场景<select id="scenario"></select></label><div class="scenario"><span class="eyebrow">输入与现场</span><p id="scenario-input"></p><span class="eyebrow">期望行为</span><p id="scenario-expected"></p></div><label>我的修改意见<textarea id="prompt-notes" rows="8" placeholder="哪些句子有歧义？缺少什么边界？"></textarea></label><div class="rule-note">权限、绑定、幂等、游标、持久性和未知结果由程序保证。提示词规定行为。</div></aside></div>
+      </section>
+      <section id="page-sources" class="page document-page" hidden>
+        <div class="section-heading"><div><h2>证据与设计，各自归位</h2><p>Peri 是实现清单；Grok Bot 是公开逻辑架构；Build 仅展示已调查的局部。未知部分保留未知。</p></div></div>
+        <div class="boundary-grid"><article><h3>Peri 当前实现</h3><p>以仓库文档和本轮源码读查为准。本次只建设计工作台，没有更改生产 Agent 行为。</p></article><article><h3>Grok Bot</h3><p>官方行为与 0.18 归档分别标记。归档不授予代码复用权，未独立重做安装包哈希链验证。</p></article><article><h3>Grok Build</h3><p>固定官方提交的 capture / consolidation / maintenance 等机制，不能代替 Bot 后台实现证据。</p></article><article><h3>我们的方案</h3><p>云端异步多 Agent、trace 查询和双向控制是本轮设计；工具名称、N 和物理部署尚待收敛。</p></article></div>
+        <div class="parameter-row"><h3>周期进度帧 · 草案参数</h3><label>每 N 轮<input id="rounds" type="number" min="1" max="100" value="3"></label><label>计数口径<select id="round-unit"><option value="main">主对话完成回合（建议）</option><option value="worker">执行 Agent 回合（待讨论）</option><option value="undecided">尚未决定</option></select></label><span>仅设计值，不是生产配置。</span></div>
+        <div id="source-list" class="source-list"></div>
+      </section>
+      <footer class="app-footer"><span>设计资料 2026-10-18 · 保留原画板与研究文档</span><span id="notice" role="status" aria-live="polite">修改保存在当前浏览器；导出可携带到其他设备。</span></footer>
+    </main>
+  </div>
+  <dialog id="export-dialog">
+    <div class="dialog-heading"><h2>保存与继续设计</h2><button id="close-export" aria-label="关闭保存窗口">×</button></div>
+    <p>自动保存只在当前浏览器。JSON 包含全部画板、画线、会话成果、提示词和设计参数；独立网页可直接打开继续编辑。</p>
+    <div class="export-actions"><button id="export-json" class="primary">下载完整 JSON</button><button id="export-html">下载带修改的网页</button><button id="export-md">下载设计文档</button><button id="import-file">导入 JSON 文件</button><input type="file" id="import-input" accept=".json,application/json" hidden></div>
+    <label>方案数据 / 讨论稿<textarea id="exchange-text" rows="12" spellcheck="false"></textarea></label>
+    <div class="export-actions"><button id="fill-json">读取全部方案</button><button id="copy-text">复制文本</button><button id="import-text">导入粘贴的 JSON</button></div>
+    <p class="muted">也支持旧版 peri-grok-board JSON，作为一块新画板导入。导入可撤销，浏览器保存失败时请立即导出备份。</p>
+  </dialog>
+  <script id="workbench-snapshot" type="application/json">null</script>
+  <script>/*__DATA__*/</script>
+  <script>/*__INTEGRATION__*/</script>
+  <script>/*__PROMPTS__*/</script>
+  <script>/*__LAYOUT__*/</script>
+  <script>/*__CANVAS__*/</script>
+  <script>/*__APP__*/</script>
+</body>
+</html>
