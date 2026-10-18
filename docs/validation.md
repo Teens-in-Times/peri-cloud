@@ -1,5 +1,17 @@
 # 验证记录
 
+## 上游更新到 7d5295c7（本地开发验证，2026-10-19）
+
+- 上游从 `e1d1b9c` 更新到 `7d5295c7`：5 个提交、395 个文件；叠加范围内 154 个文件（127 修改、27 新增、0 删除）。
+- 新 manifest 1291 个文件：1264 个与上游一致，27 个允许清单内的生产补丁，0 缺失、0 未声明漂移。处理见 [upstream/peri-7d5295c7.md](upstream/peri-7d5295c7.md)。
+- `transcript.rs` 的 2 处冲突按 deployment-owned journal 语义保留 `canonical_payloads()` 与 shrink 守卫，同时接收上游内存观测。
+- `EventSink` 返回类型、`GoalViewSnapshot.goal_id`、`complete_goal_if_current`（goal_id CAS）已适配，并补充 CAS 回归测试。
+- `cargo check --workspace --all-targets` 通过。
+- 云端库与集成测试 228 项通过；`peri-acp-types` 665 项、`peri-agent` 1169 项（4 ignored）、`peri-middlewares` 1785 项（2 ignored）通过。
+- 执行器库 16 项通过；HTTP 集成 7 项通过，仅既有 Windows PowerShell 编码测试失败；`peri-remote-tools` 6 项通过。
+- `cargo fmt --all --check` 与 scheduler/cloud/executor 严格 Clippy 通过。
+- 未构建 release，未部署生产；真实执行器 compact/重启与 MCP 网络行为仍需部署前冒烟。
+
 ## 分范围记忆与上下文帧（本地开发验证，2026-10-18）
 
 - README 六 crate 回归：35 个测试目标，428 通过，0 失败、0 忽略。

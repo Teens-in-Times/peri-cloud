@@ -70,6 +70,35 @@ async fn goal_transitions_are_terminal_until_cleared() {
 }
 
 #[tokio::test]
+async fn stale_goal_completion_is_rejected_by_identity() {
+    let (_root, journal, owner, _other, session) = fixture().await;
+    let controller = CloudGoalController::load(journal.identity_pool(), session, owner)
+        .await
+        .unwrap();
+    controller.create_goal("first".into()).await.unwrap();
+    let first_id = controller.snapshot().goal_id.expect("goal id");
+
+    assert!(controller.complete_goal_if_current("stale").await.is_err());
+    assert_eq!(controller.snapshot().status, Some(GoalStatus::Active));
+
+    controller.clear_goal().await.unwrap();
+    controller.create_goal("second".into()).await.unwrap();
+    assert!(controller
+        .complete_goal_if_current(&first_id)
+        .await
+        .is_err());
+    assert_eq!(controller.snapshot().status, Some(GoalStatus::Active));
+    assert_eq!(controller.snapshot().objective.as_deref(), Some("second"));
+
+    let second_id = controller.snapshot().goal_id.expect("goal id");
+    controller
+        .complete_goal_if_current(&second_id)
+        .await
+        .unwrap();
+    assert_eq!(controller.snapshot().status, Some(GoalStatus::Complete));
+}
+
+#[tokio::test]
 async fn goal_survives_reopen_and_is_scoped_to_its_principal() {
     let (root, journal, owner, other, session) = fixture().await;
     let controller = CloudGoalController::load(journal.identity_pool(), session, owner)

@@ -406,7 +406,14 @@ mod tests {
     struct NoEvents;
     #[async_trait]
     impl peri_acp_types::event::EventSink for NoEvents {
-        async fn push_event(&self, _: &str, _: &peri_acp_types::event::ExecutorEvent, _: u32) {}
+        async fn push_event(
+            &self,
+            _: &str,
+            _: &peri_acp_types::event::ExecutorEvent,
+            _: u32,
+        ) -> Result<(), peri_acp_types::event::EventSinkError> {
+            Ok(())
+        }
         async fn push_done(&self, _: &str, _: &str, _: Option<&str>) {}
     }
 

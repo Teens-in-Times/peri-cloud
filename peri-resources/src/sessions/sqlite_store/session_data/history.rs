@@ -1,4 +1,7 @@
 use super::*;
+use peri_acp_types::history_window::{
+    HistoryBodyChunk, HistoryEntryId, HistoryInheritedSnapshot, HistoryWindowError,
+};
 
 // ─── 分页读取（archive 视图） ──────────────────────────────────────────────────
 
@@ -23,11 +26,13 @@ pub(in crate::sessions) const HISTORY_PAGE_BOUNDS_SQL: &str = "SELECT
 /// `message_id` 定位**（同一条语句内完成，两次语句之间不引入新的时间点），排序才用
 /// `rowid`：删掉尾部行之后新插入的行会复用这些 rowid，rowid 不是稳定的条目身份。
 ///
-/// 长度是**字节数**（`length(CAST(content AS BLOB))`；直接 `length(content)` 数的是字符，
-/// 中文正文会偏小），与页预算和 `content.len()` 同一口径。`rowid` 只作为客户端可见的
+/// 长度是**字节数**，与页预算和 `content.len()` 同一口径；`rowid` 只作为客户端可见的
 /// 不透明位置返回（见 `HistoryPageItem::position`），不参与条目身份。
-pub(in crate::sessions) const HISTORY_PAGE_ROWS_SQL: &str =
-    "SELECT message_id, rowid, length(CAST(content AS BLOB))
+///
+/// 阶段一**不**在 SQL 里计算长度：`length(CAST(content AS BLOB))` 会让 SQLite 物化整条
+/// 正文（16 MiB 行每次多分配约 16 MiB）。身份与存储序先取回，长度逐行由 blob 句柄的
+/// `sqlite3_blob_bytes` 给出（O(1)，不读正文），见 [`read_content_lengths`]。
+pub(in crate::sessions) const HISTORY_PAGE_ROWS_SQL: &str = "SELECT message_id, rowid
     FROM messages
     WHERE thread_id = ?1 AND (?2 IS NULL OR rowid < (
         SELECT m.rowid FROM messages m WHERE m.thread_id = ?1 AND m.message_id = ?2))
@@ -40,6 +45,101 @@ pub(in crate::sessions) const HISTORY_PAGE_BODY_SQL: &str =
 /// 自有有效条目位置读取的语句原文（计划证据与生产读取同一份文本）。
 pub(in crate::sessions) const ACTIVE_ENTRY_POSITIONS_SQL: &str =
     "SELECT message_id, rowid FROM messages WHERE thread_id = ?1 AND excluded = 0 ORDER BY rowid ASC";
+
+// ─── 窗口读取（peri.historyWindowV1，archive 视图） ──────────────────────────
+
+/// 窗口边界：own 最旧/最新稳定身份、最新 durable 位置。
+///
+/// 不取 `content`，也不做聚合；会话不存在时没有行（`NotFound`）。最新行缺失与位置缺失
+/// 必须同时成立或同时缺失，代码在解码处显式校验，不用 `COALESCE` 兜底。
+///
+/// 冻结前缀是否存在**不在本语句**：`t.inherited_context` 是可能达 MiB 级的 blob 列，
+/// 哪怕只做 `IS NULL OR = ''` 比较也会让 SQLite 物化整列。该事实由增量 blob 扫描
+/// （[`super::inherited_blob`]）独立给出，本语句不得再引用该列。
+pub(in crate::sessions) const HISTORY_WINDOW_BOUNDS_SQL: &str = "SELECT
+        (SELECT m.message_id FROM messages m WHERE m.thread_id = t.id ORDER BY m.rowid ASC LIMIT 1),
+        (SELECT m.message_id FROM messages m WHERE m.thread_id = t.id ORDER BY m.rowid DESC LIMIT 1),
+        (SELECT m.rowid FROM messages m WHERE m.thread_id = t.id ORDER BY m.rowid DESC LIMIT 1)
+    FROM threads t WHERE t.id = ?1";
+
+/// 最近一次可由现有 canonical 行重建的 Full checkpoint：最新一条被 `superseded_by`
+/// 指向的摘要行。`json_valid` 让旧版/损坏投影不阻断边界读取；没有匹配即没有 checkpoint。
+///
+/// 这是**回退/修复**语句：正常情况下 [`HISTORY_WINDOW_CHECKPOINT_FAST_SQL`] 只读最新归档行；
+/// 只有最新归档行给不出有效指针（legacy 投影、悬挂引用、损坏）时才回到这里做全归档推导。
+pub(in crate::sessions) const HISTORY_WINDOW_CHECKPOINT_SQL: &str = "SELECT s.message_id, s.rowid
+    FROM messages e
+    JOIN messages s ON s.thread_id = e.thread_id
+      AND s.message_id = CASE WHEN json_valid(e.projection)
+          THEN json_extract(e.projection, '$.superseded_by') END
+    WHERE e.thread_id = ?1 AND e.excluded <> 0
+    ORDER BY s.rowid DESC LIMIT 1";
+
+/// checkpoint 的 O(1) 快路径：只取**最新**归档行（`idx_messages_active` 定界，
+/// `MAX(rowid)` 走索引尾端，不需要排序），再用主键回表验证它指向的摘要行仍在。
+///
+/// 不变量：Full 在同一个事务里把本次被归档的连续区间标为 `excluded` 并追加摘要，每条
+/// 归档行的 `superseded_by` 都指向该摘要；后续 Full 只会在更后面继续归档并把旧摘要也归档。
+/// 因此“rowid 最大的归档行”必然来自最近一次 Full，它的指针就是最新 checkpoint；摘要行
+/// 必须在这一行之后（`s.rowid > e.rowid`，同一事务内先写 flags 再追加摘要）。
+///
+/// `e.rowid = (SELECT MAX(...))` 把答案限定在最新归档行：该行给不出有效指针时整条语句没有
+/// 行，调用方回退 [`HISTORY_WINDOW_CHECKPOINT_SQL`] 做全归档推导。若不限定，JOIN 会静默
+/// 跳到更早的归档行，指针链异常时可能与全量推导给出不同答案。
+pub(in crate::sessions) const HISTORY_WINDOW_CHECKPOINT_FAST_SQL: &str =
+    "SELECT s.message_id, s.rowid
+    FROM messages e
+    JOIN messages s ON s.thread_id = e.thread_id
+      AND s.message_id = CASE WHEN json_valid(e.projection)
+          THEN json_extract(e.projection, '$.superseded_by') END
+    WHERE e.thread_id = ?1 AND e.excluded = 1 AND s.rowid > e.rowid
+      AND e.rowid = (SELECT MAX(m.rowid) FROM messages m
+                     WHERE m.thread_id = ?1 AND m.excluded = 1)";
+
+/// 当前 durable tail（最新一行）。
+pub(in crate::sessions) const HISTORY_WINDOW_LATEST_SQL: &str =
+    "SELECT message_id, rowid FROM messages WHERE thread_id = ?1 ORDER BY rowid DESC LIMIT 1";
+
+/// 锚点存在性（游标/seek 的身份是 `message_id`，rowid 只是内部区间键）。
+pub(in crate::sessions) const HISTORY_WINDOW_ANCHOR_SQL: &str =
+    "SELECT rowid FROM messages WHERE thread_id = ?1 AND message_id = ?2";
+
+/// 固定 tail 复核：身份与位置必须同时仍成立；新 append 不影响它。
+pub(in crate::sessions) const HISTORY_WINDOW_TAIL_CHECK_SQL: &str =
+    "SELECT 1 FROM messages WHERE thread_id = ?1 AND message_id = ?2 AND rowid = ?3 LIMIT 1";
+
+/// before 方向候选：`rowid <= tail`，并按锚点身份定位；`?4` 为 1 时包含锚点自身
+/// （seek/open(entry)），为 0 时严格更早（游标翻页）。最多 `limit + 1` 行，不取正文；
+/// 长度由 blob 句柄逐行给出（理由见 [`HISTORY_PAGE_ROWS_SQL`]）。
+pub(in crate::sessions) const HISTORY_WINDOW_BEFORE_SQL: &str = "SELECT message_id, rowid
+    FROM messages
+    WHERE thread_id = ?1 AND rowid <= ?2
+      AND (?3 IS NULL OR rowid < ?3 OR (?4 <> 0 AND rowid = ?3))
+    ORDER BY rowid DESC LIMIT ?5";
+
+/// after 方向候选：`anchor < rowid <= tail`，升序，最多 `limit + 1` 行，不取正文；
+/// 长度由 blob 句柄逐行给出；`?4` 为 1 时包含锚点自身（`open(entry, after)` 且
+/// before 半段不存在），保证锚点恰好返回一次。
+pub(in crate::sessions) const HISTORY_WINDOW_AFTER_SQL: &str = "SELECT message_id, rowid
+    FROM messages
+    WHERE thread_id = ?1 AND rowid <= ?2
+      AND (rowid > ?3 OR (?4 <> 0 AND rowid = ?3))
+    ORDER BY rowid ASC LIMIT ?5";
+
+/// 更早方向是否还有可读行（相对给定 rowid）。用于在 `before_limit == 0` 或页到达
+/// 端点时判断是否铸造 `beforeCursor`；不依赖方向游标是否被请求。
+pub(in crate::sessions) const HISTORY_WINDOW_OLDER_EXISTS_SQL: &str =
+    "SELECT 1 FROM messages WHERE thread_id = ?1 AND rowid < ?2 LIMIT 1";
+
+/// 更晚方向是否还有可读行（严格晚于给定 rowid，且不越过 fixed tail）。
+pub(in crate::sessions) const HISTORY_WINDOW_NEWER_EXISTS_SQL: &str =
+    "SELECT 1 FROM messages WHERE thread_id = ?1 AND rowid > ?2 AND rowid <= ?3 LIMIT 1";
+
+/// 超大条目的行定位：只按主键（和固定 tail）取 `rowid`，总长度与请求区间都由
+/// `sqlite3_blob_bytes`/`sqlite3_blob_read` 给出，**不**用 `length(CAST(...))` 或
+/// `substr(CAST(...))` 物化整条正文。
+pub(in crate::sessions) const HISTORY_WINDOW_BODY_ROWID_SQL: &str = "SELECT rowid FROM messages
+    WHERE thread_id = ?1 AND message_id = ?2 AND rowid <= ?3";
 
 // ─── 向前段读取（canonical 完整回放，REQ §5.3） ──────────────────────────────
 
@@ -55,13 +155,12 @@ pub(in crate::sessions) const HISTORY_SEGMENT_TAIL_SQL: &str = "SELECT
         (SELECT MAX(m.rowid) FROM messages m WHERE m.thread_id = t.id)
     FROM threads t WHERE t.id = ?1";
 
-/// 首段候选行（**阶段一**：身份 + 存储序键 + 正文长度，记忆同 [`HISTORY_PAGE_ROWS_SQL`]），
+/// 首段候选行（**阶段一**：身份 + 存储序键，记忆同 [`HISTORY_PAGE_ROWS_SQL`]），
 /// 最多 `limit + 1` 行，**升序**（canonical 完整回放方向），**不取正文**。
 ///
 /// 与非首段同形，只是去掉 `rowid > ?2`，并把上界交给同一条语句内的 `MAX(rowid)` 子查询：
 /// 首段的上界就是这一刻的最大 `rowid`，没有可以预先绑定的值（它由本次读取确定）。
-pub(in crate::sessions) const HISTORY_SEGMENT_HEAD_SQL: &str =
-    "SELECT message_id, rowid, length(CAST(content AS BLOB))
+pub(in crate::sessions) const HISTORY_SEGMENT_HEAD_SQL: &str = "SELECT message_id, rowid
     FROM messages
     WHERE thread_id = ?1 AND rowid <= (
         SELECT MAX(m.rowid) FROM messages m WHERE m.thread_id = ?1)
@@ -79,8 +178,7 @@ pub(in crate::sessions) const HISTORY_SEGMENT_ANCHOR_SQL: &str = "SELECT
 ///
 /// `tail` 是**数值**上界，不是一条要查回来的行：回放期间追加的行 `rowid > tail`，因此不进入
 /// 本次遍历；`tail` 那一行自己被删掉也不影响区间。
-pub(in crate::sessions) const HISTORY_SEGMENT_NEXT_SQL: &str =
-    "SELECT message_id, rowid, length(CAST(content AS BLOB))
+pub(in crate::sessions) const HISTORY_SEGMENT_NEXT_SQL: &str = "SELECT message_id, rowid
     FROM messages
     WHERE thread_id = ?1 AND rowid > ?2 AND rowid <= ?3
     ORDER BY rowid ASC LIMIT ?4";
@@ -201,13 +299,14 @@ impl SqliteSessionData {
         // [`resolve_browsing_range`]）。
         let range_token = resolve_browsing_range(cursor, range_head, anchor_present)?;
         // 阶段一：`limit + 1` 是「多出的那一条候选行」，只用来判断更早方向还有没有内容。
-        let candidates: Vec<(String, i64, i64)> = sqlx::query_as(HISTORY_PAGE_ROWS_SQL)
+        let candidates: Vec<(String, i64)> = sqlx::query_as(HISTORY_PAGE_ROWS_SQL)
             .bind(id.as_str())
             .bind(anchor_target.as_deref())
             .bind(limit.saturating_add(1) as i64)
             .fetch_all(&mut *tx)
             .await
             .map_err(|error| map_sqlx(&error))?;
+        let candidates = read_content_lengths(&mut tx, candidates).await?;
         let candidates = candidates
             .into_iter()
             .map(|(message_id, position, encoded_bytes)| {
@@ -258,12 +357,13 @@ impl SqliteSessionData {
                     .await
                     .map_err(|error| map_sqlx(&error))?
                     .ok_or_else(not_found)?;
-                let rows: Vec<(String, i64, i64)> = sqlx::query_as(HISTORY_SEGMENT_HEAD_SQL)
+                let rows: Vec<(String, i64)> = sqlx::query_as(HISTORY_SEGMENT_HEAD_SQL)
                     .bind(id.as_str())
                     .bind(limit.saturating_add(1) as i64)
                     .fetch_all(&mut *tx)
                     .await
                     .map_err(|error| map_sqlx(&error))?;
+                let rows = read_content_lengths(&mut tx, rows).await?;
                 let inherited = context::load_inherited_context_on(&mut tx, id)
                     .await
                     .map_err(read_failure)?
@@ -283,7 +383,7 @@ impl SqliteSessionData {
                     }
                     .into());
                 }
-                let rows: Vec<(String, i64, i64)> = sqlx::query_as(HISTORY_SEGMENT_NEXT_SQL)
+                let rows: Vec<(String, i64)> = sqlx::query_as(HISTORY_SEGMENT_NEXT_SQL)
                     .bind(id.as_str())
                     .bind(after)
                     .bind(tail)
@@ -291,6 +391,7 @@ impl SqliteSessionData {
                     .fetch_all(&mut *tx)
                     .await
                     .map_err(|error| map_sqlx(&error))?;
+                let rows = read_content_lengths(&mut tx, rows).await?;
                 (Vec::new(), Some(tail), rows)
             }
         };
@@ -317,7 +418,7 @@ impl SqliteSessionData {
     /// 与 [`Self::read_history_page`] 的调用方同一事务：两阶段必须落在同一个快照上，否则
     /// 「按长度定的页」与「取回的正文」可能来自两个时刻。每个 id 恰好一行、行内 id 必须
     /// 与请求一致，否则是损坏——不完整读取绝不能降级成「这一行没有正文」。
-    async fn read_page_bodies(
+    pub(super) async fn read_page_bodies(
         connection: &mut SqliteConnection,
         id: &ThreadId,
         ids: &[MessageId],
@@ -335,6 +436,48 @@ impl SqliteSessionData {
             rows.push(HistoryPageRow::new(&expected, content)?);
         }
         Ok(rows)
+    }
+}
+
+/// 为阶段一候选行补齐编码长度：逐行打开 blob 句柄，只取 `sqlite3_blob_bytes`。
+///
+/// 调用方必须与候选行读取处于同一连接/事务，长度与身份来自同一快照。每候选一次
+/// O(1) 打开，不读正文；瞬时失效（并发写/schema 变化）重试一次，仍失败按读取错误上抛。
+pub(super) async fn read_content_lengths(
+    connection: &mut SqliteConnection,
+    rows: Vec<(String, i64)>,
+) -> SessionResourceResult<Vec<(String, i64, i64)>> {
+    let mut measured = Vec::with_capacity(rows.len());
+    for (message_id, rowid) in rows {
+        let total = read_content_length(connection, rowid).await?;
+        let encoded_bytes = i64::try_from(total)
+            .map_err(|_| corrupt("history entry length exceeds the supported range"))?;
+        measured.push((message_id, rowid, encoded_bytes));
+    }
+    Ok(measured)
+}
+
+async fn read_content_length(
+    connection: &mut SqliteConnection,
+    rowid: i64,
+) -> SessionResourceResult<u64> {
+    let mut retried = false;
+    loop {
+        let read = SqliteSessionData::blob_scope(
+            connection,
+            b"messages\0",
+            b"content\0",
+            rowid,
+            |reader| Ok(reader.total()),
+        )
+        .await?;
+        match read {
+            Ok(total) => return Ok(total),
+            Err(error) if !retried && super::blob_reader::is_transient_blob_error(&error) => {
+                retried = true;
+            }
+            Err(error) => return Err(super::inherited_blob::map_inherited_blob_error(error)),
+        }
     }
 }
 
@@ -576,4 +719,256 @@ async fn clear_rewind_excluded(
         ));
     }
     Ok(())
+}
+
+// ─── inherited 冻结前缀（S7.4） ───────────────────────────────────────────────
+
+/// inherited 冻结前缀的定位信息：rowid、父会话身份与列类型。
+///
+/// 不在这里取 `length(CAST(inherited_context AS BLOB))`：SQLite 的 `OP_Column` 会为
+/// `CAST`/`length` 物化整列，16 MiB 冻结前缀会让每次读取多分配一份正文。列总长度由
+/// `sqlite3_blob_bytes` 在打开 blob 后直接给出。
+pub(in crate::sessions) const HISTORY_WINDOW_INHERITED_HEADER_SQL: &str =
+    "SELECT rowid, parent_thread_id, typeof(inherited_context)
+    FROM threads WHERE id = ?1";
+
+/// 增量块读取的行定位：不触碰 `inherited_context`，总长度由 blob 句柄给出。
+pub(in crate::sessions) const HISTORY_WINDOW_INHERITED_ROWID_SQL: &str =
+    "SELECT rowid FROM threads WHERE id = ?1";
+
+/// 冻结继承快照的边界事实：父会话 id、字节长度、条目数、首尾序列化 payload。
+/// `json_valid` 失败用 -1 表示，调用方按损坏失败关闭；不取整列到 Rust。
+///
+/// JSONB（BLOB 编码的 JSON）不算单参数 `json_valid(X)` 的“文本 JSON”，但 JSON1 的读取函数
+/// 都接受它；这里用 `json_valid(X, 4)` 一并识别，避免把合法的 JSONB 冻结前缀误判为损坏。
+pub(in crate::sessions) const HISTORY_WINDOW_INHERITED_BOUNDS_SQL: &str = "SELECT
+        t.parent_thread_id,
+        length(CAST(t.inherited_context AS BLOB)),
+        CASE
+          WHEN t.inherited_context IS NULL OR t.inherited_context = '' THEN 0
+          WHEN json_valid(t.inherited_context) OR json_valid(t.inherited_context, 4)
+            THEN json_array_length(t.inherited_context, '$.payloads')
+          ELSE -1
+        END,
+        CASE
+          WHEN t.inherited_context IS NULL OR t.inherited_context = '' THEN NULL
+          WHEN NOT (json_valid(t.inherited_context) OR json_valid(t.inherited_context, 4)) THEN NULL
+          ELSE json_extract(t.inherited_context, '$.payloads[0]')
+        END,
+        CASE
+          WHEN t.inherited_context IS NULL OR t.inherited_context = '' THEN NULL
+          WHEN NOT (json_valid(t.inherited_context) OR json_valid(t.inherited_context, 4)) THEN NULL
+          WHEN json_array_length(t.inherited_context, '$.payloads') = 0 THEN NULL
+          ELSE json_extract(
+            t.inherited_context,
+            '$.payloads[' || (json_array_length(t.inherited_context, '$.payloads') - 1) || ']'
+          )
+        END,
+        CASE
+          WHEN t.inherited_context IS NULL OR t.inherited_context = '' THEN NULL
+          ELSE json_type(t.inherited_context, '$.payloads')
+        END,
+        CASE
+          WHEN t.inherited_context IS NULL OR t.inherited_context = '' THEN NULL
+          ELSE json_extract(t.inherited_context, '$.version')
+        END
+    FROM threads t WHERE t.id = ?1";
+
+/// 按稳定 message id 定位冻结快照中的数组下标。
+pub(in crate::sessions) const HISTORY_WINDOW_INHERITED_ANCHOR_SQL: &str = "SELECT je.key
+    FROM threads t, json_each(t.inherited_context, '$.payloads') je
+    WHERE t.id = ?1
+      AND (
+        json_extract(je.value, '$.message.id') = ?2
+        OR json_extract(je.value, '$.id') = ?2
+      )
+    LIMIT 1";
+
+/// before 候选：key 降序，最多 limit+1 行；只取 id、key、长度，不取正文。
+pub(in crate::sessions) const HISTORY_WINDOW_INHERITED_BEFORE_SQL: &str = "SELECT
+        je.key,
+        COALESCE(json_extract(je.value, '$.message.id'), json_extract(je.value, '$.id')),
+        length(CAST(je.value AS BLOB))
+    FROM threads t, json_each(t.inherited_context, '$.payloads') je
+    WHERE t.id = ?1
+      AND (?2 IS NULL OR je.key < ?2 OR (?3 <> 0 AND je.key = ?2))
+    ORDER BY je.key DESC LIMIT ?4";
+
+/// after 候选：key 升序，最多 limit+1 行；只取 id、key、长度，不取正文。
+/// `?3` 为 1 时包含锚点自身（`open(entry, after)` 且 before 半段不存在）。
+pub(in crate::sessions) const HISTORY_WINDOW_INHERITED_AFTER_SQL: &str = "SELECT
+        je.key,
+        COALESCE(json_extract(je.value, '$.message.id'), json_extract(je.value, '$.id')),
+        length(CAST(je.value AS BLOB))
+    FROM threads t, json_each(t.inherited_context, '$.payloads') je
+    WHERE t.id = ?1 AND (je.key > ?2 OR (?3 <> 0 AND je.key = ?2))
+    ORDER BY je.key ASC LIMIT ?4";
+
+/// 按数组下标读取一条序列化 payload（阶段二，仅选中行）。
+pub(in crate::sessions) const HISTORY_WINDOW_INHERITED_BODY_SQL: &str = "SELECT je.value
+    FROM threads t, json_each(t.inherited_context, '$.payloads') je
+    WHERE t.id = ?1 AND je.key = ?2";
+
+/// 按数组下标读取有界正文块。
+pub(in crate::sessions) const HISTORY_WINDOW_INHERITED_CHUNK_SQL: &str =
+    "SELECT length(CAST(je.value AS BLOB)),
+            substr(CAST(je.value AS BLOB), ?3 + 1, ?4)
+    FROM threads t, json_each(t.inherited_context, '$.payloads') je
+    WHERE t.id = ?1 AND je.key = ?2";
+
+/// `HISTORY_WINDOW_INHERITED_BOUNDS_SQL` 的行形状：(父 id, 字节数, 条目数, 首 payload,
+/// 尾 payload, `payloads` 类型, 版本)。
+type InheritedHistoryBoundsRow = (
+    Option<String>,
+    Option<i64>,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+impl SqliteSessionData {
+    /// 非 canonical 信封的 inherited 事实回退：原语义（JSON1 + 完整反序列化首尾）。
+    ///
+    /// 增量 blob 路径只在信封不是 canonical 形状时走到这里；正常读取不取正文到 Rust。
+    pub(super) async fn read_inherited_facts_sql(
+        connection: &mut SqliteConnection,
+        id: &ThreadId,
+    ) -> SessionResourceResult<Option<HistoryInheritedSnapshot>> {
+        let row: Option<InheritedHistoryBoundsRow> =
+            sqlx::query_as(HISTORY_WINDOW_INHERITED_BOUNDS_SQL)
+                .bind(id.as_str())
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(|error| map_sqlx(&error))?;
+        let Some((parent, bytes, count, first, last, payloads_type, version)) = row else {
+            return Err(not_found());
+        };
+        if count < 0 {
+            return Err(corrupt("inherited context is not valid JSON"));
+        }
+        if count == 0 {
+            return Ok(None);
+        }
+        if payloads_type.as_deref() != Some("array") || version != Some(1) {
+            return Err(corrupt("inherited context has an unsupported shape"));
+        }
+        let first_payload =
+            first.ok_or_else(|| corrupt("inherited context first payload is missing"))?;
+        let last_payload =
+            last.ok_or_else(|| corrupt("inherited context last payload is missing"))?;
+        let first_id = deserialize_persisted_payload(&first_payload)
+            .map_err(|_| corrupt("inherited context first payload is not decodable"))?
+            .id();
+        let last_id = deserialize_persisted_payload(&last_payload)
+            .map_err(|_| corrupt("inherited context last payload is not decodable"))?
+            .id();
+        let snapshot_id = super::history_window::inherited_snapshot_id(
+            id,
+            bytes.unwrap_or(0),
+            count as usize,
+            parent.as_deref(),
+            first_id,
+            last_id,
+        );
+        Ok(Some(HistoryInheritedSnapshot {
+            snapshot_id,
+            ancestor_thread_id: parent,
+            first_entry: Some(first_id),
+            last_entry: Some(last_id),
+            entry_count: count as usize,
+        }))
+    }
+
+    /// 非 canonical 信封的正文块回退：原 SQL 语义（JSON1 定位 + 有界 `substr`）。
+    #[allow(clippy::too_many_arguments)] // 与增量路径同口径
+    pub(super) async fn read_inherited_body_chunk_sql(
+        &self,
+        connection: &mut SqliteConnection,
+        id: &ThreadId,
+        frozen_snapshot_id: &str,
+        ancestor_thread_id: Option<&ThreadId>,
+        entry_id: MessageId,
+        offset: i64,
+        max_bytes: u32,
+    ) -> SessionResourceResult<HistoryBodyChunk> {
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(|error| map_sqlx(&error))?;
+        self.require_session(&mut tx, id).await?;
+        let snapshot = Self::read_inherited_facts_sql(&mut tx, id)
+            .await?
+            .ok_or_else(|| HistoryWindowError::window_invalidated("inherited prefix is absent"))?;
+        if snapshot.snapshot_id != frozen_snapshot_id {
+            return Err(HistoryWindowError::SnapshotMismatch {
+                detail: "inherited snapshot id no longer matches the frozen prefix".into(),
+            }
+            .into());
+        }
+        if let Some(expected) = ancestor_thread_id {
+            if snapshot.ancestor_thread_id.as_ref() != Some(expected) {
+                return Err(HistoryWindowError::SnapshotMismatch {
+                    detail: "inherited ancestor identity does not match".into(),
+                }
+                .into());
+            }
+        }
+        let key: Option<(i64,)> = sqlx::query_as(HISTORY_WINDOW_INHERITED_ANCHOR_SQL)
+            .bind(id.as_str())
+            .bind(entry_id.as_uuid().to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| map_sqlx(&error))?;
+        let Some((key,)) = key else {
+            return Err(HistoryWindowError::anchor_unavailable(
+                "inherited history entry is not present in this frozen snapshot",
+            )
+            .into());
+        };
+        let row: Option<(i64, Vec<u8>)> = sqlx::query_as(HISTORY_WINDOW_INHERITED_CHUNK_SQL)
+            .bind(id.as_str())
+            .bind(key)
+            .bind(offset)
+            .bind(i64::from(max_bytes))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| map_sqlx(&error))?;
+        tx.commit().await.map_err(|error| map_sqlx(&error))?;
+        let Some((total, bytes)) = row else {
+            return Err(HistoryWindowError::anchor_unavailable(
+                "inherited history entry is not present in this frozen snapshot",
+            )
+            .into());
+        };
+        let total = u64::try_from(total)
+            .map_err(|_| corrupt("inherited history body length is negative"))?;
+        let offset = u64::try_from(offset)
+            .map_err(|_| corrupt("inherited history body offset is negative"))?;
+        if offset > total {
+            return Err(HistoryWindowError::invalid_request(
+                "body chunk offset is beyond the entry length",
+            )
+            .into());
+        }
+        let end = offset.checked_add(bytes.len() as u64).ok_or_else(|| {
+            HistoryWindowError::ReadFailed {
+                detail: "body chunk offset overflow".into(),
+            }
+        })?;
+        let complete = end >= total;
+        if !complete && bytes.is_empty() {
+            return Err(HistoryWindowError::ReadFailed {
+                detail: "body chunk made no progress".into(),
+            }
+            .into());
+        }
+        Ok(HistoryBodyChunk {
+            entry_id: HistoryEntryId::new(id, entry_id).encode(),
+            offset,
+            bytes,
+            next_offset: (!complete).then_some(end),
+            complete,
+        })
+    }
 }

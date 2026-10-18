@@ -113,6 +113,20 @@ impl GoalController for CloudGoalController {
         Ok(())
     }
 
+    async fn complete_goal_if_current(&self, expected_goal_id: &str) -> Result<(), String> {
+        let _gate = self.write_gate.lock().await;
+        let mut goal = self.active_goal("complete")?;
+        if goal.goal_id != expected_goal_id {
+            return Err("goal identity changed; completion was not applied".to_owned());
+        }
+        goal.status = GoalStatus::Complete;
+        goal.blocked_reason = None;
+        goal.updated_at = Utc::now();
+        self.persist(&goal).await?;
+        *self.state.write() = Some(goal);
+        Ok(())
+    }
+
     async fn block_goal(&self, reason: String) -> Result<(), String> {
         let reason = reason.trim();
         if reason.is_empty() {
@@ -166,6 +180,7 @@ impl GoalController for CloudGoalController {
             .read()
             .as_ref()
             .map_or_else(GoalViewSnapshot::default, |goal| GoalViewSnapshot {
+                goal_id: Some(goal.goal_id.clone()),
                 objective: Some(goal.objective.clone()),
                 status: Some(goal.status),
                 token_budget: goal.token_budget,

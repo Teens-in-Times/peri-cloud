@@ -495,6 +495,58 @@ async fn excluded_committed_delivery_is_neither_restored_nor_reemitted() {
 }
 
 #[tokio::test]
+async fn delivery_journal_admission_precedes_receive_and_recovers_after_ack() {
+    use crate::session::user_input_mailbox::{UserInputMailbox, UserInputQueueError};
+    use peri_acp_types::session::{EnqueueUserInputRequest, SessionInbox};
+    use tokio_util::sync::CancellationToken;
+
+    let context = make_context();
+    let inbox = Arc::new(SessionInbox::new(Arc::new(context.session.queue.clone())));
+    let mailbox = UserInputMailbox::new("session".into(), inbox.clone(), Arc::new(|_| {}));
+    mailbox
+        .attach_external_attempt(CancellationToken::new(), false)
+        .unwrap();
+    let enqueue = |text: &str| EnqueueUserInputRequest {
+        session_id: "session".into(),
+        generation: mailbox.generation().into(),
+        command_id: uuid::Uuid::now_v7().to_string(),
+        input_id: uuid::Uuid::now_v7().to_string(),
+        content: MessageContent::text(text),
+        original_draft: text.into(),
+    };
+
+    for _ in 0..128 {
+        let request = enqueue("填充");
+        mailbox.enqueue(&request).unwrap();
+        mailbox.enter_idle();
+        let messages = inbox.queue().drain_all();
+        let id = messages[0].message().unwrap().id();
+        mailbox.mark_claimed(&[id]);
+        mailbox.mark_delivered(&[id]);
+    }
+
+    // 容量准入在 enqueue/claim 之前：日志满时拒绝，不产生 Claimed，也不写入 MQ。
+    let rejected = enqueue("先拒绝后恢复");
+    assert_eq!(
+        mailbox.enqueue(&rejected).unwrap_err(),
+        UserInputQueueError::Capacity
+    );
+    assert!(context.session.queue.is_empty(), "拒绝输入不得进入消费队列");
+
+    // 泵确认旧日志后释放槽位；同一输入重新准入后走真实 Receive 并交付。
+    for item in mailbox.pending_delivery_notifications() {
+        mailbox.ack_delivery_notification(&item.input_id);
+    }
+    mailbox.enqueue(&rejected).unwrap();
+    mailbox.enter_idle();
+    let mut context = context;
+    context.session.user_input_mailbox = Some(mailbox.clone());
+    run_receive(ReceiveInput { context }).await.unwrap();
+    assert!(mailbox.snapshot().items.is_empty());
+    assert_eq!(mailbox.pending_delivery_notifications().len(), 1);
+}
+
+#[tokio::test]
 async fn test_receive_user_input_delivery_keeps_identity_order_and_render_fifo() {
     use crate::agent::events_v2::{EventBus, RenderEvent};
     use crate::session::user_input_mailbox::{UserInputAttemptOutcome, UserInputMailbox};
@@ -592,6 +644,86 @@ async fn test_receive_user_input_delivery_keeps_identity_order_and_render_fifo()
         "顺序不按历史队列位置重排"
     );
     assert!(mailbox.snapshot().items.is_empty(), "写入后从待发送区移除");
+}
+
+#[tokio::test]
+async fn test_receive_enters_reliable_render_fifo_without_reserving_sequence() {
+    use crate::agent::events_v2::{EventBus, EventBusConfig, RenderEvent};
+    use crate::session::user_input_mailbox::UserInputMailbox;
+    use peri_acp_types::session::{EnqueueUserInputRequest, SessionInbox};
+    use tokio_util::sync::CancellationToken;
+
+    let mut context = make_context();
+    // 生产 stage builder 会写入 canonical session 身份；测试构造器为空，显式补齐。
+    context
+        .session
+        .session_context
+        .write()
+        .insert("session_id".into(), "session".into());
+    let inbox = Arc::new(SessionInbox::new(Arc::new(context.session.queue.clone())));
+    let mailbox = UserInputMailbox::new("session".into(), inbox, Arc::new(|_| {}));
+    mailbox
+        .attach_external_attempt(CancellationToken::new(), false)
+        .unwrap();
+    let request = EnqueueUserInputRequest {
+        session_id: "session".into(),
+        generation: mailbox.generation().into(),
+        command_id: "enqueue-first".into(),
+        input_id: uuid::Uuid::now_v7().to_string(),
+        content: MessageContent::text("问题"),
+        original_draft: "问题".into(),
+    };
+    mailbox.enqueue(&request).unwrap();
+    mailbox.enter_idle();
+    context.session.user_input_mailbox = Some(mailbox.clone());
+
+    // 容量 1：先占满 render 通道，证明交付事件等待容量而不是降级丢弃。
+    let (bus, mut handles) = EventBus::new(EventBusConfig {
+        render_capacity: 1,
+        ..Default::default()
+    });
+    context.runtime.event_bus = Arc::new(bus);
+    context
+        .runtime
+        .event_bus
+        .emit_render(RenderEvent::TextChunk {
+            turn_id: context.turn_id(),
+            agent_id: context.session.agent_id,
+            message_id: crate::messages::MessageId::new(),
+            chunk: "occupied".into(),
+        });
+
+    let receive = run_receive(ReceiveInput {
+        context: context.clone(),
+    });
+    tokio::pin!(receive);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut receive)
+            .await
+            .is_err(),
+        "render 通道满时 Receive 必须等待容量，不得丢弃交付事件"
+    );
+    assert!(
+        matches!(
+            handles.render_rx.recv().await.unwrap(),
+            RenderEvent::TextChunk { .. }
+        ),
+        "先释放占位事件"
+    );
+    receive.await.unwrap();
+
+    let RenderEvent::UserInputDelivered { input_id, .. } = handles.render_rx.recv().await.unwrap()
+    else {
+        panic!("交付事件必须进入同一条 render FIFO");
+    };
+    assert_eq!(input_id, request.input_id, "交付事件与输入身份一致");
+    assert!(
+        mailbox
+            .pending_delivery_notifications()
+            .iter()
+            .all(|entry| entry.session_seq.is_none()),
+        "发布前不得由 Receive 预留序号，序号由 forwarder 发布成功后绑定"
+    );
 }
 
 #[tokio::test]
