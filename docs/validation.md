@@ -1,5 +1,16 @@
 # 验证记录
 
+## v0.7.1 部署（2026-10-18）
+
+- 发布源码：`ebde31d2bd7de794750bc9e187e1cdec5a5c4619`；[完整 CI](https://github.com/Teens-in-Times/peri-cloud/actions/runs/39098821796)；Release 资产含 Linux/Windows 包、源码 zip 与 `SHA256SUMS`。
+- 修复：原生与令牌端点除公网 authority 外，也接受宿主自身回环监听地址；浏览器路由仍只接受公网 authority。新增单测覆盖回环地址、非原生路由、伪造 Host 和未配置监听地址四种情况；`portal` 集成测试 5 项通过。
+- 上游来源校验：1264 个文件，1241 一致，23 个允许清单内的生产补丁，0 缺失、0 未声明漂移。
+- 东京生产主控切换到 `releases/v0.7.1-ebde31d`；部署前备份 `/var/backups/peri-cloud/v071-20261018-133202`（SQLite backup API 数据库 + `/etc/peri-cloud*` 打包）。
+- 切换后 schema 保持 9：`user_version=9`、`application_id=1346720323`、31 张表；`/healthz` 与公网门户返回 200；回环浏览器路由返回 403，回环原生路由在无凭据时返回 401。
+- Windows 执行器恢复上报：`device_connections` 出现 `feac1160-16b6-4fa3-a4d5-c89de5785190`，endpoint `127.0.0.1:44371`，租约按 30 秒续期；宿主到该回环端点的 TCP 连接成功。
+- 首次上报的阻塞来自旧版 guard 403 时执行器已把本地凭据标记为 `refresh_pending`；该标志按设计会阻止后续刷新。清标记前已备份本地 DPAPI vault，仅重置该布尔值，未读取或改写任何令牌；刷新随后成功。
+- 执行器与东京/北京静态连接未替换：v0.7.0 执行器已含上报代码，本次只升级宿主。
+
 ## v0.7.0 升级准备（2026-10-18）
 
 - 基线：`0941d0683802f25e21ff8b0aa8c894050e3b9377`（v0.6.1）。
