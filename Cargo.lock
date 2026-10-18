@@ -2248,7 +2248,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "peri-acp-types"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2270,7 +2270,7 @@ dependencies = [
 
 [[package]]
 name = "peri-agent"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2300,7 +2300,7 @@ dependencies = [
 
 [[package]]
 name = "peri-cloud"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "peri-config"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "dirs-next",
  "peri-acp-types",
@@ -2352,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "peri-executor"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2382,7 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "peri-js-runtime"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "dashmap",
  "libc",
@@ -2398,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "peri-mcp-artifact"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "peri-acp-types",
@@ -2415,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "peri-mcp-common"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2442,7 +2442,7 @@ dependencies = [
 
 [[package]]
 name = "peri-mcp-config"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "dirs-next",
  "fs2",
@@ -2458,7 +2458,7 @@ dependencies = [
 
 [[package]]
 name = "peri-mcp-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.22.1",
  "parking_lot",
@@ -2472,7 +2472,7 @@ dependencies = [
 
 [[package]]
 name = "peri-mcp-credentials"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "peri-acp-types",
@@ -2489,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "peri-mcp-cron"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2510,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "peri-mcp-web"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "peri-acp-types",
@@ -2526,7 +2526,7 @@ dependencies = [
 
 [[package]]
 name = "peri-mcp-workflow"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -2543,7 +2543,7 @@ dependencies = [
 
 [[package]]
 name = "peri-mcp-workspace"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2585,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "peri-middlewares"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2639,7 +2639,7 @@ dependencies = [
 
 [[package]]
 name = "peri-model"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -2659,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "peri-process"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "libc",
  "peri-time",
@@ -2672,7 +2672,7 @@ dependencies = [
 
 [[package]]
 name = "peri-remote-tools"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "peri-resources"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2722,7 +2722,7 @@ dependencies = [
 
 [[package]]
 name = "peri-time"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "chrono",
  "js-sys",
@@ -2734,7 +2734,7 @@ dependencies = [
 
 [[package]]
 name = "peri-tool-runtime"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2756,7 +2756,7 @@ dependencies = [
 
 [[package]]
 name = "peri-workflow"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "chrono",

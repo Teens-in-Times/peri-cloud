@@ -28,7 +28,7 @@ resolver = "2"
 
 [workspace.package]
 license = "AGPL-3.0-only"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 
 [profile.release]
