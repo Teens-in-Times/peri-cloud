@@ -34,6 +34,10 @@ pub struct PortalConfig {
     pub(crate) service_name: String,
     pub(crate) origin: String,
     pub(crate) authority: String,
+    /// Loopback authority of the host's own listener. Native/token endpoints
+    /// accept it in addition to the public authority so a device-side SSH
+    /// forward can reach the host without forging the public Host header.
+    pub(crate) listen_authority: Option<String>,
     pub(crate) secure: bool,
 }
 
@@ -56,8 +60,14 @@ impl PortalConfig {
             service_name: "云端主控".into(),
             authority: origin.split_once("://").unwrap().1.to_owned(),
             origin,
+            listen_authority: None,
             secure: url.scheme() == "https",
         })
+    }
+
+    pub fn with_listen_authority(mut self, listen: std::net::SocketAddr) -> Self {
+        self.listen_authority = Some(listen.to_string());
+        self
     }
 
     pub fn with_service_name(mut self, name: Option<&str>) -> Self {

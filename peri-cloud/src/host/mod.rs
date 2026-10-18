@@ -60,7 +60,8 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
     };
     let portal_config = PortalConfig::new(&config.public_origin)
         .map_err(|_| HostError::Configuration)?
-        .with_service_name(config.display_name.as_deref());
+        .with_service_name(config.display_name.as_deref())
+        .with_listen_authority(config.listen);
     let model_base = match &config.aggregation {
         Some(a) => a.origin.join("v1").map_err(|_| HostError::Configuration)?,
         None => config.model.api_base.clone(),

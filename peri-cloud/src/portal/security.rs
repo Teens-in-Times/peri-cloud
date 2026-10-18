@@ -126,6 +126,14 @@ impl IntoResponse for PortalError {
     }
 }
 
+/// The public authority identifies this deployment for every client. Native
+/// clients instead arrive through a loopback SSH forward and carry the host's
+/// own listener authority; browser routes must never accept that spelling.
+fn host_matches(config: &super::PortalConfig, host: Option<&str>, native: bool) -> bool {
+    host == Some(config.authority.as_str())
+        || (native && config.listen_authority.as_deref() == host)
+}
+
 pub(super) async fn guard(State(portal): State<Portal>, request: Request, next: Next) -> Response {
     let native =
         request.uri().path() == "/oauth/token" || request.uri().path().starts_with("/api/native/");
@@ -150,7 +158,7 @@ pub(super) async fn guard(State(portal): State<Portal>, request: Request, next: 
     let ambiguous = ["host", "origin", "authorization", "x-peri-csrf"]
         .iter()
         .any(|name| request.headers().get_all(*name).iter().count() > 1);
-    let invalid_host = ambiguous || host != Some(portal.config.authority.as_str());
+    let invalid_host = ambiguous || !host_matches(&portal.config, host, native);
     let invalid_origin = (mutation && !native && origin != Some(portal.config.origin.as_str()))
         || origin.is_some_and(|value| value != portal.config.origin);
     let too_long = request.uri().to_string().len() > 8192;
@@ -253,6 +261,28 @@ pub(super) fn set_cookies(portal: &Portal, session: &str, csrf: &str, max_age: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_listener_is_accepted_only_for_native_endpoints() {
+        let config = crate::portal::PortalConfig::new("https://agent.example.test")
+            .unwrap()
+            .with_listen_authority("127.0.0.1:47671".parse().unwrap());
+        assert!(host_matches(&config, Some("agent.example.test"), false));
+        assert!(host_matches(&config, Some("agent.example.test"), true));
+        assert!(host_matches(&config, Some("127.0.0.1:47671"), true));
+        assert!(!host_matches(&config, Some("127.0.0.1:47671"), false));
+        assert!(!host_matches(&config, Some("127.0.0.1:47672"), true));
+        assert!(!host_matches(&config, Some("attacker.example.test"), true));
+        assert!(!host_matches(&config, None, true));
+    }
+
+    #[test]
+    fn unconfigured_listener_authority_never_bypasses_the_public_host() {
+        let config = crate::portal::PortalConfig::new("https://agent.example.test").unwrap();
+        assert!(host_matches(&config, Some("agent.example.test"), true));
+        assert!(!host_matches(&config, Some("127.0.0.1:47671"), true));
+    }
+
     #[tokio::test]
     async fn task_outcome_errors_remain_distinct_from_identity_outages() {
         for (error, status, code) in [
