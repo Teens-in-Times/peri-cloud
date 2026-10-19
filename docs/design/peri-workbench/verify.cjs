@@ -4,7 +4,8 @@ const {TextEncoder,TextDecoder}=require('node:util');
 let JSDOM,VirtualConsole;
 try{({JSDOM,VirtualConsole}=require(path.resolve(__dirname,'../../../scripts/portal-ui/node_modules/jsdom')));}
 catch{({JSDOM,VirtualConsole}=require(path.resolve(__dirname,'../../../target/research/board-dom-check/node_modules/jsdom')));}
-const html=fs.readFileSync(path.join(__dirname,'index.html'),'utf8');
+// Exercise the original editable-workspace contract independently of the new seed.
+const html=fs.readFileSync(path.join(__dirname,'index.html'),'utf8').replace(/(<script id="workbench-snapshot"[^>]*>)[\s\S]*?(<\/script>)/,'$1null$2').replace(/<script id="workbench-reset">[\s\S]*?<\/script>/,'');
 function mount(source=html,saved={}){
   const errors=[],vc=new VirtualConsole();vc.on('jsdomError',e=>errors.push(e.message));
   const dom=new JSDOM(source,{runScripts:'dangerously',url:'http://127.0.0.1/peri-workbench/index.html',virtualConsole:vc,beforeParse(w){
