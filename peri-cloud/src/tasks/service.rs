@@ -400,6 +400,7 @@ impl WorkerService {
                 || !device_valid
                 || !self.execution_valid(&record).await?
             {
+                self.cancel_task_native(record.id).await?;
                 if let Some(turn) = record.turn {
                     let _ = gateway.cancel_worker(&record, turn).await;
                 }
@@ -490,19 +491,26 @@ impl WorkerService {
                         Err(error) => return Err(error),
                     }
                 }
-                let state = match turn.state {
-                    TurnState::Completed => "completed",
-                    TurnState::Failed => "failed",
-                    TurnState::Interrupted => "cancelled",
-                    TurnState::RecoveryRequired => "recovery_required",
-                    _ => continue,
+                let state = if record.state == "cancel_requested" {
+                    "cancelled"
+                } else {
+                    match turn.state {
+                        TurnState::Completed => "completed",
+                        TurnState::Failed => "failed",
+                        TurnState::Interrupted => "cancelled",
+                        TurnState::RecoveryRequired => "recovery_required",
+                        _ => continue,
+                    }
                 };
                 let worker = self
                     .journal
                     .session(record.principal, record.worker_session)
                     .await
                     .map_err(|_| TaskError::Unavailable)?;
-                record.state = if worker.execution_settled() {
+                record.state = if self.task_native_pending(record.id).await? && state == "completed"
+                {
+                    "waiting_operations".into()
+                } else if worker.execution_settled() {
                     state.into()
                 } else {
                     "recovery_required".into()

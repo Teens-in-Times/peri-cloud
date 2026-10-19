@@ -2,6 +2,7 @@
 pub(crate) mod approvals;
 pub(crate) mod continuity;
 pub(crate) mod deliverables;
+pub(crate) mod detached;
 pub(crate) mod devices;
 mod evidence;
 pub(crate) mod middleware;

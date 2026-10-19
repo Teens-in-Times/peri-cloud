@@ -8,7 +8,7 @@ window.PeriImplemented = (() => {
       gateway:['Gateway','来源准入、身份与会话路由','平台身份与逻辑会话解耦。普通输入归一化后持久排队；控制面沿原认证路径执行。账号级门保护选择，进行中轮次不被换入口重绑。','ingress'],
       runtime:['CloudRuntime','前台 / 后台容量，受理与取消','原会话继续串行；主助手和执行任务都复用 Runtime。前后台使用独立全局/账号并发预算，部署持有任务 future，取消不冒充副作用已撤销。','runtime'],
       agent:['主助手 Agent','聊天、小操作直做、大任务异步委派','保留原 run_react_loop、PermissionMiddleware 与 Todo。统一装配上下文；可委派后继续聊天，按需查看任务/trace/独立会话，并向工作者插话。普通消息只展示主助手的 AI 正文。','core'],
-      journal:['CloudJournal / SQLite','schema 22：固定目标与共用原生回执','唯一宿主拥有状态目录。任务、窗口、检查点、审批与验收分别持久化；主助手原生小操作和执行任务共用原生操作账本，记录原设备绑定与真实调用身份。未知执行或投送不盲目重试。','coreplan'],
+      journal:['CloudJournal / SQLite','schema 23：原调用、独立结算与取消','任务、窗口、检查点、审批与验收分别持久化；共用原生账本保存原设备绑定和真实调用身份，窗口轮换不转移回执归属。取消意图单次记录，未知执行或投送不盲目重试。','coreplan'],
       broker:['提问 / 审批 Broker','主助手独立审查，原权限链执行','执行任务的审批进入主助手独立、有界、无工具的审查回合，不占普通聊天；具体参数、设备、任务与指令版本绑定。删除或可能替换内容先通知再执行；原 OAuth 人工授权和主会话审批保持原路径。','worker'],
       limits:['额度与并发','前后台独立容量，时限与每日用量','主助手默认全局 4 / 每人 1 活跃回合；执行任务默认全局 2 / 每人 1。沿用每日任务、模型请求和回合时限，不等于精确 token 或金额计费。','coreplan'],
       delivery:['结果投影与持久发件箱','主助手、定时回合与任务事件统一投送','工作者事件先回根会话，由主助手组织 AI 正文。发送仍由原发件箱管理，复核账号、路由和隐私/上下文代次；平台接受不代表已读，未知投送不重试。','worker'],
@@ -29,11 +29,11 @@ window.PeriImplemented = (() => {
     add('task-event','任务事件与观察刷新','事实变化 + 可配置对话轮次','问题与终态经持久队列进入根会话，作为类型提醒。主助手在模型边界读取有界状态，变化时更新，无变化默认每 3 个本会话轮次刷新；工具迭代不计轮次，游标随会话恢复。旧观察帧退出有效上下文，执行者无需定期汇报。回复仍走原发件箱与隐私检查。','worker');
     add('device-lease','设备修改占用','首版按整台设备协调写操作','后台任务预占设备，主助手仍能聊天、读取状态和补充指令。Write/Edit/Bash 在原授权后检查占用；结算后释放，未知执行保留占用。它不是第二套审批，也不是按文件锁。','resources');
     add('execution-session','可复用执行会话','身份 / 会话 / 任务 / 窗口分离','同一执行会话串行承接独立任务；同账号跨主会话须显式复用，设备、规范工作区、隐私范围及来源代次仍须一致。不会静默继承其他范围的历史。','tasks');
-    add('execution-continuity','检查点与窗口续接','持久等待、暂停、换窗与查询恢复','主会话保留摘要压缩，执行窗口按预算轮换。宿主事实、工作笔记与历史引用生成接班材料；原调用回执保留身份。未知原生操作只查询，不能因超时或重启再提交。旧操作运行中独立换窗仍待完善。','tasks');
+    add('execution-continuity','检查点与窗口续接','工具仍运行，也能换窗观察','主会话保留摘要压缩，执行窗口按预算轮换。宿主事实、笔记、未决调用引用和最近结果有界预览接班；旧工具仍运行时，新窗口可查询，原回执独立结算。外部等待释放推理槽位，实际修改占用保留。记忆屏障适配重新核验任务授权，真实遗忘使旧任务失效。','tasks');
     add('task-evidence','有界证据检索','分页、筛选、完整详情与版本','inspect_task 分层查看窗口、操作、审批、消息与可见会话；trace 有界保留并可筛选，必要正文按字符分页且校验内容版本。明确预览与截断，不采集或暴露隐藏思考。','tasktools');
     add('task-deliverables','产物、验证与验收','执行完成不等于验收通过','产物位置、设备和版本绑定实际原生操作；验证状态来自真实回执。主助手依据最新要求接受或退回；新增要求使旧验收过期，历史保留。证据是操作时快照，不代替持续文件监控。','tasks');
     add('device-target','按调用固定设备目标','发现、认证、环境按需加载','list_devices 发现授权设备；prepare_device 认证并冻结设备和规范工作区，加载有界环境资料。execute_device 可直接执行小操作，不创建委派任务，也不修改主会话默认设备。目标限当前轮次与隐私代次；原权限链审批显示实际目标。','resources');
-    add('native-ledger','共用原生操作账本','主助手小操作与执行任务共用','持久记录真实用户、发起会话/轮次、可选任务、精确参数、原设备和执行器绑定及 invocation。原输出和后续查询回执分开；未知结果只查询原调用，不重提。所有修改路径共用设备占用，后续设备选择不改写旧操作。','resources');
+    add('native-ledger','共用原生操作账本','原操作不随换窗改名或重跑','记录真实用户、发起窗口/轮次、可选任务、精确参数和冻结执行器绑定及 invocation。原输出与查询回执分开；旧操作仍运行时可被新窗口引用，未知结果只查询。取消向原绑定单次请求；等待结算期间保留修改占用。','resources');
     add('context-assembler','ContextAssembler','主/执行共用可组合装配','基础提示词、角色、SOUL、渠道规则、已有记忆协议、外置 Markdown 和原生工具可按配置排序；支持扩展 ContextPart。顺序不改变原权限链，动态记忆帧和工作区规则继续按原契约刷新。','assemblycontext','chat memory');
     add('context-files','SOUL 与外置文件','部署者来源 + 账号私人文件','全局 SOUL.md、配置的 Markdown 与 users/<principal>/SOUL.md 每轮发现读取。私人文件不进入群聊；路径、编码、大小和越界受限。网页沿原同源/CSRF 认证管理个人 SOUL。','contextfiles','chat memory identity');
     const connect=(from,to,label,kind='flow')=>board.edges.push({id:'implemented-'+board.edges.length,from,to,label,kind,style:'solid'});
@@ -50,7 +50,7 @@ window.PeriImplemented = (() => {
       ['chat-projection','portal','聊天历史'],['context-files','context-assembler','按身份发现'],['context-assembler','agent','主角色上下文'],
       ['context-assembler','worker','执行角色上下文'],['memory','context-assembler','已有记忆协议'],['gateway','context-assembler','渠道展示规则'],
       ['worker-service','device-lease','预占设备','control'],['permission','device-lease','授权后的修改协调'],['device-lease','remote','冻结绑定执行'],
-      ['journal','task-ledger','schema 22 持久状态','data'],
+      ['journal','task-ledger','schema 23 持久状态','data'],
       ['worker-service','execution-session','显式复用'],['execution-session','execution-continuity','物理窗口与运行轮次'],
       ['execution-continuity','task-ledger','检查点与恢复事实','data'],['task-trace','task-evidence','预览与原证据引用','data'],
       ['task-evidence','agent','按需检索'],['worker','broker','审批 / 持久问题'],['broker','delivery','删除前确认通知'],['broker','permission','一次性原权限决定'],

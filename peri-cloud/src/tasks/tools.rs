@@ -228,6 +228,7 @@ impl BaseTool for TaskTool {
                         json!({"windows":rows.iter().map(|(n,id)|json!({"window_number":n,"window_id":id})).collect::<Vec<_>>(),"next_cursor":rows.last().map_or(args.after,|r|r.0+1)})
                     }
                     "operations" => {
+                        service.reconcile_native().await?;
                         service
                             .operations(record.id, args.after, args.limit)
                             .await?

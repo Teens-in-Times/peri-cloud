@@ -133,7 +133,7 @@ impl WorkerService {
         Ok(())
     }
     async fn query_native(&self, id: Uuid) -> Result<()> {
-        let row=sqlx::query("SELECT principal,source_session,frozen_json,invocation_id,tool FROM cloud_native_operations WHERE id=? AND state!='confirmed'").bind(id.to_string()).fetch_optional(&self.store.pool).await?;
+        let row=sqlx::query("SELECT principal,source_session,turn_id,call_id,task_id,frozen_json,invocation_id,tool FROM cloud_native_operations WHERE id=? AND state!='confirmed'").bind(id.to_string()).fetch_optional(&self.store.pool).await?;
         let Some(row) = row else {
             return Ok(());
         };
@@ -167,7 +167,89 @@ impl WorkerService {
             .bind(id.to_string())
             .execute(&self.store.pool)
             .await?;
+        if let Some(task) = row.get::<Option<String>, _>("task_id") {
+            let original:Option<String>=sqlx::query_scalar("SELECT call_json FROM agent_task_operations WHERE task_id=? AND turn_id=? AND call_id=? AND invocation_id=?")
+                .bind(&task).bind(row.get::<String,_>("turn_id")).bind(row.get::<String,_>("call_id")).bind(invocation.to_string()).fetch_optional(&self.store.pool).await?;
+            if let Some(original) = original {
+                let call: peri_agent::agent::react::ToolCall = serde_json::from_str(&original)?;
+                let mut receipt = peri_agent::agent::react::ToolResult::success(
+                    &call.id,
+                    &call.name,
+                    output.projected_text(Some(12000)),
+                );
+                receipt.is_error = output.execution.as_ref().is_some_and(|e| {
+                    matches!(
+                        e.status,
+                        peri_acp_types::tools::ToolExecutionStatus::Failed
+                            | peri_acp_types::tools::ToolExecutionStatus::Cancelled
+                            | peri_acp_types::tools::ToolExecutionStatus::TimedOut
+                    ) || e.exit_code.is_some_and(|c| c != 0)
+                });
+                receipt.execution = output.execution.clone();
+                sqlx::query("UPDATE agent_task_operations SET reconciled_json=? WHERE task_id=? AND turn_id=? AND call_id=? AND invocation_id=? AND (reconciled_json IS NULL OR json_extract(reconciled_json,'$.execution.status') IN ('running','running_after_timeout','unknown'))")
+                    .bind(serde_json::to_string(&receipt)?).bind(task).bind(row.get::<String,_>("turn_id")).bind(&call.id).bind(invocation.to_string()).execute(&self.store.pool).await?;
+            }
+        }
+        if settled(&output) {
+            let source =
+                Uuid::parse_str(row.get("source_session")).map_err(|_| TaskError::Invalid)?;
+            self.clear_detached_native(owner, source).await?;
+            let lease: Option<String> = sqlx::query_scalar(
+                "SELECT owner_session FROM agent_device_leases WHERE principal=? AND device_id=?",
+            )
+            .bind(owner.to_string())
+            .bind(remote.device_id().to_string())
+            .fetch_optional(&self.store.pool)
+            .await?;
+            if let Some(lease) = lease {
+                self.release_settled(
+                    owner,
+                    Uuid::parse_str(&lease).map_err(|_| TaskError::Invalid)?,
+                )
+                .await?;
+            }
+        }
         Ok(())
+    }
+    async fn clear_detached_native(&self, principal: Uuid, source: Uuid) -> Result<()> {
+        if self.native_pending(principal, source).await? {
+            return Ok(());
+        }
+        let active:i64=sqlx::query_scalar("SELECT COUNT(*) FROM cloud_turns WHERE session_id=? AND state IN ('queued','running','recovery_required')").bind(source.to_string()).fetch_one(&self.store.pool).await?;
+        if active != 0 {
+            return Ok(());
+        }
+        let mut state = self
+            .journal
+            .session(principal, source)
+            .await
+            .map_err(|_| TaskError::Forbidden)?;
+        let Some(jobs) = &state.unsettled_jobs else {
+            return Ok(());
+        };
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        for job in jobs {
+            let count:i64=sqlx::query_scalar("SELECT COUNT(*) FROM cloud_native_operations WHERE principal=? AND source_session=? AND invocation_id=? AND state='confirmed'").bind(principal.to_string()).bind(source.to_string()).bind(job.invocation_id.to_string()).fetch_one(&self.store.pool).await?;
+            if count != 1 {
+                return Ok(());
+            }
+        }
+        let revision = state.revision;
+        state.unsettled_jobs = Some(Vec::new());
+        state.revision += 1;
+        sqlx::query("UPDATE cloud_sessions SET state_json=? WHERE id=? AND principal=? AND json_extract(state_json,'$.revision')=?").bind(serde_json::to_string(&state)?).bind(source.to_string()).bind(principal.to_string()).bind(revision as i64).execute(&self.store.pool).await?;
+        Ok(())
+    }
+    pub(super) async fn task_native_pending(&self, task: Uuid) -> Result<bool> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM cloud_native_operations WHERE task_id=? AND state!='confirmed'",
+        )
+        .bind(task.to_string())
+        .fetch_one(&self.store.pool)
+        .await?;
+        Ok(count != 0)
     }
     pub(super) async fn native_history(
         &self,

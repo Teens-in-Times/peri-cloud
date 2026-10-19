@@ -39,6 +39,16 @@ impl WorkerService {
                 tx.commit().await?;
                 return Ok(());
             }
+            let shared:i64=sqlx::query_scalar("SELECT COUNT(*) FROM agent_execution_windows a JOIN agent_execution_windows b ON a.execution_session=b.execution_session JOIN agent_execution_sessions e ON e.id=a.execution_session WHERE a.cloud_session=? AND b.cloud_session=? AND e.principal=?")
+                .bind(&owner).bind(session.to_string()).bind(principal.to_string()).fetch_one(&mut *tx).await?;
+            if shared == 1 {
+                // Ownership follows the same logical execution conversation;
+                // old operations remain attributed to their original window.
+                sqlx::query("UPDATE agent_device_leases SET owner_session=?,phase=? WHERE device_id=? AND principal=?")
+                    .bind(session.to_string()).bind(if reserved{"reserved"}else{"active"}).bind(device.to_string()).bind(principal.to_string()).execute(&mut *tx).await?;
+                tx.commit().await?;
+                return Ok(());
+            }
             if row.get::<String, _>("phase") == "reserved" {
                 let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_tasks WHERE worker_session=? AND json_extract(record_json,'$.state') NOT IN ('completed','failed','cancelled','invalidated')")
                     .bind(&owner).fetch_one(&mut *tx).await?;
@@ -79,7 +89,10 @@ impl WorkerService {
             .session(principal, session)
             .await
             .map_err(|_| TaskError::Forbidden)?;
+        let held:i64=sqlx::query_scalar("SELECT COUNT(*) FROM cloud_native_operations o JOIN agent_device_leases l ON o.device_id=l.device_id AND o.principal=l.principal WHERE l.principal=? AND l.owner_session=? AND o.state!='confirmed'")
+            .bind(principal.to_string()).bind(session.to_string()).fetch_one(&self.store.pool).await?;
         if state.execution_settled()
+            && held == 0
             && !self.native_pending(principal, session).await?
             && !self
                 .journal

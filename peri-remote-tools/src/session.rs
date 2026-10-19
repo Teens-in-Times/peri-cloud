@@ -272,6 +272,11 @@ impl RemoteSession {
     pub async fn query_execution(&self, id: Uuid) -> Result<JobSnapshot> {
         self.task(id, false).await
     }
+    /// Host-authorized cancellation of an original invocation. A caller must
+    /// persist its cancellation intent and query after an uncertain response.
+    pub async fn cancel_execution(&self, id: Uuid) -> Result<JobSnapshot> {
+        self.task(id, true).await
+    }
 
     pub(crate) async fn invoke(
         &self,

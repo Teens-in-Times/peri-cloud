@@ -111,6 +111,55 @@ impl TaskFrames {
         let mut message_ids = Vec::new();
         let body = if let Some(task) = self.scope.task {
             let record = service.authorized(&self.scope, task).await?;
+            // A fresh window's initial memory barrier excludes pre-frame
+            // history. Reconstitute only host task handoff facts after the
+            // current task's privacy epoch and all source generations passed
+            // authorization. A real forget/clear fails above, never resurrects.
+            {
+                let mut transcript = self.transcript.write();
+                let history = transcript.canonical_payloads();
+                let mut active: std::collections::HashSet<String> = history
+                    .iter()
+                    .filter(|p| !transcript.flags(p.id()).excluded)
+                    .filter_map(|p| match p {
+                        peri_acp_types::store::PersistedPayload::SystemReminder {
+                            reminder,
+                            ..
+                        } => Some(reminder.as_reminder().body.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let mut restore = Vec::new();
+                for p in history.iter().rev() {
+                    let peri_acp_types::store::PersistedPayload::SystemReminder {
+                        reminder, ..
+                    } = p
+                    else {
+                        continue;
+                    };
+                    let value = reminder.as_reminder();
+                    let flags = transcript.flags(p.id());
+                    if value.source.0 == "cloud_tasks"
+                        && value.metadata["task_id"] == json!(task)
+                        && (value.metadata["continuation"] == true
+                            || value.metadata["continuation_evidence"] == true)
+                        && flags.excluded
+                        && !flags.truncated
+                        && flags.projection.is_none()
+                        && active.insert(value.body.clone())
+                    {
+                        restore.push(reminder.clone());
+                        if restore.len() == 2 {
+                            break;
+                        }
+                    }
+                }
+                // Append newly authorized facts beyond the barrier. Original
+                // exclusions and the monotonic memory cutoff remain intact.
+                for frame in restore.into_iter().rev() {
+                    transcript.append_system_reminder(frame);
+                }
+            }
             let messages = service.store.parent_context(task).await?;
             message_ids = messages
                 .iter()

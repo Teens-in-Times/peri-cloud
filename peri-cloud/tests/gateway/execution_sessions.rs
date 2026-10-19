@@ -1,8 +1,12 @@
 use super::*;
 #[path = "execution_approvals.rs"]
 mod approval_tests;
+#[path = "execution_crashes.rs"]
+mod crash_tests;
 #[path = "execution_deliverables.rs"]
 mod delivery_tests;
+#[path = "execution_detached.rs"]
+mod detached_tests;
 #[path = "execution_devices.rs"]
 mod device_tests;
 #[path = "execution_observation.rs"]
@@ -538,11 +542,11 @@ async fn low_budget_rotates_real_windows_retrieves_archived_read_and_hides_them_
     pump(&f, 8).await;
     let (status, windows) = {
         let requests = f.script.requests.lock();
+        let context = requests[3]["messages"].to_string();
+        assert!(context.contains("Most recent bounded tool evidence"));
         assert!(
-            !requests[3]["messages"]
-                .to_string()
-                .contains("WINDOW_SOURCE"),
-            "new window must not copy the entire old read"
+            context.matches("evidence ").count() < 300,
+            "the last result is a bounded preview, never the entire archived read or trace"
         );
         (
             tool_value(&requests[6], "run_number"),

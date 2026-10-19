@@ -175,7 +175,7 @@ impl CloudSide {
     async fn start(
         root: &std::path::Path,
         clock: Arc<Clock>,
-        connector: Arc<NativeSessionConnector>,
+        connector: Arc<dyn peri_cloud::gateway::SessionConnector>,
         adapter: Arc<Adapter>,
         initialize: bool,
         web: bool,
@@ -195,7 +195,7 @@ impl CloudSide {
     async fn start_with_limits(
         root: &std::path::Path,
         clock: Arc<Clock>,
-        connector: Arc<NativeSessionConnector>,
+        connector: Arc<dyn peri_cloud::gateway::SessionConnector>,
         adapter: Arc<Adapter>,
         initialize: bool,
         web: bool,
@@ -263,6 +263,9 @@ struct Fixture {
     web: bool,
     submissions: Vec<Arc<std::sync::atomic::AtomicUsize>>,
     hidden_receipts: Vec<Arc<AtomicBool>>,
+    crash_config: Value,
+    held_submissions: Vec<Arc<AtomicBool>>,
+    submission_release: Vec<Arc<Notify>>,
 }
 
 impl Fixture {
@@ -320,6 +323,9 @@ impl Fixture {
             web,
             submissions: Vec::new(),
             hidden_receipts: Vec::new(),
+            crash_config: json!({"model_url":format!("http://{model_address}/v1"),"clients":[]}),
+            held_submissions: Vec::new(),
+            submission_release: Vec::new(),
             cloud: Some(cloud),
             clock,
             connector,
@@ -371,13 +377,21 @@ impl Fixture {
         let shutdown = self.stop.clone();
         let submissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let hidden = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(Notify::new());
+        self.held_submissions.push(held.clone());
+        self.submission_release.push(release.clone());
         self.submissions.push(submissions.clone());
         self.hidden_receipts.push(hidden.clone());
         let app = web::router(executor.clone()).layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
                 let submissions = submissions.clone();
                 let hidden = hidden.clone();
+                let held = held.clone();
+                let release = release.clone();
                 async move {
+                    let submission = request.method() == axum::http::Method::POST
+                        && request.uri().path().ends_with("/jobs");
                     if request.method() == axum::http::Method::POST
                         && request.uri().path().ends_with("/jobs")
                     {
@@ -391,7 +405,11 @@ impl Fixture {
                             axum::http::StatusCode::NOT_FOUND,
                         );
                     }
-                    next.run(request).await
+                    let response = next.run(request).await;
+                    if submission && held.load(Ordering::SeqCst) {
+                        release.notified().await;
+                    }
+                    response
                 }
             },
         ));
@@ -401,6 +419,7 @@ impl Fixture {
                 .await
                 .unwrap();
         }));
+        self.crash_config["clients"].as_array_mut().unwrap().push(json!({"address":client_address.to_string(),"token":token,"device":executor.info().device_id}));
         let client = DeviceClient::connect(client_address, token, executor.info().device_id)
             .await
             .unwrap();
