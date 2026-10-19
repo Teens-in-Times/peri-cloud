@@ -96,6 +96,7 @@ fn task(scope: &TaskScope, execution: &ExecutionSession, key: &str) -> TaskRecor
         note: String::new(),
         plan: Vec::new(),
         result: String::new(),
+        delivery: Default::default(),
         notified: false,
         privacy_epoch: 0,
         parent_generation: 0,

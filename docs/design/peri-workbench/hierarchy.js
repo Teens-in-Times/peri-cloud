@@ -42,7 +42,7 @@ window.PeriHierarchy = (() => {
     reference(current,'current-atlas','Peri · 当前实现','2026-10-19 · 已实现快照。点入子图查看职责与源码；主/执行 Agent 都在云端，本地只保留执行器。原设计与 Grok 参考另列保留。',[
       ['entry','入口、身份与会话','统一输入、会话选择、持久 FIFO 和聊天投影',['user','channels','gateway','identity','portal','normalizer','logical-session','inbox','chat-projection']],
       ['runtime','云端对话运行','主助手、原循环、持久状态与前后台预算',['runtime','agent','journal','models','limits','goal']],
-      ['tasks','异步任务与双向控制','会话复用、窗口续接、消息与有界证据',['worker-service','worker','task-tools','task-ledger','task-messages','task-trace','task-event','device-lease','execution-session','execution-continuity','task-evidence']],
+      ['tasks','异步任务与双向控制','会话复用、窗口续接、消息、证据与验收',['worker-service','worker','task-tools','task-ledger','task-messages','task-trace','task-event','device-lease','execution-session','execution-continuity','task-evidence','task-deliverables']],
       ['execute','工具与执行器','原权限链、设备绑定与运输',['permission','remote','executors','broker','transport','device-choice','operations']],
       ['knowledge','上下文、记忆与 Skill','统一装配、SOUL 与已有动态来源；后台晋升仍待实现',['context-assembler','context-files','memory','frames','search','workspace','candidate']],
       ['schedule','调度与投送','独立时间模型、联系策略与原持久发件箱',['scheduler','schedule-adapter','contact','delivery']]

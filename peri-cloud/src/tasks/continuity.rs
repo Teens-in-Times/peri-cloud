@@ -57,11 +57,12 @@ impl WorkerService {
         let raw = serde_json::to_string(&snapshot)?;
         let digest = format!("{:x}", sha2::Sha256::digest(raw.as_bytes()));
         let mut tx = self.store.pool.begin().await?;
+        let instruction_version:i64=sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM agent_task_messages WHERE task_id=? AND direction='parent'").bind(task.to_string()).fetch_one(&mut *tx).await?;
         for call in calls {
             let encoded = serde_json::to_string(call)?;
             let hash = format!("{:x}", sha2::Sha256::digest(encoded.as_bytes()));
-            sqlx::query("INSERT OR IGNORE INTO agent_task_operations(task_id,turn_id,window_id,call_id,call_hash,call_json,receipt_json,intent_contract) VALUES(?,?,?,?,?,?,NULL,1)")
-                .bind(task.to_string()).bind(turn.to_string()).bind(scope.session.to_string()).bind(&call.id).bind(&hash).bind(&encoded).execute(&mut *tx).await?;
+            sqlx::query("INSERT OR IGNORE INTO agent_task_operations(task_id,turn_id,window_id,call_id,call_hash,call_json,receipt_json,intent_contract,instruction_watermark) VALUES(?,?,?,?,?,?,NULL,1,?)")
+                .bind(task.to_string()).bind(turn.to_string()).bind(scope.session.to_string()).bind(&call.id).bind(&hash).bind(&encoded).bind(instruction_version).execute(&mut *tx).await?;
             let previous: String = sqlx::query_scalar("SELECT call_hash FROM agent_task_operations WHERE task_id=? AND turn_id=? AND call_id=?")
                 .bind(task.to_string()).bind(turn.to_string()).bind(&call.id).fetch_one(&mut *tx).await?;
             if previous != hash {

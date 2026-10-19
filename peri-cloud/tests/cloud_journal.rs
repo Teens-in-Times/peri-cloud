@@ -411,7 +411,7 @@ async fn schema_eight_migrates_to_nine_and_preserves_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 20);
+    assert_eq!(version, 21);
     let (application_id,): (i64,) = sqlx::query_as("PRAGMA application_id")
         .fetch_one(&pool)
         .await
@@ -443,7 +443,7 @@ async fn schema_eight_migrates_to_nine_and_preserves_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 20);
+    assert_eq!(version, 21);
     pool.close().await;
     journal.close().await;
 }

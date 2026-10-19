@@ -325,6 +325,9 @@ impl WorkerService {
                         if !matches!(
                             call.name.as_str(),
                             "inspect_task"
+                                | "record_artifact"
+                                | "record_verification"
+                                | "inspect_deliverables"
                                 | "update_task"
                                 | "wait_task"
                                 | "AskUserQuestion"

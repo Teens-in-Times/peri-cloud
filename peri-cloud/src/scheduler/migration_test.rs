@@ -152,7 +152,7 @@ async fn legacy_plan_identity_receipts_and_unknowns_survive_migration_without_br
         .fetch_one(&store.pool)
         .await
         .unwrap();
-    assert_eq!(version, 20);
+    assert_eq!(version, 21);
     journal.close().await;
     drop(journal);
     let journal = CloudJournal::open(root.path()).await.unwrap();

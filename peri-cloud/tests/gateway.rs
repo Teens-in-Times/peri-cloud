@@ -73,7 +73,9 @@ struct Script {
     hold_review: AtomicBool,
     review_waiting: Notify,
     review_release: Notify,
+    dynamic: Mutex<Option<DynamicResponse>>,
 }
+type DynamicResponse = Box<dyn FnMut(&Value) -> String + Send>;
 
 async fn model_request(
     State(script): State<Arc<Script>>,
@@ -91,7 +93,10 @@ async fn model_request(
         let reply = script.review_replies.lock().pop_front().unwrap_or_else(|| answer(&json!({"approve":true,"deletion_possible":false,"reason":"within user task","notice":"我将按任务要求修改文件，可能替换已有内容。"}).to_string()));
         return ([(CONTENT_TYPE, "text/event-stream")], reply);
     }
-    script.requests.lock().push(request);
+    script.requests.lock().push(request.clone());
+    if let Some(responder) = script.dynamic.lock().as_mut() {
+        return ([(CONTENT_TYPE, "text/event-stream")], responder(&request));
+    }
     let reply = script.replies.lock().pop_front().expect("模型调用超出脚本");
     ([(CONTENT_TYPE, "text/event-stream")], reply)
 }

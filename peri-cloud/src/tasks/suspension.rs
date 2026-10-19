@@ -40,7 +40,9 @@ impl WorkerService {
         if record.revision != revision {
             return Err(TaskError::Conflict);
         }
-        if record.terminal() && !(action == "resume" && record.state == "failed") {
+        if record.terminal()
+            && !(action == "resume" && matches!(record.state.as_str(), "failed" | "completed"))
+        {
             return Err(TaskError::Invalid);
         }
         if record.turn.is_none() {

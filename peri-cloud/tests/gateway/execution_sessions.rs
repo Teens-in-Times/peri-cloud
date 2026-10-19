@@ -1,6 +1,8 @@
 use super::*;
 #[path = "execution_approvals.rs"]
 mod approval_tests;
+#[path = "execution_deliverables.rs"]
+mod delivery_tests;
 
 fn call(name: &str, args: Value, id: &str) -> String {
     let delta = json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});

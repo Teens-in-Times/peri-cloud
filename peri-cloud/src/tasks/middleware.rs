@@ -124,7 +124,7 @@ impl TaskFrames {
             let mut used = 0;
             for record in records.into_iter().take(12) {
                 if let Ok(record) = service.authorized(&self.scope, record.id).await {
-                    let entry = json!({"task_id":record.id,"state":record.state,"revision":record.revision,"goal":clip(&record.goal,400),"note":clip(&record.note,500),"result":clip(&record.result,1200)});
+                    let entry = json!({"task_id":record.id,"state":record.state,"revision":record.revision,"goal":clip(&record.goal,400),"note":clip(&record.note,500),"result":clip(&record.result,1200),"delivery":record.delivery.summary()});
                     let bytes = serde_json::to_vec(&entry)?.len();
                     if used + bytes > 24 * 1024 {
                         break;

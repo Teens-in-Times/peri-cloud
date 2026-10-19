@@ -28,7 +28,7 @@ impl Middleware for TaskTools {
                 "control_task",
             ]
         };
-        names
+        let mut tools: Vec<Box<dyn BaseTool>> = names
             .iter()
             .map(|name| {
                 Box::new(TaskTool {
@@ -37,7 +37,9 @@ impl Middleware for TaskTools {
                     name,
                 }) as Box<dyn BaseTool>
             })
-            .collect()
+            .collect();
+        tools.extend(super::deliverables::tools(&self.scope));
+        tools
     }
 }
 struct TaskTool {
@@ -277,7 +279,9 @@ impl BaseTool for TaskTool {
                 }
                 let args: SendMessage = serde_json::from_value(input)?;
                 let record = service.authorized(&self.scope, args.task_id).await?;
-                if record.revision != args.expected_revision || record.terminal() {
+                if record.revision != args.expected_revision
+                    || (record.terminal() && record.state != "completed")
+                {
                     return Err(TaskError::Conflict.into());
                 }
                 let receipt = service

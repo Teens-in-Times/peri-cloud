@@ -1,6 +1,7 @@
 //! Durable cloud workers. Task state, semantic notes, trace and user delivery are distinct.
 pub(crate) mod approvals;
 pub(crate) mod continuity;
+pub(crate) mod deliverables;
 mod evidence;
 pub(crate) mod middleware;
 pub(crate) mod recovery;
@@ -87,6 +88,8 @@ pub(crate) struct TaskRecord {
     pub note: String,
     pub plan: Vec<WorkItem>,
     pub result: String,
+    #[serde(default)]
+    pub delivery: deliverables::Delivery,
     pub notified: bool,
     pub privacy_epoch: u64,
     pub parent_generation: u64,

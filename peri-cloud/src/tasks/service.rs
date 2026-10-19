@@ -271,6 +271,7 @@ impl WorkerService {
             note: String::new(),
             plan: Vec::new(),
             result: String::new(),
+            delivery: Default::default(),
             notified: false,
             privacy_epoch,
             parent_generation: parent.context_generation,
@@ -298,7 +299,7 @@ impl WorkerService {
             .take(16)
             .map(|item| json!({"name":clip(&item.name,100),"state":item.state}))
             .collect();
-        json!({"task_id":record.id,"execution_session":record.execution_session,"worker_session":record.worker_session,"run_number":record.run_number,"state":record.state,"revision":record.revision,"goal":clip(&record.goal,400),"note":clip(&record.note,500),"work_plan":plan,"result":clip(&record.result,1000),"worker_turn":record.turn,"wake_at":record.wake_at,"preview":true})
+        json!({"task_id":record.id,"execution_session":record.execution_session,"worker_session":record.worker_session,"run_number":record.run_number,"state":record.state,"revision":record.revision,"goal":clip(&record.goal,400),"note":clip(&record.note,500),"work_plan":plan,"result":clip(&record.result,1000),"worker_turn":record.turn,"wake_at":record.wake_at,"delivery":record.delivery.summary(),"preview":true})
     }
     pub(crate) fn attach_transcript(
         &self,

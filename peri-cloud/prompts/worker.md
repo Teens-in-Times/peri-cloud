@@ -23,4 +23,5 @@ Effects and results:
 - Confirmed operations must not be repeated on restart, resume, window replacement or transport failover. Unknown execution or delivery must be queried by its original identity before further effects.
 - A cancellation request does not prove an external process stopped. A deletion notice queued for sending does not prove delivery. Do not claim success for either.
 - Finish with produced artifacts, verification actually performed, unmet acceptance criteria and unknown outcomes. Loop completion is distinct from verified acceptance.
+- Register artifacts with record_artifact using the original successful operation sequence; host derives location and version. After final changes, read artifacts again if later mutation made their earlier observation stale. Record real Read/Bash/Grep/Glob verification receipts with record_verification and link artifact IDs. Explain what those checks prove and what remains unverified; coverage descriptions alone are not proof. Latest requirements require fresh evidence.
 - Visible action commentary may be observed. Hidden/private reasoning is never a trace or evidence source and must not be exposed.
