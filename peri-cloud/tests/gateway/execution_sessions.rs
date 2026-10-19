@@ -71,7 +71,7 @@ async fn two_main_conversations_explicitly_reuse_one_executor_context_for_indepe
 
     f.script.replies.lock().extend([
         call("delegate_task", json!({"goal":"second independent task","execution_session":first_receipt["execution_session"]}), "delegate-second"),
-        answer("second delegated"), answer("worker-second-finished"), answer("second result confirmed"),
+        answer("second delegated"), tool_write(), answer("worker-second-finished"),
     ]);
     let second_parent = c
         .gateway
@@ -102,13 +102,63 @@ async fn two_main_conversations_explicitly_reuse_one_executor_context_for_indepe
     );
     assert_eq!(second_receipt["note"], "");
     assert_eq!(second_receipt["state"], "queued");
-    pump(&f, 8).await;
+    let card = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            c.gateway.dispatch().await.unwrap();
+            if let Some(card) = c
+                .gateway
+                .browser_interactions(&c.browser)
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+            {
+                break card;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker Write must request its own browser approval");
+    assert_eq!(
+        card.session_id.to_string(),
+        second_receipt["worker_session"].as_str().unwrap()
+    );
+    f.script.replies.lock().extend([
+        call(
+            "inspect_task",
+            json!({"task_id":second_receipt["task_id"],"view":"operations"}),
+            "inspect-receipts",
+        ),
+        answer("second result confirmed"),
+    ]);
+    c.gateway
+        .respond_browser(&c.browser, card.request_id, InteractionAction::AllowOnce {})
+        .await
+        .unwrap();
+    pump(&f, 10).await;
     let continued = f.script.requests.lock()[6]["messages"].to_string();
     assert!(
         continued.contains("worker-first-finished"),
         "same executor retains prior work context"
     );
     assert!(continued.contains("second independent task"));
+    assert!(f.workspaces[0].path().join("agent.txt").exists());
+    let operations = f.script.requests.lock()[9]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .filter_map(|m| m["content"].as_str())
+        .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+        .find(|v| v.get("entries").is_some())
+        .unwrap();
+    let write = &operations["entries"][0];
+    assert_eq!(write["name"], "Write");
+    assert_eq!(write["receipt_recorded"], true);
+    assert_eq!(write["execution"]["status"], "completed");
+    assert_eq!(write["window_id"], second_receipt["worker_session"]);
+    assert_eq!(write["call_hash"].as_str().unwrap().len(), 64);
     c.gateway
         .select_logical_conversation(&c.browser, Uuid::new_v4(), Some(second_parent))
         .await

@@ -57,6 +57,7 @@ async fn schema_six_upgrade_keeps_account_data_and_adds_access_tables() {
         .unwrap();
     let pool = journal.identity_pool();
     for statement in [
+        "DROP TABLE agent_task_operations", "DROP TABLE agent_task_checkpoints",
         "DROP TABLE agent_execution_windows", "DROP TABLE agent_execution_sessions",
         "DROP TABLE agent_task_trace", "DROP TABLE agent_task_messages",
         "DROP TABLE agent_device_leases", "DROP TABLE agent_tasks",
@@ -95,7 +96,7 @@ async fn schema_six_upgrade_keeps_account_data_and_adds_access_tables() {
         .fetch_one(&journal.identity_pool())
         .await
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     assert_eq!(
         crate::memory::MemoryStore::new(&journal, principal.id, 65536)
             .list("", 0, 5)

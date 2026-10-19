@@ -336,6 +336,8 @@ async fn schema_rebuild_preserves_old_task_and_unknown_operation_identity() {
     original.result = "unknown operation; do not replay".into();
     service.store.insert(&original).await.unwrap();
     for sql in [
+        "DROP TABLE agent_task_operations",
+        "DROP TABLE agent_task_checkpoints",
         "DROP TABLE agent_execution_windows",
         "DROP TABLE agent_execution_sessions",
         "CREATE UNIQUE INDEX legacy_one_worker ON agent_tasks(worker_session)",

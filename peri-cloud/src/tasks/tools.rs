@@ -125,7 +125,7 @@ impl BaseTool for TaskTool {
             ),
             "list_tasks" | "list_execution_sessions" => (json!({}), vec![]),
             "inspect_task" => (
-                json!({"task_id":id,"view":{"type":"string","enum":["status","trace","conversation","messages"]},"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32}}),
+                json!({"task_id":id,"view":{"type":"string","enum":["status","trace","conversation","messages","operations"]},"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32}}),
                 vec!["task_id"],
             ),
             "message_task" => (
@@ -180,6 +180,11 @@ impl BaseTool for TaskTool {
                 let record = service.authorized(&self.scope, args.task_id).await?;
                 match args.view.as_str() {
                     "status" => service.summary(&record),
+                    "operations" => {
+                        service
+                            .operations(record.id, args.after, args.limit)
+                            .await?
+                    }
                     "trace" => {
                         service
                             .store

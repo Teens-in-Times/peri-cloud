@@ -30,8 +30,42 @@ pub(crate) fn reminder(body: String, metadata: serde_json::Value) -> Result<Trus
 pub(crate) struct TaskFrames {
     pub scope: TaskScope,
     pub transcript: Arc<RwLock<MessageTranscript>>,
+    pub turn: Uuid,
 }
 impl TaskFrames {
+    async fn checkpoint(
+        &self,
+        phase: &str,
+        calls: &[peri_agent::agent::react::ToolCall],
+        results: &[(
+            peri_agent::agent::react::ToolCall,
+            peri_agent::agent::react::ToolResult,
+        )],
+    ) -> AgentResult<()> {
+        if self.scope.task.is_none() {
+            return Ok(());
+        }
+        self.scope
+            .service
+            .upgrade()
+            .ok_or_else(|| AgentError::MiddlewareError {
+                middleware: "CloudTaskFrames".into(),
+                reason: "execution service unavailable".into(),
+            })?
+            .checkpoint(
+                &self.scope,
+                self.turn,
+                &self.transcript,
+                phase,
+                calls,
+                results,
+            )
+            .await
+            .map_err(|_| AgentError::MiddlewareError {
+                middleware: "CloudTaskFrames".into(),
+                reason: "execution checkpoint could not be durably saved".into(),
+            })
+    }
     async fn refresh(&self) -> Result<()> {
         let service = self.scope.service.upgrade().ok_or(TaskError::Unavailable)?;
         let mut message_ids = Vec::new();
@@ -106,7 +140,8 @@ impl Middleware for TaskFrames {
             .map_err(|_| AgentError::MiddlewareError {
                 middleware: "CloudTaskFrames".into(),
                 reason: "task authorization or observation refresh failed".into(),
-            })
+            })?;
+        self.checkpoint("model_boundary", &[], &[]).await
     }
     async fn before_tools_batch(
         &self,
@@ -137,6 +172,25 @@ impl Middleware for TaskFrames {
             } else {
                 false
             };
+        let accepted: Vec<_> = calls
+            .iter()
+            .filter(|call| valid && (!pending || call.name == "inspect_task"))
+            .cloned()
+            .collect();
+        if !accepted.is_empty() {
+            if let Err(error) = self.checkpoint("dispatching", &accepted, &[]).await {
+                let reason = error.to_string();
+                return calls
+                    .iter()
+                    .map(|_| {
+                        Err(AgentError::MiddlewareError {
+                            middleware: "CloudTaskFrames".into(),
+                            reason: reason.clone(),
+                        })
+                    })
+                    .collect();
+            }
+        }
         calls
             .iter()
             .map(|call| {
@@ -152,5 +206,15 @@ impl Middleware for TaskFrames {
                 }
             })
             .collect()
+    }
+    async fn after_tools_batch(
+        &self,
+        _: &mut dyn capabilities::AfterToolsBatchState,
+        results: &[(
+            peri_agent::agent::react::ToolCall,
+            peri_agent::agent::react::ToolResult,
+        )],
+    ) -> AgentResult<()> {
+        self.checkpoint("tools_settled", &[], results).await
     }
 }

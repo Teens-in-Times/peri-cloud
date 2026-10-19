@@ -617,6 +617,7 @@ impl CloudAgent {
             chain.add(Box::new(crate::tasks::middleware::TaskFrames {
                 scope: scope.clone(),
                 transcript: transcript.clone(),
+                turn: request.turn_id,
             }));
         }
         let chain = Arc::new(chain);
