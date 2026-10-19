@@ -3,6 +3,8 @@ use super::*;
 mod approval_tests;
 #[path = "execution_deliverables.rs"]
 mod delivery_tests;
+#[path = "execution_devices.rs"]
+mod device_tests;
 #[path = "execution_observation.rs"]
 mod observation_tests;
 

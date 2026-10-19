@@ -11,6 +11,8 @@ pub(crate) struct WorkerService {
     pub(super) store: TaskStore,
     cursor: std::sync::atomic::AtomicI64,
     pub(super) reviews: tokio::sync::Semaphore,
+    pub(super) device_targets:
+        parking_lot::RwLock<std::collections::HashMap<Uuid, Arc<super::devices::PreparedTarget>>>,
     pub(super) transcripts: parking_lot::RwLock<
         std::collections::HashMap<
             Uuid,
@@ -98,6 +100,7 @@ impl WorkerService {
             journal,
             cursor: Default::default(),
             reviews: tokio::sync::Semaphore::new(4),
+            device_targets: Default::default(),
             transcripts: Default::default(),
         })
     }
@@ -358,6 +361,7 @@ impl WorkerService {
         )
     }
     pub async fn tick(&self) -> Result<()> {
+        self.reconcile_native().await?;
         self.transcripts
             .write()
             .retain(|_, transcript| transcript.strong_count() > 0);

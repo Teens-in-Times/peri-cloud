@@ -459,6 +459,8 @@ async fn schema_rebuild_preserves_old_task_and_unknown_operation_identity() {
     original.result = "unknown operation; do not replay".into();
     service.store.insert(&original).await.unwrap();
     for sql in [
+        "DROP TABLE cloud_native_operations",
+        "DROP TABLE cloud_device_targets",
         "DROP TABLE agent_task_instruction_reads",
         "DROP TABLE agent_task_approvals",
         "DROP TABLE agent_task_runs",

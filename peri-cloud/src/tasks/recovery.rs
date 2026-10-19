@@ -265,32 +265,38 @@ impl WorkerService {
             if unsettled {
                 if let Some(id) = row.get::<Option<String>, _>("invocation_id") {
                     let id = Uuid::parse_str(&id).map_err(|_| TaskError::Invalid)?;
-                    let job = match agent.query_bound_execution(id).await {
-                        Ok(job) => job,
-                        Err(_) => return Ok(false),
-                    };
-                    if !job.status.is_terminal()
-                        || job.tool
-                            != row
-                                .get::<Option<String>, _>("native_tool")
-                                .unwrap_or_else(|| call.name.clone())
-                        || Some(job.session_id.to_string()) != row.get("executor_session")
-                    {
-                        return Ok(false);
+                    let submitted:i64=sqlx::query_scalar("SELECT COUNT(*) FROM cloud_native_operations WHERE principal=? AND source_session=? AND invocation_id=?")
+                        .bind(record.principal.to_string()).bind(record.worker_session.to_string()).bind(id.to_string()).fetch_one(&self.store.pool).await?;
+                    if row.get::<i64, _>("intent_contract") >= 2 && submitted == 0 {
+                        result=Some(ToolResult::error(&call.id,&call.name,"Stopped before shared native operation admission. No executor request was submitted; re-evaluate current requirements and permissions."));
+                    } else {
+                        let job = match agent.query_bound_execution(id).await {
+                            Ok(job) => job,
+                            Err(_) => return Ok(false),
+                        };
+                        if !job.status.is_terminal()
+                            || job.tool
+                                != row
+                                    .get::<Option<String>, _>("native_tool")
+                                    .unwrap_or_else(|| call.name.clone())
+                            || Some(job.session_id.to_string()) != row.get("executor_session")
+                        {
+                            return Ok(false);
+                        }
+                        let is_error =
+                            job.status != peri_acp_types::device_executor::JobStatus::Completed;
+                        let output = peri_remote_tools::snapshot_output(job);
+                        let mut confirmed = ToolResult::success(
+                            &call.id,
+                            &call.name,
+                            output.projected_text(Some(12000)),
+                        );
+                        confirmed.is_error = is_error;
+                        confirmed.execution = output.execution;
+                        result = Some(confirmed);
                     }
-                    let is_error =
-                        job.status != peri_acp_types::device_executor::JobStatus::Completed;
-                    let output = peri_remote_tools::snapshot_output(job);
-                    let mut confirmed = ToolResult::success(
-                        &call.id,
-                        &call.name,
-                        output.projected_text(Some(12000)),
-                    );
-                    confirmed.is_error = is_error;
-                    confirmed.execution = output.execution;
-                    result = Some(confirmed);
                 } else {
-                    if row.get::<i64, _>("intent_contract") != 1 {
+                    if row.get::<i64, _>("intent_contract") < 1 {
                         return Ok(false);
                     }
                     if matches!(

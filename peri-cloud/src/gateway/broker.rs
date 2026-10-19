@@ -149,7 +149,19 @@ impl InteractionHub {
             return Err(GatewayError::StaleInteraction);
         }
         let session = self.journal.session(principal, card.session_id).await?;
-        if session.frozen.device_id != card.device_id {
+        let targeted = crate::tasks::devices::approval_target(
+            &self.journal,
+            principal,
+            card.session_id,
+            card.turn_id,
+            &card.context,
+        )
+        .await
+        .map_err(|_| GatewayError::StaleInteraction)?;
+        if targeted.as_ref().is_some_and(|(device, name, workspace)| {
+            *device != card.device_id || *name != card.device_name || *workspace != card.workspace
+        }) || (targeted.is_none() && session.frozen.device_id != card.device_id)
+        {
             return Err(GatewayError::StaleInteraction);
         }
         if let Some(device) = card.device_id {
@@ -319,13 +331,30 @@ impl UserInteractionBroker for SessionBroker {
         };
         let request = Uuid::new_v4();
         let (response, receiver) = oneshot::channel();
+        let target = match crate::tasks::devices::approval_target(
+            &self.hub.journal,
+            principal,
+            self.session,
+            turn.turn_id,
+            &context,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(_) => return fallback(),
+        };
+        let (device_id, device_name, workspace) = target.unwrap_or((
+            self.device,
+            self.device_name.clone(),
+            self.workspace.clone(),
+        ));
         let card = InteractionCard {
             request_id: request,
             turn_id: turn.turn_id,
             session_id: self.session,
-            device_id: self.device,
-            device_name: self.device_name.clone(),
-            workspace: self.workspace.clone(),
+            device_id,
+            device_name,
+            workspace,
             expires_at: self.hub.identity.now().saturating_add(300),
             context: context.clone(),
         };

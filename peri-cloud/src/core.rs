@@ -797,6 +797,9 @@ impl CloudAgent {
             context_window: self.context_window,
         }
     }
+    pub(crate) fn native_session(&self) -> Option<Arc<RemoteSession>> {
+        self.remote.clone()
+    }
 
     pub(crate) async fn bound_jobs(&self) -> Result<Vec<JobSnapshot>, peri_remote_tools::Error> {
         match &self.remote {

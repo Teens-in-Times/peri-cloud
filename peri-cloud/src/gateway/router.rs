@@ -46,6 +46,8 @@ mod attachments;
 mod controls;
 #[path = "conversation.rs"]
 mod conversation;
+#[path = "device_targets.rs"]
+mod device_targets;
 #[path = "memory.rs"]
 pub(super) mod memory;
 #[path = "personal.rs"]

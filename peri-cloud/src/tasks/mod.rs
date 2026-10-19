@@ -2,8 +2,10 @@
 pub(crate) mod approvals;
 pub(crate) mod continuity;
 pub(crate) mod deliverables;
+pub(crate) mod devices;
 mod evidence;
 pub(crate) mod middleware;
+pub(crate) mod native_operations;
 mod observation;
 pub(crate) mod recovery;
 pub(crate) mod resources;

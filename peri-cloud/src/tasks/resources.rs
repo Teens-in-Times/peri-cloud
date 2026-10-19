@@ -19,7 +19,11 @@ impl WorkerService {
             .await
             .map_err(|_| TaskError::Forbidden)?;
         if state.frozen.device_id != Some(device) {
-            return Err(TaskError::Forbidden);
+            let allowed:i64=sqlx::query_scalar("SELECT COUNT(*) FROM cloud_device_targets d JOIN cloud_turns t ON t.id=d.turn_id WHERE d.principal=? AND d.source_session=? AND t.state='running' AND json_extract(d.record_json,'$.frozen.device_id')=? AND json_extract(d.record_json,'$.generation')=? AND json_extract(d.record_json,'$.expires_at')>?")
+                .bind(principal.to_string()).bind(session.to_string()).bind(device.to_string()).bind(state.context_generation as i64).bind(now()).fetch_one(&self.store.pool).await?;
+            if reserved || allowed == 0 {
+                return Err(TaskError::Forbidden);
+            }
         }
         let mut tx = self.store.pool.begin().await?;
         let row = sqlx::query(
@@ -50,6 +54,11 @@ impl WorkerService {
             .fetch_one(&mut *tx)
             .await?;
             let previous: crate::state::SessionState = serde_json::from_str(&raw)?;
+            let pending:i64=sqlx::query_scalar("SELECT COUNT(*) FROM cloud_native_operations WHERE principal=? AND source_session=? AND state!='confirmed'")
+                .bind(principal.to_string()).bind(&owner).fetch_one(&mut *tx).await?;
+            if pending != 0 {
+                return Err(TaskError::Conflict);
+            }
             let active:i64=sqlx::query_scalar("SELECT COUNT(*) FROM cloud_turns WHERE session_id=? AND state IN ('queued','running','recovery_required')").bind(&owner).fetch_one(&mut *tx).await?;
             if active > 0 || !previous.execution_settled() {
                 return Err(TaskError::Conflict);
@@ -71,6 +80,7 @@ impl WorkerService {
             .await
             .map_err(|_| TaskError::Forbidden)?;
         if state.execution_settled()
+            && !self.native_pending(principal, session).await?
             && !self
                 .journal
                 .has_unconfirmed_turn(session)
@@ -167,8 +177,12 @@ impl BaseTool for ResourceTool {
         input: serde_json::Value,
         ctx: ToolContext<'_>,
     ) -> std::result::Result<ToolOutput, Box<dyn std::error::Error + Send + Sync>> {
+        // Only the immutable execute_device wrapper may project another target.
+        if input.get("_device_target").is_some() {
+            return Err(TaskError::Forbidden.into());
+        }
         self.acquire().await?;
-        if let Some(service) = self.scope.service.upgrade() {
+        let service = if let Some(service) = self.scope.service.upgrade() {
             service
                 .confirm_native_review(
                     &self.scope,
@@ -188,9 +202,15 @@ impl BaseTool for ResourceTool {
                     self.inner.aliases(),
                 )
                 .await?;
+            service
         } else {
             return Err(TaskError::Unavailable.into());
-        }
-        self.inner.invoke_output(input, ctx).await
+        };
+        let operation = service
+            .native_begin(&self.scope, &self.remote, self.inner.name(), &input, &ctx)
+            .await?;
+        let output = self.inner.invoke_output(input, ctx).await?;
+        service.native_finish(operation, &output).await?;
+        Ok(output)
     }
 }

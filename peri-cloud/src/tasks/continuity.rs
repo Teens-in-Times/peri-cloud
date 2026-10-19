@@ -61,7 +61,7 @@ impl WorkerService {
         for call in calls {
             let encoded = serde_json::to_string(call)?;
             let hash = format!("{:x}", sha2::Sha256::digest(encoded.as_bytes()));
-            sqlx::query("INSERT OR IGNORE INTO agent_task_operations(task_id,turn_id,window_id,call_id,call_hash,call_json,receipt_json,intent_contract,instruction_watermark) VALUES(?,?,?,?,?,?,NULL,1,?)")
+            sqlx::query("INSERT OR IGNORE INTO agent_task_operations(task_id,turn_id,window_id,call_id,call_hash,call_json,receipt_json,intent_contract,instruction_watermark) VALUES(?,?,?,?,?,?,NULL,2,?)")
                 .bind(task.to_string()).bind(turn.to_string()).bind(scope.session.to_string()).bind(&call.id).bind(&hash).bind(&encoded).bind(instruction_version).execute(&mut *tx).await?;
             let previous: String = sqlx::query_scalar("SELECT call_hash FROM agent_task_operations WHERE task_id=? AND turn_id=? AND call_id=?")
                 .bind(task.to_string()).bind(turn.to_string()).bind(&call.id).fetch_one(&mut *tx).await?;
@@ -82,7 +82,7 @@ impl WorkerService {
             let hash = format!("{:x}", sha2::Sha256::digest(encoded.as_bytes()));
             // A policy-rejected call may have no dispatch intent. Preserve its
             // receipt too; it is evidence that no invocation was authorized.
-            sqlx::query("INSERT OR IGNORE INTO agent_task_operations(task_id,turn_id,window_id,call_id,call_hash,call_json,receipt_json,intent_contract) VALUES(?,?,?,?,?,?,NULL,1)")
+            sqlx::query("INSERT OR IGNORE INTO agent_task_operations(task_id,turn_id,window_id,call_id,call_hash,call_json,receipt_json,intent_contract) VALUES(?,?,?,?,?,?,NULL,2)")
                 .bind(task.to_string()).bind(turn.to_string()).bind(scope.session.to_string()).bind(&call.id).bind(&hash).bind(encoded).execute(&mut *tx).await?;
             let receipt = serde_json::to_string(result)?;
             let changed = sqlx::query("UPDATE agent_task_operations SET receipt_json=? WHERE task_id=? AND turn_id=? AND call_id=? AND call_hash=? AND (receipt_json IS NULL OR receipt_json=?)")

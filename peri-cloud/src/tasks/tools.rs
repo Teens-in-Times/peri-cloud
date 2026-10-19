@@ -39,6 +39,9 @@ impl Middleware for TaskTools {
             })
             .collect();
         tools.extend(super::deliverables::tools(&self.scope));
+        if self.scope.role == AgentRole::Main {
+            tools.extend(super::devices::tools(&self.scope, self.turn));
+        }
         tools
     }
 }
