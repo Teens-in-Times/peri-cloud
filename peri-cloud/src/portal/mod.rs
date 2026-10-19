@@ -5,6 +5,7 @@ mod access;
 mod aggregate;
 mod browser;
 mod commands;
+mod context_files;
 mod conversations;
 mod interactions;
 mod memory;
@@ -168,6 +169,12 @@ pub fn router_for_host_with_models(
 fn build_router(portal: Portal) -> Router {
     Router::new()
         .route(
+            "/api/context/files",
+            get(context_files::list)
+                .post(context_files::save)
+                .layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
             "/api/schedules",
             get(schedules::list).post(schedules::create),
         )
@@ -253,6 +260,7 @@ fn build_router(portal: Portal) -> Router {
         .route("/api/conversations/{id}/result", get(conversations::result))
         .route("/api/web/chat", get(web::chat))
         .route("/api/web/chat/select", post(web::select))
+        .route("/api/web/chat/conversation", post(web::conversation))
         .route(
             "/api/web/chat/messages",
             post(web::send).layer(DefaultBodyLimit::max(64 * 1024)),

@@ -102,6 +102,7 @@ mod tests;
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptState {
     Processing,
+    Queued,
     Submitted,
     Completed,
     Interrupted,
@@ -187,6 +188,10 @@ pub enum DeliveryError {
 
 #[async_trait]
 pub trait MessageAdapter: Send + Sync {
+    /// Trusted platform presentation rules; never sourced from message text.
+    fn context_constraints(&self, _route: &ChannelRoute) -> &'static str {
+        ""
+    }
     fn supports_proactive(&self) -> bool {
         false
     }

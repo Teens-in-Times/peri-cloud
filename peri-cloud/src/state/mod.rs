@@ -1,5 +1,7 @@
 //! Durable cloud session and turn journal. No transport credentials live here.
 
+pub(crate) mod chat_projection;
+mod core_migration;
 mod journal;
 mod scheduled;
 mod schema;

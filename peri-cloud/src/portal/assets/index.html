@@ -95,6 +95,7 @@
       <section id="web-chat" class="panel" hidden>
         <div class="section-heading"><h2>和 Agent 对话</h2><span id="web-phase" class="pill"></span></div>
         <p id="web-hint" class="subtle"></p>
+        <div class="web-chat-controls"><button id="web-new-conversation" type="button" class="quiet small">新建独立会话</button><label>已有会话编号<input id="web-resume-id" maxlength="36" placeholder="可从其他聊天入口的会话列表复制"></label><button id="web-resume-conversation" type="button" class="quiet small">继续这个会话</button></div>
         <div class="web-chat-controls">
           <label>执行设备<select id="web-device"></select></label>
           <label>工作目录<input id="web-workspace" maxlength="4096"></label>
@@ -124,6 +125,7 @@
         </form>
         <p id="settings-error" class="load-error" role="status" hidden></p>
         <p id="usage-summary" class="subtle"></p>
+        <details id="soul-panel"><summary>助手风格 · SOUL.md</summary><p class="subtle">自定义长期交流风格，只在私人入口使用，从下一轮生效。工具权限继续由原审批规则决定。</p><button id="soul-load" type="button" class="quiet small">载入我的设置</button><form id="soul-form"><label>正文<textarea id="soul-text" rows="6" maxlength="32768"></textarea></label><button type="submit" class="quiet small">保存助手风格</button></form></details>
         <hr>
         <div class="section-heading"><h2>我的记忆</h2><button id="memory-reload" class="quiet small">刷新记忆</button></div>
         <p class="subtle">逐条保存事实与决定。仅私聊和已登录网页可用，置顶资料在预算内进入每轮上下文，其余按需检索。过期资料仍可在此更正或忘记。</p>

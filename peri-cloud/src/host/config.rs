@@ -40,6 +40,8 @@ pub struct HostConfig {
     pub max_iterations: usize,
     #[serde(default = "system_prompt")]
     pub system_prompt: String,
+    #[serde(default)]
+    pub context: crate::context::ContextConfig,
 }
 
 #[derive(Deserialize)]
@@ -172,6 +174,11 @@ impl HostConfig {
         if config.state_dir.is_relative() {
             config.state_dir = directory.join(&config.state_dir);
         }
+        if let Some(context_root) = &mut config.context.directory {
+            if context_root.is_relative() {
+                *context_root = directory.join(&*context_root);
+            }
+        }
         for device in &mut config.devices {
             if device.token_file.is_relative() {
                 device.token_file = directory.join(&device.token_file);
@@ -202,6 +209,9 @@ impl HostConfig {
     }
 
     pub fn validate(&self) -> HostResult<()> {
+        self.context
+            .validate()
+            .map_err(|_| HostError::Configuration)?;
         if self
             .qq
             .as_ref()

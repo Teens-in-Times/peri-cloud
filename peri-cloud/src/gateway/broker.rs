@@ -104,8 +104,8 @@ impl InteractionHub {
             .map(|pending| (pending.route.clone(), pending.card.clone()))
             .collect();
         let mut cards = Vec::new();
-        for (route, card) in candidates {
-            match self.validate_current(&route, principal, &card).await {
+        for (_, card) in candidates {
+            match self.validate_principal_current(principal, &card).await {
                 Ok(()) => cards.push(card),
                 Err(
                     GatewayError::StaleInteraction
@@ -127,14 +127,49 @@ impl InteractionHub {
         request: Uuid,
         action: InteractionAction,
     ) -> GatewayResult<()> {
-        let route = self
+        let card = self
             .pending
             .lock()
             .get(&request)
             .filter(|pending| pending.principal == principal)
-            .map(|pending| pending.route.clone())
+            .filter(|pending| !pending.response.is_closed())
+            .map(|pending| pending.card.clone())
             .ok_or(GatewayError::StaleInteraction)?;
-        self.respond(&route, request, action).await
+        self.validate_principal_current(principal, &card).await?;
+        let response = action_response(&card.context, action, super::WEB_ADAPTER)?;
+        self.complete(request, response)
+    }
+
+    async fn validate_principal_current(
+        &self,
+        principal: Uuid,
+        card: &InteractionCard,
+    ) -> GatewayResult<()> {
+        if card.expires_at <= self.identity.now() {
+            return Err(GatewayError::StaleInteraction);
+        }
+        let session = self.journal.session(principal, card.session_id).await?;
+        if session.frozen.device_id != card.device_id {
+            return Err(GatewayError::StaleInteraction);
+        }
+        if let Some(device) = card.device_id {
+            if !crate::memory::scope::devices(&self.journal.identity_pool(), principal)
+                .await?
+                .iter()
+                .any(|d| d.id == device)
+            {
+                return Err(GatewayError::StaleInteraction);
+            }
+        }
+        let active = self.journal.active_turn(principal, card.session_id).await?;
+        if !active.is_some_and(|turn| {
+            turn.turn_id == card.turn_id
+                && turn.state == TurnState::Running
+                && !turn.cancel_requested
+        }) {
+            return Err(GatewayError::StaleInteraction);
+        }
+        Ok(())
     }
 
     async fn validate_current(
@@ -152,20 +187,25 @@ impl InteractionHub {
             }
             None => self.identity.resolve_channel(&route.identity).await?,
         };
-        if principal != resolved
-            || self.store.selection(route, principal).await? != Some(card.session_id)
-        {
+        let selected = self.store.selection(route, principal).await?;
+        let owns_selection = if selected == Some(card.session_id) {
+            true
+        } else {
+            let parent: Option<String> = sqlx::query_scalar(
+                "SELECT parent_session FROM agent_tasks WHERE principal=? AND worker_session=?",
+            )
+            .bind(principal.to_string())
+            .bind(card.session_id.to_string())
+            .fetch_optional(&self.journal.identity_pool())
+            .await?;
+            parent
+                .and_then(|id| Uuid::parse_str(&id).ok())
+                .is_some_and(|id| Some(id) == selected)
+        };
+        if principal != resolved || !owns_selection {
             return Err(GatewayError::StaleInteraction);
         }
-        let active = self.journal.active_turn(principal, card.session_id).await?;
-        if !active.is_some_and(|turn| {
-            turn.turn_id == card.turn_id
-                && turn.state == TurnState::Running
-                && !turn.cancel_requested
-        }) {
-            return Err(GatewayError::StaleInteraction);
-        }
-        Ok(())
+        self.validate_principal_current(principal, card).await
     }
 
     pub async fn respond(
@@ -190,6 +230,10 @@ impl InteractionHub {
         };
         self.validate_current(route, principal, &card).await?;
         let response = action_response(&card.context, action, &route.identity.adapter_instance_id)?;
+        self.complete(request, response)
+    }
+
+    fn complete(&self, request: Uuid, response: InteractionResponse) -> GatewayResult<()> {
         let mut pending = self.pending.lock();
         // Recheck expiry after authentication/database awaits, then consume once.
         if !pending
@@ -255,26 +299,7 @@ impl UserInteractionBroker for SessionBroker {
         if !valid_context(&context) {
             return fallback();
         }
-        let resolved = match self.device {
-            Some(device) => self
-                .hub
-                .identity
-                .channel_device(&self.route.identity, device)
-                .await
-                .map(|(principal, _)| principal),
-            None => {
-                self.hub
-                    .identity
-                    .resolve_channel(&self.route.identity)
-                    .await
-            }
-        };
-        let Ok(principal) = resolved else {
-            return fallback();
-        };
-        if principal != self.principal {
-            return fallback();
-        }
+        let principal = self.principal;
         let Ok(Some(turn)) = self.hub.journal.active_turn(principal, self.session).await else {
             return fallback();
         };
@@ -303,6 +328,14 @@ impl UserInteractionBroker for SessionBroker {
             expires_at: self.hub.identity.now().saturating_add(300),
             context: context.clone(),
         };
+        if self
+            .hub
+            .validate_principal_current(principal, &card)
+            .await
+            .is_err()
+        {
+            return fallback();
+        }
         self.hub.pending.lock().insert(
             request,
             Pending {

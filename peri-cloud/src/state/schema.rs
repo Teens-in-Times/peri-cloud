@@ -40,7 +40,7 @@ pub(crate) async fn reject_foreign(pool: &SqlitePool, version: i64) -> StateResu
     {
         return Err(StateError::ForeignSchema);
     }
-    if (6..=15).contains(&version) {
+    if (6..=16).contains(&version) {
         let standalone_markers =
             has_table(pool, "web_messages").await? || has_table(pool, "device_connections").await?;
         if standalone_markers && !has_table(pool, "user_models").await? {
@@ -83,6 +83,16 @@ pub(crate) async fn reject_foreign(pool: &SqlitePool, version: i64) -> StateResu
     if version >= 15
         && (!has_table(pool, "cloud_mcp_servers").await?
             || !has_table(pool, "cloud_mcp_meta").await?)
+    {
+        return Err(StateError::ForeignSchema);
+    }
+    if version >= 16
+        && (!has_table(pool, "gateway_queue").await?
+            || !has_table(pool, "agent_tasks").await?
+            || !has_table(pool, "agent_task_messages").await?
+            || !has_table(pool, "agent_task_trace").await?
+            || !has_table(pool, "agent_device_leases").await?
+            || !has_table(pool, "conversation_projections").await?)
     {
         return Err(StateError::ForeignSchema);
     }

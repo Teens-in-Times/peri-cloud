@@ -128,8 +128,12 @@ impl WebStore {
         route: &ChannelRoute,
         after: Option<i64>,
         limit: usize,
+        session: Option<Uuid>,
     ) -> GatewayResult<(Vec<WebMessage>, i64)> {
-        let route_key = route.key()?;
+        let route_key = match session {
+            Some(id) => format!("session:{id}"),
+            None => route.key()?,
+        };
         let limit = limit.clamp(1, 200) as i64;
         let rows = if let Some(after) = after {
             sqlx::query("SELECT seq,role,text,state,created_at,card_json FROM web_messages WHERE route_key=? AND seq>? ORDER BY seq LIMIT ?")
@@ -200,7 +204,14 @@ impl Gateway {
         if after.is_none() {
             web.reconcile(&route, now).await?;
         }
-        let (messages, cursor) = web.history(&route, after, 100).await?;
+        let selected = self.store.selection(&route, principal).await?;
+        if let Some(session) = selected {
+            let state = self.journal().session(principal, session).await?;
+            let mut tx = self.store.pool.begin().await?;
+            crate::state::chat_projection::seed(&mut tx, &state).await?;
+            tx.commit().await?;
+        }
+        let (messages, cursor) = web.history(&route, after, 100, selected).await?;
         let mut states = std::collections::HashMap::new();
         for device in &devices {
             states.insert(device.id, self.connector.reachability(device).await);
@@ -216,7 +227,6 @@ impl Gateway {
                 connection: states.get(&device.id).copied().unwrap_or_default(),
             })
             .collect();
-        let selected = self.store.selection(&route, principal).await?;
         let (mut session_id, mut device_id, mut device_name, mut workspace, mut phase) =
             (None, None, None, None, None);
         let mut needs_device = web_devices.is_empty() || web_devices.len() > 1;
@@ -290,6 +300,14 @@ impl Gateway {
         actor: &Authenticated,
         text: impl Into<String>,
     ) -> GatewayResult<WebSendResult> {
+        self.web_send_idempotent(actor, text, Uuid::new_v4()).await
+    }
+    pub async fn web_send_idempotent(
+        self: &Arc<Self>,
+        actor: &Authenticated,
+        text: impl Into<String>,
+        request: Uuid,
+    ) -> GatewayResult<WebSendResult> {
         let (route, principal, devices) = self.prepare_web(actor).await?;
         let text = text.into().trim().to_owned();
         if text.is_empty() || text.len() > 32768 {
@@ -312,7 +330,7 @@ impl Gateway {
         }
         let message = InboundMessage {
             route: route.clone(),
-            event_id: format!("web:{}", Uuid::new_v4()),
+            event_id: format!("web:{principal}:{request}"),
             text,
             reply_kind: Default::default(),
         };

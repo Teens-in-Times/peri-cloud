@@ -48,6 +48,9 @@ impl DeviceReachability {
 /// SSH login or bearer tokens. Existing frozen sessions must reopen unchanged.
 #[async_trait]
 pub trait SessionConnector: Send + Sync {
+    fn context_assembler(&self) -> Option<Arc<crate::context::ContextAssembler>> {
+        None
+    }
     async fn new_conversation(&self, _principal: Uuid) -> GatewayResult<Arc<CloudAgent>> {
         Err(GatewayError::Connection)
     }
@@ -112,6 +115,7 @@ pub struct NativeSessionConnector {
     system_prompt: String,
     context_window: u32,
     account_models: RwLock<Option<Arc<crate::models::AccountModels>>>,
+    context_assembler: RwLock<Arc<crate::context::ContextAssembler>>,
 }
 
 impl NativeSessionConnector {
@@ -130,6 +134,7 @@ impl NativeSessionConnector {
             system_prompt,
             context_window,
             account_models: RwLock::new(None),
+            context_assembler: RwLock::new(Arc::new(crate::context::ContextAssembler::default())),
         }))
     }
 
@@ -145,10 +150,16 @@ impl NativeSessionConnector {
     pub fn set_account_models(&self, models: Arc<crate::models::AccountModels>) {
         *self.account_models.write() = Some(models);
     }
+    pub fn set_context_assembler(&self, assembler: Arc<crate::context::ContextAssembler>) {
+        *self.context_assembler.write() = assembler;
+    }
 }
 
 #[async_trait]
 impl SessionConnector for NativeSessionConnector {
+    fn context_assembler(&self) -> Option<Arc<crate::context::ContextAssembler>> {
+        Some(self.context_assembler.read().clone())
+    }
     async fn new_conversation(&self, principal: Uuid) -> GatewayResult<Arc<CloudAgent>> {
         self.open_conversation(
             principal,
@@ -172,7 +183,8 @@ impl SessionConnector for NativeSessionConnector {
             return Err(crate::identity::IdentityError::Forbidden.into());
         }
         let mut agent = CloudAgent::conversation(frozen, self.model.clone())
-            .with_commands(self.commands.clone());
+            .with_commands(self.commands.clone())
+            .with_context_assembler(self.context_assembler.read().clone());
         if let Some(models) = self.account_models.read().clone() {
             agent = agent.with_account_models(models);
         }
@@ -268,7 +280,9 @@ impl SessionConnector for NativeSessionConnector {
             .map_err(|_| GatewayError::Connection)?;
         let mut agent = CloudAgent::new(session_id, remote, self.model.clone(), prompt, window)
             .map_err(|_| GatewayError::Connection)?;
-        agent = agent.with_commands(self.commands.clone());
+        agent = agent
+            .with_commands(self.commands.clone())
+            .with_context_assembler(self.context_assembler.read().clone());
         if let Some(models) = self.account_models.read().clone() {
             agent = agent.with_account_models(models);
         }

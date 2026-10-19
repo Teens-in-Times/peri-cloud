@@ -35,6 +35,9 @@ fn unix_now() -> i64 {
 }
 
 impl Connections {
+    pub fn set_context_assembler(&self, assembler: Arc<crate::context::ContextAssembler>) {
+        self.native.set_context_assembler(assembler);
+    }
     pub fn set_account_models(&self, models: Arc<crate::models::AccountModels>) {
         self.native.set_account_models(models);
     }
@@ -171,6 +174,9 @@ impl Connections {
 
 #[async_trait]
 impl SessionConnector for Connections {
+    fn context_assembler(&self) -> Option<Arc<crate::context::ContextAssembler>> {
+        self.native.context_assembler()
+    }
     async fn new_conversation(&self, principal: Uuid) -> GatewayResult<Arc<CloudAgent>> {
         self.native.new_conversation(principal).await
     }

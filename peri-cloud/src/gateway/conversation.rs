@@ -71,9 +71,6 @@ impl Gateway {
         old: Uuid,
     ) -> GatewayResult<Uuid> {
         let state = self.journal().session(principal, old).await?;
-        if !state.execution_settled() || self.journal().has_unconfirmed_turn(old).await? {
-            return Err(GatewayError::Busy);
-        }
         let agent = self.connector.new_conversation(principal).await?;
         let id = agent.frozen_session(principal).session_id;
         self.attach_conversation(route, principal, agent).await?;
@@ -159,34 +156,8 @@ impl Gateway {
                 Some(principal),
             )));
         }
-        if !state.execution_settled() || self.journal().has_unconfirmed_turn(session).await? {
-            return Err(GatewayError::Busy);
-        }
-        let agent = self
-            .connector
-            .open_conversation(principal, &state.frozen)
+        self.enqueue_session_message(message, principal, session)
             .await?;
-        self.attach_conversation(&message.route, principal, agent)
-            .await?;
-        let origin = self
-            .origins
-            .read()
-            .get(&session)
-            .cloned()
-            .ok_or(GatewayError::RecoveryRequired)?;
-        *origin.write() = Some(SessionOrigin::Platform(message.event_id.clone()));
-        self.store
-            .stage(&message.key()?, principal, session)
-            .await?;
-        let turn = self
-            .submit_session_task(
-                principal,
-                session,
-                format!("gateway:{}", message.key()?),
-                MessageContent::Text(message.text.clone()),
-            )
-            .await?;
-        self.store.submitted(&message.key()?, turn.turn_id).await?;
         Ok(None)
     }
 }

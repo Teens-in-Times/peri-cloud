@@ -102,7 +102,7 @@ async fn compact_uses_summary_only_no_tools_keeps_canonical_history_and_survives
 }
 
 #[tokio::test]
-async fn failed_compact_and_busy_controls_leave_context_and_selection_unchanged() {
+async fn failed_compact_preserves_context_and_new_selects_an_independent_session_while_busy() {
     let f = Fixture::new(vec![
         answer("previous"),
         answer("   "),
@@ -126,14 +126,19 @@ async fn failed_compact_and_busy_controls_leave_context_and_selection_unchanged(
     );
     let running = command(&f, "write", "write").await;
     let card = f.card().await;
-    command(&f, "busynew", "/new").await;
     command(&f, "busycompact", "/compact").await;
     assert_eq!(selected(&f).await, session);
+    command(&f, "busynew", "/new").await;
+    assert_ne!(selected(&f).await, session);
     assert_eq!(f.script.requests.lock().len(), 3);
     assert!(!f.workspaces[0].path().join("agent.txt").exists());
     f.c()
         .gateway
-        .respond(&f.route, card.request_id, InteractionAction::Reject {})
+        .respond_browser(
+            &f.c().browser,
+            card.request_id,
+            InteractionAction::Reject {},
+        )
         .await
         .unwrap();
     f.settled(session, running.turn_id.unwrap()).await;

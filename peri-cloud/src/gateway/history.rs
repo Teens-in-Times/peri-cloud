@@ -33,17 +33,18 @@ impl Gateway {
         let (verb, args) = text.split_once(' ').unwrap_or((text, ""));
         if verb == "/resume" {
             let target = Uuid::parse_str(args).map_err(|_| GatewayError::Invalid)?;
-            if self
-                .store
-                .selections(principal)
-                .await?
-                .iter()
-                .any(|(other, id)| *id == target && other != route)
-            {
-                return Ok("这条会话仍由另一聊天入口使用。请在原聊天继续，或使用 /new 新建会话，避免审批和结果发往错误入口。".into());
+            let worker: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM agent_tasks WHERE worker_session=?")
+                    .bind(target.to_string())
+                    .fetch_one(&self.store.pool)
+                    .await?;
+            if worker != 0 {
+                return Ok(
+                    "这是执行任务的独立历史，请从主会话查询任务详情；不能将它切换成普通聊天。"
+                        .into(),
+                );
             }
             let (_, devices) = self.identity.channel_devices(&route.identity).await?;
-            let old = self.journal().session(principal, current).await?;
             let state = self.journal().session(principal, target).await?;
             if !crate::memory::context::can_attach(
                 self.journal(),
@@ -55,14 +56,14 @@ impl Gateway {
             {
                 return Err(GatewayError::PrivateHistory);
             }
-            if [current, target]
-                .iter()
-                .any(|id| self.runtime.status().active_sessions.contains(id))
-                || !old.execution_settled()
-                || !state.execution_settled()
-                || self.journal().has_unconfirmed_turn(current).await?
-                || self.journal().has_unconfirmed_turn(target).await?
-            {
+            if self.runtime.status().active_sessions.contains(&target) {
+                // Selection is not broker ownership. The running turn retains
+                // its original reply/approval route; new input queues for the
+                // same logical session and rebinds only at the next boundary.
+                self.store.select(route, principal, target).await?;
+                return Ok(format!("已选择会话：{target}。当前轮次保留原回复入口，新消息将在该轮结束后处理。也可以 /new 新建独立会话。"));
+            }
+            if !state.execution_settled() || self.journal().has_unconfirmed_turn(target).await? {
                 return Err(GatewayError::Busy);
             }
             if state.frozen.device_id.is_none() {
@@ -124,7 +125,7 @@ impl Gateway {
         if page == 0 {
             return Err(GatewayError::Invalid);
         }
-        let rows=sqlx::query("SELECT s.state_json FROM cloud_sessions s LEFT JOIN memory_session_audience a ON a.session_id=s.id WHERE s.principal=? AND (? OR a.private_memory=0) ORDER BY s.rowid DESC LIMIT 7 OFFSET ?")
+        let rows=sqlx::query("SELECT s.state_json FROM cloud_sessions s LEFT JOIN memory_session_audience a ON a.session_id=s.id WHERE s.principal=? AND (? OR a.private_memory=0) AND NOT EXISTS (SELECT 1 FROM agent_tasks t WHERE t.worker_session=s.id) ORDER BY s.rowid DESC LIMIT 7 OFFSET ?")
             .bind(principal.to_string()).bind(self.private_memory_route(route)).bind(i64::try_from((page-1).saturating_mul(6)).map_err(|_|GatewayError::Invalid)?).fetch_all(&self.store.pool).await?;
         let mut output = format!("我的历史会话 · 第 {page} 页\n");
         for row in rows.iter().take(6) {

@@ -45,7 +45,7 @@ impl CloudJournal {
         let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
-        if !matches!(version, 0..=15) {
+        if !matches!(version, 0..=16) {
             return Err(StateError::Version);
         }
         super::schema::reject_foreign(&pool, version).await?;
@@ -71,6 +71,7 @@ impl CloudJournal {
         crate::memory::migrate(&pool).await?;
         crate::goal::migrate(&pool).await?;
         crate::mcp::migrate(&pool).await?;
+        super::core_migration::migrate(&pool).await?;
         let journal = Self {
             pool,
             root: root.to_owned(),
@@ -290,6 +291,12 @@ impl CloudJournal {
         if charged == 0 {
             return Err(StateError::Limit);
         }
+        if scheduled.is_none()
+            && !request_key.starts_with("worker:")
+            && !request_key.starts_with("task-event:")
+        {
+            super::chat_projection::user(&mut tx, &session, &request_key, &prompt).await?;
+        }
         let turn = TurnRecord {
             turn_id: Uuid::new_v4(),
             session_id,
@@ -459,6 +466,17 @@ impl CloudJournal {
         let mut session: SessionState = serde_json::from_str(row.get("state_json"))?;
         if session.revision != turn.base_revision {
             return Err(StateError::TransitionConflict);
+        }
+        let worker: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_tasks WHERE worker_session=?")
+                .bind(turn.session_id.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+        if worker == 0 {
+            super::chat_projection::seed(&mut tx, &session).await?;
+            for reply in &result.replies {
+                super::chat_projection::assistant(&mut tx, &session, reply).await?;
+            }
         }
         session.history = result.history.clone();
         session.history_flags = result.history_flags.clone();

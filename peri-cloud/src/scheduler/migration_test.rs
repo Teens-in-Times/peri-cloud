@@ -54,6 +54,9 @@ async fn legacy_plan_identity_receipts_and_unknowns_survive_migration_without_br
     .await
     .unwrap();
     for sql in [
+        "DROP TABLE agent_task_trace", "DROP TABLE agent_task_messages",
+        "DROP TABLE agent_device_leases", "DROP TABLE agent_tasks",
+        "DROP TABLE gateway_queue", "DROP TABLE conversation_projections",
         "DROP TABLE memory_session_audience", "DROP TABLE memory_fts",
         "DROP TABLE memory_audit",
         "DROP TABLE memory_items",
@@ -147,7 +150,7 @@ async fn legacy_plan_identity_receipts_and_unknowns_survive_migration_without_br
         .fetch_one(&store.pool)
         .await
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     journal.close().await;
     drop(journal);
     let journal = CloudJournal::open(root.path()).await.unwrap();

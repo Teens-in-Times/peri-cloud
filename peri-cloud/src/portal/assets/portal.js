@@ -449,6 +449,8 @@ async function signIn(login, password) {
 }
 
 function clearPersonal() {
+  byId('soul-form').reset(); byId('soul-panel').open=false; soulOwner=null; webPending=null; conversationPending=null; webSession=null;
+  byId('web-input').value='';byId('web-resume-id').value='';
   MemoryView.clear();
   WorkspaceView.clear();
   ModelView.clear();
@@ -629,10 +631,14 @@ let webCursor = 0;
 let webRendered = 0;
 let webLoading = false;
 let webDeviceSignature = '';
+let webPending = null;
+let soulOwner = null;
+let conversationPending = null;
+let webSession = null;
 
 function webPhaseLabel(phase) {
   return ({
-    running: '任务执行中', waiting_approval: '等待你审批', waiting_answer: '等待你回答',
+    running: '正在处理 · 可以继续发送', waiting_approval: '等待你审批', waiting_answer: '等待你回答',
     cancelling: '正在取消', needs_attention: '结果待核实', idle: '可以继续对话'
   })[phase] || '';
 }
@@ -640,8 +646,11 @@ function webPhaseLabel(phase) {
 async function loadWebChat(reset) {
   if (!activeAccount || !activeAccount.service?.agent_enabled || webLoading) return;
   webLoading = true;
+  const owner = activeAccount.principal.id, epoch=authEpoch;
   try {
     const chat = await api('/api/web/chat' + (reset ? '' : '?after=' + webCursor));
+    if(activeAccount?.principal.id!==owner||epoch!==authEpoch)return;
+    if(!reset&&webSession!==chat.session_id){webLoading=false;await loadWebChat(true);return;}
     renderWebChat(chat, reset);
   } catch (error) {
     byId('web-hint').textContent = error.message;
@@ -651,11 +660,12 @@ async function loadWebChat(reset) {
 }
 
 function renderWebChat(chat, reset) {
+  webSession=chat.session_id;
   byId('web-chat').hidden = false;
   byId('web-phase').textContent = webPhaseLabel(chat.phase);
   byId('web-hint').textContent = chat.needs_device
     ? '请选择一个执行设备与目录。'
-    : (chat.device_name || '') + (chat.workspace ? ' · ' + chat.workspace : '');
+    : (chat.device_name || '云端对话') + (chat.workspace ? ' · ' + chat.workspace : '') + (chat.session_id ? ' · 会话 '+chat.session_id : '');
   const select = byId('web-device');
   const signature = chat.devices.map(device => device.id + ':' + device.connection).join(',');
   if (signature !== webDeviceSignature) {
@@ -681,7 +691,7 @@ function renderWebChat(chat, reset) {
     row.className = 'web-message ' + message.role;
     const meta = document.createElement('span');
     meta.className = 'web-message-meta';
-    meta.textContent = message.role === 'user' ? '你' : message.role === 'assistant' ? 'Agent' : '系统';
+    meta.textContent = message.role === 'user' ? '你' : message.role === 'assistant' ? 'Agent' : message.role==='history_input' ? '历史输入' : '系统';
     const body = document.createElement('p');
     body.textContent = message.text;
     row.append(meta, body);
@@ -713,7 +723,12 @@ byId('web-form').addEventListener('submit', event => {
   const text = input.value.trim();
   if (!text) return;
   action(form.querySelector('button[type=submit]'), async () => {
-    await api('/api/web/chat/messages', { text });
+    const owner=activeAccount?.principal.id, epoch=authEpoch;
+    if(!webPending||webPending.text!==text)webPending={text,request_id:crypto.randomUUID()};
+    const result=await api('/api/web/chat/messages', webPending);
+    if(activeAccount?.principal.id!==owner||epoch!==authEpoch)return;
+    webPending=null;
+    if(result.receipt.state==='queued')notice('消息已排队，当前轮次结束后继续处理。');
     input.value = '';
     await loadWebChat(false);
   });
@@ -721,6 +736,34 @@ byId('web-form').addEventListener('submit', event => {
 setInterval(() => {
   if (activeAccount && !document.hidden) loadWebChat(false);
 }, 2000);
+
+function chooseConversation(button,target){
+  action(button,async()=>{
+    const owner=activeAccount?.principal.id,epoch=authEpoch;
+    if(!conversationPending||conversationPending.session_id!==target)conversationPending={request_id:crypto.randomUUID(),session_id:target};
+    const result=await api('/api/web/chat/conversation',conversationPending);
+    if(activeAccount?.principal.id!==owner||epoch!==authEpoch)return;
+    conversationPending=null;byId('web-resume-id').value='';await loadWebChat(true);notice('已选择会话 '+result.session_id+'。');
+  });
+}
+byId('web-new-conversation').addEventListener('click',()=>chooseConversation(byId('web-new-conversation'),null));
+byId('web-resume-conversation').addEventListener('click',()=>{
+  const target=byId('web-resume-id').value.trim();
+  if(!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(target)){notice('请填写完整的会话编号。');return;}
+  chooseConversation(byId('web-resume-conversation'),target);
+});
+byId('soul-load').addEventListener('click',()=>action(byId('soul-load'),async()=>{
+  const owner=activeAccount?.principal.id,epoch=authEpoch;const documents=await api('/api/context/files');
+  if(activeAccount?.principal.id!==owner||epoch!==authEpoch)return;
+  byId('soul-text').value=documents.find(item=>item.name==='SOUL.md')?.text||'';soulOwner=owner;
+}));
+byId('soul-form').addEventListener('submit',event=>{
+  event.preventDefault();action(event.currentTarget.querySelector('button'),async()=>{
+    const owner=activeAccount?.principal.id,epoch=authEpoch;if(!owner||soulOwner!==owner)throw new Error('请先载入当前账号的设置。');
+    await api('/api/context/files',{name:'SOUL.md',text:byId('soul-text').value});
+    if(activeAccount?.principal.id===owner&&epoch===authEpoch)notice('助手风格已保存，从下一轮生效。');
+  });
+});
 
 async function start() {
   const state = await api('/api/status'); csrfCookie = state.csrf_cookie;

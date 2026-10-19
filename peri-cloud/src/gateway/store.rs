@@ -49,6 +49,7 @@ pub(crate) struct PendingTurn {
     pub principal: Uuid,
     pub session: Uuid,
     pub turn: Uuid,
+    pub reply_kind: ReplyKind,
 }
 
 pub(crate) struct PendingDelivery {
@@ -122,6 +123,7 @@ impl GatewayStore {
                 .await?;
         let state = match row.get::<&str, _>("state") {
             "processing" => ReceiptState::Processing,
+            "queued" => ReceiptState::Queued,
             "submitted" => ReceiptState::Submitted,
             "completed" => ReceiptState::Completed,
             "interrupted" => ReceiptState::Interrupted,
@@ -203,12 +205,6 @@ impl GatewayStore {
         Ok(paths)
     }
 
-    pub async fn stage(&self, key: &str, principal: Uuid, session: Uuid) -> GatewayResult<()> {
-        sqlx::query("UPDATE gateway_inbox SET principal=?,session_id=? WHERE event_key=? AND state='processing'")
-            .bind(principal.to_string()).bind(session.to_string()).bind(key).execute(&self.pool).await?;
-        Ok(())
-    }
-
     pub async fn link_existing(&self, key: &str) -> GatewayResult<bool> {
         let row = sqlx::query("SELECT t.id FROM gateway_inbox i JOIN cloud_turns t ON t.session_id=i.session_id AND t.request_key=? WHERE i.event_key=? AND i.state='processing'")
             .bind(format!("gateway:{key}")).bind(key).fetch_optional(&self.pool).await?;
@@ -233,6 +229,22 @@ impl GatewayStore {
         principal: Option<Uuid>,
     ) -> GatewayResult<()> {
         let mut tx = self.pool.begin().await?;
+        if let (Some(principal), DeliveryBody::Notice { text }) = (principal, &body) {
+            let raw:Option<String>=sqlx::query_scalar("SELECT s.state_json FROM gateway_routes r JOIN cloud_sessions s ON s.id=r.session_id WHERE r.route_key=? AND r.principal=? AND s.principal=?")
+                .bind(message.route.key()?).bind(principal.to_string()).bind(principal.to_string()).fetch_optional(&mut *tx).await?;
+            if let Some(raw) = raw {
+                let state: crate::state::SessionState = serde_json::from_str(&raw)?;
+                crate::state::chat_projection::user(
+                    &mut tx,
+                    &state,
+                    &format!("gateway:{}", message.key()?),
+                    &peri_acp_types::messages::MessageContent::Text(message.text.clone()),
+                )
+                .await?;
+                crate::state::chat_projection::notice(&mut tx, &state, &message.key()?, text)
+                    .await?;
+            }
+        }
         enqueue(
             &mut tx,
             &format!("notice:{}", message.key()?),
@@ -300,7 +312,7 @@ impl GatewayStore {
     }
 
     pub async fn pending_turns(&self) -> GatewayResult<Vec<PendingTurn>> {
-        let rows = sqlx::query("SELECT * FROM gateway_inbox WHERE state='submitted' LIMIT 128")
+        let rows = sqlx::query("SELECT i.*,q.reply_reference,q.reply_kind FROM gateway_inbox i LEFT JOIN gateway_queue q ON q.event_key=i.event_key WHERE i.state='submitted' LIMIT 128")
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter()
@@ -308,10 +320,17 @@ impl GatewayStore {
                 Ok(PendingTurn {
                     event_key: row.get("event_key"),
                     route: serde_json::from_str(row.get("route_json"))?,
-                    event_id: row.get("event_id"),
+                    event_id: row
+                        .get::<Option<String>, _>("reply_reference")
+                        .unwrap_or_else(|| row.get("event_id")),
                     principal: uuid(row.get("principal"))?,
                     session: uuid(row.get("session_id"))?,
                     turn: uuid(row.get("turn_id"))?,
+                    reply_kind: row
+                        .get::<Option<String>, _>("reply_kind")
+                        .map(|s| serde_json::from_str(&s))
+                        .transpose()?
+                        .unwrap_or_default(),
                 })
             })
             .collect()
@@ -334,7 +353,7 @@ impl GatewayStore {
                 &mut tx,
                 &format!("reply:{}:{}", turn.turn_id, reply.message_id),
                 &pending.route,
-                (&pending.event_id, ReplyKind::Message),
+                (&pending.event_id, pending.reply_kind),
                 DeliveryBody::Reply { reply: preview },
                 Some(pending.principal),
                 device,
@@ -356,7 +375,7 @@ impl GatewayStore {
                 &mut tx,
                 &format!("turn-status:{}", turn.turn_id),
                 &pending.route,
-                (&pending.event_id, ReplyKind::Message),
+                (&pending.event_id, pending.reply_kind),
                 DeliveryBody::Notice { text: text.into() },
                 Some(pending.principal),
                 device,

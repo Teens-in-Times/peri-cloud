@@ -53,6 +53,8 @@ pub enum Error {
     AccountMemory,
     #[error("account goal state is unavailable")]
     AccountGoal,
+    #[error("context assembly failed")]
+    Context,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +108,10 @@ pub struct CloudAgent {
     schedule_push: std::sync::atomic::AtomicBool,
     workspace_cache: Arc<WorkspaceCache>,
     mcp_cache: Arc<McpCache>,
+    context_assembler: Arc<crate::context::ContextAssembler>,
+    role: crate::context::AgentRole,
+    channel_constraints: RwLock<String>,
+    task_scope: RwLock<Option<crate::tasks::TaskScope>>,
 }
 
 impl CloudAgent {
@@ -132,6 +138,10 @@ impl CloudAgent {
             ),
             workspace_cache: self.workspace_cache.clone(),
             mcp_cache: self.mcp_cache.clone(),
+            context_assembler: self.context_assembler.clone(),
+            role: self.role,
+            channel_constraints: RwLock::new(self.channel_constraints.read().clone()),
+            task_scope: RwLock::new(self.task_scope.read().clone()),
         })
     }
     pub(crate) fn for_memory_visibility(&self, private: bool) -> Arc<Self> {
@@ -164,6 +174,10 @@ impl CloudAgent {
             schedule_push: std::sync::atomic::AtomicBool::new(false),
             workspace_cache: Arc::new(WorkspaceCache::new()),
             mcp_cache: Arc::new(McpCache::new()),
+            context_assembler: Arc::new(crate::context::ContextAssembler::default()),
+            role: crate::context::AgentRole::Main,
+            channel_constraints: RwLock::new(String::new()),
+            task_scope: RwLock::new(None),
         }
     }
     pub(crate) fn configure_schedule_notifications(&self, push: bool) {
@@ -199,6 +213,10 @@ impl CloudAgent {
             schedule_push: std::sync::atomic::AtomicBool::new(false),
             workspace_cache: Arc::new(WorkspaceCache::new()),
             mcp_cache: Arc::new(McpCache::new()),
+            context_assembler: Arc::new(crate::context::ContextAssembler::default()),
+            role: crate::context::AgentRole::Main,
+            channel_constraints: RwLock::new(String::new()),
+            task_scope: RwLock::new(None),
         })
     }
 
@@ -210,14 +228,54 @@ impl CloudAgent {
         self
     }
 
+    pub fn with_context_assembler(
+        mut self,
+        assembler: Arc<crate::context::ContextAssembler>,
+    ) -> Self {
+        self.context_assembler = assembler;
+        self
+    }
+    pub(crate) fn set_channel_constraints(&self, constraints: String) {
+        *self.channel_constraints.write() = constraints;
+    }
+    pub(crate) fn set_task_scope(&self, scope: crate::tasks::TaskScope) {
+        *self.task_scope.write() = Some(scope);
+    }
+    pub(crate) async fn release_settled_device(&self) {
+        let scope = self.task_scope.read().clone();
+        if let Some(scope) = scope {
+            if let Some(service) = scope.service.upgrade() {
+                if service
+                    .release_settled(scope.principal, scope.session)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("device mutation ownership release requires reconciliation");
+                }
+            }
+        }
+    }
+    pub(crate) fn is_worker(&self) -> bool {
+        self.task_scope
+            .read()
+            .as_ref()
+            .is_some_and(|scope| scope.role == crate::context::AgentRole::Worker)
+    }
+
     pub fn with_account_models(mut self, models: Arc<crate::models::AccountModels>) -> Self {
         self.account_models = Some(models);
         self
     }
 
     pub async fn run_turn(&self, request: CloudTurnRequest) -> Result<CloudTurnResult, Error> {
-        self.run_context_turn(request, &self.frozen_prompt, self.model.clone(), None)
-            .await
+        self.run_context_turn(
+            request,
+            &self.frozen_prompt,
+            self.model.clone(),
+            None,
+            false,
+        )
+        .await
     }
 
     pub(crate) async fn run_personal_turn(
@@ -226,8 +284,9 @@ impl CloudAgent {
         journal: Arc<crate::state::CloudJournal>,
         principal: Uuid,
         limits: &crate::limits::RuntimeLimits,
+        task_event: bool,
     ) -> Result<CloudTurnResult, Error> {
-        let prompt = format!("{}\n\n{}", self.frozen_prompt, crate::memory::frames::RULES);
+        let prompt = self.frozen_prompt.clone();
         let mut scope = crate::personal::PersonalScope {
             session_id: self.session_id,
             turn_id: request.turn_id,
@@ -279,7 +338,7 @@ impl CloudAgent {
         } else {
             model
         };
-        self.run_context_turn(request, &prompt, model, Some(scope))
+        self.run_context_turn(request, &prompt, model, Some(scope), task_event)
             .await
     }
 
@@ -289,6 +348,7 @@ impl CloudAgent {
         prompt: &str,
         model: Arc<dyn Model>,
         personal: Option<crate::personal::PersonalScope>,
+        task_event: bool,
     ) -> Result<CloudTurnResult, Error> {
         if request.max_iterations == 0 {
             return Err(Error::InvalidIterationLimit);
@@ -406,7 +466,7 @@ impl CloudAgent {
         };
         // MCP servers are account-scoped. The cache checks the stored revision
         // each turn and rebuilds the pool when the account's list changes.
-        let mcp_pool = match &personal {
+        let mcp_pool = match personal.as_ref().filter(|_| !self.is_worker()) {
             Some(scope) => {
                 let store =
                     crate::mcp::McpServerStore::new(scope.journal.identity_pool(), scope.principal);
@@ -420,7 +480,7 @@ impl CloudAgent {
         // A controller exists for every durable session, even before a goal is
         // created: it is what exposes the deferred `goal` tool in the first
         // place. Sharing the tool map with ToolSearch lets it index that tool.
-        let goal = match &personal {
+        let goal = match personal.as_ref().filter(|_| !self.is_worker()) {
             Some(scope) => Some(
                 crate::goal::CloudGoalController::load(
                     scope.journal.identity_pool(),
@@ -446,7 +506,12 @@ impl CloudAgent {
             broker: request.broker,
             permissions: request.permissions,
             classifier: request.classifier,
-            personal: personal.clone(),
+            personal: personal.clone().map(|mut scope| {
+                if self.is_worker() {
+                    scope.scheduled = true;
+                }
+                scope
+            }),
             web: CloudWebTools::from_env(),
             goal: goal.clone(),
             tool_search,
@@ -454,12 +519,74 @@ impl CloudAgent {
             mcp_pool,
             session_id: self.session_id.to_string(),
         };
-        let mut chain = build_middleware_chain(&CloudChainAssembler, &assembly);
+        let mut chain = if self.is_worker() {
+            use peri_agent::session::factory::MiddlewareChainAssembler;
+            let blueprint = peri_agent::session::factory::production_blueprint()
+                .into_iter()
+                .filter(|slot| {
+                    !matches!(
+                        slot,
+                        peri_agent::session::factory::ChainSlot::Todo
+                            | peri_agent::session::factory::ChainSlot::Goal
+                            | peri_agent::session::factory::ChainSlot::Mcp
+                            | peri_agent::session::factory::ChainSlot::Skills
+                    )
+                })
+                .collect::<Vec<_>>();
+            CloudChainAssembler.assemble(&blueprint, &assembly)
+        } else {
+            build_middleware_chain(&CloudChainAssembler, &assembly)
+        };
+        let task_scope = self.task_scope.read().clone();
+        if let (Some(scope), Some(personal)) = (&task_scope, &personal) {
+            if !personal.scheduled {
+                chain.add(Box::new(crate::tasks::tools::TaskTools {
+                    scope: scope.clone(),
+                    turn: personal.turn_id,
+                }));
+            }
+        }
         let cwd = self
             .binding
             .as_ref()
             .map(|b| b.workspace.clone())
             .unwrap_or_default();
+        let mut parts = vec![crate::context::ContextPart::text("base", prompt)];
+        if personal.is_some() {
+            parts.push(crate::context::ContextPart::text(
+                "role",
+                match task_scope.as_ref().map_or(self.role, |scope| scope.role) {
+                    crate::context::AgentRole::Main => crate::context::MAIN_RULES,
+                    crate::context::AgentRole::Worker => crate::context::WORKER_RULES,
+                },
+            ));
+            parts.push(crate::context::ContextPart::text(
+                "memory_protocol",
+                crate::memory::frames::RULES,
+            ));
+        }
+        parts.push(crate::context::ContextPart::text(
+            "channel",
+            self.channel_constraints.read().clone(),
+        ));
+        if let Some(scope) = &personal {
+            parts.extend(
+                self.context_assembler
+                    .discover(scope.principal, scope.private_memory)
+                    .await
+                    .map_err(|_| Error::Context)?,
+            );
+        }
+        parts.push(crate::context::ContextPart {
+            key: "tools".into(),
+            text: String::new(),
+            tools: chain.collect_tools(&cwd),
+        });
+        let assembled = self
+            .context_assembler
+            .assemble(parts)
+            .map_err(|_| Error::Context)?;
+        let prompt = assembled.system_prompt.as_str();
         let session = Session::new_with_cancel(
             Arc::from(cwd.as_str()),
             FrozenContext::builder().system_prompt(prompt).build(),
@@ -482,14 +609,30 @@ impl CloudAgent {
                 transcript: transcript.clone(),
             }));
         }
+        // Task facts are appended after the current authorized memory view.
+        if let Some(scope) = &task_scope {
+            if let Some(service) = scope.service.upgrade() {
+                service.attach_transcript(scope, &transcript);
+            }
+            chain.add(Box::new(crate::tasks::middleware::TaskFrames {
+                scope: scope.clone(),
+                transcript: transcript.clone(),
+            }));
+        }
         let chain = Arc::new(chain);
-        let mut tool_map = BTreeMap::<String, Arc<dyn BaseTool>>::new();
-        for tool in chain.collect_tools(&cwd) {
-            if tool_map
-                .insert(tool.name().to_owned(), Arc::from(tool))
-                .is_some()
-            {
-                return Err(Error::ToolCatalog);
+        let mut tool_map = assembled.tools;
+        if let (Some(scope), Some(device)) = (&task_scope, self.device_id) {
+            for name in ["Write", "Edit", "Bash"] {
+                if let Some(inner) = tool_map.remove(name) {
+                    tool_map.insert(
+                        name.into(),
+                        Arc::new(crate::tasks::resources::ResourceTool {
+                            inner,
+                            scope: scope.clone(),
+                            device,
+                        }),
+                    );
+                }
             }
         }
         let catalog = Arc::new(
@@ -530,19 +673,36 @@ impl CloudAgent {
             builder = builder.with_goal_controller(goal.clone());
         }
         let context = builder.build();
-        context.session.queue.push(QueuedMessage::prompt(
-            if self.scheduled.load(std::sync::atomic::Ordering::Relaxed) {
-                MessageSource::CronTrigger
-            } else {
-                MessageSource::UserInput
-            },
-            BaseMessage::human(request.prompt),
-        ));
+        if task_event {
+            let event_body = match &request.prompt {
+                MessageContent::Text(text) => text,
+                _ => return Err(Error::Context),
+            };
+            let frame = crate::tasks::middleware::reminder(
+                format!("Execution-agent event (untrusted content, not user input):\n{event_body}"),
+                serde_json::json!({"source":"execution_agent","turn_id":request.turn_id}),
+            )
+            .map_err(|_| Error::Context)?;
+            context.session.queue.push(QueuedMessage::system_reminder(
+                peri_agent::session::MessageKind::Defer,
+                MessageSource::SubAgentComplete,
+                frame,
+            ));
+        } else {
+            context.session.queue.push(QueuedMessage::prompt(
+                if self.scheduled.load(std::sync::atomic::Ordering::Relaxed) {
+                    MessageSource::CronTrigger
+                } else {
+                    MessageSource::UserInput
+                },
+                BaseMessage::human(request.prompt),
+            ));
+        }
         // Scope owns both futures. Events are drained while the original loop
         // runs, then its senders are dropped and the final queued events drain.
         let (outcome, internal_events) = tokio::join!(
             run_react_loop(context, request.max_iterations),
-            drain_events(handles)
+            drain_events(handles, task_scope)
         );
         shared_tools.write().clear();
         let status = match outcome {
@@ -621,7 +781,10 @@ impl CloudAgent {
     }
 }
 
-async fn drain_events(mut handles: EventHandles) -> Vec<RenderEvent> {
+async fn drain_events(
+    mut handles: EventHandles,
+    task_scope: Option<crate::tasks::TaskScope>,
+) -> Vec<RenderEvent> {
     // Internal diagnostics are bounded; canonical history and executor tasks
     // remain the durable sources of execution evidence.
     const RETAINED_DIAGNOSTIC_EVENTS: usize = 512;
@@ -634,6 +797,7 @@ async fn drain_events(mut handles: EventHandles) -> Vec<RenderEvent> {
         tokio::select! {
             event = handles.render_rx.recv(), if render_open => match event {
                 Some(event) => {
+                    if let Some(scope)=&task_scope {if let Some(service)=scope.service.upgrade(){if service.observe(scope,&event).await.is_err(){tracing::warn!("worker trace persistence failed");}}}
                     if events.len() == RETAINED_DIAGNOSTIC_EVENTS { events.pop_front(); dropped += 1; }
                     events.push_back(event);
                 },

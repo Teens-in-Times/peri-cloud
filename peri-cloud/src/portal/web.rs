@@ -55,6 +55,7 @@ pub(super) async fn select(
 #[serde(deny_unknown_fields)]
 pub(super) struct Message {
     text: String,
+    request_id: Option<Uuid>,
 }
 
 pub(super) async fn send(
@@ -64,5 +65,31 @@ pub(super) async fn send(
 ) -> Result<Json<WebSendResult>, PortalError> {
     let actor = security::browser(&portal, &headers, true).await?;
     let gateway = portal.gateway.as_ref().ok_or(PortalError::Invalid)?;
-    Ok(Json(gateway.web_send(&actor, input.text).await?))
+    Ok(Json(
+        gateway
+            .web_send_idempotent(
+                &actor,
+                input.text,
+                input.request_id.unwrap_or_else(Uuid::new_v4),
+            )
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ConversationSelection {
+    request_id: Uuid,
+    session_id: Option<Uuid>,
+}
+pub(super) async fn conversation(
+    State(portal): State<Portal>,
+    headers: HeaderMap,
+    Json(input): Json<ConversationSelection>,
+) -> Result<Json<Value>, PortalError> {
+    let actor = security::browser(&portal, &headers, true).await?;
+    let gateway = portal.gateway.as_ref().ok_or(PortalError::Invalid)?;
+    Ok(Json(
+        json!({"session_id":gateway.select_logical_conversation(&actor,input.request_id,input.session_id).await?}),
+    ))
 }

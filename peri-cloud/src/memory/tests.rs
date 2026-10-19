@@ -26,6 +26,9 @@ async fn schema_eleven_imports_original_once_and_removes_the_old_contract() {
     let (root, journal, a, b) = fixture().await;
     let pool = journal.identity_pool();
     for sql in [
+        "DROP TABLE agent_task_trace", "DROP TABLE agent_task_messages",
+        "DROP TABLE agent_device_leases", "DROP TABLE agent_tasks",
+        "DROP TABLE gateway_queue", "DROP TABLE conversation_projections",
         "DROP TABLE memory_session_audience", "DROP TABLE memory_fts","DROP TABLE memory_audit","DROP TABLE memory_items","DROP TABLE memory_accounts","DROP TABLE user_preferences",
         "CREATE TABLE user_data (principal TEXT PRIMARY KEY REFERENCES principals(id),revision INTEGER NOT NULL,instructions TEXT NOT NULL,memory TEXT NOT NULL)",
         "PRAGMA user_version=11",

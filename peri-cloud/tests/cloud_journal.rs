@@ -371,6 +371,9 @@ async fn schema_eight_migrates_to_nine_and_preserves_rows() {
         .await
         .unwrap();
     for sql in [
+        "DROP TABLE agent_task_trace", "DROP TABLE agent_task_messages",
+        "DROP TABLE agent_device_leases", "DROP TABLE agent_tasks",
+        "DROP TABLE gateway_queue", "DROP TABLE conversation_projections",
         "DROP TABLE memory_session_audience", "DROP TABLE memory_fts",
         "DROP TABLE memory_audit",
         "DROP TABLE memory_items",
@@ -406,7 +409,7 @@ async fn schema_eight_migrates_to_nine_and_preserves_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     let (application_id,): (i64,) = sqlx::query_as("PRAGMA application_id")
         .fetch_one(&pool)
         .await
@@ -438,7 +441,7 @@ async fn schema_eight_migrates_to_nine_and_preserves_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     pool.close().await;
     journal.close().await;
 }

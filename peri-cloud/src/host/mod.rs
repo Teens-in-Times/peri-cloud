@@ -198,6 +198,10 @@ pub async fn serve(config: HostConfig, stop: CancellationToken) -> HostResult<()
         Some(identity.connection_store()),
     )?;
     connector.set_account_models(account_models.clone());
+    connector.set_context_assembler(Arc::new(
+        crate::context::ContextAssembler::new(config.context, config.state_dir.join("context"))
+            .map_err(|_| HostError::Configuration)?,
+    ));
     let runtime =
         CloudRuntime::with_limits(journal, config.limits).map_err(|_| HostError::Configuration)?;
     let mut adapters: Vec<Arc<dyn MessageAdapter>> = qq

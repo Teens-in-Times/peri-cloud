@@ -3,6 +3,7 @@
 pub mod aggregation;
 mod assembly;
 pub mod commands;
+pub mod context;
 mod core;
 pub mod gateway;
 mod goal;
@@ -20,6 +21,7 @@ mod reply;
 mod runtime;
 pub mod scheduler;
 pub mod state;
+mod tasks;
 mod workspace;
 
 pub use core::{CloudAgent, CloudTurnRequest, CloudTurnResult, Error, TurnStatus};

@@ -48,6 +48,7 @@ struct LiveSession {
 }
 
 struct OwnedTask {
+    background: bool,
     principal_id: Uuid,
     session_id: Uuid,
     turn_id: Option<Uuid>,
@@ -112,11 +113,9 @@ impl CloudRuntime {
         &self.limits
     }
     pub(crate) fn has_active_for(&self, principal: Uuid) -> bool {
-        self.ownership
-            .lock()
-            .tasks
-            .values()
-            .any(|task| task.principal_id == principal && !task.handle.is_finished())
+        self.ownership.lock().tasks.values().any(|task| {
+            task.principal_id == principal && !task.background && !task.handle.is_finished()
+        })
     }
 
     pub async fn attach(
@@ -284,6 +283,7 @@ impl CloudRuntime {
         let task_id = Uuid::new_v4();
         let session_id = request.session_id;
         let principal_id = request.principal_id;
+        let background = live.agent.is_worker();
         let cancellation = CancellationToken::new();
         let (sender, receiver) = oneshot::channel();
         {
@@ -294,14 +294,24 @@ impl CloudRuntime {
             let active: Vec<_> = owner
                 .tasks
                 .values()
-                .filter(|t| !t.handle.is_finished())
+                .filter(|t| !t.handle.is_finished() && t.background == background)
                 .collect();
-            if active.len() >= self.limits.max_active_turns
+            let total_limit = if background {
+                self.limits.max_background_turns
+            } else {
+                self.limits.max_active_turns
+            };
+            let user_limit = if background {
+                self.limits.max_background_per_user
+            } else {
+                self.limits.max_active_per_user
+            };
+            if active.len() >= total_limit
                 || active
                     .iter()
                     .filter(|t| t.principal_id == principal_id)
                     .count()
-                    >= self.limits.max_active_per_user
+                    >= user_limit
             {
                 return Err(StateError::Limit.into());
             }
@@ -317,6 +327,7 @@ impl CloudRuntime {
             owner.tasks.insert(
                 task_id,
                 OwnedTask {
+                    background,
                     principal_id,
                     session_id,
                     turn_id: None,
@@ -430,12 +441,14 @@ impl CloudRuntime {
                 self.journal.clone(),
                 request.principal_id,
                 &self.limits,
+                admission.turn.request_key.starts_with("task-event:"),
             )
             .await;
         timer.abort();
         match result {
             Ok(result) => {
                 self.journal.settle(admission.turn.turn_id, &result).await?;
+                live.agent.release_settled_device().await;
                 Ok(())
             }
             Err(_) => {
@@ -520,6 +533,7 @@ impl CloudRuntime {
             owner.tasks.insert(
                 Uuid::new_v4(),
                 OwnedTask {
+                    background: false,
                     principal_id,
                     session_id: id,
                     turn_id: None,

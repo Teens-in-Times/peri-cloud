@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub struct RuntimeLimits {
     pub max_active_turns: usize,
     pub max_active_per_user: usize,
+    pub max_background_turns: usize,
+    pub max_background_per_user: usize,
     pub daily_turns: u32,
     pub daily_model_requests: u32,
     pub max_turn_seconds: u64,
@@ -18,6 +20,8 @@ impl Default for RuntimeLimits {
         Self {
             max_active_turns: 4,
             max_active_per_user: 1,
+            max_background_turns: 2,
+            max_background_per_user: 1,
             daily_turns: 200,
             daily_model_requests: 1000,
             max_turn_seconds: 600,
@@ -31,6 +35,8 @@ impl RuntimeLimits {
     pub fn valid(&self) -> bool {
         (1..=128).contains(&self.max_active_turns)
             && (1..=self.max_active_turns).contains(&self.max_active_per_user)
+            && (1..=64).contains(&self.max_background_turns)
+            && (1..=self.max_background_turns).contains(&self.max_background_per_user)
             && (1..=100000).contains(&self.daily_turns)
             && (1..=1000000).contains(&self.daily_model_requests)
             && (1..=86400).contains(&self.max_turn_seconds)

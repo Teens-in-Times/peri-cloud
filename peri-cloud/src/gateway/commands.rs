@@ -1,5 +1,5 @@
 //! Chat command vocabulary; adapters share the same deterministic controls.
-use super::{ChannelRoute, Gateway, GatewayError, GatewayResult};
+use super::{ChannelRoute, Gateway, GatewayResult};
 use crate::identity::DeviceRecord;
 use uuid::Uuid;
 
@@ -77,7 +77,7 @@ pub(super) fn normalize(text: &str) -> String {
 }
 
 pub(super) fn help() -> &'static str {
-    "QQ 命令（官方机器人与个人 QQ 通用）\n\n会话\n/new：当前设备和目录开启空白会话，保留权限与模型，旧历史保留\n/clear（/cls、/reset）：清空当前上下文，保留历史\n/rewind 消息ID --no-revert-files：回退上下文，不改文件\n/loop 目标：按原 Agent 循环执行目标\n/history [页码|messages]：会话列表或本会话消息 ID\n/resume 会话ID：恢复历史会话\n/compact：生成摘要并继续当前会话，保留原始历史；会调用模型并计入额度\n/status：任务状态\n/cancel 或 /stop：请求取消当前任务\n/result [页码]：查看已存结果\n/pwd 或 /context：查看当前会话、设备、目录与权限\n\n设备与配置\n/devices：选择设备\n/connect 设备ID [绝对路径]：连接设备\n/workspace [绝对路径]：选择或切换目录\n/model [模型名]：查看或切换模型，default 恢复默认\n/permissions [default|edit|all]：工具权限\n/schedule 或 /定时：主动聊天与定时任务，查看创建/暂停/恢复/删除用法\n/usage：用量\n/memory：个人记忆\n/settings：个人设置\n/gateway：管理员私聊管理白黑名单\n\n/menu：打开按钮菜单\n/help 或 /commands：本帮助\n中文命令继续可用；/新会话、/压缩也可使用。\n/new 和 /compact 须等待当前任务结束；有未确认的执行状态时不会强行清空或切换。"
+    "QQ 命令（官方机器人与个人 QQ 通用）\n\n会话\n/new：当前设备和目录开启空白会话，保留权限与模型，旧历史保留\n/clear（/cls、/reset）：清空当前上下文，保留历史\n/rewind 消息ID --no-revert-files：回退上下文，不改文件\n/loop 目标：按原 Agent 循环执行目标\n/history [页码|messages]：会话列表或本会话消息 ID\n/resume 会话ID：恢复历史会话\n/compact：生成摘要并继续当前会话，保留原始历史；会调用模型并计入额度\n/status：任务状态\n/cancel 或 /stop：请求取消当前任务\n/result [页码]：查看已存结果\n/pwd 或 /context：查看当前会话、设备、目录与权限\n\n设备与配置\n/devices：选择设备\n/connect 设备ID [绝对路径]：连接设备\n/workspace [绝对路径]：选择或切换目录\n/model [模型名]：查看或切换模型，default 恢复默认\n/permissions [default|edit|all]：工具权限\n/schedule 或 /定时：主动聊天与定时任务，查看创建/暂停/恢复/删除用法\n/usage：用量\n/memory：个人记忆\n/settings：个人设置\n/gateway：管理员私聊管理白黑名单\n\n/menu：打开按钮菜单\n/help 或 /commands：本帮助\n中文命令继续可用；/新会话、/压缩也可使用。\n/new 可新建独立会话，旧轮次与回复来源保留；/compact 须等待当前任务结束。未确认的执行状态不会自动重放。"
 }
 
 impl Gateway {
@@ -141,9 +141,6 @@ impl Gateway {
         old: Uuid,
     ) -> GatewayResult<String> {
         let state = self.journal().session(principal, old).await?;
-        if !state.execution_settled() || self.journal().has_unconfirmed_turn(old).await? {
-            return Err(GatewayError::Busy);
-        }
         let agent = self
             .connector
             .open_workspace(principal, device, &state.frozen.workspace())
