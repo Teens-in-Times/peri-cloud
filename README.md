@@ -138,3 +138,5 @@ QQ 日常操作与交互审计：[QQ 优先交互说明](docs/qq-experience-audi
 架构升级与产品边界见 [实况审计与目标方案](docs/architecture-upgrade-20261017.md)，接口、独立部署及恢复见 [控制接口与运维](docs/control-operations.md)。
 
 QQ 原生命令发现、执行 API、扩展接口和兼容范围：[QQ CLI 命令](docs/qq-cli-commands.md)。
+
+本轮执行架构的逐项验证、故障恢复证据和实际限制见 [完整验收记录](docs/execution-continuity-verification.md)。最新可编辑实现拓扑为 [执行架构快照](docs/design/peri-workbench/execution-architecture-20261019.html)，使用独立存档身份，保留原画板修改。

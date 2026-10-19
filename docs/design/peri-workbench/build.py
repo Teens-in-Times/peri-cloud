@@ -36,5 +36,12 @@ if len(template.splitlines()) >= 1000:
 (root / "index.html").write_text(template, encoding="utf-8", newline="\n")
 if atlas.exists():
     (root / "atlas-20261019.html").write_text(template, encoding="utf-8", newline="\n")
+    fresh = dict(workspace, workspaceId="peri-execution-20261019-schema23")
+    old_snapshot = json.dumps(workspace, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
+    fresh_snapshot = json.dumps(fresh, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
+    if template.count(old_snapshot) != 1:
+        raise ValueError("Expected one immutable source snapshot")
+    (root / "execution-architecture-20261019.html").write_text(
+        template.replace(old_snapshot, fresh_snapshot), encoding="utf-8", newline="\n")
 print(json.dumps({"output": str(root / "index.html"), "bytes": len(template.encode("utf-8")),
                   "lines": len(template.splitlines())}, ensure_ascii=False))

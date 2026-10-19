@@ -115,8 +115,19 @@ impl WorkerService {
             let input = call.input.to_string();
             entries.push(json!({"cursor":row.get::<i64,_>("seq"),"turn_id":row.get::<String,_>("turn_id"),"window_id":row.get::<String,_>("window_id"),"invocation_id":row.get::<Option<String>,_>("invocation_id"),"call_id":call.id,"name":call.name,"call_hash":row.get::<String,_>("call_hash"),"input_preview":clip(&input,800),"input_bytes":input.len(),"input_truncated":input.chars().count()>800,"receipt_recorded":result.is_some(),"execution":result.as_ref().and_then(|r|r.execution.as_ref()),"is_error":result.as_ref().map(|r|r.is_error),"output_preview":result.as_ref().map(|r|clip(&r.output,1200)),"output_truncated":result.as_ref().is_some_and(|r|r.output.chars().count()>1200)}));
         }
+        let next = entries
+            .last()
+            .and_then(|e| e["cursor"].as_i64())
+            .unwrap_or(after);
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_task_operations WHERE task_id=? AND seq>?",
+        )
+        .bind(task.to_string())
+        .bind(next)
+        .fetch_one(&self.store.pool)
+        .await?;
         Ok(
-            json!({"next_cursor":entries.last().and_then(|e|e["cursor"].as_i64()).unwrap_or(after),"entries":entries,"previews":true,"missing_receipt":"unknown; never replay"}),
+            json!({"next_cursor":next,"has_more":remaining>0,"entries":entries,"previews":true,"missing_receipt":"unknown; never replay"}),
         )
     }
 }

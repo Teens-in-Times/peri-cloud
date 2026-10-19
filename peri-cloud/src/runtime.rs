@@ -49,6 +49,7 @@ struct LiveSession {
 
 struct OwnedTask {
     background: bool,
+    parked: bool,
     principal_id: Uuid,
     session_id: Uuid,
     turn_id: Option<Uuid>,
@@ -301,7 +302,7 @@ impl CloudRuntime {
             let active: Vec<_> = owner
                 .tasks
                 .values()
-                .filter(|t| !t.handle.is_finished() && t.background == background)
+                .filter(|t| !t.handle.is_finished() && !t.parked && t.background == background)
                 .collect();
             let total_limit = if background {
                 self.limits.max_background_turns
@@ -335,6 +336,7 @@ impl CloudRuntime {
                 task_id,
                 OwnedTask {
                     background,
+                    parked: false,
                     principal_id,
                     session_id,
                     turn_id: None,
@@ -372,6 +374,85 @@ impl CloudRuntime {
             .map(|task| task.cancellation.clone())
     }
 
+    pub(crate) fn park_background(&self, principal: Uuid, session: Uuid, turn: Uuid) -> bool {
+        let mut owner = self.ownership.lock();
+        if owner
+            .tasks
+            .values()
+            .filter(|t| t.parked && !t.handle.is_finished())
+            .count()
+            >= 64
+        {
+            return false;
+        }
+        if let Some(task) = owner.tasks.values_mut().find(|t| {
+            t.background
+                && t.principal_id == principal
+                && t.session_id == session
+                && t.turn_id == Some(turn)
+                && !t.handle.is_finished()
+        }) {
+            task.parked = true;
+            true
+        } else {
+            false
+        }
+    }
+    pub(crate) async fn resume_background(
+        &self,
+        principal: Uuid,
+        session: Uuid,
+        turn: Uuid,
+        cancel: &CancellationToken,
+    ) -> bool {
+        loop {
+            if cancel.is_cancelled() {
+                return false;
+            }
+            {
+                let mut owner = self.ownership.lock();
+                if owner.closing {
+                    return false;
+                }
+                let key = owner
+                    .tasks
+                    .iter()
+                    .find(|(_, t)| {
+                        t.background
+                            && t.principal_id == principal
+                            && t.session_id == session
+                            && t.turn_id == Some(turn)
+                    })
+                    .map(|(id, _)| *id);
+                let Some(key) = key else {
+                    return false;
+                };
+                if !owner.tasks[&key].parked {
+                    return true;
+                }
+                let active: Vec<_> = owner
+                    .tasks
+                    .values()
+                    .filter(|t| t.background && !t.parked && !t.handle.is_finished())
+                    .collect();
+                if active.len() < self.limits.max_background_turns
+                    && active
+                        .iter()
+                        .filter(|t| t.principal_id == principal)
+                        .count()
+                        < self.limits.max_background_per_user
+                {
+                    owner
+                        .tasks
+                        .get_mut(&key)
+                        .expect("owned task under lock")
+                        .parked = false;
+                    return true;
+                }
+            }
+            tokio::select! { _=cancel.cancelled()=>return false,_=tokio::time::sleep(Duration::from_millis(25))=>() }
+        }
+    }
     async fn run_owned(
         self: Arc<Self>,
         task_id: Uuid,
@@ -541,6 +622,7 @@ impl CloudRuntime {
                 Uuid::new_v4(),
                 OwnedTask {
                     background: false,
+                    parked: false,
                     principal_id,
                     session_id: id,
                     turn_id: None,

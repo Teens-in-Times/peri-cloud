@@ -593,6 +593,11 @@ impl CloudAgent {
             .assemble(parts)
             .map_err(|_| Error::Context)?;
         let prompt = assembled.system_prompt.as_str();
+        let effective_window = model
+            .context_window()
+            .map_or(self.context_window, |window| {
+                window.min(self.context_window)
+            });
         let session = Session::new_with_cancel(
             Arc::from(cwd.as_str()),
             FrozenContext::builder().system_prompt(prompt).build(),
@@ -626,7 +631,7 @@ impl CloudAgent {
                 transcript: transcript.clone(),
                 turn: request.turn_id,
                 prior_context,
-                context_window: self.context_window,
+                context_window: effective_window,
                 max_iterations: request.max_iterations,
                 overhead_tokens: (prompt.len()
                     + assembled
@@ -689,7 +694,7 @@ impl CloudAgent {
                     .and_then(|scope| scope.execution_agent)
                     .unwrap_or(self.session_id),
             ))
-            .with_context_budget(ContextBudget::new(self.context_window))
+            .with_context_budget(ContextBudget::new(effective_window))
             .with_compact_config(CompactConfig {
                 auto_compact_enabled: !self.is_worker(),
                 ..CompactConfig::default()

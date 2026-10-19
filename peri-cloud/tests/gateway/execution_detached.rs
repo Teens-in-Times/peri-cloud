@@ -1,6 +1,113 @@
 use super::*;
 
 #[tokio::test]
+async fn expired_memory_boundary_invalidates_a_waiting_task_before_any_new_work() {
+    use peri_cloud::memory::{MemoryContent, MemoryKind, MemorySource, MemoryStore};
+    let f = Fixture::new_for(
+        vec![
+            call(
+                "delegate_task",
+                json!({"goal":"wait under a bounded memory lifetime"}),
+                "delegate",
+            ),
+            answer("delegated"),
+            call("wait_task", json!({"reason":"external condition"}), "wait"),
+        ],
+        true,
+    )
+    .await;
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3600;
+    MemoryStore::new(&f.c().journal, f.c().browser.principal().id, 65536)
+        .add(
+            Uuid::new_v4(),
+            0,
+            MemoryContent {
+                content: "temporary authorized fixture".into(),
+                kind: MemoryKind::Fact,
+                pinned: false,
+                valid_until: Some(expiry),
+            },
+            MemorySource::web(),
+        )
+        .await
+        .unwrap();
+    let parent = f
+        .c()
+        .gateway
+        .open_browser_workspace(&f.c().browser, Uuid::new_v4(), f.devices[0].id, None)
+        .await
+        .unwrap();
+    let turn = f
+        .c()
+        .gateway
+        .submit_browser_task(&f.c().browser, parent, Uuid::new_v4(), "delegate".into())
+        .await
+        .unwrap();
+    f.settled(parent, turn.turn_id).await;
+    pump(&f, 3).await;
+    let task = delegate_receipt(&f.script.requests.lock()[1])["task_id"].clone();
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(f.root.path().join("cloud.sqlite")),
+        )
+        .await
+        .unwrap();
+    let captured: i64 = sqlx::query_scalar(
+        "SELECT json_extract(record_json,'$.memory_expires_at') FROM agent_tasks WHERE id=?",
+    )
+    .bind(task.as_str().unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        captured, expiry,
+        "delegation captures the actual authorized memory lifetime"
+    );
+    // Simulate the persisted deadline having elapsed without sleeping or
+    // changing the host clock shared by unrelated regression tests.
+    sqlx::query("UPDATE agent_tasks SET record_json=json_set(record_json,'$.memory_expires_at',0) WHERE id=?").bind(task.as_str().unwrap()).execute(&pool).await.unwrap();
+    f.c().gateway.dispatch().await.unwrap();
+    let state: String = sqlx::query_scalar(
+        "SELECT json_extract(record_json,'$.state') FROM agent_tasks WHERE id=?",
+    )
+    .bind(task.as_str().unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "invalidated");
+    let before = f.script.requests.lock().len();
+    f.script.replies.lock().extend([
+        call("inspect_task", json!({"task_id":task}), "expired-task"),
+        answer("previous task's memory boundary expired"),
+    ]);
+    let turn = f
+        .c()
+        .gateway
+        .submit_browser_task(&f.c().browser, parent, Uuid::new_v4(), "inspect".into())
+        .await
+        .unwrap();
+    f.settled(parent, turn.turn_id).await;
+    assert_eq!(f.script.requests.lock().len(), before + 2);
+    assert_eq!(f.submissions[0].load(Ordering::SeqCst), 0);
+    assert!(f.script.requests.lock()[before + 1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["role"] == "tool"
+            && m["tool_call_id"] == "expired-task"
+            && m["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("outside this conversation"))));
+    pool.close().await;
+    f.finish().await;
+}
+
+#[tokio::test]
 async fn fresh_window_handoff_does_not_survive_a_real_forget_privacy_boundary() {
     use peri_cloud::memory::{MemoryContent, MemoryKind, MemorySource, MemoryStore};
     let limits = peri_cloud::limits::RuntimeLimits {

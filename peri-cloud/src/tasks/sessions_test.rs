@@ -99,6 +99,7 @@ fn task(scope: &TaskScope, execution: &ExecutionSession, key: &str) -> TaskRecor
         delivery: Default::default(),
         notified: false,
         privacy_epoch: 0,
+        memory_expires_at: None,
         parent_generation: 0,
         permission_mode: 0,
         private_memory: true,

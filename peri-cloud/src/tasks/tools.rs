@@ -80,6 +80,14 @@ struct SendMessage {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct TaskPage {
+    #[serde(default)]
+    after: i64,
+    #[serde(default = "page_size")]
+    limit: usize,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Control {
     task_id: Uuid,
     expected_revision: u64,
@@ -122,8 +130,8 @@ impl BaseTool for TaskTool {
         match self.name {
         "delegate_task"=>"Persist an independent cloud execution task and return immediately. Supply goal, constraints and acceptance; optional device/workspace must belong to this user. Native tools remain available for small operations. Workers use their own context and the original tool approval policy.",
         "list_execution_sessions"=>"List authorized execution conversations for explicit reuse. Reuse preserves work context across independent tasks, within the same device, canonical workspace and privacy scope. Supply the execution_session plus matching device/workspace to delegate_task.",
-        "list_tasks"=>"List bounded task status for this logical conversation. Runtime state and worker-authored notes are separate. Never poll continuously while the user wants to chat.",
-        "inspect_task"=>"Read status, full task contract, approval/operation receipts, windows, bounded trace, conversation or messages. Trace supports kind/query filters. Use detail with source/id/offset/chars/version for complete evidence in bounded versioned chunks; preserve the returned version across pages. For archived context, list windows then select window_id in conversation. Cropped previews and agent claims are not complete evidence; private reasoning is excluded.",
+        "list_tasks"=>"List paginated bounded task history for this logical conversation, newest first; pass next_cursor as after. Runtime state and worker-authored notes are separate. Never poll continuously while the user wants to chat.",
+        "inspect_task"=>"Read status, full task contract, approval/operation receipts, windows, bounded trace, conversation or messages. related_tasks pages prior tasks in the same explicitly reused execution session; these are historical evidence and do not grant control over other tasks. Trace supports kind/query filters. Use detail with source/id/offset/chars/version for complete evidence in bounded versioned chunks; preserve the returned version across pages. For archived context, list windows then select window_id in conversation. Cropped previews and agent claims are not complete evidence; private reasoning is excluded.",
         "message_task"=>"Send a supplement or question to this conversation's task at its current revision. Submitted, consumed and applied are different receipts. A message cannot authorize additional permissions.",
         "control_task"=>"Control a task at its current revision: pause at a safe boundary, resume a durable wait/paused task, rotate its context window, or cancel. Unknown execution is queried before any continuation; cancellation does not prove that an effect stopped.",
         "wait_task"=>"Durably wait for an external condition. Supply reason and optional resume_after_seconds (up to one week). Host stops at a safe boundary and releases the loop slot; main assistant can resume explicitly.",
@@ -139,9 +147,13 @@ impl BaseTool for TaskTool {
                 json!({"goal":{"type":"string","maxLength":16384},"constraints":{"type":"string","maxLength":16384},"acceptance":{"type":"string","maxLength":8192},"device_id":id,"workspace":{"type":"string"},"execution_session":id}),
                 vec!["goal"],
             ),
-            "list_tasks" | "list_execution_sessions" => (json!({}), vec![]),
+            "list_execution_sessions" => (json!({}), vec![]),
+            "list_tasks" => (
+                json!({"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32}}),
+                vec![],
+            ),
             "inspect_task" => (
-                json!({"task_id":id,"view":{"type":"string","enum":["status","trace","conversation","messages","operations","windows","contract","approvals","detail"]},"window_id":id,"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32},"kind":{"type":"string","maxLength":80},"query":{"type":"string","maxLength":200},"detail":{"type":"object","properties":{"source":{"type":"string","enum":["operation_input","operation_output","approval_input","conversation"]},"id":{"type":"string","maxLength":256},"offset":{"type":"integer","minimum":0},"chars":{"type":"integer","minimum":1,"maximum":16384},"version":{"type":"string","maxLength":80}},"required":["source","id"],"additionalProperties":false}}),
+                json!({"task_id":id,"view":{"type":"string","enum":["status","trace","conversation","messages","operations","windows","contract","approvals","detail","related_tasks"]},"window_id":id,"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32},"kind":{"type":"string","maxLength":80},"query":{"type":"string","maxLength":200},"detail":{"type":"object","properties":{"source":{"type":"string","enum":["operation_input","operation_output","approval_input","conversation"]},"id":{"type":"string","maxLength":256},"offset":{"type":"integer","minimum":0},"chars":{"type":"integer","minimum":1,"maximum":16384},"version":{"type":"string","maxLength":80}},"required":["source","id"],"additionalProperties":false}}),
                 vec!["task_id"],
             ),
             "message_task" => (
@@ -185,20 +197,32 @@ impl BaseTool for TaskTool {
                     .await?;
                 service.summary(&record)
             }
-            "list_tasks" | "list_execution_sessions" => {
+            "list_tasks" => {
+                let args: TaskPage = serde_json::from_value(input)?;
+                service
+                    .task_history_page(&self.scope, None, args.after, args.limit)
+                    .await?
+            }
+            "list_execution_sessions" => {
                 if input != json!({}) {
                     return Err(TaskError::Invalid.into());
                 }
-                if self.name == "list_execution_sessions" {
-                    service.list_execution_sessions(&self.scope).await?
-                } else {
-                    service.list(&self.scope).await?
-                }
+                service.list_execution_sessions(&self.scope).await?
             }
             "inspect_task" => {
                 let args: Inspect = serde_json::from_value(input)?;
-                let record = service.authorized(&self.scope, args.task_id).await?;
+                let record = service.readable(&self.scope, args.task_id).await?;
                 match args.view.as_str() {
+                    "related_tasks" => {
+                        service
+                            .task_history_page(
+                                &self.scope,
+                                Some(record.execution_session),
+                                args.after,
+                                args.limit.clamp(1, 32),
+                            )
+                            .await?
+                    }
                     "status" => {
                         let mut status = service.summary(&record);
                         status["instruction_version"] =
@@ -225,7 +249,9 @@ impl BaseTool for TaskTool {
                     "windows" => {
                         let rows:Vec<(i64,String)> = sqlx::query_as("SELECT window_number,cloud_session FROM agent_execution_windows WHERE execution_session=? AND window_number>=? ORDER BY window_number LIMIT ?")
                             .bind(record.execution_session.to_string()).bind(args.after.max(0)).bind(args.limit.clamp(1,16) as i64).fetch_all(&service.store.pool).await?;
-                        json!({"windows":rows.iter().map(|(n,id)|json!({"window_number":n,"window_id":id})).collect::<Vec<_>>(),"next_cursor":rows.last().map_or(args.after,|r|r.0+1)})
+                        let next = rows.last().map_or(args.after, |r| r.0 + 1);
+                        let remaining:i64=sqlx::query_scalar("SELECT COUNT(*) FROM agent_execution_windows WHERE execution_session=? AND window_number>=?").bind(record.execution_session.to_string()).bind(next).fetch_one(&service.store.pool).await?;
+                        json!({"windows":rows.iter().map(|(n,id)|json!({"window_number":n,"window_id":id})).collect::<Vec<_>>(),"next_cursor":next,"has_more":remaining>0,"complete":args.after==0&&remaining==0})
                     }
                     "operations" => {
                         service.reconcile_native().await?;
@@ -272,7 +298,18 @@ impl BaseTool for TaskTool {
                             .store
                             .consume(record.id, self.scope.session, &consumed)
                             .await?;
-                        json!({"messages":messages,"next_cursor":messages.last().and_then(|m|m["message_id"].as_i64()).unwrap_or(args.after),"truncated":messages.len()<count,"full_bodies":true})
+                        let next = messages
+                            .last()
+                            .and_then(|m| m["message_id"].as_i64())
+                            .unwrap_or(args.after);
+                        let remaining: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM agent_task_messages WHERE task_id=? AND seq>?",
+                        )
+                        .bind(record.id.to_string())
+                        .bind(next)
+                        .fetch_one(&service.store.pool)
+                        .await?;
+                        json!({"messages":messages,"next_cursor":next,"has_more":remaining>0,"truncated":messages.len()<count||remaining>0,"full_bodies":true,"complete":args.after==0&&remaining==0})
                     }
                     _ => return Err(TaskError::Invalid.into()),
                 }

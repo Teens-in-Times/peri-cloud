@@ -59,6 +59,8 @@ schema 23 允许已认证、已确认受理的旧原生工具继续运行，同�
 
 新窗口首次装配记忆时，原记忆屏障仍保持单调排除。任务层在核验当前账号、任务、设备、隐私版本及所有来源会话后，在屏障后重新装配当前任务的宿主交接帧；不取消原历史排除标记。真实遗忘、清空或来源失效使任务无权恢复，不能重新带入旧材料。
 
+私人任务还保存委派时个人记忆的最近有效期；到期使任务失效，不能借交接笔记重新引入过期记忆。公开任务不读取私人记忆，也不绑定这份私人期限。
+
 执行循环先结束而旧工具仍未结算时，任务进入 waiting_operations；确认原结果后才进入终态。普通外部等待仍释放推理槽位，运行中的修改继续占用设备。取消跨窗口任务通过持久 cloud_native_cancellations 向原绑定发送一次取消；响应未知只查询原操作，不盲目重发取消或原工具。
 
 inspect_task 提供以下视图，均核验当前账号、任务和隐私边界：
@@ -76,3 +78,5 @@ inspect_task 提供以下视图，均核验当前账号、任务和隐私边界�
 | detail | 授权证据的版本化分段详情 |
 
 使用返回的 next_cursor 翻页。trace 可用 kind 和 query 筛选，显式返回 has_more 和保留边界，不声称预览等于完整历史。detail 使用 source（operation_input、operation_output、approval_input 或 conversation）、id、offset 和 chars（最多 16384）分段读取；conversation 的 id 为 message_id，operation 的 id 为 cursor，审批的 id 为 request_id。后续分段传入返回的 version，内容变化时返回冲突，避免拼接不同版本。返回 total_chars/total_bytes、next_offset、complete 和 truncated；旧窗口读取遵守历史排除标记，并排除隐藏思考。任务历史与个人长期记忆保持独立，不自动整体写入个人记忆。
+
+list_tasks 默认返回当前主会话最近 12 项任务，after/limit（1–32）有界翻页，包含 tasks、next_cursor、has_more 和 newest_first 排序。inspect_task(view=related_tasks) 按相同契约读取显式共享的执行会话任务。跨主会话读取仅限已参与显式复用的来源，工作者只能读取当前执行会话历史；隐私版本、来源代次、记忆期限及设备授权仍须有效。message_task/control_task 等修改能力保持原任务归属。分页扫描可跳过失效记录，空页也须按 has_more 判断是否继续。

@@ -172,6 +172,7 @@ impl WorkerService {
             .await
             .map_err(|_| TaskError::Forbidden)?;
         if record.privacy_epoch != epoch
+            || record.memory_expires_at.is_some_and(|at| at <= now())
             || record.parent_generation != parent.context_generation
             || !self.execution_valid(&record).await?
         {
@@ -277,6 +278,14 @@ impl WorkerService {
             delivery: Default::default(),
             notified: false,
             privacy_epoch,
+            memory_expires_at: if gateway.worker_private_route(&scope.route) {
+                crate::memory::MemoryStore::new(&self.journal, scope.principal, 65536)
+                    .next_expiry()
+                    .await
+                    .map_err(|_| TaskError::Unavailable)?
+            } else {
+                None
+            },
             parent_generation: parent.context_generation,
             permission_mode: parent.permission_mode,
             private_memory: gateway.worker_private_route(&scope.route),
@@ -284,16 +293,6 @@ impl WorkerService {
         };
         self.store.insert(&record).await?;
         Ok(record)
-    }
-    pub async fn list(&self, scope: &TaskScope) -> Result<serde_json::Value> {
-        let records = self.store.list(scope).await?;
-        let mut summaries = Vec::new();
-        for record in records.into_iter().take(12) {
-            if let Ok(record) = self.authorized(scope, record.id).await {
-                summaries.push(self.summary(&record));
-            }
-        }
-        Ok(json!({"tasks":summaries}))
     }
     pub fn summary(&self, record: &TaskRecord) -> serde_json::Value {
         let plan: Vec<_> = record
@@ -356,8 +355,23 @@ impl WorkerService {
             let text = m.content();
             json!({"cursor":i+1,"message_id":m.id(),"role":role,"text":clip(&text,4000),"content_bytes":text.len(),"truncated":text.chars().count()>4000})
         }).collect();
+        let total = history
+            .iter()
+            .filter(|p| {
+                !flags
+                    .get(&p.id())
+                    .is_some_and(|f| f.excluded || f.truncated)
+            })
+            .filter(|p| p.as_message().is_some())
+            .count();
+        let next = entries
+            .last()
+            .and_then(|e| e["cursor"].as_i64())
+            .unwrap_or(after);
+        let more = total > next.max(0) as usize;
+        let complete = after == 0 && !more && entries.iter().all(|e| e["truncated"] == false);
         Ok(
-            json!({"entries":entries,"next_cursor":entries.last().and_then(|e|e["cursor"].as_i64()).unwrap_or(after),"window_id":window,"source":source,"exclusions_respected":true}),
+            json!({"entries":entries,"next_cursor":next,"has_more":more,"complete_visible_history":complete,"total_visible_messages":total,"window_id":window,"source":source,"exclusions_respected":true}),
         )
     }
     pub async fn tick(&self) -> Result<()> {
@@ -396,6 +410,7 @@ impl WorkerService {
                 .await
                 .map_err(|_| TaskError::Unavailable)?;
             if epoch != record.privacy_epoch
+                || record.memory_expires_at.is_some_and(|at| at <= now())
                 || parent.context_generation != record.parent_generation
                 || !device_valid
                 || !self.execution_valid(&record).await?

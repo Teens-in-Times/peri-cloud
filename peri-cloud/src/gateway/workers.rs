@@ -4,6 +4,20 @@ use crate::tasks::{Delegate, TaskRecord, TaskScope};
 use std::sync::Weak;
 
 impl Gateway {
+    pub(crate) fn park_worker(&self, scope: &TaskScope, turn: Uuid) -> bool {
+        self.runtime
+            .park_background(scope.principal, scope.session, turn)
+    }
+    pub(crate) async fn resume_worker_slot(
+        &self,
+        scope: &TaskScope,
+        turn: Uuid,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        self.runtime
+            .resume_background(scope.principal, scope.session, turn, cancel)
+            .await
+    }
     pub(crate) fn worker_cancellation(
         &self,
         principal: Uuid,

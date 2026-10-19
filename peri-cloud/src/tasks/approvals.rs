@@ -60,10 +60,49 @@ impl UserInteractionBroker for WorkerBroker {
                 .await;
             return InteractionResponse::Interrupted{reason:"Question persisted for the main assistant. This execution run waits durably for a parent reply; do not repeat the question.".into()};
         };
+        let parked = gateway.park_worker(&self.scope, turn.as_uuid());
         let result = tokio::select! {biased;
             _=cancel.cancelled()=>Err(TaskError::Unavailable),
             result=tokio::time::timeout(std::time::Duration::from_secs(90),service.review(&self.scope,turn.as_uuid(),items,cancel.clone()))=>result.unwrap_or(Err(TaskError::Unavailable)),
         };
+        if parked {
+            let mut capacity_wait = false;
+            if result.is_ok() {
+                if let Ok(mut record) = service
+                    .authorized(&self.scope, self.scope.task.unwrap_or(Uuid::nil()))
+                    .await
+                {
+                    if record.state == "running" {
+                        record.state = "waiting_capacity".into();
+                        if service.store.save(&mut record).await.is_err() {
+                            return interrupted();
+                        }
+                        capacity_wait = true;
+                    }
+                }
+            }
+            if !gateway
+                .resume_worker_slot(&self.scope, turn.as_uuid(), &cancel)
+                .await
+            {
+                return interrupted();
+            }
+            if capacity_wait {
+                let Ok(mut record) = service
+                    .authorized(&self.scope, self.scope.task.unwrap_or(Uuid::nil()))
+                    .await
+                else {
+                    return interrupted();
+                };
+                if record.state != "waiting_capacity" {
+                    return interrupted();
+                }
+                record.state = "running".into();
+                if service.store.save(&mut record).await.is_err() {
+                    return interrupted();
+                }
+            }
+        }
         match result {
             Ok(value) => value,
             Err(_) => {
@@ -140,8 +179,19 @@ impl WorkerService {
         let rows=sqlx::query("SELECT rowid,id,window_id,turn_id,instruction_watermark,expires_at,state,request_hash,decision_json FROM agent_task_approvals WHERE task_id=? AND rowid>? ORDER BY rowid LIMIT ?")
             .bind(task.to_string()).bind(after.max(0)).bind(limit.clamp(1,16) as i64).fetch_all(&self.store.pool).await?;
         let entries:Vec<_>=rows.iter().map(|row|json!({"cursor":row.get::<i64,_>("rowid"),"request_id":row.get::<String,_>("id"),"window_id":row.get::<String,_>("window_id"),"turn_id":row.get::<String,_>("turn_id"),"instruction_version":row.get::<i64,_>("instruction_watermark"),"expires_at":row.get::<i64,_>("expires_at"),"state":row.get::<String,_>("state"),"request_hash":row.get::<String,_>("request_hash"),"decision":row.get::<Option<String>,_>("decision_json").and_then(|v|serde_json::from_str::<serde_json::Value>(&v).ok()),"reviewer":"main_agent"})).collect();
+        let next = entries
+            .last()
+            .and_then(|e| e["cursor"].as_i64())
+            .unwrap_or(after);
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_task_approvals WHERE task_id=? AND rowid>?",
+        )
+        .bind(task.to_string())
+        .bind(next)
+        .fetch_one(&self.store.pool)
+        .await?;
         Ok(
-            json!({"next_cursor":entries.last().and_then(|e|e["cursor"].as_i64()).unwrap_or(after),"entries":entries}),
+            json!({"next_cursor":next,"has_more":remaining>0,"entries":entries,"parameters_included":false}),
         )
     }
     pub(super) async fn confirm_native_review(
@@ -286,7 +336,7 @@ impl WorkerService {
         let deletion = decision.deletion_possible
             || items
                 .iter()
-                .any(|i| matches!(i.tool_name.as_str(), "Bash" | "Shell" | "Write" | "Edit"));
+                .any(|i| super::deletion::possible(&i.tool_name, &i.tool_input));
         let next = if !decision.approve {
             "rejected"
         } else if deletion {

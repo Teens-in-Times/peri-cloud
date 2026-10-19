@@ -119,16 +119,19 @@ impl WorkerService {
         Ok(count != 0)
     }
     pub(crate) async fn reconcile_native(&self) -> Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         let rows:Vec<String>=sqlx::query_scalar("SELECT id FROM cloud_native_operations WHERE state!='confirmed' ORDER BY last_query_at,created_at LIMIT 16").fetch_all(&self.store.pool).await?;
         for id in rows {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
             let id = Uuid::parse_str(&id).map_err(|_| TaskError::Invalid)?;
             sqlx::query("UPDATE cloud_native_operations SET last_query_at=? WHERE id=?")
                 .bind(now())
                 .bind(id.to_string())
                 .execute(&self.store.pool)
                 .await?;
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.query_native(id))
-                .await;
+            let _ = tokio::time::timeout(remaining, self.query_native(id)).await;
         }
         Ok(())
     }
