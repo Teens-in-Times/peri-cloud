@@ -109,11 +109,20 @@ impl TaskStore {
             .bind(task.to_string()).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(|row|{let body:String=row.get("body");serde_json::json!({"message_id":row.get::<i64,_>("seq"),"body_preview":clip(&body,200),"body_bytes":body.len(),"truncated":body.chars().count()>200,"state":row.get::<String,_>("state")})}).collect())
     }
-    pub async fn consume(&self, task: Uuid, ids: &[i64]) -> Result<()> {
+    pub async fn consume(&self, task: Uuid, window: Uuid, ids: &[i64]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
         for id in ids {
-            sqlx::query("UPDATE agent_task_messages SET state='consumed' WHERE task_id=? AND seq=? AND state='submitted'").bind(task.to_string()).bind(id).execute(&self.pool).await?;
+            sqlx::query("UPDATE agent_task_messages SET state='consumed' WHERE task_id=? AND seq=? AND state='submitted'").bind(task.to_string()).bind(id).execute(&mut *tx).await?;
+            sqlx::query("INSERT OR IGNORE INTO agent_task_instruction_reads(task_id,window_id,message_seq) SELECT task_id,?,seq FROM agent_task_messages WHERE task_id=? AND seq=? AND direction='parent'")
+                .bind(window.to_string()).bind(task.to_string()).bind(id).execute(&mut *tx).await?;
         }
+        tx.commit().await?;
         Ok(())
+    }
+    pub async fn unread_instructions(&self, task: Uuid, window: Uuid) -> Result<bool> {
+        let count:i64=sqlx::query_scalar("SELECT COUNT(*) FROM agent_task_messages m WHERE m.task_id=? AND m.direction='parent' AND NOT EXISTS(SELECT 1 FROM agent_task_instruction_reads r WHERE r.task_id=m.task_id AND r.message_seq=m.seq AND r.window_id=?)")
+            .bind(task.to_string()).bind(window.to_string()).fetch_one(&self.pool).await?;
+        Ok(count > 0)
     }
     pub async fn append_trace(&self, task: Uuid, event: serde_json::Value) -> Result<()> {
         // Retain bounded observation previews. Canonical turn history remains the detailed evidence.
@@ -127,15 +136,32 @@ impl TaskStore {
         tx.commit().await?;
         Ok(())
     }
-    pub async fn trace(&self, task: Uuid, after: i64, limit: usize) -> Result<serde_json::Value> {
-        let rows=sqlx::query("SELECT seq,event_json FROM agent_task_trace WHERE task_id=? AND seq>? ORDER BY seq LIMIT ?").bind(task.to_string()).bind(after).bind(limit.clamp(1,32) as i64).fetch_all(&self.pool).await?;
+    pub async fn trace(
+        &self,
+        task: Uuid,
+        after: i64,
+        limit: usize,
+        kind: Option<&str>,
+        query: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        if kind.is_some_and(|s| s.len() > 80) || query.is_some_and(|s| s.chars().count() > 200) {
+            return Err(TaskError::Invalid);
+        }
+        let rows=sqlx::query("SELECT seq,event_json FROM agent_task_trace WHERE task_id=? AND seq>? AND (? IS NULL OR json_extract(event_json,'$.kind')=?) AND (? IS NULL OR instr(lower(event_json),lower(?))>0) ORDER BY seq LIMIT ?").bind(task.to_string()).bind(after.max(0)).bind(kind).bind(kind).bind(query).bind(query).bind(limit.clamp(1,32) as i64).fetch_all(&self.pool).await?;
         let entries: Vec<_> = rows.into_iter().map(|r| serde_json::json!({"cursor":r.get::<i64,_>("seq"),"event":serde_json::from_str::<serde_json::Value>(r.get("event_json")).unwrap_or_default()})).collect();
         let next = entries
             .last()
             .and_then(|e| e["cursor"].as_i64())
             .unwrap_or(after);
+        let remaining:i64=sqlx::query_scalar("SELECT COUNT(*) FROM agent_task_trace WHERE task_id=? AND seq>? AND (? IS NULL OR json_extract(event_json,'$.kind')=?) AND (? IS NULL OR instr(lower(event_json),lower(?))>0)")
+            .bind(task.to_string()).bind(next).bind(kind).bind(kind).bind(query).bind(query).fetch_one(&self.pool).await?;
+        let earliest: Option<i64> =
+            sqlx::query_scalar("SELECT MIN(seq) FROM agent_task_trace WHERE task_id=?")
+                .bind(task.to_string())
+                .fetch_one(&self.pool)
+                .await?;
         Ok(
-            serde_json::json!({"entries":entries,"next_cursor":next,"retention":"latest_1024_previews","raw":"inspect conversation for retained canonical evidence"}),
+            serde_json::json!({"entries":entries,"next_cursor":next,"has_more":remaining>0,"earliest_retained_cursor":earliest,"complete_history":false,"previews":true,"retention":"latest_1024_previews","raw":"inspect versioned operation or conversation details for retained canonical evidence"}),
         )
     }
 }

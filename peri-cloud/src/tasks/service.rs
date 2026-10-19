@@ -10,6 +10,7 @@ pub(crate) struct WorkerService {
     pub(super) journal: Arc<CloudJournal>,
     pub(super) store: TaskStore,
     cursor: std::sync::atomic::AtomicI64,
+    pub(super) reviews: tokio::sync::Semaphore,
     pub(super) transcripts: parking_lot::RwLock<
         std::collections::HashMap<
             Uuid,
@@ -96,6 +97,7 @@ impl WorkerService {
             },
             journal,
             cursor: Default::default(),
+            reviews: tokio::sync::Semaphore::new(4),
             transcripts: Default::default(),
         })
     }

@@ -817,6 +817,19 @@ impl Gateway {
                 || !live
                 || !self.route_allowed(&pending.delivery.route).await?
                 || !self.scheduled_delivery_current(&pending.key).await?
+                || if let Some(id) = pending
+                    .key
+                    .strip_prefix("task-deletion:")
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                {
+                    !self
+                        .workers
+                        .notice_current(id)
+                        .await
+                        .map_err(|_| GatewayError::RecoveryRequired)?
+                } else {
+                    false
+                }
             {
                 if let DeliveryBody::Interaction { card } = &pending.delivery.body {
                     self.hub.invalidate(card.request_id);

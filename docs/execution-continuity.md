@@ -1,6 +1,6 @@
 # 执行会话、轮次与上下文窗口
 
-实施状态：schema 19 接入可复用会话、检查点、轮次续接、协作等待及窗口轮换。主助手自动审批、按调用跨设备执行和结构化验收仍属于后续阶段；完整目标尚未交付。阶段记录见 [实施计划](execution-continuity-plan.md)。
+实施状态：schema 19 接入可复用会话、检查点、轮次续接、协作等待及窗口轮换；schema 20 接入 [主助手自动审批](task-approvals.md) 和删除前通知。按调用跨设备执行和结构化验收仍属于后续阶段；完整目标尚未交付。阶段记录见 [实施计划](execution-continuity-plan.md)。
 
 ## 身份与复用
 
@@ -62,5 +62,7 @@ inspect_task 提供以下视图，均核验当前账号、任务和隐私边界�
 | operations | 原窗口/轮次、参数指纹、调用 ID 和执行状态预览 |
 | trace | 有界事件预览 |
 | messages | 双向任务消息和应用回执 |
+| approvals | 主助手决定、参数指纹、指令版本、期限和请求状态 |
+| detail | 授权证据的版本化分段详情 |
 
-使用返回的 next_cursor 翻页。文本预览标记截断；旧窗口读取遵守历史排除标记，并排除隐藏思考。当前必要详情和筛选接口还会随完整目标继续扩展，不将预览冒充完整输出。任务历史与个人长期记忆保持独立，不自动整体写入个人记忆。
+使用返回的 next_cursor 翻页。trace 可用 kind 和 query 筛选，显式返回 has_more 和保留边界，不声称预览等于完整历史。detail 使用 source（operation_input、operation_output、approval_input 或 conversation）、id、offset 和 chars（最多 16384）分段读取；conversation 的 id 为 message_id，operation 的 id 为 cursor，审批的 id 为 request_id。后续分段传入返回的 version，内容变化时返回冲突，避免拼接不同版本。返回 total_chars/total_bytes、next_offset、complete 和 truncated；旧窗口读取遵守历史排除标记，并排除隐藏思考。任务历史与个人长期记忆保持独立，不自动整体写入个人记忆。

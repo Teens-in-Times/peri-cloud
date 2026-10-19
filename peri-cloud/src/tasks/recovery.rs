@@ -47,8 +47,9 @@ impl WorkerService {
             .invocation_id(ctx)
             .map_err(|_| TaskError::Forbidden)?;
         let binding = remote.binding().session_id;
-        let changed = sqlx::query("UPDATE agent_task_operations SET invocation_id=?,executor_session=?,native_tool=? WHERE task_id=? AND turn_id=? AND window_id=? AND call_id=? AND call_hash=? AND (invocation_id IS NULL OR (invocation_id=? AND executor_session=? AND native_tool=?))")
-            .bind(effect.to_string()).bind(binding.to_string()).bind(name).bind(task.to_string()).bind(turn.to_string()).bind(scope.session.to_string()).bind(id).bind(hash).bind(effect.to_string()).bind(binding.to_string()).bind(name).execute(&self.store.pool).await?.rows_affected();
+        let changed = sqlx::query("UPDATE agent_task_operations SET invocation_id=?,executor_session=?,native_tool=? WHERE task_id=? AND turn_id=? AND window_id=? AND call_id=? AND call_hash=? AND (invocation_id IS NULL OR (invocation_id=? AND executor_session=? AND native_tool=?)) AND (?=0 OR EXISTS(SELECT 1 FROM agent_task_approvals a,json_each(a.request_json) i WHERE a.task_id=agent_task_operations.task_id AND a.turn_id=agent_task_operations.turn_id AND a.window_id=agent_task_operations.window_id AND a.state='consumed' AND a.expires_at>? AND json_extract(i.value,'$.tool_call_id')=agent_task_operations.call_id AND json_extract(i.value,'$.tool_input')=json(?) AND a.instruction_watermark=(SELECT COALESCE(MAX(seq),0) FROM agent_task_messages m WHERE m.task_id=a.task_id AND direction='parent')))")
+            .bind(effect.to_string()).bind(binding.to_string()).bind(name).bind(task.to_string()).bind(turn.to_string()).bind(scope.session.to_string()).bind(id).bind(hash).bind(effect.to_string()).bind(binding.to_string()).bind(name)
+            .bind(i32::from(matches!(name,"Write"|"Edit"|"Bash"))).bind(now()).bind(serde_json::to_string(input)?).execute(&self.store.pool).await?.rows_affected();
         if changed != 1 {
             return Err(TaskError::Conflict);
         }
@@ -115,6 +116,11 @@ impl WorkerService {
         if !controlled && turn_state != TurnState::RecoveryRequired {
             return Ok(false);
         }
+        let blocked_notice:i64=sqlx::query_scalar("SELECT COUNT(*) FROM agent_task_approvals a LEFT JOIN gateway_outbox o ON o.semantic_key='task-deletion:'||a.id WHERE a.task_id=? AND (a.state='notice_unconfirmed' OR o.state IN ('unconfirmed','sending'))")
+            .bind(record.id.to_string()).fetch_one(&self.store.pool).await?;
+        if blocked_notice > 0 {
+            return Ok(true);
+        }
         let gateway = self.gateway.upgrade().ok_or(TaskError::Unavailable)?;
         if gateway.worker_active(record.worker_session) {
             return Ok(true);
@@ -125,6 +131,7 @@ impl WorkerService {
         }
         let ready = match record.state.as_str() {
             "paused" | "cancel_requested" => false,
+            "waiting_approval" => true,
             "waiting_parent" => self.parent_replied(record).await?,
             "waiting_external" => record.wake_at.is_some_and(|at| at <= now()),
             _ => true,
@@ -320,6 +327,7 @@ impl WorkerService {
                             "inspect_task"
                                 | "update_task"
                                 | "wait_task"
+                                | "AskUserQuestion"
                                 | "SearchMemory"
                                 | "GetMemory"
                                 | "schedule_list"

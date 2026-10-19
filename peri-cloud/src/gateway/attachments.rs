@@ -38,7 +38,7 @@ impl Gateway {
             )
             .await
             .map_err(|_| GatewayError::RecoveryRequired)?;
-        agent.set_task_scope(task_scope);
+        agent.set_task_scope(task_scope.clone());
         agent.set_channel_constraints(
             self.adapters
                 .get(&route.identity.adapter_instance_id)
@@ -75,6 +75,15 @@ impl Gateway {
             workspace: frozen.workspace(),
             origin: origin.clone(),
         });
+        let broker: Arc<dyn peri_acp_types::interaction::UserInteractionBroker> =
+            if task_scope.task.is_some() {
+                Arc::new(crate::tasks::approvals::WorkerBroker {
+                    inner: broker,
+                    scope: task_scope,
+                })
+            } else {
+                broker
+            };
         if self.origins.read().contains_key(&frozen.session_id) {
             self.runtime.rebind_idle(principal, agent, broker).await?;
         } else {

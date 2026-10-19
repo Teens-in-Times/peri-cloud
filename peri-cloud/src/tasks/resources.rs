@@ -170,6 +170,15 @@ impl BaseTool for ResourceTool {
         self.acquire().await?;
         if let Some(service) = self.scope.service.upgrade() {
             service
+                .confirm_native_review(
+                    &self.scope,
+                    &ctx,
+                    self.inner.name(),
+                    &input,
+                    self.inner.aliases(),
+                )
+                .await?;
+            service
                 .record_native_intent(
                     &self.scope,
                     &ctx,

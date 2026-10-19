@@ -89,6 +89,13 @@ pub struct CloudRuntime {
 }
 
 impl CloudRuntime {
+    pub(crate) fn attached_agent(&self, principal: Uuid, session: Uuid) -> Option<Arc<CloudAgent>> {
+        self.sessions
+            .read()
+            .get(&session)
+            .filter(|live| live.principal_id == principal)
+            .map(|live| live.agent.clone())
+    }
     pub fn new(journal: Arc<CloudJournal>) -> Arc<Self> {
         Self::with_limits(journal, crate::limits::RuntimeLimits::default()).expect("valid defaults")
     }

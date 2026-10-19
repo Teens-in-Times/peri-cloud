@@ -1,4 +1,6 @@
 use super::*;
+#[path = "execution_approvals.rs"]
+mod approval_tests;
 
 fn call(name: &str, args: Value, id: &str) -> String {
     let delta = json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});
@@ -81,34 +83,6 @@ async fn recovery_queries_original_receipt_and_never_resubmits_a_missing_or_know
     f.settled(parent, first.turn_id).await;
     let receipt = delegate_receipt(&f.script.requests.lock()[1]);
     let window = Uuid::parse_str(receipt["worker_session"].as_str().unwrap()).unwrap();
-    let card = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            f.c().gateway.dispatch().await.unwrap();
-            if let Some(card) = f
-                .c()
-                .gateway
-                .browser_interactions(&f.c().browser)
-                .await
-                .unwrap()
-                .into_iter()
-                .next()
-            {
-                break card;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    f.c()
-        .gateway
-        .respond_browser(
-            &f.c().browser,
-            card.request_id,
-            InteractionAction::AllowOnce {},
-        )
-        .await
-        .unwrap();
     pump(&f, 4).await;
     assert_eq!(f.submissions[0].load(Ordering::SeqCst), 1);
     let owner = f.c().browser.principal().id;
@@ -345,89 +319,95 @@ async fn external_wait_survives_restart_releases_slot_and_resumes_a_new_run() {
 
 #[tokio::test]
 async fn parent_question_wait_is_durable_and_reply_wakes_the_same_task() {
-    let mut f = Fixture::new_for(
-        vec![
-            call(
-                "delegate_task",
-                json!({"goal":"ask parent then finish"}),
-                "delegate-question",
-            ),
-            answer("delegated"),
-            call(
-                "message_parent",
-                json!({"body":"need parent decision","wait_for_reply":true}),
-                "ask-parent",
-            ),
-            answer("main received the worker question"),
-        ],
-        true,
-    )
-    .await;
-    let parent = f
-        .c()
-        .gateway
-        .open_browser_workspace(&f.c().browser, Uuid::new_v4(), f.devices[0].id, None)
-        .await
-        .unwrap();
-    let first = f
-        .c()
-        .gateway
-        .submit_browser_task(&f.c().browser, parent, Uuid::new_v4(), "delegate".into())
-        .await
-        .unwrap();
-    f.settled(parent, first.turn_id).await;
-    let receipt = delegate_receipt(&f.script.requests.lock()[1]);
-    pump(&f, 4).await;
-    f.restart().await;
-    f.c().gateway.dispatch().await.unwrap();
-    assert_eq!(
-        f.script.requests.lock().len(),
-        4,
-        "delivered question and waiting run must not be replayed"
-    );
-    f.script.replies.lock().extend([
-        call(
-            "inspect_task",
-            json!({"task_id":receipt["task_id"]}),
-            "inspect-question",
-        ),
-        answer("question still waiting"),
-    ]);
-    let inspect = f
-        .c()
-        .gateway
-        .submit_browser_task(
-            &f.c().browser,
-            parent,
-            Uuid::new_v4(),
-            "inspect question".into(),
+    for native_question in [false, true] {
+        let mut f = Fixture::new_for(
+            vec![
+                call(
+                    "delegate_task",
+                    json!({"goal":"ask parent then finish"}),
+                    "delegate-question",
+                ),
+                answer("delegated"),
+                if native_question {
+                    super::experience_tests::question(false)
+                } else {
+                    call(
+                        "message_parent",
+                        json!({"body":"need parent decision","wait_for_reply":true}),
+                        "ask-parent",
+                    )
+                },
+                answer("main received the worker question"),
+            ],
+            true,
         )
-        .await
-        .unwrap();
-    f.settled(parent, inspect.turn_id).await;
-    let status = tool_value(&f.script.requests.lock()[5], "state");
-    assert_eq!(status["state"], "waiting_parent");
-    f.script.replies.lock().extend([
+        .await;
+        let parent = f
+            .c()
+            .gateway
+            .open_browser_workspace(&f.c().browser, Uuid::new_v4(), f.devices[0].id, None)
+            .await
+            .unwrap();
+        let first = f
+            .c()
+            .gateway
+            .submit_browser_task(&f.c().browser, parent, Uuid::new_v4(), "delegate".into())
+            .await
+            .unwrap();
+        f.settled(parent, first.turn_id).await;
+        let receipt = delegate_receipt(&f.script.requests.lock()[1]);
+        pump(&f, 4).await;
+        f.restart().await;
+        f.c().gateway.dispatch().await.unwrap();
+        assert_eq!(
+            f.script.requests.lock().len(),
+            4,
+            "delivered question and waiting run must not be replayed"
+        );
+        f.script.replies.lock().extend([
+            call(
+                "inspect_task",
+                json!({"task_id":receipt["task_id"]}),
+                "inspect-question",
+            ),
+            answer("question still waiting"),
+        ]);
+        let inspect = f
+            .c()
+            .gateway
+            .submit_browser_task(
+                &f.c().browser,
+                parent,
+                Uuid::new_v4(),
+                "inspect question".into(),
+            )
+            .await
+            .unwrap();
+        f.settled(parent, inspect.turn_id).await;
+        let status = tool_value(&f.script.requests.lock()[5], "state");
+        assert_eq!(status["state"], "waiting_parent");
+        f.script.replies.lock().extend([
         call("message_task",json!({"task_id":receipt["task_id"],"expected_revision":status["revision"],"body":"parent decision: ready"}),"reply-parent"),answer("reply accepted"),answer("worker used the reply and finished"),answer("parent result confirmed"),
     ]);
-    let reply = f
-        .c()
-        .gateway
-        .submit_browser_task(
-            &f.c().browser,
-            parent,
-            Uuid::new_v4(),
-            "answer worker".into(),
-        )
-        .await
-        .unwrap();
-    f.settled(parent, reply.turn_id).await;
-    pump(&f, 10).await;
-    assert!(f.script.requests.lock()[8]["messages"]
-        .to_string()
-        .contains("parent decision: ready"));
-    assert_eq!(f.submissions[0].load(Ordering::SeqCst), 0);
-    f.finish().await;
+        let reply = f
+            .c()
+            .gateway
+            .submit_browser_task(
+                &f.c().browser,
+                parent,
+                Uuid::new_v4(),
+                "answer worker".into(),
+            )
+            .await
+            .unwrap();
+        f.settled(parent, reply.turn_id).await;
+        pump(&f, 10).await;
+        assert!(f.script.requests.lock()[8]["messages"]
+            .to_string()
+            .contains("parent decision: ready"));
+        assert_eq!(f.submissions[0].load(Ordering::SeqCst), 0);
+        f.finish().await;
+    }
 }
 
 #[tokio::test]
@@ -661,28 +641,6 @@ async fn two_main_conversations_explicitly_reuse_one_executor_context_for_indepe
     );
     assert_eq!(second_receipt["note"], "");
     assert_eq!(second_receipt["state"], "queued");
-    let card = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            c.gateway.dispatch().await.unwrap();
-            if let Some(card) = c
-                .gateway
-                .browser_interactions(&c.browser)
-                .await
-                .unwrap()
-                .into_iter()
-                .next()
-            {
-                break card;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("worker Write must request its own browser approval");
-    assert_eq!(
-        card.session_id.to_string(),
-        second_receipt["worker_session"].as_str().unwrap()
-    );
     f.script.replies.lock().extend([
         call(
             "inspect_task",
@@ -691,10 +649,6 @@ async fn two_main_conversations_explicitly_reuse_one_executor_context_for_indepe
         ),
         answer("second result confirmed"),
     ]);
-    c.gateway
-        .respond_browser(&c.browser, card.request_id, InteractionAction::AllowOnce {})
-        .await
-        .unwrap();
     pump(&f, 10).await;
     let continued = f.script.requests.lock()[6]["messages"].to_string();
     assert!(
@@ -718,6 +672,28 @@ async fn two_main_conversations_explicitly_reuse_one_executor_context_for_indepe
     assert_eq!(write["execution"]["status"], "completed");
     assert_eq!(write["window_id"], second_receipt["worker_session"]);
     assert_eq!(write["call_hash"].as_str().unwrap().len(), 64);
+    f.script.replies.lock().extend([
+        call("inspect_task",json!({"task_id":second_receipt["task_id"],"view":"detail","detail":{"source":"operation_input","id":write["cursor"].as_i64().unwrap().to_string(),"chars":4096}}),"read-full-evidence"),
+        answer("operation evidence inspected"),
+    ]);
+    let detail = c
+        .gateway
+        .submit_browser_task(
+            &c.browser,
+            second_parent,
+            Uuid::new_v4(),
+            "inspect full operation input".into(),
+        )
+        .await
+        .unwrap();
+    f.settled(second_parent, detail.turn_id).await;
+    let full = tool_value(&f.script.requests.lock()[11], "version");
+    assert_eq!(full["complete"], true);
+    assert!(full["text"]
+        .as_str()
+        .unwrap()
+        .contains("PRIVATE_TOOL_CONTENT"));
+    assert!(!full["text"].as_str().unwrap().contains("PRIVATE_REASONING"));
     c.gateway
         .select_logical_conversation(&c.browser, Uuid::new_v4(), Some(second_parent))
         .await

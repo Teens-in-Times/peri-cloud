@@ -68,12 +68,29 @@ impl IdentityClock for Clock {
 struct Script {
     replies: Mutex<VecDeque<String>>,
     requests: Mutex<Vec<Value>>,
+    review_requests: Mutex<Vec<Value>>,
+    review_replies: Mutex<VecDeque<String>>,
+    hold_review: AtomicBool,
+    review_waiting: Notify,
+    review_release: Notify,
 }
 
 async fn model_request(
     State(script): State<Arc<Script>>,
     Json(request): Json<Value>,
 ) -> ([(axum::http::HeaderName, &'static str); 1], String) {
+    if request["messages"]
+        .to_string()
+        .contains("isolated approval review turn")
+    {
+        script.review_requests.lock().push(request);
+        if script.hold_review.load(Ordering::SeqCst) {
+            script.review_waiting.notify_one();
+            script.review_release.notified().await;
+        }
+        let reply = script.review_replies.lock().pop_front().unwrap_or_else(|| answer(&json!({"approve":true,"deletion_possible":false,"reason":"within user task","notice":"我将按任务要求修改文件，可能替换已有内容。"}).to_string()));
+        return ([(CONTENT_TYPE, "text/event-stream")], reply);
+    }
     script.requests.lock().push(request);
     let reply = script.replies.lock().pop_front().expect("模型调用超出脚本");
     ([(CONTENT_TYPE, "text/event-stream")], reply)

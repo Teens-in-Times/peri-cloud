@@ -56,6 +56,9 @@ struct Inspect {
     #[serde(default = "page_size")]
     limit: usize,
     window_id: Option<Uuid>,
+    detail: Option<super::evidence::Detail>,
+    kind: Option<String>,
+    query: Option<String>,
 }
 fn status_view() -> String {
     "status".into()
@@ -115,7 +118,7 @@ impl BaseTool for TaskTool {
         "delegate_task"=>"Persist an independent cloud execution task and return immediately. Supply goal, constraints and acceptance; optional device/workspace must belong to this user. Native tools remain available for small operations. Workers use their own context and the original tool approval policy.",
         "list_execution_sessions"=>"List authorized execution conversations for explicit reuse. Reuse preserves work context across independent tasks, within the same device, canonical workspace and privacy scope. Supply the execution_session plus matching device/workspace to delegate_task.",
         "list_tasks"=>"List bounded task status for this logical conversation. Runtime state and worker-authored notes are separate. Never poll continuously while the user wants to chat.",
-        "inspect_task"=>"Read status, full task contract, operation receipts, windows, bounded trace, conversation or messages. For archived context, list windows then select window_id in conversation. Cropped previews and agent claims are not complete evidence; private reasoning is excluded.",
+        "inspect_task"=>"Read status, full task contract, approval/operation receipts, windows, bounded trace, conversation or messages. Trace supports kind/query filters. Use detail with source/id/offset/chars/version for complete evidence in bounded versioned chunks; preserve the returned version across pages. For archived context, list windows then select window_id in conversation. Cropped previews and agent claims are not complete evidence; private reasoning is excluded.",
         "message_task"=>"Send a supplement or question to this conversation's task at its current revision. Submitted, consumed and applied are different receipts. A message cannot authorize additional permissions.",
         "control_task"=>"Control a task at its current revision: pause at a safe boundary, resume a durable wait/paused task, rotate its context window, or cancel. Unknown execution is queried before any continuation; cancellation does not prove that an effect stopped.",
         "wait_task"=>"Durably wait for an external condition. Supply reason and optional resume_after_seconds (up to one week). Host stops at a safe boundary and releases the loop slot; main assistant can resume explicitly.",
@@ -133,7 +136,7 @@ impl BaseTool for TaskTool {
             ),
             "list_tasks" | "list_execution_sessions" => (json!({}), vec![]),
             "inspect_task" => (
-                json!({"task_id":id,"view":{"type":"string","enum":["status","trace","conversation","messages","operations","windows","contract"]},"window_id":id,"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32}}),
+                json!({"task_id":id,"view":{"type":"string","enum":["status","trace","conversation","messages","operations","windows","contract","approvals","detail"]},"window_id":id,"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32},"kind":{"type":"string","maxLength":80},"query":{"type":"string","maxLength":200},"detail":{"type":"object","properties":{"source":{"type":"string","enum":["operation_input","operation_output","approval_input","conversation"]},"id":{"type":"string","maxLength":256},"offset":{"type":"integer","minimum":0},"chars":{"type":"integer","minimum":1,"maximum":16384},"version":{"type":"string","maxLength":80}},"required":["source","id"],"additionalProperties":false}}),
                 vec!["task_id"],
             ),
             "message_task" => (
@@ -191,7 +194,26 @@ impl BaseTool for TaskTool {
                 let args: Inspect = serde_json::from_value(input)?;
                 let record = service.authorized(&self.scope, args.task_id).await?;
                 match args.view.as_str() {
-                    "status" => service.summary(&record),
+                    "status" => {
+                        let mut status = service.summary(&record);
+                        status["instruction_version"] =
+                            json!(service.instruction_watermark(record.id).await?);
+                        status
+                    }
+                    "approvals" => {
+                        service
+                            .approval_history(record.id, args.after, args.limit)
+                            .await?
+                    }
+                    "detail" => {
+                        service
+                            .detail(
+                                &record,
+                                args.window_id,
+                                args.detail.ok_or(TaskError::Invalid)?,
+                            )
+                            .await?
+                    }
                     "contract" => {
                         json!({"goal":record.goal,"constraints":record.constraints,"acceptance":record.acceptance,"task_id":record.id,"run_number":record.run_number,"window_id":record.worker_session,"note":record.note,"note_source":"agent"})
                     }
@@ -208,7 +230,13 @@ impl BaseTool for TaskTool {
                     "trace" => {
                         service
                             .store
-                            .trace(record.id, args.after, args.limit)
+                            .trace(
+                                record.id,
+                                args.after,
+                                args.limit,
+                                args.kind.as_deref(),
+                                args.query.as_deref(),
+                            )
                             .await?
                     }
                     "conversation" => {
@@ -229,15 +257,15 @@ impl BaseTool for TaskTool {
                                 break;
                             }
                             used += bytes;
-                            if self.scope.task == Some(record.id)
-                                && direction == "parent"
-                                && state == "submitted"
-                            {
+                            if self.scope.task == Some(record.id) && direction == "parent" {
                                 consumed.push(id);
                             }
                             messages.push(entry);
                         }
-                        service.store.consume(record.id, &consumed).await?;
+                        service
+                            .store
+                            .consume(record.id, self.scope.session, &consumed)
+                            .await?;
                         json!({"messages":messages,"next_cursor":messages.last().and_then(|m|m["message_id"].as_i64()).unwrap_or(args.after),"truncated":messages.len()<count,"full_bodies":true})
                     }
                     _ => return Err(TaskError::Invalid.into()),

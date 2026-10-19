@@ -328,6 +328,124 @@ async fn public_execution_context_is_scoped_to_its_original_audience() {
 }
 
 #[tokio::test]
+async fn rotated_windows_must_read_all_retained_parent_requirements_again() {
+    let (_root, service, scope, worker) = fixture().await;
+    let execution = service
+        .resolve_execution_session(&scope, None, &worker, SessionBoundary::new(true, 0, 0))
+        .await
+        .unwrap();
+    let record = task(&scope, &execution, "requirements");
+    service.store.insert(&record).await.unwrap();
+    let a = service
+        .store
+        .message(record.id, "a", "parent", "keep the first constraint")
+        .await
+        .unwrap()["message_id"]
+        .as_i64()
+        .unwrap();
+    let b = service
+        .store
+        .message(record.id, "b", "parent", "also keep the next constraint")
+        .await
+        .unwrap()["message_id"]
+        .as_i64()
+        .unwrap();
+    service
+        .store
+        .consume(record.id, worker.session_id, &[a, b])
+        .await
+        .unwrap();
+    assert!(!service
+        .store
+        .unread_instructions(record.id, worker.session_id)
+        .await
+        .unwrap());
+    assert!(service
+        .store
+        .pending_messages(record.id, "parent")
+        .await
+        .unwrap()
+        .is_empty());
+    let next = frozen(scope.principal, worker.device_id, "/canonical/project");
+    service
+        .journal
+        .bind(next.clone(), PermissionMode::Default)
+        .await
+        .unwrap();
+    assert!(
+        service
+            .store
+            .unread_instructions(record.id, next.session_id)
+            .await
+            .unwrap(),
+        "old consumed flags do not prove a new window has read the constraints"
+    );
+    service
+        .store
+        .consume(record.id, next.session_id, &[b])
+        .await
+        .unwrap();
+    assert!(service
+        .store
+        .unread_instructions(record.id, next.session_id)
+        .await
+        .unwrap());
+    service
+        .store
+        .consume(record.id, next.session_id, &[a])
+        .await
+        .unwrap();
+    assert!(!service
+        .store
+        .unread_instructions(record.id, next.session_id)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn trace_filters_and_pagination_preserve_bounded_evidence_scope() {
+    let (_root, service, scope, worker) = fixture().await;
+    let execution = service
+        .resolve_execution_session(&scope, None, &worker, SessionBoundary::new(true, 0, 0))
+        .await
+        .unwrap();
+    let record = task(&scope, &execution, "trace-filter");
+    service.store.insert(&record).await.unwrap();
+    for kind in ["tool_started", "tool_finished", "tool_finished"] {
+        service.store.append_trace(record.id,serde_json::json!({"kind":kind,"name":"Read","output_preview":"a unicode 检索 needle"})).await.unwrap();
+    }
+    let first = service
+        .store
+        .trace(record.id, 0, 1, Some("tool_finished"), Some("检索"))
+        .await
+        .unwrap();
+    assert_eq!(first["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(first["has_more"], true);
+    assert_eq!(first["complete_history"], false);
+    let next = service
+        .store
+        .trace(
+            record.id,
+            first["next_cursor"].as_i64().unwrap(),
+            1,
+            Some("tool_finished"),
+            Some("检索"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(next["has_more"], false);
+    assert!(service
+        .store
+        .trace(Uuid::new_v4(), 0, 2, None, None)
+        .await
+        .unwrap()["entries"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn schema_rebuild_preserves_old_task_and_unknown_operation_identity() {
     let (root, service, scope, worker) = fixture().await;
     let execution = service
@@ -340,6 +458,8 @@ async fn schema_rebuild_preserves_old_task_and_unknown_operation_identity() {
     original.result = "unknown operation; do not replay".into();
     service.store.insert(&original).await.unwrap();
     for sql in [
+        "DROP TABLE agent_task_instruction_reads",
+        "DROP TABLE agent_task_approvals",
         "DROP TABLE agent_task_runs",
         "DROP TABLE agent_task_operations",
         "DROP TABLE agent_task_checkpoints",

@@ -34,6 +34,8 @@ use crate::mcp::McpCache;
 use crate::reply::{replies, ChatReply};
 use crate::workspace::WorkspaceCache;
 
+#[path = "approval_review.rs"]
+mod approval_review;
 #[path = "compact.rs"]
 mod compact;
 
@@ -504,7 +506,11 @@ impl CloudAgent {
         let assembly = CloudAssemblyContext {
             remote: self.remote.clone(),
             broker: request.broker,
-            permissions: request.permissions,
+            permissions: if self.is_worker() {
+                SharedPermissionMode::new(peri_acp_types::permission::PermissionMode::Default)
+            } else {
+                request.permissions
+            },
             classifier: request.classifier,
             personal: personal.clone().map(|mut scope| {
                 if self.is_worker() {

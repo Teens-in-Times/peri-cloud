@@ -8,8 +8,8 @@ window.PeriImplemented = (() => {
       gateway:['Gateway','来源准入、身份与会话路由','平台身份与逻辑会话解耦。普通输入归一化后持久排队；控制面沿原认证路径执行。账号级门保护选择，进行中轮次不被换入口重绑。','ingress'],
       runtime:['CloudRuntime','前台 / 后台容量，受理与取消','原会话继续串行；主助手和执行任务都复用 Runtime。前后台使用独立全局/账号并发预算，部署持有任务 future，取消不冒充副作用已撤销。','runtime'],
       agent:['主助手 Agent','聊天、小操作直做、大任务异步委派','保留原 run_react_loop、PermissionMiddleware 与 Todo。统一装配上下文；可委派后继续聊天，按需查看任务/trace/独立会话，并向工作者插话。普通消息只展示主助手的 AI 正文。','core'],
-      journal:['CloudJournal / SQLite','schema 16：原状态 + FIFO / 任务 / trace','唯一宿主拥有状态目录。保存原历史、轮次、权限、执行/投送不确定性；新增持久输入、任务账本、双向消息、trace、设备占用和逻辑聊天投影。','coreplan'],
-      broker:['提问 / 审批 Broker','真实子会话与轮次，跨入口查看','浏览器按已认证账号、真实 session/device/turn 和一次性 request 校验，平台回调额外校验入口和选择。主会话不会冒充子任务审批身份。等待仍在进程内，重启不自动续批。','worker'],
+      journal:['CloudJournal / SQLite','schema 20：会话、窗口、检查点与审批','唯一宿主拥有状态目录。任务、窗口、运行轮次、原始操作回执、指令阅读水位与一次性审批分别持久化；未知执行或投送不盲目重试。','coreplan'],
+      broker:['提问 / 审批 Broker','主助手独立审查，原权限链执行','执行任务的审批进入主助手独立、有界、无工具的审查回合，不占普通聊天；具体参数、设备、任务与指令版本绑定。删除或可能替换内容先通知再执行；原 OAuth 人工授权和主会话审批保持原路径。','worker'],
       limits:['额度与并发','前后台独立容量，时限与每日用量','主助手默认全局 4 / 每人 1 活跃回合；执行任务默认全局 2 / 每人 1。沿用每日任务、模型请求和回合时限，不等于精确 token 或金额计费。','coreplan'],
       delivery:['结果投影与持久发件箱','主助手、定时回合与任务事件统一投送','工作者事件先回根会话，由主助手组织 AI 正文。发送仍由原发件箱管理，复核账号、路由和隐私/上下文代次；平台接受不代表已读，未知投送不重试。','worker'],
       portal:['账号工作台与菜单','显式会话、SOUL、任务和原控制面','网页可新建独立逻辑会话、按 ID 续接本人会话，管理个人 SOUL；聊天按逻辑会话展示。原绑定、目录、模型/记忆/计划、审批详情保留。','coreplan']
@@ -28,6 +28,9 @@ window.PeriImplemented = (() => {
     add('task-trace','自动 trace 与深层查看','工具预览、可见说明、live 历史','宿主记录工具开始/结束、裁剪输入输出和等待审批。可见说明按定稿迭代落库，排除内部思考；inspect_task 可分页查看 trace、消息、运行中或已结算会话，尊重历史排除与隐私版本。','traces');
     add('task-event','任务事件回流','带类型提醒进入原主会话','工作者问题与终态通过持久队列回到根逻辑会话，作为规范提醒而非人类输入。主助手组织普通 AI 回复后，沿原发件箱投送。旧入口失效时仅选满足同账号、原会话及隐私条件的主动入口。','worker');
     add('device-lease','设备修改占用','首版按整台设备协调写操作','后台任务预占设备，主助手仍能聊天、读取状态和补充指令。Write/Edit/Bash 在原授权后检查占用；结算后释放，未知执行保留占用。它不是第二套审批，也不是按文件锁。','resources');
+    add('execution-session','可复用执行会话','身份 / 会话 / 任务 / 窗口分离','同一执行会话串行承接独立任务；同账号跨主会话须显式复用，设备、规范工作区、隐私范围及来源代次仍须一致。不会静默继承其他范围的历史。','tasks');
+    add('execution-continuity','检查点与窗口续接','持久等待、暂停、换窗与查询恢复','主会话保留摘要压缩，执行窗口按预算轮换。宿主事实、工作笔记与历史引用生成接班材料；原调用回执保留身份。未知原生操作只查询，不能因超时或重启再提交。旧操作运行中独立换窗仍待完善。','tasks');
+    add('task-evidence','有界证据检索','分页、筛选、完整详情与版本','inspect_task 分层查看窗口、操作、审批、消息与可见会话；trace 有界保留并可筛选，必要正文按字符分页且校验内容版本。明确预览与截断，不采集或暴露隐藏思考。结构化产物与验收仍待实现。','tasktools');
     add('context-assembler','ContextAssembler','主/执行共用可组合装配','基础提示词、角色、SOUL、渠道规则、已有记忆协议、外置 Markdown 和原生工具可按配置排序；支持扩展 ContextPart。顺序不改变原权限链，动态记忆帧和工作区规则继续按原契约刷新。','assemblycontext','chat memory');
     add('context-files','SOUL 与外置文件','部署者来源 + 账号私人文件','全局 SOUL.md、配置的 Markdown 与 users/<principal>/SOUL.md 每轮发现读取。私人文件不进入群聊；路径、编码、大小和越界受限。网页沿原同源/CSRF 认证管理个人 SOUL。','contextfiles','chat memory identity');
     const connect=(from,to,label,kind='flow')=>board.edges.push({id:'implemented-'+board.edges.length,from,to,label,kind,style:'solid'});
@@ -44,7 +47,10 @@ window.PeriImplemented = (() => {
       ['chat-projection','portal','聊天历史'],['context-files','context-assembler','按身份发现'],['context-assembler','agent','主角色上下文'],
       ['context-assembler','worker','执行角色上下文'],['memory','context-assembler','已有记忆协议'],['gateway','context-assembler','渠道展示规则'],
       ['worker-service','device-lease','预占设备','control'],['permission','device-lease','授权后的修改协调'],['device-lease','remote','冻结绑定执行'],
-      ['journal','task-ledger','schema 16 持久状态','data']
+      ['journal','task-ledger','schema 20 持久状态','data'],
+      ['worker-service','execution-session','显式复用'],['execution-session','execution-continuity','物理窗口与运行轮次'],
+      ['execution-continuity','task-ledger','检查点与恢复事实','data'],['task-trace','task-evidence','预览与原证据引用','data'],
+      ['task-evidence','agent','按需检索'],['worker','broker','审批 / 持久问题'],['broker','delivery','删除前确认通知'],['broker','permission','一次性原权限决定']
     ])connect(from,to,label,kind);
     return board;
   }

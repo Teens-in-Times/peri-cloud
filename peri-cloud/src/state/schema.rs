@@ -111,6 +111,12 @@ pub(crate) async fn reject_foreign(pool: &SqlitePool, version: i64) -> StateResu
     if version >= 19 && !has_table(pool, "agent_task_runs").await? {
         return Err(StateError::ForeignSchema);
     }
+    if version >= 20
+        && (!has_table(pool, "agent_task_approvals").await?
+            || !has_table(pool, "agent_task_instruction_reads").await?)
+    {
+        return Err(StateError::ForeignSchema);
+    }
     Ok(())
 }
 

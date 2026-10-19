@@ -4,6 +4,106 @@ use crate::tasks::{Delegate, TaskRecord, TaskScope};
 use std::sync::Weak;
 
 impl Gateway {
+    pub(crate) fn worker_cancellation(
+        &self,
+        principal: Uuid,
+        session: Uuid,
+        turn: Uuid,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        self.runtime.turn_cancellation(principal, session, turn)
+    }
+    pub(crate) async fn main_review(
+        &self,
+        record: &TaskRecord,
+        review: Uuid,
+        data: serde_json::Value,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> crate::tasks::Result<crate::tasks::approvals::ReviewDecision> {
+        let agent = match self
+            .runtime
+            .attached_agent(record.principal, record.parent_session)
+        {
+            Some(agent) => agent,
+            None => {
+                let parent = self
+                    .journal()
+                    .session(record.principal, record.parent_session)
+                    .await
+                    .map_err(|_| crate::tasks::TaskError::Forbidden)?;
+                self.connector
+                    .open_conversation(record.principal, &parent.frozen)
+                    .await
+                    .map_err(|_| crate::tasks::TaskError::Unavailable)?
+            }
+        };
+        agent
+            .review_operation(
+                self.journal().clone(),
+                record.principal,
+                review,
+                data,
+                cancellation,
+                self.limits().daily_model_requests,
+            )
+            .await
+            .map_err(|_| crate::tasks::TaskError::Unavailable)
+    }
+    pub(crate) async fn queue_deletion_notice(
+        &self,
+        record: &TaskRecord,
+        review: Uuid,
+        text: &str,
+    ) -> GatewayResult<String> {
+        let gate = self.worker_control_gate(record.principal);
+        let _guard = gate.lock().await;
+        if self
+            .identity
+            .resolve_channel(&record.route.identity)
+            .await?
+            != record.principal
+            || !self.route_allowed(&record.route).await?
+        {
+            return Err(IdentityError::Forbidden.into());
+        }
+        let key = format!("task-deletion:{review}");
+        let proactive = self
+            .adapters
+            .get(&record.route.identity.adapter_instance_id)
+            .is_some_and(|a| a.supports_proactive());
+        let parent = if record.reply_to.is_empty() {
+            key.as_str()
+        } else {
+            record.reply_to.as_str()
+        };
+        let kind = if proactive {
+            ReplyKind::Proactive
+        } else {
+            record.reply_kind
+        };
+        let state = self
+            .journal()
+            .session(record.principal, record.parent_session)
+            .await?;
+        let reply = crate::ChatReply {
+            message_id: key.clone(),
+            text: text.into(),
+        };
+        let mut tx = self.store.pool.begin().await?;
+        crate::state::chat_projection::seed(&mut tx, &state).await?;
+        crate::state::chat_projection::assistant(&mut tx, &state, &reply).await?;
+        crate::gateway::store::enqueue(
+            &mut tx,
+            &key,
+            &record.route,
+            (parent, kind),
+            super::DeliveryBody::Reply { reply },
+            Some(record.principal),
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(key)
+    }
     pub(crate) fn worker_active(&self, session: Uuid) -> bool {
         self.runtime.status().active_sessions.contains(&session)
     }
