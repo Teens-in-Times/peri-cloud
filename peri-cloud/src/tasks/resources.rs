@@ -36,7 +36,7 @@ impl WorkerService {
                 return Ok(());
             }
             if row.get::<String, _>("phase") == "reserved" {
-                let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_tasks WHERE worker_session=? AND json_extract(record_json,'$.state') NOT IN ('completed','failed','cancelled','recovery_required','invalidated')")
+                let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_tasks WHERE worker_session=? AND json_extract(record_json,'$.state') NOT IN ('completed','failed','cancelled','invalidated')")
                     .bind(&owner).fetch_one(&mut *tx).await?;
                 if pending != 0 {
                     return Err(TaskError::Conflict);
@@ -90,6 +90,8 @@ pub(crate) struct ResourceTool {
     pub inner: Arc<dyn BaseTool>,
     pub scope: TaskScope,
     pub device: Uuid,
+    pub remote: Arc<peri_remote_tools::RemoteSession>,
+    pub mutation: bool,
 }
 impl ResourceTool {
     async fn acquire(&self) -> Result<()> {
@@ -107,9 +109,12 @@ impl ResourceTool {
         if let Some(task) = self.scope.task {
             service.authorized(&self.scope, task).await?;
         }
-        service
-            .claim_device(self.scope.principal, self.scope.session, self.device, false)
-            .await
+        if self.mutation {
+            service
+                .claim_device(self.scope.principal, self.scope.session, self.device, false)
+                .await?;
+        }
+        Ok(())
     }
 }
 #[async_trait]
@@ -152,8 +157,10 @@ impl BaseTool for ResourceTool {
         input: serde_json::Value,
         ctx: ToolContext<'_>,
     ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.acquire().await?;
-        self.inner.invoke(input, ctx).await
+        Ok(self
+            .invoke_output(input, ctx)
+            .await?
+            .projected_text(self.output_char_limit()))
     }
     async fn invoke_output(
         &self,
@@ -161,6 +168,20 @@ impl BaseTool for ResourceTool {
         ctx: ToolContext<'_>,
     ) -> std::result::Result<ToolOutput, Box<dyn std::error::Error + Send + Sync>> {
         self.acquire().await?;
+        if let Some(service) = self.scope.service.upgrade() {
+            service
+                .record_native_intent(
+                    &self.scope,
+                    &ctx,
+                    &self.remote,
+                    self.inner.name(),
+                    &input,
+                    self.inner.aliases(),
+                )
+                .await?;
+        } else {
+            return Err(TaskError::Unavailable.into());
+        }
         self.inner.invoke_output(input, ctx).await
     }
 }

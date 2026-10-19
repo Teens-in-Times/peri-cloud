@@ -158,6 +158,27 @@ impl CloudSide {
         initialize: bool,
         web: bool,
     ) -> Self {
+        Self::start_with_limits(
+            root,
+            clock,
+            connector,
+            adapter,
+            initialize,
+            web,
+            Default::default(),
+        )
+        .await
+    }
+
+    async fn start_with_limits(
+        root: &std::path::Path,
+        clock: Arc<Clock>,
+        connector: Arc<NativeSessionConnector>,
+        adapter: Arc<Adapter>,
+        initialize: bool,
+        web: bool,
+        limits: peri_cloud::limits::RuntimeLimits,
+    ) -> Self {
         let journal = Arc::new(CloudJournal::open(root).await.unwrap());
         let identity = IdentityService::with_clock(&journal, SETUP, clock)
             .await
@@ -173,7 +194,7 @@ impl CloudSide {
             .authenticate_browser(&login.session_token)
             .await
             .unwrap();
-        let runtime = CloudRuntime::new(journal.clone());
+        let runtime = CloudRuntime::with_limits(journal.clone(), limits).unwrap();
         let mut adapters: Vec<Arc<dyn MessageAdapter>> = vec![adapter];
         if web {
             adapters.push(Arc::new(WebAdapter::from_journal(&journal)));
@@ -216,6 +237,10 @@ struct Fixture {
     stop: CancellationToken,
     servers: Vec<tokio::task::JoinHandle<()>>,
     route: ChannelRoute,
+    limits: peri_cloud::limits::RuntimeLimits,
+    web: bool,
+    submissions: Vec<Arc<std::sync::atomic::AtomicUsize>>,
+    hidden_receipts: Vec<Arc<AtomicBool>>,
 }
 
 impl Fixture {
@@ -223,6 +248,14 @@ impl Fixture {
         Self::new_for(responses, false).await
     }
     async fn new_for(responses: Vec<String>, web: bool) -> Self {
+        Self::new_for_limits(responses, web, Default::default()).await
+    }
+
+    async fn new_for_limits(
+        responses: Vec<String>,
+        web: bool,
+        limits: peri_cloud::limits::RuntimeLimits,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let stop = CancellationToken::new();
         let clock = Arc::new(Clock(AtomicI64::new(1_900_000_000)));
@@ -249,17 +282,22 @@ impl Fixture {
         )));
         let connector = NativeSessionConnector::new(model, "You are a personal cloud agent. Use only the selected device. Keep tool and reasoning events internal.".into(), 128_000).unwrap();
         let adapter = Arc::new(Adapter::default());
-        let cloud = CloudSide::start(
+        let cloud = CloudSide::start_with_limits(
             root.path(),
             clock.clone(),
             connector.clone(),
             adapter.clone(),
             true,
             web,
+            limits.clone(),
         )
         .await;
         let mut f = Self {
             root,
+            limits,
+            web,
+            submissions: Vec::new(),
+            hidden_receipts: Vec::new(),
             cloud: Some(cloud),
             clock,
             connector,
@@ -309,7 +347,32 @@ impl Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_address = listener.local_addr().unwrap();
         let shutdown = self.stop.clone();
-        let app = web::router(executor.clone());
+        let submissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hidden = Arc::new(AtomicBool::new(false));
+        self.submissions.push(submissions.clone());
+        self.hidden_receipts.push(hidden.clone());
+        let app = web::router(executor.clone()).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let submissions = submissions.clone();
+                let hidden = hidden.clone();
+                async move {
+                    if request.method() == axum::http::Method::POST
+                        && request.uri().path().ends_with("/jobs")
+                    {
+                        submissions.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if request.method() == axum::http::Method::GET
+                        && request.uri().path().contains("/jobs/")
+                        && hidden.load(Ordering::SeqCst)
+                    {
+                        return axum::response::IntoResponse::into_response(
+                            axum::http::StatusCode::NOT_FOUND,
+                        );
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
         self.servers.push(tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown.cancelled_owned())
@@ -488,13 +551,14 @@ impl Fixture {
         old.stop().await;
         drop(old);
         self.cloud = Some(
-            CloudSide::start(
+            CloudSide::start_with_limits(
                 self.root.path(),
                 self.clock.clone(),
                 self.connector.clone(),
                 self.adapter.clone(),
                 false,
-                false,
+                self.web,
+                self.limits.clone(),
             )
             .await,
         );

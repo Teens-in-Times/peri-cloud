@@ -1,10 +1,12 @@
 //! Durable cloud workers. Task state, semantic notes, trace and user delivery are distinct.
 pub(crate) mod continuity;
 pub(crate) mod middleware;
+pub(crate) mod recovery;
 pub(crate) mod resources;
 mod service;
 pub(crate) mod sessions;
 mod store;
+mod suspension;
 pub(crate) mod tools;
 pub(crate) use service::WorkerService;
 
@@ -71,6 +73,14 @@ pub(crate) struct TaskRecord {
     pub acceptance: String,
     pub state: String,
     pub turn: Option<Uuid>,
+    #[serde(default)]
+    pub run_number: u64,
+    #[serde(default)]
+    pub lifecycle_version: u8,
+    #[serde(default)]
+    pub wait_after: i64,
+    #[serde(default)]
+    pub wake_at: Option<i64>,
     pub revision: u64,
     pub note: String,
     pub plan: Vec<WorkItem>,
@@ -86,8 +96,15 @@ impl TaskRecord {
     pub fn terminal(&self) -> bool {
         matches!(
             self.state.as_str(),
-            "completed" | "failed" | "cancelled" | "recovery_required" | "invalidated"
+            "completed" | "failed" | "cancelled" | "invalidated"
         )
+    }
+    pub fn run_key(&self) -> String {
+        if self.run_number == 0 {
+            format!("worker:{}", self.id)
+        } else {
+            format!("worker:{}:{}", self.id, self.run_number)
+        }
     }
 }
 #[derive(Deserialize, Serialize)]

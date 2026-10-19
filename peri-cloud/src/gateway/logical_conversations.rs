@@ -63,11 +63,12 @@ impl Gateway {
                 if !crate::memory::context::can_attach(self.journal(), principal, id, true).await? {
                     return Err(GatewayError::PrivateHistory);
                 }
-                let worker: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM agent_tasks WHERE worker_session=?")
-                        .bind(id.to_string())
-                        .fetch_one(&self.store.pool)
-                        .await?;
+                let worker: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM agent_execution_windows WHERE cloud_session=?",
+                )
+                .bind(id.to_string())
+                .fetch_one(&self.store.pool)
+                .await?;
                 if worker != 0 {
                     return Err(IdentityError::Forbidden.into());
                 }

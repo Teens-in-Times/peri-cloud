@@ -18,7 +18,7 @@ impl TaskStore {
     }
     pub async fn by_session(&self, owner: Uuid, session: Uuid) -> Result<Option<TaskRecord>> {
         let raw: Option<String> = sqlx::query_scalar(
-            "SELECT record_json FROM agent_tasks WHERE worker_session=? AND principal=? ORDER BY (json_extract(record_json,'$.state') IN ('completed','failed','cancelled','recovery_required','invalidated')),rowid LIMIT 1",
+            "SELECT record_json FROM agent_tasks WHERE worker_session=? AND principal=? ORDER BY (json_extract(record_json,'$.state') IN ('completed','failed','cancelled','invalidated')),rowid LIMIT 1",
         )
         .bind(session.to_string())
         .bind(owner.to_string())
@@ -39,14 +39,14 @@ impl TaskStore {
     pub async fn save(&self, record: &mut TaskRecord) -> Result<()> {
         let previous = record.revision;
         record.revision = record.revision.saturating_add(1);
-        let updated = sqlx::query("UPDATE agent_tasks SET record_json=? WHERE id=? AND principal=? AND json_extract(record_json,'$.revision')=?").bind(serde_json::to_string(record)?).bind(record.id.to_string()).bind(record.principal.to_string()).bind(previous as i64).execute(&self.pool).await?.rows_affected();
+        let updated = sqlx::query("UPDATE agent_tasks SET record_json=?,worker_session=? WHERE id=? AND principal=? AND json_extract(record_json,'$.revision')=?").bind(serde_json::to_string(record)?).bind(record.worker_session.to_string()).bind(record.id.to_string()).bind(record.principal.to_string()).bind(previous as i64).execute(&self.pool).await?.rows_affected();
         if updated != 1 {
             return Err(TaskError::Conflict);
         }
         Ok(())
     }
     pub async fn list(&self, scope: &TaskScope) -> Result<Vec<TaskRecord>> {
-        let rows: Vec<String> = sqlx::query_scalar("SELECT record_json FROM agent_tasks WHERE principal=? AND parent_session=? ORDER BY (json_extract(record_json,'$.state') IN ('completed','failed','cancelled','recovery_required','invalidated')),rowid DESC LIMIT 64").bind(scope.principal.to_string()).bind(scope.root_session.to_string()).fetch_all(&self.pool).await?;
+        let rows: Vec<String> = sqlx::query_scalar("SELECT record_json FROM agent_tasks WHERE principal=? AND parent_session=? ORDER BY (json_extract(record_json,'$.state') IN ('completed','failed','cancelled','invalidated')),rowid DESC LIMIT 64").bind(scope.principal.to_string()).bind(scope.root_session.to_string()).fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|raw| serde_json::from_str(&raw).map_err(TaskError::from))
             .collect()

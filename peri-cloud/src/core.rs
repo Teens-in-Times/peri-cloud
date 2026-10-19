@@ -595,6 +595,7 @@ impl CloudAgent {
         );
         let initial_ids: HashSet<_> = request.history.iter().map(PersistedPayload::id).collect();
         let transcript = session.transcript();
+        let prior_context = request.history.iter().any(|p| p.as_message().is_some());
         {
             let mut current = transcript.write();
             *current = MessageTranscript::new().with_own_payloads(request.history);
@@ -618,12 +619,24 @@ impl CloudAgent {
                 scope: scope.clone(),
                 transcript: transcript.clone(),
                 turn: request.turn_id,
+                prior_context,
+                context_window: self.context_window,
+                max_iterations: request.max_iterations,
+                overhead_tokens: (prompt.len()
+                    + assembled
+                        .tools
+                        .values()
+                        .map(|tool| tool.description().len() + tool.parameters().to_string().len())
+                        .sum::<usize>())
+                    / 2,
             }));
         }
         let chain = Arc::new(chain);
         let mut tool_map = assembled.tools;
-        if let (Some(scope), Some(device)) = (&task_scope, self.device_id) {
-            for name in ["Write", "Edit", "Bash"] {
+        if let (Some(scope), Some(device), Some(remote)) =
+            (&task_scope, self.device_id, &self.remote)
+        {
+            for name in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
                 if let Some(inner) = tool_map.remove(name) {
                     tool_map.insert(
                         name.into(),
@@ -631,6 +644,8 @@ impl CloudAgent {
                             inner,
                             scope: scope.clone(),
                             device,
+                            remote: remote.clone(),
+                            mutation: matches!(name, "Write" | "Edit" | "Bash"),
                         }),
                     );
                 }
@@ -669,7 +684,10 @@ impl CloudAgent {
                     .unwrap_or(self.session_id),
             ))
             .with_context_budget(ContextBudget::new(self.context_window))
-            .with_compact_config(CompactConfig::default())
+            .with_compact_config(CompactConfig {
+                auto_compact_enabled: !self.is_worker(),
+                ..CompactConfig::default()
+            })
             .with_compact_llm(model)
             // Deferred tools are executed through ExecuteExtraTool. Without
             // this resolver the outer meta tool would be the only approval
@@ -721,7 +739,11 @@ impl CloudAgent {
             }
         };
         let jobs = match &self.remote {
-            Some(remote) if status == TurnStatus::Interrupted => remote.cancel_active().await,
+            Some(remote)
+                if status == TurnStatus::Interrupted && request.cancellation.is_cancelled() =>
+            {
+                remote.cancel_active().await
+            }
             Some(remote) => remote.jobs().await,
             None => Ok(Vec::new()), // Conversation mode has no executor tools; prior jobs were settled at admission.
         };
@@ -784,6 +806,17 @@ impl CloudAgent {
             Some(remote) => remote.cancel_active().await,
             None => Ok(Vec::new()),
         }
+    }
+
+    pub(crate) async fn query_bound_execution(
+        &self,
+        id: Uuid,
+    ) -> Result<JobSnapshot, peri_remote_tools::Error> {
+        self.remote
+            .as_ref()
+            .ok_or(peri_remote_tools::Error::MissingIdentity)?
+            .query_execution(id)
+            .await
     }
 }
 

@@ -17,7 +17,7 @@ impl Middleware for TaskTools {
     }
     fn collect_tools(&self, _: &str) -> Vec<Box<dyn BaseTool>> {
         let names: &[&str] = if self.scope.role == AgentRole::Worker {
-            &["inspect_task", "update_task", "message_parent"]
+            &["inspect_task", "update_task", "message_parent", "wait_task"]
         } else {
             &[
                 "delegate_task",
@@ -55,6 +55,7 @@ struct Inspect {
     after: i64,
     #[serde(default = "page_size")]
     limit: usize,
+    window_id: Option<Uuid>,
 }
 fn status_view() -> String {
     "status".into()
@@ -94,6 +95,12 @@ struct Parent {
     #[serde(default)]
     wait_for_reply: bool,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Wait {
+    reason: String,
+    resume_after_seconds: Option<u64>,
+}
 
 #[async_trait]
 impl BaseTool for TaskTool {
@@ -108,11 +115,12 @@ impl BaseTool for TaskTool {
         "delegate_task"=>"Persist an independent cloud execution task and return immediately. Supply goal, constraints and acceptance; optional device/workspace must belong to this user. Native tools remain available for small operations. Workers use their own context and the original tool approval policy.",
         "list_execution_sessions"=>"List authorized execution conversations for explicit reuse. Reuse preserves work context across independent tasks, within the same device, canonical workspace and privacy scope. Supply the execution_session plus matching device/workspace to delegate_task.",
         "list_tasks"=>"List bounded task status for this logical conversation. Runtime state and worker-authored notes are separate. Never poll continuously while the user wants to chat.",
-        "inspect_task"=>"Read status, bounded trace, retained conversation evidence or task messages. Trace previews are cropped; conversation view reads retained canonical content with exclusions respected. Does not expose private reasoning.",
+        "inspect_task"=>"Read status, full task contract, operation receipts, windows, bounded trace, conversation or messages. For archived context, list windows then select window_id in conversation. Cropped previews and agent claims are not complete evidence; private reasoning is excluded.",
         "message_task"=>"Send a supplement or question to this conversation's task at its current revision. Submitted, consumed and applied are different receipts. A message cannot authorize additional permissions.",
-        "control_task"=>"Request cancellation of a task at its current revision. A cancellation request is not proof that an already dispatched effect stopped. Unknown execution is never replayed.",
+        "control_task"=>"Control a task at its current revision: pause at a safe boundary, resume a durable wait/paused task, rotate its context window, or cancel. Unknown execution is queried before any continuation; cancellation does not prove that an effect stopped.",
+        "wait_task"=>"Durably wait for an external condition. Supply reason and optional resume_after_seconds (up to one week). Host stops at a safe boundary and releases the loop slot; main assistant can resume explicitly.",
         "update_task"=>"Update this execution task's work plan, discoveries and blockers, and explicitly acknowledge applied parent messages. These are worker-authored claims; they do not overwrite host lifecycle state. Trace is collected automatically.",
-        _=>"Send a message or question to the main assistant through its durable conversation queue. For a question requiring a response, set wait_for_reply=true; the worker waits asynchronously while the main assistant remains free to chat. Do not send ordinary user messages directly.",
+        _=>"Send a message or question to the main assistant through its durable conversation queue. For a question requiring a response, set wait_for_reply=true; the host durably suspends this run and resumes on the parent response while the main assistant remains free to chat. Do not send ordinary user messages directly.",
     }
     }
     fn parameters(&self) -> Value {
@@ -125,7 +133,7 @@ impl BaseTool for TaskTool {
             ),
             "list_tasks" | "list_execution_sessions" => (json!({}), vec![]),
             "inspect_task" => (
-                json!({"task_id":id,"view":{"type":"string","enum":["status","trace","conversation","messages","operations"]},"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32}}),
+                json!({"task_id":id,"view":{"type":"string","enum":["status","trace","conversation","messages","operations","windows","contract"]},"window_id":id,"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32}}),
                 vec!["task_id"],
             ),
             "message_task" => (
@@ -133,12 +141,16 @@ impl BaseTool for TaskTool {
                 vec!["task_id", "expected_revision", "body"],
             ),
             "control_task" => (
-                json!({"task_id":id,"expected_revision":rev,"action":{"type":"string","enum":["cancel"]}}),
+                json!({"task_id":id,"expected_revision":rev,"action":{"type":"string","enum":["cancel","pause","resume","rotate"]}}),
                 vec!["task_id", "expected_revision", "action"],
             ),
             "update_task" => (
                 json!({"task_id":id,"expected_revision":rev,"note":{"type":"string","maxLength":4000},"work_plan":{"type":"array","maxItems":16,"items":{"type":"object","properties":{"name":{"type":"string"},"state":{"type":"string","enum":["pending","in_progress","done","blocked"]}},"required":["name","state"],"additionalProperties":false}},"applied_messages":{"type":"array","items":{"type":"integer"},"maxItems":16}}),
                 vec!["task_id", "expected_revision", "note"],
+            ),
+            "wait_task" => (
+                json!({"reason":{"type":"string","maxLength":4000},"resume_after_seconds":{"type":"integer","minimum":0,"maximum":604800}}),
+                vec!["reason"],
             ),
             _ => (
                 json!({"body":{"type":"string","maxLength":16384},"wait_for_reply":{"type":"boolean"}}),
@@ -180,6 +192,14 @@ impl BaseTool for TaskTool {
                 let record = service.authorized(&self.scope, args.task_id).await?;
                 match args.view.as_str() {
                     "status" => service.summary(&record),
+                    "contract" => {
+                        json!({"goal":record.goal,"constraints":record.constraints,"acceptance":record.acceptance,"task_id":record.id,"run_number":record.run_number,"window_id":record.worker_session,"note":record.note,"note_source":"agent"})
+                    }
+                    "windows" => {
+                        let rows:Vec<(i64,String)> = sqlx::query_as("SELECT window_number,cloud_session FROM agent_execution_windows WHERE execution_session=? AND window_number>=? ORDER BY window_number LIMIT ?")
+                            .bind(record.execution_session.to_string()).bind(args.after.max(0)).bind(args.limit.clamp(1,16) as i64).fetch_all(&service.store.pool).await?;
+                        json!({"windows":rows.iter().map(|(n,id)|json!({"window_number":n,"window_id":id})).collect::<Vec<_>>(),"next_cursor":rows.last().map_or(args.after,|r|r.0+1)})
+                    }
                     "operations" => {
                         service
                             .operations(record.id, args.after, args.limit)
@@ -193,7 +213,7 @@ impl BaseTool for TaskTool {
                     }
                     "conversation" => {
                         service
-                            .conversation(&record, args.after, args.limit)
+                            .conversation(&record, args.after, args.limit, args.window_id)
                             .await?
                     }
                     "messages" => {
@@ -236,20 +256,19 @@ impl BaseTool for TaskTool {
                     .store
                     .message(record.id, &key, "parent", &args.body)
                     .await?;
-                service.message_ready(record.id);
                 receipt
             }
             "control_task" => {
                 let args: Control = serde_json::from_value(input)?;
                 let record = service.authorized(&self.scope, args.task_id).await?;
-                if args.action != "cancel" || self.scope.role != AgentRole::Main {
+                if self.scope.role != AgentRole::Main {
                     return Err(TaskError::Invalid.into());
                 }
                 if record.revision != args.expected_revision {
                     return Err(TaskError::Conflict.into());
                 }
                 let record = service
-                    .request_cancel(&self.scope, record.id, args.expected_revision)
+                    .request_control(&self.scope, record.id, args.expected_revision, &args.action)
                     .await?;
                 service.summary(&record)
             }
@@ -282,6 +301,12 @@ impl BaseTool for TaskTool {
                 }
                 service.summary(&record)
             }
+            "wait_task" => {
+                let args: Wait = serde_json::from_value(input)?;
+                service
+                    .wait_external(&self.scope, &args.reason, args.resume_after_seconds)
+                    .await?
+            }
             _ => {
                 let args: Parent = serde_json::from_value(input)?;
                 let task = self.scope.task.ok_or(TaskError::Forbidden)?;
@@ -290,6 +315,15 @@ impl BaseTool for TaskTool {
                     .store
                     .message(task, &key, "worker", &args.body)
                     .await?;
+                let waiting = if args.wait_for_reply {
+                    Some(
+                        service
+                            .wait_for_parent(&self.scope, &ctx.cancellation)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
                 service
                     .gateway
                     .upgrade()
@@ -301,13 +335,9 @@ impl BaseTool for TaskTool {
                     )
                     .await
                     .map_err(|_| TaskError::Unavailable)?;
-                if args.wait_for_reply {
-                    service
-                        .wait_for_parent(&self.scope, &ctx.cancellation)
-                        .await?
-                } else {
-                    receipt
-                }
+                sqlx::query("UPDATE agent_task_messages SET state='forwarded' WHERE task_id=? AND seq=? AND direction='worker' AND state='submitted'")
+                    .bind(task.to_string()).bind(receipt["message_id"].as_i64()).execute(&service.store.pool).await?;
+                waiting.unwrap_or(receipt)
             }
         };
         Ok(serde_json::to_string(&result)?)

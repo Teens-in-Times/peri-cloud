@@ -13,6 +13,8 @@ pub struct RuntimeLimits {
     pub max_turn_seconds: u64,
     pub max_prompt_bytes: usize,
     pub max_memory_bytes: usize,
+    pub worker_window_tokens: u32,
+    pub worker_reserve_tokens: u32,
 }
 
 impl Default for RuntimeLimits {
@@ -27,6 +29,8 @@ impl Default for RuntimeLimits {
             max_turn_seconds: 600,
             max_prompt_bytes: 65536,
             max_memory_bytes: 65536,
+            worker_window_tokens: 48000,
+            worker_reserve_tokens: 8000,
         }
     }
 }
@@ -42,5 +46,8 @@ impl RuntimeLimits {
             && (1..=86400).contains(&self.max_turn_seconds)
             && (256..=1048576).contains(&self.max_prompt_bytes)
             && (256..=1048576).contains(&self.max_memory_bytes)
+            && (512..=1048576).contains(&self.worker_window_tokens)
+            && self.worker_reserve_tokens >= 64
+            && self.worker_reserve_tokens < self.worker_window_tokens / 2
     }
 }

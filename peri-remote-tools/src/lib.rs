@@ -6,5 +6,5 @@ mod tool;
 mod transport;
 
 pub use client::{DeviceClient, Error, Result};
-pub use session::RemoteSession;
+pub use session::{snapshot_output, RemoteSession};
 pub use transport::{ExecutorEndpoint, WireGuardEndpoint};

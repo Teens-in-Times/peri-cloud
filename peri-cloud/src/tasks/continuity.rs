@@ -60,7 +60,7 @@ impl WorkerService {
         for call in calls {
             let encoded = serde_json::to_string(call)?;
             let hash = format!("{:x}", sha2::Sha256::digest(encoded.as_bytes()));
-            sqlx::query("INSERT OR IGNORE INTO agent_task_operations(task_id,turn_id,window_id,call_id,call_hash,call_json,receipt_json) VALUES(?,?,?,?,?,?,NULL)")
+            sqlx::query("INSERT OR IGNORE INTO agent_task_operations(task_id,turn_id,window_id,call_id,call_hash,call_json,receipt_json,intent_contract) VALUES(?,?,?,?,?,?,NULL,1)")
                 .bind(task.to_string()).bind(turn.to_string()).bind(scope.session.to_string()).bind(&call.id).bind(&hash).bind(&encoded).execute(&mut *tx).await?;
             let previous: String = sqlx::query_scalar("SELECT call_hash FROM agent_task_operations WHERE task_id=? AND turn_id=? AND call_id=?")
                 .bind(task.to_string()).bind(turn.to_string()).bind(&call.id).fetch_one(&mut *tx).await?;
@@ -69,14 +69,19 @@ impl WorkerService {
             }
         }
         for (call, result) in results {
-            if call.id != result.tool_call_id || call.name != result.tool_name {
+            let native: Option<String> = sqlx::query_scalar("SELECT native_tool FROM agent_task_operations WHERE task_id=? AND turn_id=? AND call_id=?")
+                .bind(task.to_string()).bind(turn.to_string()).bind(&call.id).fetch_optional(&mut *tx).await?.flatten();
+            if call.id != result.tool_call_id
+                || (call.name != result.tool_name
+                    && native.as_deref() != Some(result.tool_name.as_str()))
+            {
                 return Err(TaskError::Conflict);
             }
             let encoded = serde_json::to_string(call)?;
             let hash = format!("{:x}", sha2::Sha256::digest(encoded.as_bytes()));
             // A policy-rejected call may have no dispatch intent. Preserve its
             // receipt too; it is evidence that no invocation was authorized.
-            sqlx::query("INSERT OR IGNORE INTO agent_task_operations(task_id,turn_id,window_id,call_id,call_hash,call_json,receipt_json) VALUES(?,?,?,?,?,?,NULL)")
+            sqlx::query("INSERT OR IGNORE INTO agent_task_operations(task_id,turn_id,window_id,call_id,call_hash,call_json,receipt_json,intent_contract) VALUES(?,?,?,?,?,?,NULL,1)")
                 .bind(task.to_string()).bind(turn.to_string()).bind(scope.session.to_string()).bind(&call.id).bind(&hash).bind(encoded).execute(&mut *tx).await?;
             let receipt = serde_json::to_string(result)?;
             let changed = sqlx::query("UPDATE agent_task_operations SET receipt_json=? WHERE task_id=? AND turn_id=? AND call_id=? AND call_hash=? AND (receipt_json IS NULL OR receipt_json=?)")
@@ -87,21 +92,27 @@ impl WorkerService {
         }
         sqlx::query("INSERT INTO agent_task_checkpoints(task_id,turn_id,window_id,phase,snapshot_json,snapshot_hash,record_revision,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(task_id,turn_id) DO UPDATE SET phase=excluded.phase,snapshot_json=excluded.snapshot_json,snapshot_hash=excluded.snapshot_hash,record_revision=excluded.record_revision,created_at=excluded.created_at")
             .bind(task.to_string()).bind(turn.to_string()).bind(scope.session.to_string()).bind(phase).bind(raw).bind(digest).bind(record.revision as i64).bind(now()).execute(&mut *tx).await?;
+        if phase == "model_boundary" {
+            sqlx::query("UPDATE agent_task_checkpoints SET parent_watermark=(SELECT COALESCE(MAX(seq),0) FROM agent_task_messages WHERE task_id=? AND direction='parent' AND state IN ('consumed','applied')) WHERE task_id=? AND turn_id=?")
+                .bind(task.to_string()).bind(task.to_string()).bind(turn.to_string()).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
 
     pub(super) async fn operations(&self, task: Uuid, after: i64, limit: usize) -> Result<Value> {
-        let rows = sqlx::query("SELECT seq,turn_id,window_id,call_id,call_hash,call_json,receipt_json FROM agent_task_operations WHERE task_id=? AND seq>? ORDER BY seq LIMIT ?")
+        let rows = sqlx::query("SELECT seq,turn_id,window_id,call_id,call_hash,call_json,receipt_json,reconciled_json,invocation_id FROM agent_task_operations WHERE task_id=? AND seq>? ORDER BY seq LIMIT ?")
             .bind(task.to_string()).bind(after).bind(limit.clamp(1,16) as i64).fetch_all(&self.store.pool).await?;
         let mut entries = Vec::new();
         for row in rows {
             let call: ToolCall = serde_json::from_str(row.get("call_json"))?;
-            let receipt: Option<String> = row.get("receipt_json");
+            let receipt: Option<String> = row
+                .get::<Option<String>, _>("reconciled_json")
+                .or(row.get("receipt_json"));
             let result: Option<ToolResult> =
                 receipt.as_deref().map(serde_json::from_str).transpose()?;
             let input = call.input.to_string();
-            entries.push(json!({"cursor":row.get::<i64,_>("seq"),"turn_id":row.get::<String,_>("turn_id"),"window_id":row.get::<String,_>("window_id"),"call_id":call.id,"name":call.name,"call_hash":row.get::<String,_>("call_hash"),"input_preview":clip(&input,800),"input_bytes":input.len(),"input_truncated":input.chars().count()>800,"receipt_recorded":result.is_some(),"execution":result.as_ref().and_then(|r|r.execution.as_ref()),"is_error":result.as_ref().map(|r|r.is_error),"output_preview":result.as_ref().map(|r|clip(&r.output,1200)),"output_truncated":result.as_ref().is_some_and(|r|r.output.chars().count()>1200)}));
+            entries.push(json!({"cursor":row.get::<i64,_>("seq"),"turn_id":row.get::<String,_>("turn_id"),"window_id":row.get::<String,_>("window_id"),"invocation_id":row.get::<Option<String>,_>("invocation_id"),"call_id":call.id,"name":call.name,"call_hash":row.get::<String,_>("call_hash"),"input_preview":clip(&input,800),"input_bytes":input.len(),"input_truncated":input.chars().count()>800,"receipt_recorded":result.is_some(),"execution":result.as_ref().and_then(|r|r.execution.as_ref()),"is_error":result.as_ref().map(|r|r.is_error),"output_preview":result.as_ref().map(|r|clip(&r.output,1200)),"output_truncated":result.as_ref().is_some_and(|r|r.output.chars().count()>1200)}));
         }
         Ok(
             json!({"next_cursor":entries.last().and_then(|e|e["cursor"].as_i64()).unwrap_or(after),"entries":entries,"previews":true,"missing_receipt":"unknown; never replay"}),

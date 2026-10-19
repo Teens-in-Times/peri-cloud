@@ -236,7 +236,9 @@ impl RemoteSession {
         }
     }
 
-    fn invocation_id(&self, ctx: &ToolContext<'_>) -> Result<Uuid> {
+    /// Opaque execution receipt identity for a trusted deployment journal.
+    /// Uses the actual canonical invocation, never the model call ID alone.
+    pub fn invocation_id(&self, ctx: &ToolContext<'_>) -> Result<Uuid> {
         self.check_context(ctx)?;
         let turn = ctx
             .turn_generation
@@ -264,6 +266,11 @@ impl RemoteSession {
         bytes[6] = (bytes[6] & 0x0f) | 0x80;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
         Ok(Uuid::from_bytes(bytes))
+    }
+
+    /// Read the original receipt without submitting or cancelling an operation.
+    pub async fn query_execution(&self, id: Uuid) -> Result<JobSnapshot> {
+        self.task(id, false).await
     }
 
     pub(crate) async fn invoke(
@@ -450,7 +457,7 @@ fn ambiguous(error: &Error) -> bool {
     ) || matches!(error, Error::Rejected(status) if *status == 408 || *status >= 500)
 }
 
-pub(crate) fn snapshot_output(job: JobSnapshot) -> ToolOutput {
+pub fn snapshot_output(job: JobSnapshot) -> ToolOutput {
     let status = match job.status {
         JobStatus::Completed => ToolExecutionStatus::Completed,
         JobStatus::Failed => ToolExecutionStatus::Failed,

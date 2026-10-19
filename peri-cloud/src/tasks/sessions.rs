@@ -182,7 +182,7 @@ impl WorkerService {
     }
 
     pub(crate) async fn session_head(&self, task: &TaskRecord) -> Result<bool> {
-        let head: Option<String> = sqlx::query_scalar("SELECT id FROM agent_tasks WHERE worker_session=? AND json_extract(record_json,'$.state') NOT IN ('completed','failed','cancelled','recovery_required','invalidated') ORDER BY rowid LIMIT 1")
+        let head: Option<String> = sqlx::query_scalar("SELECT id FROM agent_tasks WHERE worker_session=? AND json_extract(record_json,'$.state') NOT IN ('completed','failed','cancelled','invalidated') ORDER BY rowid LIMIT 1")
             .bind(task.worker_session.to_string()).fetch_optional(&self.store.pool).await?;
         Ok(head.as_deref() == Some(task.id.to_string().as_str()))
     }

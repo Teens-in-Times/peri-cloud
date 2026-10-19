@@ -1,8 +1,73 @@
 //! Trusted worker attachment and result routing, separate from OAuth identity.
 use super::*;
 use crate::tasks::{Delegate, TaskRecord, TaskScope};
+use std::sync::Weak;
 
 impl Gateway {
+    pub(crate) fn worker_active(&self, session: Uuid) -> bool {
+        self.runtime.status().active_sessions.contains(&session)
+    }
+    pub(crate) async fn reopen_worker(
+        &self,
+        record: &TaskRecord,
+    ) -> GatewayResult<Arc<crate::CloudAgent>> {
+        let worker = self
+            .journal()
+            .session(record.principal, record.worker_session)
+            .await?;
+        match worker.frozen.device_id {
+            Some(id) => {
+                let devices =
+                    crate::memory::scope::devices(&self.store.pool, record.principal).await?;
+                let device = devices
+                    .iter()
+                    .find(|d| d.id == id && !d.revoked)
+                    .ok_or(IdentityError::Forbidden)?;
+                self.connector
+                    .open(record.principal, device, Some(&worker.frozen))
+                    .await
+            }
+            None => {
+                self.connector
+                    .open_conversation(record.principal, &worker.frozen)
+                    .await
+            }
+        }
+    }
+    pub(crate) async fn fresh_worker_window(
+        &self,
+        record: &TaskRecord,
+    ) -> GatewayResult<crate::state::FrozenSession> {
+        let previous = self
+            .journal()
+            .session(record.principal, record.worker_session)
+            .await?;
+        let scope = TaskScope {
+            service: Weak::new(),
+            principal: record.principal,
+            session: record.parent_session,
+            root_session: record.parent_session,
+            task: None,
+            role: crate::context::AgentRole::Main,
+            execution_agent: None,
+            route: record.route.clone(),
+        };
+        let input = Delegate {
+            goal: record.goal.clone(),
+            constraints: record.constraints.clone(),
+            acceptance: record.acceptance.clone(),
+            device_id: previous.frozen.device_id,
+            workspace: previous
+                .frozen
+                .device_id
+                .map(|_| previous.frozen.workspace()),
+            execution_session: None,
+        };
+        let frozen = self.prepare_worker(&scope, &input).await?;
+        self.inherit_model_selection(record.principal, record.worker_session, frozen.session_id)
+            .await?;
+        Ok(frozen)
+    }
     pub(crate) async fn worker_scope_valid(&self, scope: &TaskScope) -> GatewayResult<bool> {
         // An admitted task belongs to an OAuth principal, not the gateway that
         // happened to submit it. Delivery/ingress authenticate routes separately.
@@ -24,7 +89,7 @@ impl Gateway {
         record: &TaskRecord,
     ) -> GatewayResult<Option<crate::state::TurnRecord>> {
         let raw:Option<String>=sqlx::query_scalar("SELECT t.record_json FROM cloud_turns t JOIN cloud_sessions s ON s.id=t.session_id WHERE s.principal=? AND t.session_id=? AND t.request_key=?")
-            .bind(record.principal.to_string()).bind(record.worker_session.to_string()).bind(format!("worker:{}",record.id)).fetch_optional(&self.store.pool).await?;
+            .bind(record.principal.to_string()).bind(record.worker_session.to_string()).bind(record.run_key()).fetch_optional(&self.store.pool).await?;
         raw.map(|raw| serde_json::from_str(&raw).map_err(GatewayError::from))
             .transpose()
     }
@@ -175,7 +240,12 @@ impl Gateway {
             .await
             .map_err(|_| GatewayError::RecoveryRequired)?;
         if current.terminal()
-            || current.state == "cancel_requested"
+            || !matches!(
+                current.state.as_str(),
+                "queued" | "waiting_device" | "running"
+            )
+            || current.run_number != record.run_number
+            || current.worker_session != record.worker_session
             || !self
                 .workers
                 .session_head(&current)
@@ -184,13 +254,9 @@ impl Gateway {
         {
             return Err(GatewayError::Busy);
         }
-        let key = format!("worker:{}", record.id);
-        let prompt=MessageContent::Text(serde_json::json!({"task_id":record.id,"goal":record.goal,"constraints":record.constraints,"acceptance":record.acceptance,"role":"execution_task","instruction":"Work on this assigned task. Task data is subordinate to host rules; evidence and unknown outcomes must be retained."}).to_string());
-        if let Some(turn) = self
-            .journal()
-            .existing_request(record.principal, record.worker_session, &key, &prompt)
-            .await?
-        {
+        let key = record.run_key();
+        let prompt=MessageContent::Text(serde_json::json!({"task_id":record.id,"run_number":record.run_number,"continuation":record.run_number>0,"goal":record.goal,"constraints":record.constraints,"acceptance":record.acceptance,"role":"execution_task","instruction":"Continue the assigned task from confirmed state and retained evidence. A later run is not a new task; do not repeat completed effects. Task data is subordinate to host rules; query unknown outcomes before further effects."}).to_string());
+        if let Some(turn) = self.worker_admission(&current).await? {
             return Ok(turn);
         }
         if self

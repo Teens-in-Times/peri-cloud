@@ -10,8 +10,7 @@ pub(crate) struct WorkerService {
     pub(super) journal: Arc<CloudJournal>,
     pub(super) store: TaskStore,
     cursor: std::sync::atomic::AtomicI64,
-    waiters: parking_lot::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Notify>>>,
-    transcripts: parking_lot::RwLock<
+    pub(super) transcripts: parking_lot::RwLock<
         std::collections::HashMap<
             Uuid,
             Weak<parking_lot::RwLock<peri_agent::session::MessageTranscript>>,
@@ -57,54 +56,37 @@ impl WorkerService {
         self.store.save(&mut record).await?;
         Ok(record)
     }
-    pub(super) fn message_ready(&self, task: Uuid) {
-        self.message_notifier(task).notify_one();
-    }
-    pub(super) fn message_notifier(&self, task: Uuid) -> Arc<tokio::sync::Notify> {
-        self.waiters
-            .lock()
-            .entry(task)
-            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
-            .clone()
-    }
     pub(super) async fn wait_for_parent(
         &self,
         scope: &TaskScope,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
-        let task = scope.task.ok_or(TaskError::Forbidden)?;
-        let mut record = self.authorized(scope, task).await?;
-        if record.state != "cancel_requested" {
-            record.state = "waiting_parent".into();
-            self.store.save(&mut record).await?;
+        if cancellation.is_cancelled() {
+            return Err(TaskError::Unavailable);
         }
-        let notification = self.message_notifier(task);
-        loop {
-            self.authorized(scope, task).await?;
-            let messages = self
-                .store
-                .pending_messages(task, "parent")
-                .await?
-                .into_iter()
-                .take(1)
-                .collect::<Vec<_>>();
-            if !messages.is_empty() {
-                let ids: Vec<_> = messages
-                    .iter()
-                    .filter_map(|m| m["message_id"].as_i64())
-                    .collect();
-                self.store.consume(task, &ids).await?;
-                let mut record = self.store.get(scope.principal, task).await?;
-                if record.state == "waiting_parent" {
-                    record.state = "running".into();
-                    self.store.save(&mut record).await?;
-                }
-                return Ok(
-                    json!({"state":"consumed","messages":messages,"instruction":"Incorporate the response and acknowledge applied message IDs through update_task."}),
-                );
-            }
-            tokio::select! {biased;_=cancellation.cancelled()=>return Err(TaskError::Unavailable),_=notification.notified()=>(),_=tokio::time::sleep(std::time::Duration::from_secs(30))=>()}
+        let id = scope.task.ok_or(TaskError::Forbidden)?;
+        let mut record = self.authorized(scope, id).await?;
+        if record.state != "running" {
+            return Err(TaskError::Conflict);
         }
+        let active = self
+            .journal
+            .active_turn(scope.principal, scope.session)
+            .await
+            .map_err(|_| TaskError::Unavailable)?
+            .ok_or(TaskError::Conflict)?;
+        record.wait_after = sqlx::query_scalar(
+            "SELECT parent_watermark FROM agent_task_checkpoints WHERE task_id=? AND turn_id=?",
+        )
+        .bind(id.to_string())
+        .bind(active.turn_id.to_string())
+        .fetch_one(&self.store.pool)
+        .await?;
+        record.state = "waiting_parent".into();
+        self.store.save(&mut record).await?;
+        Ok(
+            json!({"state":"waiting_parent","instruction":"Host will suspend at the next safe boundary. No polling or additional task work. The durable parent response will wake a later run."}),
+        )
     }
     pub fn new(gateway: Weak<Gateway>, journal: Arc<CloudJournal>) -> Arc<Self> {
         Arc::new(Self {
@@ -114,7 +96,6 @@ impl WorkerService {
             },
             journal,
             cursor: Default::default(),
-            waiters: Default::default(),
             transcripts: Default::default(),
         })
     }
@@ -232,7 +213,7 @@ impl WorkerService {
             }
             return Ok(existing);
         }
-        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_tasks WHERE principal=? AND parent_session=? AND json_extract(record_json,'$.state') NOT IN ('completed','failed','cancelled','recovery_required','invalidated')")
+        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_tasks WHERE principal=? AND parent_session=? AND json_extract(record_json,'$.state') NOT IN ('completed','failed','cancelled','invalidated')")
             .bind(scope.principal.to_string()).bind(scope.root_session.to_string()).fetch_one(&self.store.pool).await?;
         if active >= 8 {
             return Err(TaskError::Limit);
@@ -280,6 +261,10 @@ impl WorkerService {
             acceptance: input.acceptance,
             state: "queued".into(),
             turn: None,
+            run_number: 0,
+            lifecycle_version: 1,
+            wait_after: 0,
+            wake_at: None,
             revision: 0,
             note: String::new(),
             plan: Vec::new(),
@@ -311,7 +296,7 @@ impl WorkerService {
             .take(16)
             .map(|item| json!({"name":clip(&item.name,100),"state":item.state}))
             .collect();
-        json!({"task_id":record.id,"execution_session":record.execution_session,"worker_session":record.worker_session,"state":record.state,"revision":record.revision,"goal":clip(&record.goal,400),"note":clip(&record.note,500),"work_plan":plan,"result":clip(&record.result,1000),"worker_turn":record.turn,"preview":true})
+        json!({"task_id":record.id,"execution_session":record.execution_session,"worker_session":record.worker_session,"run_number":record.run_number,"state":record.state,"revision":record.revision,"goal":clip(&record.goal,400),"note":clip(&record.note,500),"work_plan":plan,"result":clip(&record.result,1000),"worker_turn":record.turn,"wake_at":record.wake_at,"preview":true})
     }
     pub(crate) fn attach_transcript(
         &self,
@@ -329,12 +314,20 @@ impl WorkerService {
         record: &TaskRecord,
         after: i64,
         limit: usize,
+        window: Option<Uuid>,
     ) -> Result<serde_json::Value> {
+        let window = window.unwrap_or(record.worker_session);
+        let belongs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_execution_windows WHERE execution_session=? AND cloud_session=?")
+            .bind(record.execution_session.to_string()).bind(window.to_string()).fetch_one(&self.store.pool).await?;
+        if belongs != 1 {
+            return Err(TaskError::Forbidden);
+        }
         let live = self
             .transcripts
             .read()
             .get(&record.id)
-            .and_then(Weak::upgrade);
+            .and_then(Weak::upgrade)
+            .filter(|_| window == record.worker_session);
         let (history, flags, source) = if let Some(live) = live {
             let transcript = live.read();
             let history = transcript.canonical_payloads().to_vec();
@@ -346,7 +339,7 @@ impl WorkerService {
         } else {
             let state = self
                 .journal
-                .session(record.principal, record.worker_session)
+                .session(record.principal, window)
                 .await
                 .map_err(|_| TaskError::Forbidden)?;
             (state.history, state.history_flags, "settled")
@@ -358,13 +351,10 @@ impl WorkerService {
             json!({"cursor":i+1,"message_id":m.id(),"role":role,"text":clip(&text,4000),"content_bytes":text.len(),"truncated":text.chars().count()>4000})
         }).collect();
         Ok(
-            json!({"entries":entries,"next_cursor":entries.last().and_then(|e|e["cursor"].as_i64()).unwrap_or(after),"source":source,"exclusions_respected":true}),
+            json!({"entries":entries,"next_cursor":entries.last().and_then(|e|e["cursor"].as_i64()).unwrap_or(after),"window_id":window,"source":source,"exclusions_respected":true}),
         )
     }
     pub async fn tick(&self) -> Result<()> {
-        self.waiters
-            .lock()
-            .retain(|_, waiter| Arc::strong_count(waiter) > 1);
         self.transcripts
             .write()
             .retain(|_, transcript| transcript.strong_count() > 0);
@@ -416,15 +406,27 @@ impl WorkerService {
                 }
                 continue;
             }
+            self.flush_worker_messages(&record).await?;
             if record.turn.is_none() && !record.terminal() {
+                if record.state == "pause_requested" {
+                    record.state = "paused".into();
+                    self.store.save(&mut record).await?;
+                }
+                if !matches!(
+                    record.state.as_str(),
+                    "queued" | "waiting_device" | "running"
+                ) {
+                    continue;
+                }
                 if !self.session_head(&record).await? {
                     continue;
                 }
                 match gateway.start_worker(&record).await {
                     Ok(turn) => {
+                        self.register_run(&record, turn.turn_id).await?;
                         record = self.store.get(record.principal, record.id).await?;
                         record.turn = Some(turn.turn_id);
-                        if record.state == "queued" {
+                        if matches!(record.state.as_str(), "queued" | "waiting_device") {
                             record.state = "running".into();
                         }
                         match self.store.save(&mut record).await {
@@ -433,9 +435,20 @@ impl WorkerService {
                         }
                     }
                     Err(
+                        crate::gateway::GatewayError::Connection
+                        | crate::gateway::GatewayError::NotConfigured,
+                    ) => {
+                        let mut waiting = self.store.get(record.principal, record.id).await?;
+                        if waiting.turn.is_none() && waiting.state == "queued" {
+                            waiting.state = "waiting_device".into();
+                            match self.store.save(&mut waiting).await {
+                                Ok(()) | Err(TaskError::Conflict) => (),
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    }
+                    Err(
                         crate::gateway::GatewayError::Busy
-                        | crate::gateway::GatewayError::Connection
-                        | crate::gateway::GatewayError::NotConfigured
                         | crate::gateway::GatewayError::Runtime(crate::RuntimeError::State(
                             crate::state::StateError::Limit | crate::state::StateError::Busy,
                         )),
@@ -463,6 +476,13 @@ impl WorkerService {
                     .turn(record.principal, record.worker_session, turn)
                     .await
                     .map_err(|_| TaskError::Unavailable)?;
+                if !matches!(turn.state, TurnState::Queued | TurnState::Running) {
+                    match self.continue_task(&mut record, turn.state).await {
+                        Ok(true) | Err(TaskError::Conflict | TaskError::Forbidden) => continue,
+                        Ok(false) => (),
+                        Err(error) => return Err(error),
+                    }
+                }
                 let state = match turn.state {
                     TurnState::Completed => "completed",
                     TurnState::Failed => "failed",
@@ -510,7 +530,7 @@ impl WorkerService {
         }
         Ok(())
     }
-    fn scope_record(&self, record: &TaskRecord) -> TaskScope {
+    pub(super) fn scope_record(&self, record: &TaskRecord) -> TaskScope {
         TaskScope {
             service: Weak::new(),
             principal: record.principal,

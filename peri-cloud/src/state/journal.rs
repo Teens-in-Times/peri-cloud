@@ -45,7 +45,7 @@ impl CloudJournal {
         let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
-        if !matches!(version, 0..=18) {
+        if !matches!(version, 0..=19) {
             return Err(StateError::Version);
         }
         super::schema::reject_foreign(&pool, version).await?;
@@ -74,6 +74,7 @@ impl CloudJournal {
         super::core_migration::migrate(&pool).await?;
         crate::tasks::sessions::migrate(&pool).await?;
         crate::tasks::continuity::migrate(&pool).await?;
+        crate::tasks::recovery::migrate(&pool).await?;
         let journal = Self {
             pool,
             root: root.to_owned(),
@@ -469,11 +470,12 @@ impl CloudJournal {
         if session.revision != turn.base_revision {
             return Err(StateError::TransitionConflict);
         }
-        let worker: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM agent_tasks WHERE worker_session=?")
-                .bind(turn.session_id.to_string())
-                .fetch_one(&mut *tx)
-                .await?;
+        let worker: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_execution_windows WHERE cloud_session=?",
+        )
+        .bind(turn.session_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
         if worker == 0 {
             super::chat_projection::seed(&mut tx, &session).await?;
             for reply in &result.replies {

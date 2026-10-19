@@ -31,8 +31,48 @@ pub(crate) struct TaskFrames {
     pub scope: TaskScope,
     pub transcript: Arc<RwLock<MessageTranscript>>,
     pub turn: Uuid,
+    pub prior_context: bool,
+    pub context_window: u32,
+    pub max_iterations: usize,
+    pub overhead_tokens: usize,
 }
 impl TaskFrames {
+    async fn stop_at_boundary(&self, progressed: bool, step: Option<usize>) -> AgentResult<()> {
+        if self.scope.task.is_none() {
+            return Ok(());
+        }
+        let estimated = {
+            let current = self.transcript.read();
+            current
+                .canonical_payloads()
+                .iter()
+                .filter(|p| !current.flags(p.id()).excluded && !current.flags(p.id()).truncated)
+                .map(|p| match p {
+                    peri_acp_types::store::PersistedPayload::SystemReminder {
+                        reminder, ..
+                    } => reminder.as_reminder().body.len(),
+                    _ => p
+                        .as_message()
+                        .and_then(|m| serde_json::to_vec(m).ok())
+                        .map_or(0, |v| v.len()),
+                })
+                .sum::<usize>()
+                / 2
+        };
+        self.scope
+            .service
+            .upgrade()
+            .ok_or(AgentError::Interrupted)?
+            .boundary_stop(
+                &self.scope,
+                estimated.saturating_add(self.overhead_tokens),
+                progressed,
+                self.context_window,
+                step.unwrap_or(0),
+                self.max_iterations,
+            )
+            .await
+    }
     async fn checkpoint(
         &self,
         phase: &str,
@@ -134,14 +174,26 @@ impl Middleware for TaskFrames {
     fn name(&self) -> &str {
         "CloudTaskFrames"
     }
-    async fn before_model(&self, _: &mut dyn capabilities::BeforeModelState) -> AgentResult<()> {
+    async fn before_react_start(&self, _: &mut dyn capabilities::StartupState) -> AgentResult<()> {
+        self.checkpoint("model_boundary", &[], &[]).await?;
+        self.stop_at_boundary(self.prior_context, None).await
+    }
+    async fn before_model(
+        &self,
+        state: &mut dyn capabilities::BeforeModelState,
+    ) -> AgentResult<()> {
         self.refresh()
             .await
             .map_err(|_| AgentError::MiddlewareError {
                 middleware: "CloudTaskFrames".into(),
                 reason: "task authorization or observation refresh failed".into(),
             })?;
-        self.checkpoint("model_boundary", &[], &[]).await
+        self.checkpoint("model_boundary", &[], &[]).await?;
+        self.stop_at_boundary(
+            state.current_step().is_some_and(|s| s > 1) || self.prior_context,
+            None,
+        )
+        .await
     }
     async fn before_tools_batch(
         &self,
@@ -209,12 +261,13 @@ impl Middleware for TaskFrames {
     }
     async fn after_tools_batch(
         &self,
-        _: &mut dyn capabilities::AfterToolsBatchState,
+        state: &mut dyn capabilities::AfterToolsBatchState,
         results: &[(
             peri_agent::agent::react::ToolCall,
             peri_agent::agent::react::ToolResult,
         )],
     ) -> AgentResult<()> {
-        self.checkpoint("tools_settled", &[], results).await
+        self.checkpoint("tools_settled", &[], results).await?;
+        self.stop_at_boundary(true, state.current_step()).await
     }
 }

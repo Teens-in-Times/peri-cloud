@@ -88,6 +88,10 @@ fn task(scope: &TaskScope, execution: &ExecutionSession, key: &str) -> TaskRecor
         acceptance: String::new(),
         state: "queued".into(),
         turn: None,
+        run_number: 0,
+        lifecycle_version: 1,
+        wait_after: 0,
+        wake_at: None,
         revision: 0,
         note: String::new(),
         plan: Vec::new(),
@@ -336,6 +340,7 @@ async fn schema_rebuild_preserves_old_task_and_unknown_operation_identity() {
     original.result = "unknown operation; do not replay".into();
     service.store.insert(&original).await.unwrap();
     for sql in [
+        "DROP TABLE agent_task_runs",
         "DROP TABLE agent_task_operations",
         "DROP TABLE agent_task_checkpoints",
         "DROP TABLE agent_execution_windows",
