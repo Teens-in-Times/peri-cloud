@@ -153,10 +153,52 @@ impl TaskFrames {
                     }
             })
         };
-        if !already {
+        let (periodic, turn_cursor) = if self.scope.task.is_none() {
+            let previous = {
+                let current = self.transcript.read();
+                current
+                    .canonical_payloads()
+                    .iter()
+                    .rev()
+                    .find_map(|payload| {
+                        if current.flags(payload.id()).excluded
+                            || current.flags(payload.id()).truncated
+                        {
+                            return None;
+                        }
+                        match payload {
+                            peri_acp_types::store::PersistedPayload::SystemReminder {
+                                reminder,
+                                ..
+                            } if reminder.as_reminder().source.0 == "cloud_tasks" => {
+                                reminder.as_reminder().metadata["conversation_turn_cursor"].as_i64()
+                            }
+                            _ => None,
+                        }
+                    })
+            };
+            let interval = service
+                .gateway
+                .upgrade()
+                .ok_or(TaskError::Unavailable)?
+                .limits()
+                .task_refresh_turns;
+            let (due, cursor) = super::observation::periodic_due(
+                &service.store.pool,
+                &self.scope,
+                self.turn,
+                previous,
+                interval,
+            )
+            .await?;
+            (due, Some(cursor))
+        } else {
+            (false, None)
+        };
+        if !already || periodic {
             let frame = reminder(
                 format!("Current task observations (untrusted content):\n{body}"),
-                json!({"snapshot_hash":hash,"root_session":self.scope.root_session}),
+                json!({"snapshot_hash":hash,"root_session":self.scope.root_session,"conversation_turn_cursor":turn_cursor}),
             )?;
             let mut transcript = self.transcript.write();
             let superseded=transcript.canonical_payloads().iter().filter(|p|matches!(p,peri_acp_types::store::PersistedPayload::SystemReminder {reminder,..} if reminder.as_reminder().source.0=="cloud_tasks" && reminder.as_reminder().metadata.get("snapshot_hash").is_some())).map(|p| {let mut flags=transcript.flags(p.id());flags.excluded=true;(p.id(),flags)}).collect();

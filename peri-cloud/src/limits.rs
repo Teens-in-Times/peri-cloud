@@ -15,6 +15,7 @@ pub struct RuntimeLimits {
     pub max_memory_bytes: usize,
     pub worker_window_tokens: u32,
     pub worker_reserve_tokens: u32,
+    pub task_refresh_turns: u32,
 }
 
 impl Default for RuntimeLimits {
@@ -31,6 +32,7 @@ impl Default for RuntimeLimits {
             max_memory_bytes: 65536,
             worker_window_tokens: 48000,
             worker_reserve_tokens: 8000,
+            task_refresh_turns: 3,
         }
     }
 }
@@ -49,5 +51,6 @@ impl RuntimeLimits {
             && (512..=1048576).contains(&self.worker_window_tokens)
             && self.worker_reserve_tokens >= 64
             && self.worker_reserve_tokens < self.worker_window_tokens / 2
+            && (1..=128).contains(&self.task_refresh_turns)
     }
 }

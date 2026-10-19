@@ -4,6 +4,7 @@ pub(crate) mod continuity;
 pub(crate) mod deliverables;
 mod evidence;
 pub(crate) mod middleware;
+mod observation;
 pub(crate) mod recovery;
 pub(crate) mod resources;
 mod service;
