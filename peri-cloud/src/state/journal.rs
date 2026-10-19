@@ -45,7 +45,7 @@ impl CloudJournal {
         let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
-        if !matches!(version, 0..=16) {
+        if !matches!(version, 0..=17) {
             return Err(StateError::Version);
         }
         super::schema::reject_foreign(&pool, version).await?;
@@ -72,6 +72,7 @@ impl CloudJournal {
         crate::goal::migrate(&pool).await?;
         crate::mcp::migrate(&pool).await?;
         super::core_migration::migrate(&pool).await?;
+        crate::tasks::sessions::migrate(&pool).await?;
         let journal = Self {
             pool,
             root: root.to_owned(),

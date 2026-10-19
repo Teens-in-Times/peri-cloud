@@ -61,7 +61,67 @@ impl Gateway {
             .journal()
             .session(scope.principal, scope.session)
             .await?;
-        let target = input.device_id.or(parent.frozen.device_id);
+        let reuse = match input.execution_session {
+            Some(id) => Some(
+                self.workers
+                    .execution_session(scope.principal, id)
+                    .await
+                    .map_err(|_| IdentityError::Forbidden)?,
+            ),
+            None => None,
+        };
+        let target = match (input.device_id, &reuse) {
+            (Some(id), _) => Some(id),
+            (None, Some(reuse)) => reuse.device,
+            (None, None) => parent.frozen.device_id,
+        };
+        if target.is_none() && input.workspace.as_ref().is_some_and(|p| !p.is_empty()) {
+            return Err(GatewayError::Invalid);
+        }
+        if let Some(reuse) = &reuse {
+            if target != reuse.device {
+                return Err(IdentityError::Forbidden.into());
+            }
+            let state = self
+                .journal()
+                .session(scope.principal, reuse.window)
+                .await?;
+            let agent = match target {
+                Some(id) => {
+                    let device = devices
+                        .iter()
+                        .find(|d| d.id == id && !d.revoked)
+                        .ok_or(IdentityError::Forbidden)?;
+                    if let Some(path) = input.workspace.as_deref().filter(|p| !p.trim().is_empty())
+                    {
+                        let canonical = self
+                            .connector
+                            .directories(
+                                scope.principal,
+                                device,
+                                peri_acp_types::device_executor::DirectoryQuery {
+                                    path: path.into(),
+                                    offset: 0,
+                                    limit: 1,
+                                },
+                            )
+                            .await?;
+                        if canonical.path != reuse.workspace {
+                            return Err(IdentityError::Forbidden.into());
+                        }
+                    }
+                    self.connector
+                        .open(scope.principal, device, Some(&state.frozen))
+                        .await?
+                }
+                None => {
+                    self.connector
+                        .open_conversation(scope.principal, &state.frozen)
+                        .await?
+                }
+            };
+            return Ok(agent.frozen_session(scope.principal));
+        }
         let agent = match target {
             Some(id) => {
                 let device = devices
@@ -114,7 +174,14 @@ impl Gateway {
             .record(record.principal, record.id)
             .await
             .map_err(|_| GatewayError::RecoveryRequired)?;
-        if current.terminal() || current.state == "cancel_requested" {
+        if current.terminal()
+            || current.state == "cancel_requested"
+            || !self
+                .workers
+                .session_head(&current)
+                .await
+                .map_err(|_| GatewayError::RecoveryRequired)?
+        {
             return Err(GatewayError::Busy);
         }
         let key = format!("worker:{}", record.id);
@@ -139,6 +206,13 @@ impl Gateway {
         let worker = self
             .journal()
             .session(principal, record.worker_session)
+            .await?;
+        self.journal()
+            .set_permissions(
+                principal,
+                record.worker_session,
+                peri_acp_types::permission::PermissionMode::from(record.permission_mode),
+            )
             .await?;
         let agent = match worker.frozen.device_id {
             Some(id) => {

@@ -18,7 +18,7 @@ impl TaskStore {
     }
     pub async fn by_session(&self, owner: Uuid, session: Uuid) -> Result<Option<TaskRecord>> {
         let raw: Option<String> = sqlx::query_scalar(
-            "SELECT record_json FROM agent_tasks WHERE worker_session=? AND principal=?",
+            "SELECT record_json FROM agent_tasks WHERE worker_session=? AND principal=? ORDER BY (json_extract(record_json,'$.state') IN ('completed','failed','cancelled','recovery_required','invalidated')),rowid LIMIT 1",
         )
         .bind(session.to_string())
         .bind(owner.to_string())

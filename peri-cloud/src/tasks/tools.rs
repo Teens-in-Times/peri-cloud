@@ -21,6 +21,7 @@ impl Middleware for TaskTools {
         } else {
             &[
                 "delegate_task",
+                "list_execution_sessions",
                 "list_tasks",
                 "inspect_task",
                 "message_task",
@@ -105,6 +106,7 @@ impl BaseTool for TaskTool {
     fn description(&self) -> &str {
         match self.name {
         "delegate_task"=>"Persist an independent cloud execution task and return immediately. Supply goal, constraints and acceptance; optional device/workspace must belong to this user. Native tools remain available for small operations. Workers use their own context and the original tool approval policy.",
+        "list_execution_sessions"=>"List authorized execution conversations for explicit reuse. Reuse preserves work context across independent tasks, within the same device, canonical workspace and privacy scope. Supply the execution_session plus matching device/workspace to delegate_task.",
         "list_tasks"=>"List bounded task status for this logical conversation. Runtime state and worker-authored notes are separate. Never poll continuously while the user wants to chat.",
         "inspect_task"=>"Read status, bounded trace, retained conversation evidence or task messages. Trace previews are cropped; conversation view reads retained canonical content with exclusions respected. Does not expose private reasoning.",
         "message_task"=>"Send a supplement or question to this conversation's task at its current revision. Submitted, consumed and applied are different receipts. A message cannot authorize additional permissions.",
@@ -118,10 +120,10 @@ impl BaseTool for TaskTool {
         let rev = json!({"type":"integer","minimum":0});
         let (properties, required) = match self.name {
             "delegate_task" => (
-                json!({"goal":{"type":"string","maxLength":16384},"constraints":{"type":"string","maxLength":16384},"acceptance":{"type":"string","maxLength":8192},"device_id":id,"workspace":{"type":"string"}}),
+                json!({"goal":{"type":"string","maxLength":16384},"constraints":{"type":"string","maxLength":16384},"acceptance":{"type":"string","maxLength":8192},"device_id":id,"workspace":{"type":"string"},"execution_session":id}),
                 vec!["goal"],
             ),
-            "list_tasks" => (json!({}), vec![]),
+            "list_tasks" | "list_execution_sessions" => (json!({}), vec![]),
             "inspect_task" => (
                 json!({"task_id":id,"view":{"type":"string","enum":["status","trace","conversation","messages"]},"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32}}),
                 vec!["task_id"],
@@ -163,11 +165,15 @@ impl BaseTool for TaskTool {
                     .await?;
                 service.summary(&record)
             }
-            "list_tasks" => {
+            "list_tasks" | "list_execution_sessions" => {
                 if input != json!({}) {
                     return Err(TaskError::Invalid.into());
                 }
-                service.list(&self.scope).await?
+                if self.name == "list_execution_sessions" {
+                    service.list_execution_sessions(&self.scope).await?
+                } else {
+                    service.list(&self.scope).await?
+                }
             }
             "inspect_task" => {
                 let args: Inspect = serde_json::from_value(input)?;

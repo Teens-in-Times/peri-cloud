@@ -38,6 +38,8 @@ const VERIFIER: &str = "fixture-native-pkce-verifier-with-at-least-43-characters
 mod access_tests;
 #[path = "gateway/commands.rs"]
 mod command_tests;
+#[path = "gateway/execution_sessions.rs"]
+mod execution_session_tests;
 #[path = "gateway/experience.rs"]
 mod experience_tests;
 #[path = "gateway/memory.rs"]

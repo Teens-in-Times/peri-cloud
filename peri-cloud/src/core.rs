@@ -661,7 +661,12 @@ impl CloudAgent {
             .with_middleware_chain(chain)
             .with_event_bus(Arc::new(bus))
             .with_session_context(Arc::new(RwLock::new(metadata)))
-            .with_agent_id(AgentId::from_uuid(self.session_id))
+            .with_agent_id(AgentId::from_uuid(
+                task_scope
+                    .as_ref()
+                    .and_then(|scope| scope.execution_agent)
+                    .unwrap_or(self.session_id),
+            ))
             .with_context_budget(ContextBudget::new(self.context_window))
             .with_compact_config(CompactConfig::default())
             .with_compact_llm(model)

@@ -192,10 +192,11 @@ impl InteractionHub {
             true
         } else {
             let parent: Option<String> = sqlx::query_scalar(
-                "SELECT parent_session FROM agent_tasks WHERE principal=? AND worker_session=?",
+                "SELECT parent_session FROM agent_tasks WHERE principal=? AND worker_session=? AND json_extract(record_json,'$.turn')=?",
             )
             .bind(principal.to_string())
             .bind(card.session_id.to_string())
+            .bind(card.turn_id.to_string())
             .fetch_optional(&self.journal.identity_pool())
             .await?;
             parent

@@ -2,6 +2,7 @@
 pub(crate) mod middleware;
 pub(crate) mod resources;
 mod service;
+pub(crate) mod sessions;
 mod store;
 pub(crate) mod tools;
 pub(crate) use service::WorkerService;
@@ -39,6 +40,7 @@ pub(crate) struct TaskScope {
     pub root_session: Uuid,
     pub task: Option<Uuid>,
     pub role: AgentRole,
+    pub execution_agent: Option<Uuid>,
     pub route: ChannelRoute,
 }
 
@@ -54,6 +56,9 @@ pub(crate) struct TaskRecord {
     pub principal: Uuid,
     pub parent_session: Uuid,
     pub worker_session: Uuid,
+    /// Stable execution conversation; worker_session identifies its physical window.
+    #[serde(default)]
+    pub execution_session: Uuid,
     pub parent_turn: Uuid,
     pub request_key: String,
     pub request_fingerprint: String,
@@ -94,6 +99,8 @@ pub(crate) struct Delegate {
     pub acceptance: String,
     pub device_id: Option<Uuid>,
     pub workspace: Option<String>,
+    /// Explicit reuse only. Device, canonical workspace and privacy must still match.
+    pub execution_session: Option<Uuid>,
 }
 pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()

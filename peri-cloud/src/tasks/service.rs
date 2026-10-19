@@ -125,6 +125,14 @@ impl WorkerService {
         route: ChannelRoute,
     ) -> Result<TaskScope> {
         let task = self.store.by_session(principal, session).await?;
+        let execution_agent = match &task {
+            Some(record) => Some(
+                self.execution_session(principal, record.execution_session)
+                    .await?
+                    .agent_id,
+            ),
+            None => None,
+        };
         Ok(TaskScope {
             service: Arc::downgrade(self),
             principal,
@@ -136,6 +144,7 @@ impl WorkerService {
                 AgentRole::Main
             },
             task: task.map(|r| r.id),
+            execution_agent,
             route,
         })
     }
@@ -176,7 +185,10 @@ impl WorkerService {
             .session(scope.principal, record.parent_session)
             .await
             .map_err(|_| TaskError::Forbidden)?;
-        if record.privacy_epoch != epoch || record.parent_generation != parent.context_generation {
+        if record.privacy_epoch != epoch
+            || record.parent_generation != parent.context_generation
+            || !self.execution_valid(&record).await?
+        {
             return Err(TaskError::Forbidden);
         }
         Ok(record)
@@ -209,12 +221,22 @@ impl WorkerService {
             }
             return Ok(existing);
         }
+        let gateway = self.gateway.upgrade().ok_or(TaskError::Unavailable)?;
+        let gate = gateway.worker_control_gate(scope.principal);
+        let _guard = gate.lock().await;
+        // Serialize the idempotency check and session-source updates across
+        // different foreground conversations owned by this principal.
+        if let Some(existing) = self.store.existing(scope, key).await? {
+            if existing.request_fingerprint != fingerprint {
+                return Err(TaskError::Conflict);
+            }
+            return Ok(existing);
+        }
         let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_tasks WHERE principal=? AND parent_session=? AND json_extract(record_json,'$.state') NOT IN ('completed','failed','cancelled','recovery_required','invalidated')")
             .bind(scope.principal.to_string()).bind(scope.root_session.to_string()).fetch_one(&self.store.pool).await?;
         if active >= 8 {
             return Err(TaskError::Limit);
         }
-        let gateway = self.gateway.upgrade().ok_or(TaskError::Unavailable)?;
         let parent = self
             .journal
             .session(scope.principal, scope.session)
@@ -228,12 +250,25 @@ impl WorkerService {
             .privacy_epoch()
             .await
             .map_err(|_| TaskError::Unavailable)?;
+        let execution = self
+            .resolve_execution_session(
+                scope,
+                input.execution_session,
+                &worker,
+                super::sessions::SessionBoundary::new(
+                    gateway.worker_private_route(&scope.route),
+                    privacy_epoch,
+                    parent.context_generation,
+                ),
+            )
+            .await?;
         let (reply_to, reply_kind) = gateway.worker_parent_reference(scope.session);
         let record = TaskRecord {
             id: Uuid::new_v4(),
             principal: scope.principal,
             parent_session: scope.session,
-            worker_session: worker.session_id,
+            worker_session: execution.window,
+            execution_session: execution.id,
             parent_turn: turn,
             request_key: key.into(),
             request_fingerprint: fingerprint,
@@ -276,7 +311,7 @@ impl WorkerService {
             .take(16)
             .map(|item| json!({"name":clip(&item.name,100),"state":item.state}))
             .collect();
-        json!({"task_id":record.id,"worker_session":record.worker_session,"state":record.state,"revision":record.revision,"goal":clip(&record.goal,400),"note":clip(&record.note,500),"work_plan":plan,"result":clip(&record.result,1000),"worker_turn":record.turn,"preview":true})
+        json!({"task_id":record.id,"execution_session":record.execution_session,"worker_session":record.worker_session,"state":record.state,"revision":record.revision,"goal":clip(&record.goal,400),"note":clip(&record.note,500),"work_plan":plan,"result":clip(&record.result,1000),"worker_turn":record.turn,"preview":true})
     }
     pub(crate) fn attach_transcript(
         &self,
@@ -366,6 +401,7 @@ impl WorkerService {
             if epoch != record.privacy_epoch
                 || parent.context_generation != record.parent_generation
                 || !device_valid
+                || !self.execution_valid(&record).await?
             {
                 if let Some(turn) = record.turn {
                     let _ = gateway.cancel_worker(&record, turn).await;
@@ -381,6 +417,9 @@ impl WorkerService {
                 continue;
             }
             if record.turn.is_none() && !record.terminal() {
+                if !self.session_head(&record).await? {
+                    continue;
+                }
                 match gateway.start_worker(&record).await {
                     Ok(turn) => {
                         record = self.store.get(record.principal, record.id).await?;
@@ -479,6 +518,7 @@ impl WorkerService {
             root_session: record.parent_session,
             task: Some(record.id),
             role: AgentRole::Worker,
+            execution_agent: None,
             route: record.route.clone(),
         }
     }

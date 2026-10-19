@@ -96,6 +96,12 @@ pub(crate) async fn reject_foreign(pool: &SqlitePool, version: i64) -> StateResu
     {
         return Err(StateError::ForeignSchema);
     }
+    if version >= 17
+        && (!has_table(pool, "agent_execution_sessions").await?
+            || !has_table(pool, "agent_execution_windows").await?)
+    {
+        return Err(StateError::ForeignSchema);
+    }
     Ok(())
 }
 
