@@ -34,8 +34,6 @@ use crate::mcp::McpCache;
 use crate::reply::{replies, ChatReply};
 use crate::workspace::WorkspaceCache;
 
-#[path = "approval_review.rs"]
-mod approval_review;
 #[path = "compact.rs"]
 mod compact;
 
@@ -356,6 +354,13 @@ impl CloudAgent {
             return Err(Error::InvalidIterationLimit);
         }
         let _gate = self.turn_gate.lock().await;
+        let approval_control = task_event
+            && matches!(&request.prompt, MessageContent::Text(text)
+            if serde_json::from_str::<serde_json::Value>(text).is_ok_and(|v| v["source"] == "host_approval_event"));
+        if approval_control {
+            request.max_iterations = request.max_iterations.min(3);
+            request.cancellation = request.cancellation.child_token();
+        }
         if let MessageContent::Text(text) = &request.prompt {
             if text.starts_with('/') {
                 if let Some(resolved) = self.commands.resolve(text) {
@@ -466,9 +471,23 @@ impl CloudAgent {
             Some(remote) => Some(self.workspace_cache.load(remote).await),
             None => None,
         };
+        let workspace = if let Some(scope) = &personal {
+            crate::workspace::with_global_skills(
+                workspace,
+                self.context_assembler.files(),
+                scope.principal,
+                scope.private_memory,
+            )
+            .await
+        } else {
+            workspace
+        };
         // MCP servers are account-scoped. The cache checks the stored revision
         // each turn and rebuilds the pool when the account's list changes.
-        let mcp_pool = match personal.as_ref().filter(|_| !self.is_worker()) {
+        let mcp_pool = match personal
+            .as_ref()
+            .filter(|_| !self.is_worker() && !approval_control)
+        {
             Some(scope) => {
                 let store =
                     crate::mcp::McpServerStore::new(scope.journal.identity_pool(), scope.principal);
@@ -482,7 +501,10 @@ impl CloudAgent {
         // A controller exists for every durable session, even before a goal is
         // created: it is what exposes the deferred `goal` tool in the first
         // place. Sharing the tool map with ToolSearch lets it index that tool.
-        let goal = match personal.as_ref().filter(|_| !self.is_worker()) {
+        let goal = match personal
+            .as_ref()
+            .filter(|_| !self.is_worker() && !approval_control)
+        {
             Some(scope) => Some(
                 crate::goal::CloudGoalController::load(
                     scope.journal.identity_pool(),
@@ -535,7 +557,6 @@ impl CloudAgent {
                         peri_agent::session::factory::ChainSlot::Todo
                             | peri_agent::session::factory::ChainSlot::Goal
                             | peri_agent::session::factory::ChainSlot::Mcp
-                            | peri_agent::session::factory::ChainSlot::Skills
                     )
                 })
                 .collect::<Vec<_>>();
@@ -558,6 +579,10 @@ impl CloudAgent {
             .map(|b| b.workspace.clone())
             .unwrap_or_default();
         let mut parts = vec![crate::context::ContextPart::text("base", prompt)];
+        parts.push(crate::context::ContextPart::text(
+            "extensions",
+            include_str!("../prompts/extensions.md"),
+        ));
         if personal.is_some() {
             parts.push(crate::context::ContextPart::text(
                 "role",
@@ -590,9 +615,10 @@ impl CloudAgent {
         });
         let assembled = self
             .context_assembler
-            .assemble(parts)
+            .assemble_for_role(parts, task_scope.as_ref().map_or(self.role, |s| s.role))
             .map_err(|_| Error::Context)?;
         let prompt = assembled.system_prompt.as_str();
+        tracing::debug!(sections=?assembled.sections,"assembled cloud context sources");
         let effective_window = model
             .context_window()
             .map_or(self.context_window, |window| {
@@ -633,7 +659,11 @@ impl CloudAgent {
                 prior_context,
                 context_window: effective_window,
                 max_iterations: request.max_iterations,
+                approval_control,
                 overhead_tokens: (prompt.len()
+                    + chain
+                        .collect_prompt_contributions()
+                        .map_or(0, |text| text.len())
                     + assembled
                         .tools
                         .values()
@@ -661,6 +691,14 @@ impl CloudAgent {
                     );
                 }
             }
+        }
+        if approval_control {
+            tool_map.retain(|name, _| {
+                matches!(
+                    name.as_str(),
+                    "decide_approval" | "inspect_task" | "message_task"
+                )
+            });
         }
         let catalog = Arc::new(
             SessionToolCatalog::try_new(tool_map.clone(), None).map_err(|_| Error::ToolCatalog)?,
@@ -735,10 +773,23 @@ impl CloudAgent {
         }
         // Scope owns both futures. Events are drained while the original loop
         // runs, then its senders are dropped and the final queued events drain.
-        let (outcome, internal_events) = tokio::join!(
-            run_react_loop(context, request.max_iterations),
-            drain_events(handles, task_scope)
-        );
+        let control_cancel = request.cancellation.clone();
+        let execution = async {
+            let run = run_react_loop(context, request.max_iterations);
+            tokio::pin!(run);
+            if approval_control {
+                tokio::select! {
+                    result = &mut run => result,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                        control_cancel.cancel();
+                        run.await
+                    }
+                }
+            } else {
+                run.await
+            }
+        };
+        let (outcome, internal_events) = tokio::join!(execution, drain_events(handles, task_scope));
         shared_tools.write().clear();
         let status = match outcome {
             LoopResult::Completed => TurnStatus::Completed,
@@ -784,7 +835,11 @@ impl CloudAgent {
         let visible = replies(&new_payloads);
         Ok(CloudTurnResult {
             status,
-            replies: visible,
+            replies: if approval_control {
+                Vec::new()
+            } else {
+                visible
+            },
             history,
             history_flags,
             internal_events,

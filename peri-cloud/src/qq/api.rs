@@ -380,7 +380,7 @@ fn button(id: &str, label: &str, data: &str) -> Value {
 #[async_trait]
 impl MessageAdapter for QqAdapter {
     fn context_constraints(&self, _route: &crate::gateway::ChannelRoute) -> &'static str {
-        "Channel: official QQ bot. Keep ordinary replies concise and readable as plain text; approvals and menus use the host's structured channel."
+        "Channel: official QQ bot. Keep replies clear, natural and appropriate to the user's current question."
     }
     fn display_name(&self) -> &'static str {
         "官方 QQBot"

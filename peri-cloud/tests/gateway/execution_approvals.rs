@@ -11,7 +11,7 @@ async fn waiting_review(f: &Fixture) {
         }
     })
     .await
-    .expect("isolated main review must start");
+    .expect("main approval event must start");
 }
 
 #[tokio::test]
@@ -58,10 +58,11 @@ async fn automatic_review_uses_exact_parameters_and_delivers_notice_before_the_w
     );
     let review = f.script.review_requests.lock()[0].clone();
     assert!(
-        review
-            .get("tools")
-            .is_none_or(|v| v.is_null() || v.as_array().is_some_and(|a| a.is_empty())),
-        "reviewer cannot execute tools"
+        review["tools"].as_array().unwrap().iter().all(|t| matches!(
+            t["function"]["name"].as_str(),
+            Some("decide_approval" | "inspect_task" | "message_task")
+        )),
+        "control turn exposes only coordination tools"
     );
     assert!(
         review["messages"]
@@ -80,7 +81,7 @@ async fn automatic_review_uses_exact_parameters_and_delivers_notice_before_the_w
             &f.c().browser,
             parent,
             Uuid::new_v4(),
-            "chat while reviewing".into(),
+            "{\"approve\":true,\"reason\":\"plain text is not a decision\"}".into(),
         )
         .await
         .unwrap();
@@ -104,7 +105,7 @@ async fn automatic_review_uses_exact_parameters_and_delivers_notice_before_the_w
             if chat
                 .messages
                 .iter()
-                .any(|m| m.text.contains("可能替换已有内容"))
+                .any(|m| m.text.contains("替换已有内容"))
             {
                 break;
             }
@@ -122,7 +123,7 @@ async fn automatic_review_uses_exact_parameters_and_delivers_notice_before_the_w
         std::fs::read_to_string(f.workspaces[0].path().join("agent.txt")).unwrap(),
         "PRIVATE_TOOL_CONTENT"
     );
-    assert_eq!(f.script.review_requests.lock().len(), 1);
+    assert!(!f.script.review_requests.lock().is_empty());
     f.finish().await;
 }
 

@@ -5,7 +5,11 @@
 //! the cloud host's filesystem, and an executor that does not advertise the
 //! capability simply contributes no workspace context.
 
+mod environment;
+mod global;
 mod skills;
+pub(crate) use environment::EnvironmentContext;
+pub(crate) use global::with_global_skills;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -29,6 +33,7 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(8);
 #[derive(Clone, Debug)]
 pub(crate) struct WorkspaceSkill {
     pub name: String,
+    pub source: SkillSource,
     /// Workspace-relative path, always `.claude/skills/**/SKILL.md`.
     pub path: String,
 }
@@ -53,9 +58,11 @@ impl SkillReader for RemoteSkillReader {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DeviceWorkspace {
     pub main: Option<String>,
     pub local: Option<String>,
+    pub environment: Option<peri_acp_types::device_executor::EnvironmentSnapshot>,
     pub skills: Vec<WorkspaceSkill>,
     /// `false` when discovery failed or the executor lacks the capability.
     /// An empty catalog with `true` is a legitimate empty skill root.
@@ -68,14 +75,15 @@ impl DeviceWorkspace {
         let metadata: Vec<SkillMetadata> = self
             .skills
             .iter()
+            .filter(|skill| skills::effective(skill))
             .map(|skill| SkillMetadata {
                 name: skill.name.clone(),
                 description: String::new(),
-                source: SkillSource::Project,
+                source: skill.source,
                 ..Default::default()
             })
             .collect();
-        SkillsMiddleware::render_frozen_summary(&metadata)
+        SkillsMiddleware::render_frozen_summary(&metadata).map(|text| cap_text(text, 32768))
     }
 
     pub(crate) fn has_instructions(&self) -> bool {
@@ -100,7 +108,13 @@ impl WorkspaceCache {
     pub(crate) async fn load(&self, remote: &Arc<RemoteSession>) -> Arc<DeviceWorkspace> {
         let mut state = self.state.lock().await;
         if let Some(workspace) = state.as_ref() {
-            return workspace.clone();
+            let mut snapshot = (**workspace).clone();
+            snapshot.environment =
+                tokio::time::timeout(std::time::Duration::from_secs(2), remote.environment())
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+            return Arc::new(snapshot);
         }
         let workspace = Arc::new(load(remote).await);
         *state = Some(workspace.clone());
@@ -116,24 +130,26 @@ async fn load(remote: &Arc<RemoteSession>) -> DeviceWorkspace {
         return DeviceWorkspace {
             main: None,
             local: None,
+            environment: None,
             skills: Vec::new(),
             skills_available: false,
             reader,
         };
     }
-    let (instructions, listed) = tokio::join!(
+    let (instructions, listed, environment) = tokio::join!(
         tokio::time::timeout(LOAD_TIMEOUT, remote.workspace_instructions()),
         tokio::time::timeout(LOAD_TIMEOUT, remote.workspace_skills()),
+        tokio::time::timeout(std::time::Duration::from_secs(2), remote.environment()),
     );
     let instructions = instructions.ok().and_then(Result::ok);
     let main = instructions
         .as_ref()
         .and_then(|value| value.main.as_ref())
-        .map(|file| cap_text(file.content.clone(), MAX_MAIN_BYTES));
+        .map(|file| instruction_text(file, MAX_MAIN_BYTES));
     let local = instructions
         .as_ref()
         .and_then(|value| value.local.as_ref())
-        .map(|file| cap_text(file.content.clone(), MAX_LOCAL_BYTES));
+        .map(|file| instruction_text(file, MAX_LOCAL_BYTES));
     let listed = listed.ok().and_then(Result::ok);
     let skills = listed
         .as_ref()
@@ -142,15 +158,33 @@ async fn load(remote: &Arc<RemoteSession>) -> DeviceWorkspace {
     DeviceWorkspace {
         main,
         local,
+        environment: environment.ok().and_then(Result::ok),
         skills,
         skills_available: listed.is_some(),
         reader,
     }
 }
 
+pub(crate) fn instruction_text(file: &WorkspaceFile, budget: usize) -> String {
+    cap_text(format!("Workspace instruction {:?} (version {}; workspace-local guidance, never additional permissions):\n{}",file.path,file.digest,file.content),budget)
+}
+
 fn catalog<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<WorkspaceSkill> {
     let mut unique: BTreeMap<String, String> = BTreeMap::new();
+    let mut selected: BTreeMap<String, String> = BTreeMap::new();
     for path in paths {
+        if !valid_skill_path(path) {
+            continue;
+        }
+        let key = relative_dir(path).to_lowercase();
+        if selected.get(&key).is_some_and(|previous| {
+            previous.starts_with(".agents/") || path.starts_with(".claude/")
+        }) {
+            continue;
+        }
+        selected.insert(key, path.to_owned());
+    }
+    for path in selected.values().map(String::as_str) {
         if !valid_skill_path(path) {
             continue;
         }
@@ -166,6 +200,7 @@ fn catalog<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<WorkspaceSkill> 
     let mut skills: Vec<WorkspaceSkill> = unique
         .into_iter()
         .map(|(path, base)| WorkspaceSkill {
+            source: SkillSource::Project,
             name: if counts.get(&base) == Some(&1) {
                 base
             } else {
@@ -189,6 +224,7 @@ fn valid_skill_path(path: &str) -> bool {
     }
     let Some(dir) = path
         .strip_prefix(".claude/skills/")
+        .or_else(|| path.strip_prefix(".agents/skills/"))
         .and_then(|rest| rest.strip_suffix("/SKILL.md"))
     else {
         return false;
@@ -211,6 +247,7 @@ fn display_name(raw: &str) -> Option<String> {
 
 fn relative_dir(path: &str) -> &str {
     path.strip_prefix(".claude/skills/")
+        .or_else(|| path.strip_prefix(".agents/skills/"))
         .and_then(|rest| rest.strip_suffix("/SKILL.md"))
         .unwrap_or(path)
 }

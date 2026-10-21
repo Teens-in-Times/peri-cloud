@@ -1,0 +1,936 @@
+{
+  "source_commit": "242d9bdbc6de8dc7cc215740cd0ad08e6867f9da",
+  "files": [
+    {
+      "file": "02-main.md",
+      "kind": "active-role",
+      "sources": [
+        {
+          "path": "peri-cloud/prompts/main.md",
+          "sha256": "19b0fc383a4a53a376ddee88d4f6866c8f91656fe41618bca914cb5b35f4983a"
+        }
+      ],
+      "export_sha256": "a2242f21ca6b0ddffe4f89ca6bf79c9e43b0ceb97e41573650ced6e8231cb6f1"
+    },
+    {
+      "file": "03-worker.md",
+      "kind": "active-role",
+      "sources": [
+        {
+          "path": "peri-cloud/prompts/worker.md",
+          "sha256": "72c6eb58833f79613b4182fa3fd16fe0ec7f6faafb5cb66e553862a72d6454d6"
+        }
+      ],
+      "export_sha256": "ee76fe82d5c967294689d7457c0aee26d1b74b7f08bc274eb996f5e12a6fa733"
+    },
+    {
+      "file": "01-host-base.md",
+      "kind": "active-default",
+      "sources": [
+        {
+          "path": "peri-cloud/prompts/base.md",
+          "sha256": "19db9ff3492dc4face7684989337e499ae84fd329fb2e919f37657d6b54ace81"
+        }
+      ],
+      "export_sha256": "356ae5f28863867d29777790daa50a3cf3b2d6c30926aaf833af80b393fa9802"
+    },
+    {
+      "file": "04-approval.md",
+      "kind": "active-isolated-review",
+      "sources": [
+        {
+          "path": "peri-cloud/src/tasks/approvals.rs",
+          "sha256": "f1f98c71b3ff2fd49ecc8e8705f1e85b2617f987e21bf0e9d3f0bd4299652798"
+        },
+        {
+          "path": "peri-cloud/prompts/approval.md",
+          "sha256": "d66f8bb9257fd4cd2cb9caae67db10274d55ca95dbaaa937721e8672231c5ba4"
+        }
+      ],
+      "export_sha256": "0315500113b102d6362641fbd501635e64a5de30f75781dabd0e5dd9fcd181d7"
+    },
+    {
+      "file": "05-memory-protocol.md",
+      "kind": "active-protocol",
+      "sources": [
+        {
+          "path": "peri-cloud/src/memory/frames.rs",
+          "sha256": "39d54286ed7cd752e0d671ced704a980a5d68f346a437db4e54f31d9fe13c329"
+        },
+        {
+          "path": "peri-cloud/prompts/memory.md",
+          "sha256": "9a106bf2ae60db3313d87376f1bca68ab165ae710f6337d321f205075df0ff08"
+        }
+      ],
+      "export_sha256": "d66891715e6c5045217855a86e3bef5f00b02922d0770ec49fdc9dddd2d7f5b1"
+    },
+    {
+      "file": "09-summary-system.md",
+      "kind": "active-main-compaction",
+      "sources": [
+        {
+          "path": "peri-agent/src/agent/compact_v2/descriptions/summary_system_prompt.md",
+          "sha256": "419a2357098ed781a08d14d306d36bf252aa6525084cc7ac7f4a14f8987f66be"
+        }
+      ],
+      "export_sha256": "c7f82c0effa4697f8843a846b4125a9640fe812651981bb3863e9c9e96dc11be"
+    },
+    {
+      "file": "10-summary-user.md",
+      "kind": "active-main-compaction",
+      "sources": [
+        {
+          "path": "peri-agent/src/agent/compact_v2/descriptions/summary_user_prompt.md",
+          "sha256": "184c65162535dd64b9071e7e159bb2fb63c3aac2913a45249cb34f35e1933be9"
+        }
+      ],
+      "export_sha256": "cab9ec1850a58918dee014fe3de9a99f6f54d87a4d440bc1aca36caa56265e77"
+    },
+    {
+      "file": "11-summary-continuation.md",
+      "kind": "active-main-compaction",
+      "sources": [
+        {
+          "path": "peri-agent/src/agent/compact_v2/full.rs",
+          "sha256": "2d7cf3679059542de82d024f5bcc674f95b905af33af5a4a6a2e1f8882ecfec0"
+        }
+      ],
+      "export_sha256": "6b2ace74e9ac72653d28a1ebdcbef4696da0542edfbc891bfa1ae29eb31244ec"
+    },
+    {
+      "file": "06-channels.md",
+      "kind": "active-channel",
+      "sources": [
+        {
+          "path": "peri-cloud/src/qq/api.rs",
+          "sha256": "492c2238ae7b4b443b6dee0b422597e0cfe2431a27ef0b3df1cc68ce47aff1bf"
+        },
+        {
+          "path": "peri-cloud/src/onebot/mod.rs",
+          "sha256": "93c6b6c72e1af76d13c8e11b3be5d6e5642cb18f946427ce7b05522b41106c2c"
+        }
+      ],
+      "export_sha256": "9a1019102891469deb10cd561ed70b988eefb7ca01f2218cef0b863c5e2a92d2"
+    },
+    {
+      "file": "07-task-frames.md",
+      "kind": "active-host-frames",
+      "sources": [
+        {
+          "path": "peri-cloud/src/tasks/middleware.rs",
+          "sha256": "db6eddc2510df1e8f08e6d532690f9650d457a196138ee62e1c02e7831d4b086"
+        }
+      ],
+      "export_sha256": "00faa3fbfc5728fcf429a0d0a21f4040212c5d3ea2f1e1bcaf80b67edf6b4cc8"
+    },
+    {
+      "file": "08-window-handoff.md",
+      "kind": "active-host-handoff",
+      "sources": [
+        {
+          "path": "peri-cloud/src/tasks/recovery.rs",
+          "sha256": "b49e4c5ed58597378952f67769e7a30e1b86cca77cc829f33cd61bbf125aacaf"
+        }
+      ],
+      "export_sha256": "1367c486f2804a692936e19687fc11f369081e4c1a77c02d4873477d58dbda24"
+    },
+    {
+      "file": "12-goal-and-schedule.md",
+      "kind": "active-continuation-scheduler",
+      "sources": [],
+      "export_sha256": "3adda47e56cfcb8423f59957b455605cb118766a46a4e0c19c85438630e1f005"
+    },
+    {
+      "file": "13-workspace-and-skills.md",
+      "kind": "active-workspace-memory-wrapper",
+      "sources": [
+        {
+          "path": "peri-cloud/src/workspace/skills.rs",
+          "sha256": "45abfc75d9240d85a2a64baf3128cc5b6b5cd81337ed144f97386cacfa0bfa3e"
+        }
+      ],
+      "export_sha256": "d9c3a71af4f980fba758f659116679e10822d5b15b28fa2334690d6af87089a7"
+    },
+    {
+      "file": "tools/peri-cloud--tasks-tools.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-cloud/src/tasks/tools.rs",
+          "sha256": "d77cde1ec5ceebb2e9fb6dbfc9665c72995beeb04609646853e1b59db43597e9"
+        }
+      ],
+      "export_sha256": "3a8030aa3856255a63c9c56d37c7f0f7eafcab1e75fa320990616fc1b7aa88d3"
+    },
+    {
+      "file": "tools/peri-cloud--tasks-deliverables.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-cloud/src/tasks/deliverables.rs",
+          "sha256": "63f20bdef7800d0040976b6e9f053b9d67fd5bd8b73992ddfcf850278144947e"
+        }
+      ],
+      "export_sha256": "2a353cb6b87d94785f275580a6d2b6129cbbb8735aecfff34329fb45ebf14784"
+    },
+    {
+      "file": "tools/peri-cloud--tasks-devices.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-cloud/src/tasks/devices.rs",
+          "sha256": "71ac76471328a188cbaf41c22903c9ec017c482b2120583f253c12a202ec9018"
+        }
+      ],
+      "export_sha256": "6b427a80e954af596298fe51a56dde3241c5e6b866a27057bbc8ec2009e5c743"
+    },
+    {
+      "file": "tools/peri-cloud--tasks-resources.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-cloud/src/tasks/resources.rs",
+          "sha256": "d353798e45e828d8b172c7800580b72fc458afaa6136c5de4bd96e985de661c8"
+        }
+      ],
+      "export_sha256": "fcd7b9fdf5480f9e3b672a764e108b546dd5656e0de98bd8be96936d51fde1fa"
+    },
+    {
+      "file": "tools/peri-cloud--memory-tools.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-cloud/src/memory/tools.rs",
+          "sha256": "904fc88390d5cb0565ff6d83977f1ed691c3f5a3850cd0120cce6496b6f0293f"
+        }
+      ],
+      "export_sha256": "13ad6cb3dddaafe0e45ecee133a0f5c76337b3ce5e87775f9fe3231b66c482f7"
+    },
+    {
+      "file": "tools/peri-cloud--scheduler-tools.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-cloud/src/scheduler/tools.rs",
+          "sha256": "a62003574a96fdd479410e6445cb9a3b335ce61df33cd3bbe52c1f3078703d0c"
+        }
+      ],
+      "export_sha256": "0cf2408d7bdc84d35e537f176f47acd3dd5785c7550397a0717e4af8c89d6656"
+    },
+    {
+      "file": "tools/peri-cloud--workspace-skills.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-cloud/src/workspace/skills.rs",
+          "sha256": "45abfc75d9240d85a2a64baf3128cc5b6b5cd81337ed144f97386cacfa0bfa3e"
+        }
+      ],
+      "export_sha256": "b81522b565ed22170bab0f9f9c95b029585c27c64b2f60c892dd8b1538383277"
+    },
+    {
+      "file": "tools/peri-middlewares--tools-ask_user_tool.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/tools/ask_user_tool.rs",
+          "sha256": "e223e5008a5a8172deadb1def28332973eeca64ee4e299971a65e28aada4f287"
+        }
+      ],
+      "export_sha256": "0fcfc0a2642058f9dbdb337999af1d75048a753c238fcde5abc41fa9433ace5b"
+    },
+    {
+      "file": "tools/peri-middlewares--tools-todo.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/tools/todo.rs",
+          "sha256": "f26b0df499f76272c339ddd5573c1b4cc2cb3c5da3565e43d61dbd1e94cec1c7"
+        }
+      ],
+      "export_sha256": "058a4cb92b6abaf4a8a2e09a047f65b87ae8a5469bc7b4f0d6deae70a6102dc8"
+    },
+    {
+      "file": "tools/peri-middlewares--goal-tool.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/goal/tool.rs",
+          "sha256": "0cc3af02a039f7ebe4dd08bfe5f670ee4e7ead0eb8023d795a5c284ea7875a3b"
+        }
+      ],
+      "export_sha256": "81ce38f0b5b67493667a3330df701b16c430d6fd1c41aad44fc0b3e65a5d1fc5"
+    },
+    {
+      "file": "tools/peri-middlewares--tool_search-search_tool.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/tool_search/search_tool.rs",
+          "sha256": "ec35b1b29e864186ce2a858f0204acf3dff8d32e1545fee9db7ef650b042ed03"
+        }
+      ],
+      "export_sha256": "e736f5b3131e6df6353ad0cacff30b75a49b77c22c0b596565c69b988bafafaf"
+    },
+    {
+      "file": "tools/peri-middlewares--tool_search-execute_tool.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/tool_search/execute_tool.rs",
+          "sha256": "36bf1431df703c7cce794e1b52c347ed21d6fd4bf1c2082a56a443f8d9ada7ba"
+        }
+      ],
+      "export_sha256": "5e7adc1d9bb472d3fbe2e173103d9407f5e2186aaf1072c3199fc61d9425909e"
+    },
+    {
+      "file": "tools/peri-middlewares--mcp-discover_tool.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/mcp/discover_tool.rs",
+          "sha256": "ea4a8cb0db9fed11dfd52945919af1f0f41f23ce2efa5af1e227e17ebc6c74e6"
+        }
+      ],
+      "export_sha256": "cc340c352acfa1933050c9e4f453ae1495df56a29aed7e471779a76e96ead715"
+    },
+    {
+      "file": "tools/peri-middlewares--mcp-resource_tool.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/mcp/resource_tool.rs",
+          "sha256": "5fdc8a2ab98af1999f559e2de6f4055992ffeb78840297af42935ccf6e580103"
+        }
+      ],
+      "export_sha256": "18367dfc96ff6d0364494c05082b0b961dfb2bfa4fc7a27e657d32dc8b42dd69"
+    },
+    {
+      "file": "tools/peri-middlewares--mcp-dynamic-tool.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/mcp/dynamic/tool.rs",
+          "sha256": "dd4a85eb379771ec7b0d7f189cc724bd0b030c3447898bc664d1dd285e10d0b6"
+        }
+      ],
+      "export_sha256": "14be3f2393692ff8e4200e1c9351f49582ebed3550528ee6b3e2ffa2b4294884"
+    },
+    {
+      "file": "tools/peri-remote-tools--tool.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-remote-tools/src/tool.rs",
+          "sha256": "f4049c38b7d11869ef7a76de3f8fe89646356bf76119c3b4bc4faae828f25116"
+        }
+      ],
+      "export_sha256": "58f696b7170c5ff7c7d1a787fc6f39f2dc6acfffa8954fb459b44a3d16442577"
+    },
+    {
+      "file": "reference/design/frames.md",
+      "kind": "historical-design-only",
+      "sources": [
+        {
+          "path": "docs/design/peri-workbench/prompts/frames.md",
+          "sha256": "b86fdcbb88f8dc592ca11d670cd78621b420ff19f92fc1c7ee65aa8a4a8db290"
+        }
+      ],
+      "export_sha256": "4fb07f5ac88b61467cd52dff3d542123d1ed592174c5371a852385cad51be8be"
+    },
+    {
+      "file": "reference/design/main.md",
+      "kind": "historical-design-only",
+      "sources": [
+        {
+          "path": "docs/design/peri-workbench/prompts/main.md",
+          "sha256": "aeb5e1ffa2015bf6cb9cea7093f22d4b4e535a01f1e3947f7017f175c6963ec1"
+        }
+      ],
+      "export_sha256": "38e6fb19dcae015a2b97477de0c5ca1b236337797b2410d8055f1ee75f9a9f7f"
+    },
+    {
+      "file": "reference/design/worker.md",
+      "kind": "historical-design-only",
+      "sources": [
+        {
+          "path": "docs/design/peri-workbench/prompts/worker.md",
+          "sha256": "1c6adc264f33b491617dd2faa6eb37f2cda4f87443d41cf84be1237dea0d04fb"
+        }
+      ],
+      "export_sha256": "eecee4936d02c7852589aaa08c4f3ef3340cda009d0fe080bb6c6c88f93c7b4e"
+    },
+    {
+      "file": "tool-text/mcp-packages/web/src/descriptions/web_fetch.md",
+      "kind": "native-or-optional-tool-description",
+      "sources": [
+        {
+          "path": "mcp-packages/web/src/descriptions/web_fetch.md",
+          "sha256": "38473c1c26376082f77ad90af8d6d6fe735c0a9400e7262d8dc1195498cca2ed"
+        }
+      ],
+      "export_sha256": "72866e86473e0fd647a79ca65135eb3b13553481ca69c79a9eebba036384553f"
+    },
+    {
+      "file": "tool-text/mcp-packages/web/src/descriptions/web_search.md",
+      "kind": "native-or-optional-tool-description",
+      "sources": [
+        {
+          "path": "mcp-packages/web/src/descriptions/web_search.md",
+          "sha256": "e7ea7fa8975bd91f0d861a505c90472d0b203a53d4d61cc17cd3fde7c29c6708"
+        }
+      ],
+      "export_sha256": "df91ba7caf439153b030e82da74a5fa78c4f9cf495f521fb0bc4a1def69bc7c9"
+    },
+    {
+      "file": "reference/mcp-packages/workspace/src/descriptions/bash.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "mcp-packages/workspace/src/descriptions/bash.md",
+          "sha256": "b98db93d40cd3d29f1a2ebd673bae9b8a3af3e9b298c7c3fdf9161f00001ce84"
+        }
+      ],
+      "export_sha256": "a081cd9cf1939a7fc1866e65bc73f6dba485f5ce96d5dff03d5f75665b6ae654"
+    },
+    {
+      "file": "reference/mcp-packages/workspace/src/filesystem/descriptions/edit.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "mcp-packages/workspace/src/filesystem/descriptions/edit.md",
+          "sha256": "6eeabee3f5dff531586e3869b5c8267f6871499095b8a44cc25fa7fb29baf54d"
+        }
+      ],
+      "export_sha256": "6373875f118014fbf502d9eef2b8a323810391dfcf5037347a67781d2bc4a8f9"
+    },
+    {
+      "file": "reference/mcp-packages/workspace/src/filesystem/descriptions/folder.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "mcp-packages/workspace/src/filesystem/descriptions/folder.md",
+          "sha256": "f70ba763ed766aaf36c0854a7b9a69dd7db17c3afb8be21a0c771b7feca61cde"
+        }
+      ],
+      "export_sha256": "b9121d65457f0b1c1f22d34b3ce88a334327c408a7023c7d6c119c7ad2b9b1af"
+    },
+    {
+      "file": "reference/mcp-packages/workspace/src/filesystem/descriptions/glob.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "mcp-packages/workspace/src/filesystem/descriptions/glob.md",
+          "sha256": "a86d2f282cfd9dc393cc2f4e1be742b43cc83ed4a85afad18f1a4cedde04d8c5"
+        }
+      ],
+      "export_sha256": "f10a9875144cabdb159c495431f419a257c09362f0d9f608ef8aa7e9f56589df"
+    },
+    {
+      "file": "reference/mcp-packages/workspace/src/filesystem/descriptions/grep.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "mcp-packages/workspace/src/filesystem/descriptions/grep.md",
+          "sha256": "24ad200c2d9d52b512beb12701cbd0e546ac6252acdd58b555e287d01163f6a3"
+        }
+      ],
+      "export_sha256": "a06b5038325f7a7d19e351c0eb95bb716ef24e64a526d94d3ba65804c00a5da6"
+    },
+    {
+      "file": "reference/mcp-packages/workspace/src/filesystem/descriptions/read.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "mcp-packages/workspace/src/filesystem/descriptions/read.md",
+          "sha256": "5f73f146fa090a8817faf5c27d2e390641e18a41c0c8d91d65936d72c0b77c75"
+        }
+      ],
+      "export_sha256": "80137b4261ac76ba4928e70959d4373b012c2a466eb316012a7d3333d4431320"
+    },
+    {
+      "file": "reference/mcp-packages/workspace/src/filesystem/descriptions/write.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "mcp-packages/workspace/src/filesystem/descriptions/write.md",
+          "sha256": "dfbdfa9c74b57beccc51019dfcbc0a6a10bdfa5105392e2286d69da8ecc43ba9"
+        }
+      ],
+      "export_sha256": "6f25dd907b361bcd3eb34ef8c5fa1c8dbfe9ef2016d0ae9f8765a21a550d0b45"
+    },
+    {
+      "file": "reference/peri-acp/prompts/sections/01_intro.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-acp/prompts/sections/01_intro.md",
+          "sha256": "76733c1face078fa426093b3d92ce5c0b8ba506e04cb7573867c2eee4a6afc02"
+        }
+      ],
+      "export_sha256": "d4c655ad57d4828a1d410810f17dacf539e9a3bf294f0cbeb8feb62fc20192df"
+    },
+    {
+      "file": "reference/peri-acp/prompts/sections/02_system.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-acp/prompts/sections/02_system.md",
+          "sha256": "e84a3722f73c348404dda9ccf2e5e98acce6660adc49509734c5cb39c6a0ac1f"
+        }
+      ],
+      "export_sha256": "4b7c3500abf287d42d568522367e053c4f44d8a664c47633c08589270220fce5"
+    },
+    {
+      "file": "reference/peri-acp/prompts/sections/03_doing_tasks.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-acp/prompts/sections/03_doing_tasks.md",
+          "sha256": "9185ec30571399b3e25749a4ab78ea4361b129a83faaf1b0eccd719fd0aafc7e"
+        }
+      ],
+      "export_sha256": "93fe95a1397c2f4c16cfb25b91f5c3d78b4fb94850930dd08b5e65ac37f4d129"
+    },
+    {
+      "file": "reference/peri-acp/prompts/sections/04_actions.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-acp/prompts/sections/04_actions.md",
+          "sha256": "37f9686b75a37ba52d8eccd3a36139bd780f90eb010c5036348671342f592500"
+        }
+      ],
+      "export_sha256": "e6f7702e69799ddac609e48d5313637b49e696e5bd9e776ac98913ad1c2b10f2"
+    },
+    {
+      "file": "reference/peri-acp/prompts/sections/05_using_tools.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-acp/prompts/sections/05_using_tools.md",
+          "sha256": "0d7611477a4985ce360faa12d8ed0d323896846ff6eaa950ed57eb3d10b765a0"
+        }
+      ],
+      "export_sha256": "b57196115690211253636ea514d2321cb99efc607e9c81305842565f250e05b4"
+    },
+    {
+      "file": "reference/peri-acp/prompts/sections/06_tone_style.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-acp/prompts/sections/06_tone_style.md",
+          "sha256": "baecd2ad62539d51d82f581d4f9fb2c730e2a18ff5809eeb5f0522ecc9fadd29"
+        }
+      ],
+      "export_sha256": "b2af936264ec2c0b834d2fb540eb3c79ce63680d500b4495ba0c99713cdb69fe"
+    },
+    {
+      "file": "reference/peri-acp/prompts/sections/07_runtime.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-acp/prompts/sections/07_runtime.md",
+          "sha256": "62bfb9c8ada88471158899cc4d539eaa2dfa2b53bc383a1ae56fafa0ce669214"
+        }
+      ],
+      "export_sha256": "27486a242ede8f8add5a93a7bb9d6c7b7c5aafecda9c99fcb71fb7cb3b8f3eea"
+    },
+    {
+      "file": "middleware/10_hitl.md",
+      "kind": "mounted-middleware-section",
+      "sources": [
+        {
+          "path": "peri-acp/prompts/sections/10_hitl.md",
+          "sha256": "9ae3a988fd8f080a1b5cbf81901248534b159b8d4d563a7d9f182a2de9325044"
+        }
+      ],
+      "export_sha256": "00693cc7cad683d6f2df3ed54f0f8e5ceb52e38105591f9f4c805c7a0c936c16"
+    },
+    {
+      "file": "reference/peri-acp/prompts/sections/11_subagent.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-acp/prompts/sections/11_subagent.md",
+          "sha256": "53456a5a783ae73ae1339ee5dc628db043986d88aa27e12739a1f33f4220e4ee"
+        }
+      ],
+      "export_sha256": "56c047c6cd489cb85aad47b6d2a944185198be77fef9ed6ecf6d39a20dddd8c2"
+    },
+    {
+      "file": "middleware/12_ask_user.md",
+      "kind": "mounted-middleware-section",
+      "sources": [
+        {
+          "path": "peri-acp/prompts/sections/12_ask_user.md",
+          "sha256": "d6271f21a7e6dd6e35e8764774ae38602bea9123868fd770d363ad80f899c622"
+        }
+      ],
+      "export_sha256": "c172b2a1622fb54e53ececea4f3a4525bf4010b0e11f7d6fb6086f51b072af66"
+    },
+    {
+      "file": "reference/peri-acp/prompts/sections/13_skills.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-acp/prompts/sections/13_skills.md",
+          "sha256": "257dd8ed0b57d90b0017b7f71d1b30dfd035c6f9538f3fa045f41c22470abd09"
+        }
+      ],
+      "export_sha256": "bb61bb49bd02c809794f3e1ddecc9e0a49439c41d3b6795412f16312b31de644"
+    },
+    {
+      "file": "reference/peri-middlewares/prompts/sections/01_intro.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-middlewares/prompts/sections/01_intro.md",
+          "sha256": "76733c1face078fa426093b3d92ce5c0b8ba506e04cb7573867c2eee4a6afc02"
+        }
+      ],
+      "export_sha256": "d4c655ad57d4828a1d410810f17dacf539e9a3bf294f0cbeb8feb62fc20192df"
+    },
+    {
+      "file": "reference/peri-middlewares/prompts/sections/02_system.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-middlewares/prompts/sections/02_system.md",
+          "sha256": "e84a3722f73c348404dda9ccf2e5e98acce6660adc49509734c5cb39c6a0ac1f"
+        }
+      ],
+      "export_sha256": "4b7c3500abf287d42d568522367e053c4f44d8a664c47633c08589270220fce5"
+    },
+    {
+      "file": "reference/peri-middlewares/prompts/sections/03_doing_tasks.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-middlewares/prompts/sections/03_doing_tasks.md",
+          "sha256": "9185ec30571399b3e25749a4ab78ea4361b129a83faaf1b0eccd719fd0aafc7e"
+        }
+      ],
+      "export_sha256": "93fe95a1397c2f4c16cfb25b91f5c3d78b4fb94850930dd08b5e65ac37f4d129"
+    },
+    {
+      "file": "reference/peri-middlewares/prompts/sections/04_actions.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-middlewares/prompts/sections/04_actions.md",
+          "sha256": "37f9686b75a37ba52d8eccd3a36139bd780f90eb010c5036348671342f592500"
+        }
+      ],
+      "export_sha256": "e6f7702e69799ddac609e48d5313637b49e696e5bd9e776ac98913ad1c2b10f2"
+    },
+    {
+      "file": "reference/peri-middlewares/prompts/sections/05_using_tools.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-middlewares/prompts/sections/05_using_tools.md",
+          "sha256": "0d7611477a4985ce360faa12d8ed0d323896846ff6eaa950ed57eb3d10b765a0"
+        }
+      ],
+      "export_sha256": "b57196115690211253636ea514d2321cb99efc607e9c81305842565f250e05b4"
+    },
+    {
+      "file": "reference/peri-middlewares/prompts/sections/06_tone_style.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-middlewares/prompts/sections/06_tone_style.md",
+          "sha256": "baecd2ad62539d51d82f581d4f9fb2c730e2a18ff5809eeb5f0522ecc9fadd29"
+        }
+      ],
+      "export_sha256": "b2af936264ec2c0b834d2fb540eb3c79ce63680d500b4495ba0c99713cdb69fe"
+    },
+    {
+      "file": "reference/peri-middlewares/prompts/sections/07_runtime.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-middlewares/prompts/sections/07_runtime.md",
+          "sha256": "62bfb9c8ada88471158899cc4d539eaa2dfa2b53bc383a1ae56fafa0ce669214"
+        }
+      ],
+      "export_sha256": "27486a242ede8f8add5a93a7bb9d6c7b7c5aafecda9c99fcb71fb7cb3b8f3eea"
+    },
+    {
+      "file": "reference/peri-middlewares/prompts/sections/10_hitl.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-middlewares/prompts/sections/10_hitl.md",
+          "sha256": "9ae3a988fd8f080a1b5cbf81901248534b159b8d4d563a7d9f182a2de9325044"
+        }
+      ],
+      "export_sha256": "9511fd219c70dde1d874f95b499e3e4ecf12c1f1944f50b70b8f85ff8ea35c78"
+    },
+    {
+      "file": "reference/peri-middlewares/prompts/sections/11_subagent.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-middlewares/prompts/sections/11_subagent.md",
+          "sha256": "53456a5a783ae73ae1339ee5dc628db043986d88aa27e12739a1f33f4220e4ee"
+        }
+      ],
+      "export_sha256": "56c047c6cd489cb85aad47b6d2a944185198be77fef9ed6ecf6d39a20dddd8c2"
+    },
+    {
+      "file": "reference/peri-middlewares/prompts/sections/12_ask_user.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-middlewares/prompts/sections/12_ask_user.md",
+          "sha256": "d6271f21a7e6dd6e35e8764774ae38602bea9123868fd770d363ad80f899c622"
+        }
+      ],
+      "export_sha256": "9d4abd0caf674174ab87a8492157934f3463c7499b8c7d3e1813782f2e9a3bf9"
+    },
+    {
+      "file": "reference/peri-middlewares/prompts/sections/13_skills.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-middlewares/prompts/sections/13_skills.md",
+          "sha256": "257dd8ed0b57d90b0017b7f71d1b30dfd035c6f9538f3fa045f41c22470abd09"
+        }
+      ],
+      "export_sha256": "bb61bb49bd02c809794f3e1ddecc9e0a49439c41d3b6795412f16312b31de644"
+    },
+    {
+      "file": "reference/peri-middlewares/src/subagent/descriptions/agent_result.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/subagent/descriptions/agent_result.md",
+          "sha256": "610c65cbcebd53c7ca4552944dde3fd8b9e94a124a831caa62df6a890a67ccfa"
+        }
+      ],
+      "export_sha256": "d492137f9137e0bc994b45671915dcbdc8c9784739e56087cb39962a2711c2a7"
+    },
+    {
+      "file": "reference/peri-middlewares/src/subagent/tool/descriptions/agent.md",
+      "kind": "retained-reference-not-cloud-default",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/subagent/tool/descriptions/agent.md",
+          "sha256": "5afa9e494cc66508bdde65985c9a726498a593df97bdb9cc6f8f1a8a2070ce37"
+        }
+      ],
+      "export_sha256": "9f80378d48d8579db58f352be0632ee22edb358b84a0cfae14511a3832d25514"
+    },
+    {
+      "file": "tool-text/peri-middlewares/src/tools/descriptions/todo.md",
+      "kind": "native-or-optional-tool-description",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/tools/descriptions/todo.md",
+          "sha256": "a46ab0703420f0b3235865b5821d5b67da8bcdd45c93df833f42dd5b3cf626b7"
+        }
+      ],
+      "export_sha256": "eb3724512ca7625ccd891652aba0a306c448f024344cd83670676792818e95d6"
+    },
+    {
+      "file": "tool-text/peri-tool-runtime/src/descriptions/bash.md",
+      "kind": "native-or-optional-tool-description",
+      "sources": [
+        {
+          "path": "peri-tool-runtime/src/descriptions/bash.md",
+          "sha256": "f4cd1f81d56b412f90661ad9bf181e8a55f519d65fd974d43a707b736b84b93f"
+        }
+      ],
+      "export_sha256": "d34d6cd15f8932140fa03c6c62769ef817f77ea5726d3ff7efd024cfd2ae3575"
+    },
+    {
+      "file": "tool-text/peri-tool-runtime/src/filesystem/descriptions/edit.md",
+      "kind": "native-or-optional-tool-description",
+      "sources": [
+        {
+          "path": "peri-tool-runtime/src/filesystem/descriptions/edit.md",
+          "sha256": "5c4dbc56f96431332db59590f2c54658b2f9a13a001fbdbdf95e29f1b301bfe2"
+        }
+      ],
+      "export_sha256": "b4ff4f8eebd62d56206707edd7bc330243c522092b6b01f74c92557dfe3984d8"
+    },
+    {
+      "file": "tool-text/peri-tool-runtime/src/filesystem/descriptions/folder.md",
+      "kind": "native-or-optional-tool-description",
+      "sources": [
+        {
+          "path": "peri-tool-runtime/src/filesystem/descriptions/folder.md",
+          "sha256": "9ed6904ea000591d7e896e277947f2f95858e8458a6ca24c81866fe3a36de043"
+        }
+      ],
+      "export_sha256": "f46a289ca83686c3259816906caf9b0bfdb42e5d7be0e41df770b6f86b65e8ae"
+    },
+    {
+      "file": "tool-text/peri-tool-runtime/src/filesystem/descriptions/glob.md",
+      "kind": "native-or-optional-tool-description",
+      "sources": [
+        {
+          "path": "peri-tool-runtime/src/filesystem/descriptions/glob.md",
+          "sha256": "faf9259d69981c4addce29f53273630dfe9448964bd0a54f8b914b9c712b7e2d"
+        }
+      ],
+      "export_sha256": "0d59a831727915ab43b8be2487b73eb2db1e4c5375a8bf9e0041e15e4eab0026"
+    },
+    {
+      "file": "tool-text/peri-tool-runtime/src/filesystem/descriptions/grep.md",
+      "kind": "native-or-optional-tool-description",
+      "sources": [
+        {
+          "path": "peri-tool-runtime/src/filesystem/descriptions/grep.md",
+          "sha256": "e2e0caf03f772154acb911264b5793caf5f1512f9f2b09bdcd36841ede94bdf2"
+        }
+      ],
+      "export_sha256": "f02c6ec39bf8bed639e43a05de1caabd3dd16f379127b68c101a6ab0f9d5cf8c"
+    },
+    {
+      "file": "tool-text/peri-tool-runtime/src/filesystem/descriptions/read.md",
+      "kind": "native-or-optional-tool-description",
+      "sources": [
+        {
+          "path": "peri-tool-runtime/src/filesystem/descriptions/read.md",
+          "sha256": "6b481d73d788b5348b2b3163a84ef876eccc40e648a3bcfeb69cdbcf447ff417"
+        }
+      ],
+      "export_sha256": "68208c7c39d97e1f4f460ca17e85f9fa6d5266fd9c5fbac32f98e5ff99f45023"
+    },
+    {
+      "file": "tool-text/peri-tool-runtime/src/filesystem/descriptions/write.md",
+      "kind": "native-or-optional-tool-description",
+      "sources": [
+        {
+          "path": "peri-tool-runtime/src/filesystem/descriptions/write.md",
+          "sha256": "16418b62016ba532f0752e15ed72e0ce3906d002ed4789835d284230405ec41d"
+        }
+      ],
+      "export_sha256": "a8411790455d5a479a0fccb301e1b4faee9dee8cb8e8947078c159b2c79b6d34"
+    },
+    {
+      "file": "reference/peri-middlewares/src/permission/auto_classifier.md",
+      "kind": "retained-optional-reference",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/permission/auto_classifier.rs",
+          "sha256": "199f714d45e8c29e404ef8a575ac76439a322cdced00d4c162ab37106939349b"
+        }
+      ],
+      "export_sha256": "3d4dc6a8288606b870e376bda7d5c83ee079fed232226064b2592dfa809e3283"
+    },
+    {
+      "file": "reference/peri-middlewares/src/default_system_prompt/mod.md",
+      "kind": "retained-optional-reference",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/default_system_prompt/mod.rs",
+          "sha256": "77fe9c226d477c072337f90393185c3a2356d01a8566dfa49e360b73c7419c43"
+        }
+      ],
+      "export_sha256": "a55f6ff6a60d49d13be685c0f2967674f37fdfc46a7acb518706e7e5c73becc7"
+    },
+    {
+      "file": "reference/peri-agent/src/session/subagent/directives.md",
+      "kind": "retained-optional-reference",
+      "sources": [
+        {
+          "path": "peri-agent/src/session/subagent/directives.rs",
+          "sha256": "db0f8902593254d457e2fbccf225b6801929088a1322f6ee0a2848469be63df1"
+        }
+      ],
+      "export_sha256": "4c45108e46f7724411fe9cdee8354ac003cc7b3e894c6152ee678be9771b571d"
+    },
+    {
+      "file": "reference/goal-evaluator.md",
+      "kind": "retained-optional-reference",
+      "sources": [
+        {
+          "path": "peri-middlewares/src/goal/tool.rs",
+          "sha256": "0cc3af02a039f7ebe4dd08bfe5f670ee4e7ead0eb8023d795a5c284ea7875a3b"
+        }
+      ],
+      "export_sha256": "cc3f8c5b45ae5f93e3194f92a32f1289858b41766651b994efa168b968b27e11"
+    },
+    {
+      "file": "00-assembly-and-macros.md",
+      "kind": "review-guide",
+      "sources": [
+        {
+          "path": "peri-cloud/src/context/mod.rs",
+          "sha256": "ce9a06f5cb84971a65fe6f02e543110b1fc0ac3d0ac28a40a37b48ee027e4592"
+        },
+        {
+          "path": "peri-cloud/src/workspace/mod.rs",
+          "sha256": "ec874d40bf9dd701f43d6459640fe56e674c6eea238a9ae85f256b90bace413c"
+        },
+        {
+          "path": "peri-executor/src/workspace.rs",
+          "sha256": "a1e7d9ade95cf9cb224a9e92a5d6538d465a363ebd84a78330094c69f148d77e"
+        }
+      ],
+      "export_sha256": "4fa7486df3b68b4a6ccc388dd0b7b7e30d045a809a93d31e82c03364480bfc30"
+    },
+    {
+      "file": "README.md",
+      "kind": "review-index",
+      "sources": [],
+      "export_sha256": "86722269509922dda8849464108db0e2a70f04f76c7e98c2a6dda99fbedcaa10"
+    },
+    {
+      "file": "PROMPTS-EDIT.md",
+      "kind": "review-combined",
+      "sources": [],
+      "export_sha256": "93fba07dd29eb5450f33c8a81df0d4cf6fe465b19de785bce7edba79a9c8db78"
+    },
+    {
+      "file": "14-capability-loading.md",
+      "kind": "active-protocol",
+      "sources": [
+        {
+          "path": "peri-cloud/prompts/extensions.md",
+          "sha256": "ff95257dc54b379b8e092f7871d44816a4875fbea1c29076add23e563867a0d3"
+        }
+      ],
+      "export_sha256": "89d9675e9e58b86986c0b3189e2ccd3a6fd0a60ff30e7823a991cca21af6f4d8"
+    },
+    {
+      "file": "15-environment.md",
+      "kind": "active-host-environment",
+      "sources": [
+        {
+          "path": "peri-cloud/src/workspace/environment.rs",
+          "sha256": "f0627ed2d10794e45a7c9837997c3bf1c7b666908d65d229dbe1bb1b8fbc8150"
+        }
+      ],
+      "export_sha256": "1cd5bd2e3298d368553968f4bfa27f292a1134a62b5ab6502db3a88dae808fa0"
+    },
+    {
+      "file": "16-assistant-soul.md",
+      "kind": "review-authoring-slot",
+      "sources": [],
+      "export_sha256": "826673f7d55f567d802e4b0ffdea7837d6b7a182853bc4210d3423d55e353dd6"
+    },
+    {
+      "file": "17-project-instructions.md",
+      "kind": "review-authoring-slot",
+      "sources": [],
+      "export_sha256": "66bdda100c3a9dd23bb0b6492e31063b35c29e12f2c16836a6b3b1c96e860c1e"
+    },
+    {
+      "file": "18-host-contracts.md",
+      "kind": "review-host-contract",
+      "sources": [
+        {
+          "path": "docs/prompt-host-contracts.md",
+          "sha256": "2fc6c48b09a80d6d23a719f54b65ed393cdd6da46d40e09275187b20a7d55ec9"
+        }
+      ],
+      "export_sha256": "3013764e9f901339ace43fe957dc4f77833f8fcd7cce3020ee5cfd6cf080a640"
+    }
+  ],
+  "source_snapshot": "working tree, source hashes recorded per document"
+}

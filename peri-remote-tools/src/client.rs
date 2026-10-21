@@ -129,6 +129,36 @@ impl DeviceClient {
             .any(|feature| feature == WORKSPACE_READ_FEATURE)
     }
 
+    pub async fn environment(&self, binding: &SessionBinding) -> Result<EnvironmentSnapshot> {
+        if !self
+            .device
+            .features
+            .iter()
+            .any(|f| f == ENVIRONMENT_READ_FEATURE)
+        {
+            return Err(Error::Protocol);
+        }
+        let value: EnvironmentSnapshot = self
+            .request(
+                Method::GET,
+                &format!("/v1/sessions/{}/environment", binding.session_id),
+                None,
+            )
+            .await?;
+        if value.device_id != self.device.device_id
+            || value.binding != *binding
+            || value.platform != self.device.platform
+            || value.applications.len() > 32
+            || serde_json::to_vec(&value)
+                .map_err(|_| Error::Protocol)?
+                .len()
+                > 16384
+        {
+            return Err(Error::Protocol);
+        }
+        Ok(value)
+    }
+
     pub async fn workspace_instructions(&self, id: Uuid) -> Result<WorkspaceInstructions> {
         self.request(
             Method::GET,

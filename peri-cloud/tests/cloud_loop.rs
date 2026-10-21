@@ -26,6 +26,8 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[path = "cloud_loop/context_assembly.rs"]
+mod context_assembly_tests;
 #[path = "cloud_loop/personal.rs"]
 mod personal_tests;
 

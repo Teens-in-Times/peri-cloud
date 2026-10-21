@@ -45,7 +45,7 @@ impl CloudJournal {
         let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
-        if !matches!(version, 0..=23) {
+        if !matches!(version, 0..=24) {
             return Err(StateError::Version);
         }
         super::schema::reject_foreign(&pool, version).await?;
@@ -79,6 +79,7 @@ impl CloudJournal {
         crate::tasks::deliverables::migrate(&pool).await?;
         crate::tasks::native_operations::migrate(&pool).await?;
         crate::tasks::detached::migrate(&pool).await?;
+        crate::tasks::approval_inbox::migrate(&pool).await?;
         let journal = Self {
             pool,
             root: root.to_owned(),
@@ -567,6 +568,29 @@ impl CloudJournal {
         for row in rows {
             let mut turn: TurnRecord = serde_json::from_str(row.get("record_json"))?;
             if turn.state == TurnState::Running {
+                // The authenticated control-turn tag fixes a coordination-only
+                // catalog in core. Reconcile durable decisions/messages later;
+                // neither model output nor a tool invocation is replayed here.
+                let native_pending:i64=sqlx::query_scalar("SELECT COUNT(*) FROM cloud_native_operations WHERE source_session=? AND state!='confirmed'")
+                    .bind(turn.session_id.to_string()).fetch_one(&mut *tx).await?;
+                if crate::tasks::approval_inbox::is_control_turn(&turn) && native_pending == 0 {
+                    let raw: String =
+                        sqlx::query_scalar("SELECT state_json FROM cloud_sessions WHERE id=?")
+                            .bind(turn.session_id.to_string())
+                            .fetch_one(&mut *tx)
+                            .await?;
+                    let mut session: SessionState = serde_json::from_str(&raw)?;
+                    session.unsettled_jobs = Some(Vec::new());
+                    session.revision += 1;
+                    turn.state = TurnState::Interrupted;
+                    sqlx::query("UPDATE cloud_sessions SET state_json=? WHERE id=?")
+                        .bind(serde_json::to_string(&session)?)
+                        .bind(turn.session_id.to_string())
+                        .execute(&mut *tx)
+                        .await?;
+                    update_turn(&mut tx, &turn).await?;
+                    continue;
+                }
                 turn.state = TurnState::RecoveryRequired;
                 let row = sqlx::query("SELECT state_json FROM cloud_sessions WHERE id=?")
                     .bind(turn.session_id.to_string())

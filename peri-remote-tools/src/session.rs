@@ -21,6 +21,7 @@ pub struct RemoteSession {
     cloud_session_id: String,
     catalog: Vec<NativeToolDescriptor>,
     admission: Mutex<()>,
+    environment_cache: Mutex<Option<(Instant, EnvironmentSnapshot)>>,
     // true means a submit may have reached the executor. A missing job cannot
     // settle it: the original request may still be in admission after a timeout.
     uncertain: Mutex<HashMap<Uuid, Uncertain>>,
@@ -78,6 +79,7 @@ impl RemoteSession {
             cloud_session_id,
             catalog,
             admission: Mutex::new(()),
+            environment_cache: Mutex::new(None),
             uncertain: Mutex::new(HashMap::new()),
         }))
     }
@@ -102,6 +104,18 @@ impl RemoteSession {
         self.client
             .workspace_instructions(self.binding.session_id)
             .await
+    }
+
+    pub async fn environment(&self) -> Result<EnvironmentSnapshot> {
+        let mut cache = self.environment_cache.lock().await;
+        if let Some((at, value)) = cache.as_ref() {
+            if at.elapsed() < Duration::from_secs(300) {
+                return Ok(value.clone());
+            }
+        }
+        let value = self.client.environment(&self.binding).await?;
+        *cache = Some((Instant::now(), value.clone()));
+        Ok(value)
     }
 
     pub async fn workspace_skills(&self) -> Result<WorkspaceSkills> {

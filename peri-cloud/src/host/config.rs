@@ -414,7 +414,7 @@ fn max_tokens() -> u32 {
     32000
 }
 fn system_prompt() -> String {
-    "You are a personal cloud agent. Work only on the session's selected device and workspace. Use its reported operating system. Keep tool output and reasoning internal; give the user clear, concise replies. When an execution is unconfirmed, query its existing task ID before requesting another operation.".into()
+    include_str!("../../prompts/base.md").into()
 }
 
 #[cfg(test)]

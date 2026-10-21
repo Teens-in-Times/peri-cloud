@@ -17,3 +17,7 @@
 4. 从该 tag 的 CI 产物生成 release，上传 GitHub Releases。
 5. 部署机下载 release，校验 SHA256 与 `BUILD.json` 的 commit，再切换 `current` 指针。
 6. 回滚使用上一个 release 指针和迁移前备份；不使用服务器本地构建。
+
+## 预览候选
+
+尚未合入 main 的发布候选可以从已推送的 PR 分支构建。必须记录完整 commit 和该 commit 的成功 CI run，使用同一次 CI 的 Windows/Linux 原生资产，候选包保留 BUILD.json、SHA256SUMS 与源码快照。使用 rc 版本号，并保持 GitHub Release 为 draft/prerelease；不据此切换生产。main 正式发布流程不变。

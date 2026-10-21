@@ -20,6 +20,7 @@ pub fn router(executor: Arc<Executor>) -> Router {
         .route("/v1/directories", post(directories))
         .route("/v1/sessions/{id}", put(bind_session))
         .route("/v1/sessions/{id}/tools", get(tools))
+        .route("/v1/sessions/{id}/environment", get(environment))
         .route("/v1/sessions/{id}/jobs", get(session_jobs))
         .route(
             "/v1/sessions/{id}/workspace/instructions",
@@ -83,6 +84,13 @@ async fn tools(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<NativeToolDescriptor>>, Error> {
     Ok(Json(executor.tools(id).await?))
+}
+
+async fn environment(
+    State(executor): State<Arc<Executor>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<EnvironmentSnapshot>, Error> {
+    Ok(Json(executor.environment(id).await?))
 }
 
 async fn submit(

@@ -148,6 +148,27 @@ pub struct JobReceipt {
 /// read endpoints. The cloud denies the capability when it is absent instead
 /// of probing endpoints that older executors do not serve.
 pub const WORKSPACE_READ_FEATURE: &str = "workspace-read@1";
+pub const ENVIRONMENT_READ_FEATURE: &str = "environment-read@1";
+
+/// Authenticated observations, never permissions or proof of future liveness.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EnvironmentSnapshot {
+    pub device_id: Uuid,
+    pub binding: SessionBinding,
+    pub platform: String,
+    pub architecture: String,
+    pub shell: String,
+    pub observed_at: String,
+    pub applications: Vec<EnvironmentApplication>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EnvironmentApplication {
+    pub name: String,
+    pub executable: Option<String>,
+    /// Discovery does not launch binaries; versions need normal approved tools.
+    pub version: Option<String>,
+}
 
 /// One workspace file returned by the device. `path` is workspace-relative and
 /// always uses `/`; `digest` is `sha256:<64 lowercase hex>` over the bytes read.
@@ -165,6 +186,9 @@ pub struct WorkspaceFile {
 pub struct WorkspaceInstructions {
     pub main: Option<WorkspaceFile>,
     pub local: Option<WorkspaceFile>,
+    /// Ordered cwd documents. Older peers can continue using main/local.
+    #[serde(default)]
+    pub documents: Vec<WorkspaceFile>,
 }
 
 /// `SKILL.md` paths found under `<workspace>/.claude/skills`, sorted.

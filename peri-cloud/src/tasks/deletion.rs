@@ -1,13 +1,35 @@
 //! Conservative semantic fallback after the main assistant reviews exact input.
 use serde_json::Value;
 
+/// Small fast path; scripts, dynamic syntax and mutating native calls always
+/// go to the main conversation. This does not grant account/device authority.
+pub(super) fn safe_read(name: &str, input: &Value) -> bool {
+    match name {
+        "Read" | "Glob" | "Grep" => true,
+        "Bash" | "Shell" => {
+            let command = input.get("command").and_then(Value::as_str);
+            plain_read_only(command)
+                && command
+                    .and_then(|c| c.split_whitespace().next())
+                    .is_some_and(|n| {
+                        matches!(
+                            n.to_ascii_lowercase().as_str(),
+                            "pwd" | "get-location" | "echo" | "write-output"
+                        )
+                    })
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn possible(name: &str, input: &Value) -> bool {
     match name {
         // Both operations can replace existing contents. Absence was not
         // established by an authenticated read, so replacement remains possible.
         "Write" | "Edit" => true,
         "Bash" | "Shell" => !plain_read_only(input.get("command").and_then(Value::as_str)),
-        _ => false,
+        "Read" | "Glob" | "Grep" => false,
+        _ => true,
     }
 }
 fn plain_read_only(command: Option<&str>) -> bool {
@@ -56,6 +78,10 @@ mod tests {
     use serde_json::json;
     #[test]
     fn literal_output_is_not_deletion_but_nested_code_and_replacement_need_notice() {
+        assert!(safe_read("Bash", &json!({"command":"echo hello"})));
+        assert!(!safe_read("Write", &json!({"file_path":"new.txt"})));
+        assert!(!safe_read("Bash", &json!({"command":"echo $(rm file)"})));
+        assert!(possible("mcp__opaque_action", &json!({})));
         for command in [
             "echo hello",
             "echo rm discard.txt",

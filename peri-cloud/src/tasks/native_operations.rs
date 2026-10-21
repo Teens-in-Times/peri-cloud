@@ -17,7 +17,82 @@ fn settled(output: &ToolOutput) -> bool {
         )
     })
 }
+
+pub(super) enum NativeAdmission {
+    Dispatch(Uuid),
+    Existing(Uuid),
+}
 impl WorkerService {
+    /// A repeated invocation observes its original result without obtaining a
+    /// fresh approval or replacing the original executor invocation identity.
+    pub(super) async fn native_existing(
+        &self,
+        scope: &TaskScope,
+        remote: &RemoteSession,
+        name: &str,
+        input: &Value,
+        ctx: &ToolContext<'_>,
+    ) -> Result<Option<Uuid>> {
+        if ctx.session_id.as_deref() != Some(scope.session.to_string().as_str())
+            || ctx.cancellation.is_cancelled()
+        {
+            return Err(TaskError::Forbidden);
+        }
+        let turn = ctx
+            .turn_generation
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .ok_or(TaskError::Invalid)?;
+        let call = ctx
+            .tool_call_id
+            .as_ref()
+            .ok_or(TaskError::Invalid)?
+            .to_string();
+        let old = sqlx::query("SELECT id,input_hash,task_id,context_generation,privacy_epoch FROM cloud_native_operations WHERE principal=? AND source_session=? AND turn_id=? AND call_id=?")
+            .bind(scope.principal.to_string()).bind(scope.session.to_string()).bind(turn.to_string()).bind(call).fetch_optional(&self.store.pool).await?;
+        let Some(old) = old else {
+            return Ok(None);
+        };
+        let active = self
+            .journal
+            .turn(scope.principal, scope.session, turn)
+            .await
+            .map_err(|_| TaskError::Forbidden)?;
+        if active.state != crate::state::TurnState::Running || active.cancel_requested {
+            return Err(TaskError::Conflict);
+        }
+        if let Some(task) = scope.task {
+            self.authorized(scope, task).await?;
+        }
+        let state = self
+            .journal
+            .session(scope.principal, scope.session)
+            .await
+            .map_err(|_| TaskError::Forbidden)?;
+        let epoch = crate::memory::MemoryStore::new(&self.journal, scope.principal, 65536)
+            .privacy_epoch()
+            .await
+            .map_err(|_| TaskError::Unavailable)?;
+        let fingerprint = format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&(
+                remote.device_id(),
+                remote.binding(),
+                name,
+                input
+            ))?)
+        );
+        if old.get::<String, _>("input_hash") != fingerprint
+            || old.get::<Option<String>, _>("task_id") != scope.task.map(|id| id.to_string())
+            || old.get::<i64, _>("context_generation") != state.context_generation as i64
+            || old.get::<i64, _>("privacy_epoch") != epoch as i64
+        {
+            return Err(TaskError::Conflict);
+        }
+        Ok(Some(
+            Uuid::parse_str(old.get("id")).map_err(|_| TaskError::Invalid)?,
+        ))
+    }
     pub(super) async fn native_begin(
         &self,
         scope: &TaskScope,
@@ -25,7 +100,7 @@ impl WorkerService {
         name: &str,
         input: &Value,
         ctx: &ToolContext<'_>,
-    ) -> Result<Uuid> {
+    ) -> Result<NativeAdmission> {
         if ctx.session_id.as_deref() != Some(scope.session.to_string().as_str())
             || ctx.cancellation.is_cancelled()
         {
@@ -80,6 +155,18 @@ impl WorkerService {
             .map_err(|_| TaskError::Unavailable)?;
         let id = Uuid::new_v4();
         let mut tx = self.store.pool.begin().await?;
+        // Stable host-persisted call identity is the idempotency key; input is
+        // a separately checked fingerprint, not permission to create a new key.
+        if let Some(old) = sqlx::query("SELECT id,input_hash,task_id,context_generation,privacy_epoch FROM cloud_native_operations WHERE principal=? AND source_session=? AND turn_id=? AND call_id=?")
+            .bind(scope.principal.to_string()).bind(scope.session.to_string()).bind(turn.to_string()).bind(&call).fetch_optional(&mut *tx).await? {
+            if old.get::<String,_>("input_hash") != fingerprint
+                || old.get::<Option<String>,_>("task_id") != scope.task.map(|id| id.to_string())
+                || old.get::<i64,_>("context_generation") != state.context_generation as i64
+                || old.get::<i64,_>("privacy_epoch") != epoch as i64 { return Err(TaskError::Conflict); }
+            let id = Uuid::parse_str(old.get("id")).map_err(|_| TaskError::Invalid)?;
+            tx.commit().await?;
+            return Ok(NativeAdmission::Existing(id));
+        }
         if let Some(task) = scope.task {
             let valid:i64=sqlx::query_scalar("SELECT COUNT(*) FROM agent_task_operations o JOIN agent_tasks t ON t.id=o.task_id WHERE o.task_id=? AND o.turn_id=? AND o.window_id=? AND o.call_id=? AND o.invocation_id=? AND o.instruction_watermark=(SELECT COALESCE(MAX(seq),0) FROM agent_task_messages WHERE task_id=o.task_id AND direction='parent') AND json_extract(t.record_json,'$.state')='running'")
                 .bind(task.to_string()).bind(turn.to_string()).bind(scope.session.to_string()).bind(&call).bind(invocation.to_string()).fetch_one(&mut *tx).await?;
@@ -98,16 +185,25 @@ impl WorkerService {
         if bound_pending != 0 {
             return Err(TaskError::Conflict);
         }
-        // No INSERT OR IGNORE followed by execution: an old submission is query-only.
-        let exists:i64=sqlx::query_scalar("SELECT COUNT(*) FROM cloud_native_operations WHERE principal=? AND source_session=? AND turn_id=? AND call_id=?")
-            .bind(scope.principal.to_string()).bind(scope.session.to_string()).bind(turn.to_string()).bind(&call).fetch_one(&mut *tx).await?;
-        if exists != 0 {
-            return Err(TaskError::Conflict);
-        }
         sqlx::query("INSERT INTO cloud_native_operations(id,principal,source_session,turn_id,task_id,call_id,device_id,frozen_json,invocation_id,tool,input_json,input_hash,state,context_generation,privacy_epoch,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'submitted_unknown',?,?,?)")
             .bind(id.to_string()).bind(scope.principal.to_string()).bind(scope.session.to_string()).bind(turn.to_string()).bind(scope.task.map(|v|v.to_string())).bind(call).bind(remote.device_id().to_string()).bind(serde_json::to_string(&frozen)?).bind(invocation.to_string()).bind(name).bind(serde_json::to_string(input)?).bind(fingerprint).bind(state.context_generation as i64).bind(epoch as i64).bind(now()).execute(&mut *tx).await?;
         tx.commit().await?;
-        Ok(id)
+        Ok(NativeAdmission::Dispatch(id))
+    }
+    pub(super) async fn native_observe(&self, id: Uuid) -> Result<ToolOutput> {
+        // Only GET/reconciliation is permitted for an existing admission.
+        let _ = self.query_native(id).await;
+        let row = sqlx::query(
+            "SELECT receipt_json,reconciled_json FROM cloud_native_operations WHERE id=?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&self.store.pool)
+        .await?;
+        let raw = row
+            .get::<Option<String>, _>("reconciled_json")
+            .or(row.get("receipt_json"))
+            .ok_or(TaskError::Unavailable)?;
+        Ok(serde_json::from_str(&raw)?)
     }
     pub(super) async fn native_finish(&self, id: Uuid, output: &ToolOutput) -> Result<()> {
         sqlx::query("UPDATE cloud_native_operations SET receipt_json=?,state=CASE WHEN state='confirmed' OR ? THEN 'confirmed' ELSE 'running_or_unknown' END,reconciled_json=CASE WHEN ? THEN NULL ELSE reconciled_json END WHERE id=? AND receipt_json IS NULL")

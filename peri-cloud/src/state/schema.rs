@@ -25,6 +25,9 @@ async fn has_table(pool: &SqlitePool, name: &str) -> StateResult<bool> {
 /// Refuse databases created by the standalone schema lineage before any
 /// migration can add production tables to them.
 pub(crate) async fn reject_foreign(pool: &SqlitePool, version: i64) -> StateResult<()> {
+    if version >= 24 && !has_table(pool, "agent_task_approval_presentations").await? {
+        return Err(StateError::ForeignSchema);
+    }
     if version >= 23 && !has_table(pool, "cloud_native_cancellations").await? {
         return Err(StateError::ForeignSchema);
     }

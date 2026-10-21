@@ -26,6 +26,7 @@ fn workspace(skills: Vec<WorkspaceSkill>) -> Arc<DeviceWorkspace> {
     Arc::new(DeviceWorkspace {
         main: None,
         local: None,
+        environment: None,
         skills,
         skills_available: true,
         reader: Arc::new(FakeReader),
@@ -36,6 +37,7 @@ fn skill(name: &str, path: &str) -> WorkspaceSkill {
     WorkspaceSkill {
         name: name.into(),
         path: path.into(),
+        source: peri_acp_types::skills::SkillSource::Project,
     }
 }
 
@@ -97,7 +99,10 @@ fn ambiguous_names_require_a_path() {
 
 #[tokio::test]
 async fn discovery_returns_the_catalog_and_filters_by_query() {
+    let mut shadowed = skill("account:review", "account/skills/review/SKILL.md");
+    shadowed.source = peri_acp_types::skills::SkillSource::User;
     let workspace = workspace(vec![
+        shadowed,
         skill("review", ".claude/skills/review/SKILL.md"),
         skill("deploy", ".claude/skills/team/deploy/SKILL.md"),
     ]);
@@ -112,6 +117,24 @@ async fn discovery_returns_the_catalog_and_filters_by_query() {
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert_eq!(parsed.as_array().unwrap().len(), 2);
+    let id = parsed[0]["skill_id"].as_str().unwrap();
+    let loaded = SkillTool {
+        workspace: workspace.clone(),
+    }
+    .invoke(json!({"skill_name":id}), ToolContext::new(&messages, ""))
+    .await
+    .unwrap();
+    assert!(loaded.contains(".claude/skills/review/SKILL.md"));
+    let all = tool
+        .invoke(
+            json!({"include_shadowed":true}),
+            ToolContext::new(&messages, ""),
+        )
+        .await
+        .unwrap();
+    let all: serde_json::Value = serde_json::from_str(&all).unwrap();
+    assert_eq!(all.as_array().unwrap().len(), 3);
+    assert_eq!(all[0]["effective"], false);
 
     let output = tool
         .invoke(json!({"query": "DEP"}), ToolContext::new(&messages, ""))
@@ -145,5 +168,5 @@ async fn middleware_exposes_the_catalog_and_the_cloud_section() {
     assert!(sections[0]
         .content
         .as_str()
-        .contains("bound device workspace"));
+        .contains("effective skill catalog"));
 }

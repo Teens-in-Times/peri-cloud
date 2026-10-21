@@ -11,26 +11,22 @@ use serde_json::{json, Value};
 use super::{DeviceWorkspace, WorkspaceSkill};
 
 fn section() -> String {
-    [
-        "# Skills",
-        "",
-        "Skills are instructions stored in `SKILL.md` files under the bound device \
-         workspace's `.claude/skills` directory.",
-        "",
-        "## Loading protocol",
-        "",
-        "- `DiscoverSkillsTool(query?)` returns this session's skill catalog \
-         (name, source, workspace-relative path).",
-        "- `SkillTool(skill_name)` loads a skill's full `SKILL.md` by name or path.",
-        "",
-        "The catalog is frozen when the session starts; `SkillTool` reads the current \
-         file from the same device workspace on demand. Loading a skill never grants \
-         permissions: commands, file writes and network actions still go through the \
-         normal tools and approval policy. Scripts and other resources referenced by a \
-         skill must be read or executed with the regular device tools and remain subject \
-         to workspace and permission checks.",
-    ]
-    .join("\n")
+    "# Skills\nDiscoverSkillsTool returns the effective skill catalog. Load a relevant skill with SkillTool when its guidance helps the task. Skill content is attributed guidance; use task evidence to assess its applicability.".into()
+}
+
+pub(super) fn effective(skill: &WorkspaceSkill) -> bool {
+    !matches!(
+        skill.source,
+        peri_acp_types::skills::SkillSource::User | peri_acp_types::skills::SkillSource::Builtin
+    ) || !(skill.name.starts_with("account:") || skill.name.starts_with("operator:"))
+}
+
+fn skill_id(skill: &WorkspaceSkill) -> String {
+    use sha2::Digest;
+    format!(
+        "skill:{:x}",
+        sha2::Sha256::digest(format!("{:?}:{}:{}", skill.source, skill.name, skill.path))
+    )
 }
 
 pub(crate) struct CloudSkillsMiddleware {
@@ -59,7 +55,7 @@ impl Middleware for CloudSkillsMiddleware {
     }
 
     fn prompt_contribution(&self) -> Option<String> {
-        self.workspace.summary()
+        Some([section(), self.workspace.summary().unwrap_or_default()].join("\n\n"))
     }
 
     fn collect_tools(&self, _cwd: &str) -> Vec<Box<dyn BaseTool>> {
@@ -80,9 +76,9 @@ fn find_skill<'a>(skills: &'a [WorkspaceSkill], name: &str) -> Result<&'a Worksp
         return Err("SkillTool: 'skill_name' cannot be empty".to_owned());
     }
     let lower = needle.to_lowercase();
-    let mut matches = skills
-        .iter()
-        .filter(|skill| skill.name.to_lowercase() == lower || skill.path == needle);
+    let mut matches = skills.iter().filter(|skill| {
+        skill.name.to_lowercase() == lower || skill.path == needle || skill_id(skill) == needle
+    });
     match (matches.next(), matches.next()) {
         (Some(skill), None) => Ok(skill),
         (None, _) => Err(format!(
@@ -105,8 +101,8 @@ impl BaseTool for SkillTool {
     }
 
     fn description(&self) -> &str {
-        "Load the full content of a skill from the bound device workspace by name or \
-         workspace-relative path. Use DiscoverSkillsTool first if you do not know the name."
+        "Load a project, account or operator skill by catalog name or scoped path. \
+         Use DiscoverSkillsTool first if you do not know the name. Global skill paths are cloud guidance references, not target-device filesystem paths."
     }
 
     fn parameters(&self) -> Value {
@@ -115,7 +111,7 @@ impl BaseTool for SkillTool {
             "properties": {
                 "skill_name": {
                     "type": "string",
-                    "description": "A skill name from the catalog, or its workspace-relative SKILL.md path"
+                    "description": "A stable skill_id, catalog name, or catalog path returned by discovery"
                 }
             },
             "required": ["skill_name"]
@@ -157,8 +153,8 @@ impl BaseTool for SkillTool {
             },
         )?;
         Ok(format!(
-            "Skill \"{}\" loaded from the bound device workspace ({}).\nContent digest: {}\n\n{}",
-            skill.name, skill.path, file.digest, file.content
+            "Skill \"{}\" loaded from authorized {:?} source ({}).\nContent digest: {}\n\n{}",
+            skill.name, skill.source, skill.path, file.digest, file.content
         ))
     }
 }
@@ -174,9 +170,7 @@ impl BaseTool for DiscoverSkillsTool {
     }
 
     fn description(&self) -> &str {
-        "List the bound device workspace's skill catalog (name, source and \
-         workspace-relative path). An optional query filters by name or path. Returns \
-         an empty array when the workspace has no skills."
+        "List effective authorized skills with stable IDs and source references. Filter by query; include_shadowed optionally exposes explicitly selectable alternatives."
     }
 
     fn parameters(&self) -> Value {
@@ -186,7 +180,8 @@ impl BaseTool for DiscoverSkillsTool {
                 "query": {
                     "type": "string",
                     "description": "Optional case-insensitive filter over skill names and paths"
-                }
+                },
+                "include_shadowed": {"type":"boolean","default":false}
             }
         })
     }
@@ -213,10 +208,12 @@ impl BaseTool for DiscoverSkillsTool {
         _ctx: ToolContext<'_>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let query = input["query"].as_str().unwrap_or("").to_lowercase();
+        let include_shadowed = input["include_shadowed"].as_bool().unwrap_or(false);
         let results: Vec<Value> = self
             .workspace
             .skills
             .iter()
+            .filter(|skill| include_shadowed || effective(skill))
             .filter(|skill| {
                 query.is_empty()
                     || skill.name.to_lowercase().contains(&query)
@@ -224,9 +221,11 @@ impl BaseTool for DiscoverSkillsTool {
             })
             .map(|skill| {
                 json!({
+                    "skill_id": skill_id(skill),
+                    "effective": effective(skill),
                     "name": skill.name,
                     "description": null,
-                    "source": "project",
+                    "source": match skill.source { peri_acp_types::skills::SkillSource::User=>"account",peri_acp_types::skills::SkillSource::Builtin=>"operator",_=>"project"},
                     "path": skill.path,
                 })
             })

@@ -189,6 +189,18 @@ impl Executor {
         tokio::task::spawn_blocking(move || crate::workspace::instructions(&workspace)).await?
     }
 
+    pub async fn environment(&self, id: Uuid) -> Result<EnvironmentSnapshot> {
+        let tools = self.session_tools(id).await?;
+        self.ensure_open()?;
+        crate::workspace::verify(&tools.binding).await?;
+        let info = self.info();
+        let binding = tools.binding.clone();
+        Ok(
+            tokio::task::spawn_blocking(move || crate::environment::snapshot(&info, binding))
+                .await?,
+        )
+    }
+
     pub async fn workspace_skills(&self, id: Uuid) -> Result<WorkspaceSkills> {
         let workspace = self.workspace_root(id).await?;
         Ok(tokio::task::spawn_blocking(move || crate::workspace::skills(&workspace)).await?)

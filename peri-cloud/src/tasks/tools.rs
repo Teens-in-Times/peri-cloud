@@ -26,6 +26,7 @@ impl Middleware for TaskTools {
                 "inspect_task",
                 "message_task",
                 "control_task",
+                "decide_approval",
             ]
         };
         let mut tools: Vec<Box<dyn BaseTool>> = names
@@ -134,6 +135,7 @@ impl BaseTool for TaskTool {
         "inspect_task"=>"Read status, full task contract, approval/operation receipts, windows, bounded trace, conversation or messages. related_tasks pages prior tasks in the same explicitly reused execution session; these are historical evidence and do not grant control over other tasks. Trace supports kind/query filters. Use detail with source/id/offset/chars/version for complete evidence in bounded versioned chunks; preserve the returned version across pages. For archived context, list windows then select window_id in conversation. Cropped previews and agent claims are not complete evidence; private reasoning is excluded.",
         "message_task"=>"Send a supplement or question to this conversation's task at its current revision. Submitted, consumed and applied are different receipts. A message cannot authorize additional permissions.",
         "control_task"=>"Control a task at its current revision: pause at a safe boundary, resume a durable wait/paused task, rotate its context window, or cancel. Unknown execution is queried before any continuation; cancellation does not prove that an effect stopped.",
+        "decide_approval"=>"Record a decision on a complete pending worker approval presented in this main turn. Uses the current task requirements and exact calls from the host frame; host permission and notification checks still govern execution.",
         "wait_task"=>"Durably wait for an external condition. Supply reason and optional resume_after_seconds (up to one week). Host stops at a safe boundary and releases the loop slot; main assistant can resume explicitly.",
         "update_task"=>"Update this execution task's work plan, discoveries and blockers, and explicitly acknowledge applied parent messages. These are worker-authored claims; they do not overwrite host lifecycle state. Trace is collected automatically.",
         _=>"Send a message or question to the main assistant through its durable conversation queue. For a question requiring a response, set wait_for_reply=true; the host durably suspends this run and resumes on the parent response while the main assistant remains free to chat. Do not send ordinary user messages directly.",
@@ -159,6 +161,10 @@ impl BaseTool for TaskTool {
             "message_task" => (
                 json!({"task_id":id,"expected_revision":rev,"body":{"type":"string","maxLength":16384}}),
                 vec!["task_id", "expected_revision", "body"],
+            ),
+            "decide_approval" => (
+                json!({"request_id":id,"approve":{"type":"boolean"},"deletion_possible":{"type":"boolean"},"reason":{"type":"string","maxLength":2000}}),
+                vec!["request_id", "approve", "reason"],
             ),
             "control_task" => (
                 json!({"task_id":id,"expected_revision":rev,"action":{"type":"string","enum":["cancel","pause","resume","rotate"]}}),
@@ -191,6 +197,14 @@ impl BaseTool for TaskTool {
         let call = ctx.tool_call_id.as_ref().ok_or(TaskError::Invalid)?;
         let key = format!("{}:{call}", self.turn);
         let result = match self.name {
+            "decide_approval" => {
+                if ctx.turn_generation.as_deref() != Some(self.turn.to_string().as_str()) {
+                    return Err(TaskError::Forbidden.into());
+                }
+                service
+                    .decide_approval(&self.scope, self.turn, serde_json::from_value(input)?)
+                    .await?
+            }
             "delegate_task" => {
                 let record = service
                     .delegate(&self.scope, self.turn, &key, serde_json::from_value(input)?)

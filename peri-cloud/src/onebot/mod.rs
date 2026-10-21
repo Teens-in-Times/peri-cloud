@@ -133,7 +133,7 @@ impl OneBotAdapter {
 #[async_trait]
 impl MessageAdapter for OneBotAdapter {
     fn context_constraints(&self, _route: &crate::gateway::ChannelRoute) -> &'static str {
-        "Channel: personal QQ account. Reply naturally in plain text. Avoid Markdown headings, tables and decorative formatting; keep ordinary chat to assistant text. Structured approvals use the host interaction channel."
+        "Channel: personal QQ account. Reply naturally and warmly, matching the conversation and the assistant's personality. Focus on meaningful progress, actual results and decisions needing the user's attention."
     }
     fn supports_proactive(&self) -> bool {
         true

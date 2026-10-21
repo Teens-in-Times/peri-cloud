@@ -2,7 +2,7 @@
 
 支持多个独立账号的云 Agent：推理循环在服务器，工具在各自选择的 Windows / Linux 实例上执行，官方 QQBot 与可选的个人 QQ / OneBot 是并存的聊天入口。服务器本地实例仅属于管理员。
 
-本项目基于 [Peri](https://github.com/KonghaYao/peri) 的 Rust Agent 核心，拆出原生执行器并加入账号、设备连接、网关和常驻服务。发布包不包含 TUI。保留依赖所需的编译期提示词与 workflow 资源。当前版本 `v0.7.1`（Peri v4 核心），仍处于预览阶段。
+本项目基于 [Peri](https://github.com/KonghaYao/peri) 的 Rust Agent 核心，拆出原生执行器并加入账号、设备连接、网关和常驻服务。发布包不包含 TUI。保留依赖所需的编译期提示词与 workflow 资源。当前候选版本 `v0.8.0-rc.1`（Peri v4 核心），仅供个人预览验证，未替代现有生产部署。发布范围与验收门槛见 [候选说明](docs/releases/v0.8.0-rc.1.md)。
 
 ## 能做什么
 
@@ -12,7 +12,7 @@
 - 聊天入口可显式选择同一个逻辑会话或新建独立会话；同会话运行中的新输入持久排队，按顺序继续处理。网页聊天按逻辑会话展示历史。
 - 主助手可以直接处理小操作，也可以通过任务工具派发独立的云端执行 Agent，继续聊天并查询状态、trace、任务历史，双向传递补充信息。执行器仍只负责本地工具。
 - 执行会话可显式复用，连续串行承接独立任务；按 OAuth 用户、设备、规范化工作区和隐私范围隔离。支持执行窗口轮换、持久暂停与等待、原操作回执查询恢复；未知结果不重放。完整实施状态见 [执行连续性计划](docs/execution-continuity-plan.md)。
-- 执行 Agent 的命令由主助手独立审查并交给原权限中间件执行，普通聊天可以继续。删除或可能替换内容先通知，通知结果未知时不执行；主会话及 OAuth 的原授权流程保留。见 [任务审批](docs/task-approvals.md)。
+- 执行 Agent 的命令经宿主快速策略或主会话类型化审批，再交给原权限中间件执行，普通聊天可以继续。删除或可能替换内容先通知，通知结果未知时不执行；主会话及 OAuth 的原授权流程保留。见 [任务审批](docs/task-approvals.md)。
 - 任务产物和验证关联真实执行回执，主助手按最新要求验收；执行完成、产物生成和验收通过分别记录，新增要求使旧验收失效。见 [产物与验收](docs/task-deliverables.md)。
 - 主助手可发现授权设备、按需加载环境，以固定目标直接调用另一设备的小操作；无需创建执行任务或修改主会话默认设备。原权限审批、操作回执和设备修改占用共用。见 [按调用选择设备](docs/device-invocations.md)。
 - 主助手与执行 Agent 共用上下文装配器，支持外置 SOUL.md、渠道规则、Markdown 来源及装配顺序；用户可在网页管理自己的 SOUL.md。运行契约和验证状态见 [Agent 核心重构](docs/core-agent-refactor.md)。
@@ -115,7 +115,7 @@ chcp 65001   # Windows：让 PowerShell 中文输出按 UTF-8 解码
 - 尚未提供远程开机 / Wake-on-LAN 的常驻家中节点。
 - Linux 核心工具可运行，完全无人值守服务器的 OAuth 登录体验仍需完善。
 - Windows 提供用户登录后的启动方式，尚未提供经过验收的登录前系统服务安装器。
-- 设备连接可由执行器自动上报；静态 `devices` 配置仍作为回退，首次登录与部署配置仍需按指南完成。同一任务中由模型自动切换执行设备的工具尚未提供。
+- 设备连接可由执行器自动上报；静态 `devices` 配置仍作为回退，首次登录与部署配置仍需按指南完成。主助手已支持按调用准备固定设备目标，不会更改已提交操作的设备。
 - 官方 QQBot 与可选 OneBot v11 适配器可以同时使用；个人号的扫码与真实客户端需单独验收。微信适配器、独立项目授权/CONTEXT 和后台自动提炼属于后续扩展；个人/设备池/设备环境条目及中文检索已实现。
 - 额度统计逻辑模型请求次数，包含上下文压缩；尚不提供准确的 token / 金额计费或用户历史存储配额。
 - 一个状态目录只能由一个云服务进程持有；并行任务不代表可同时启动多个共享 SQLite 的宿主。
@@ -133,10 +133,13 @@ QQ 日常操作与交互审计：[QQ 优先交互说明](docs/qq-experience-audi
 
 网页信息层级：[运行拓扑与会话归属](docs/web-topology.md)。
 
-后续设计：[跨设备上下文、模型/API 与渐进式 Skill](docs/context-and-model-control-design-20261017.md)（方案，尚未实现）。
+历史设计：[跨设备上下文、模型/API 与渐进式 Skill](docs/context-and-model-control-design-20261017.md)；实际范围以 [装配契约](docs/context-assembly.md) 和 [设备调用契约](docs/device-invocations.md) 为准。
 
 架构升级与产品边界见 [实况审计与目标方案](docs/architecture-upgrade-20261017.md)，接口、独立部署及恢复见 [控制接口与运维](docs/control-operations.md)。
 
 QQ 原生命令发现、执行 API、扩展接口和兼容范围：[QQ CLI 命令](docs/qq-cli-commands.md)。
 
 本轮执行架构的逐项验证、故障恢复证据和实际限制见 [完整验收记录](docs/execution-continuity-verification.md)。最新可编辑实现拓扑为 [执行架构快照](docs/design/peri-workbench/execution-architecture-20261019.html)，使用独立存档身份，保留原画板修改。
+
+上下文分段、助手级 SOUL、项目指令回退、全局／项目 Skill 与按需设备环境，见 [装配契约](docs/context-assembly.md)。提示词创作入口为 [带逐份说明的合订稿](docs/prompt-review/PROMPTS-EDIT.md)。
+提示词规则由宿主承接：主会话类型化审批、完整活跃约束快照、原调用回执复用、空工具摘要、QQ Markdown 降级和生效 Skill 目录。实现边界见 [宿主契约](docs/prompt-host-contracts.md)。

@@ -2,6 +2,7 @@
 
 mod config;
 mod directories;
+mod environment;
 mod error;
 pub mod login;
 mod native;

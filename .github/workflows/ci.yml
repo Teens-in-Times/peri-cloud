@@ -61,6 +61,25 @@ jobs:
         run: bash ./scripts/cargo-rmcp-patched.sh clippy --locked -p peri-scheduler -p peri-cloud -p peri-executor --all-targets --no-deps -- -D warnings
       - name: Build optimized binaries
         run: bash ./scripts/cargo-rmcp-patched.sh build --release --locked -p peri-cloud --bin peri-cloud-host -p peri-executor --bin peri-executor
+      - name: Fetch verified upgrade baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/prepare-upgrade-baseline.py --output target/upgrade-baseline
+      - name: Rehearse isolated upgrade and backup restore
+        shell: bash
+        run: |
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          python scripts/smoke-upgrade.py --baseline "target/upgrade-baseline/peri-cloud-host$suffix" --candidate "target/release/peri-cloud-host$suffix" --output target/upgrade-rehearsal
+      - name: Preserve non-private upgrade report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: upgrade-report-${{ matrix.os }}
+          path: |
+            target/upgrade-rehearsal/report.json
+            target/upgrade-baseline/baseline.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Preserve verified native binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

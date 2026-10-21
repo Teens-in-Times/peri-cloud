@@ -47,12 +47,11 @@ async fn independent_execution_sessions_run_in_parallel_while_reused_session_tas
             stage += 1;
             return reply;
         }
-        let worker = request["messages"].as_array().unwrap().iter().any(|m| {
-            m["role"] == "system"
-                && m["content"]
-                    .as_str()
-                    .is_some_and(|s| s.contains("You are a cloud execution agent"))
-        });
+        let worker = request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "message_parent");
         if worker {
             let task = request["messages"]
                 .as_array()

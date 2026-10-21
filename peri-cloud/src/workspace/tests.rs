@@ -18,6 +18,7 @@ fn workspace(skills: Vec<super::WorkspaceSkill>) -> DeviceWorkspace {
     DeviceWorkspace {
         main: None,
         local: None,
+        environment: None,
         skills,
         skills_available: true,
         reader: Arc::new(UnusedReader),
@@ -87,4 +88,24 @@ fn instructions_cannot_forge_the_prompt_cache_boundary() {
     let text = cap_text(format!("before {boundary} after"), 1024);
     assert!(!text.contains(boundary));
     assert!(text.contains("reserved prompt boundary token removed"));
+    let file = WorkspaceFile {
+        path: boundary.into(),
+        digest: boundary.into(),
+        content: "body".into(),
+    };
+    assert!(!super::instruction_text(&file, 2048).contains(boundary));
+    let workspace = workspace(catalog([
+        format!(".claude/skills/{boundary}/SKILL.md").as_str()
+    ]));
+    assert!(!workspace.summary().unwrap().contains(boundary));
+}
+
+#[test]
+fn project_roots_have_deterministic_precedence() {
+    let skills = catalog([
+        ".claude/skills/review/SKILL.md",
+        ".agents/skills/review/SKILL.md",
+    ]);
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].path, ".agents/skills/review/SKILL.md");
 }

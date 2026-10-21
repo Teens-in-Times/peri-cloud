@@ -19,6 +19,59 @@ struct Harness {
     server: tokio::task::JoinHandle<()>,
 }
 
+#[tokio::test]
+async fn environment_is_authenticated_binding_scoped_and_does_not_launch_jobs() {
+    let h = Harness::new().await;
+    let url = format!("{}/v1/sessions/{}/environment", h.base, h.session);
+    assert_eq!(
+        h.client.get(&url).send().await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let value: EnvironmentSnapshot = h
+        .client
+        .get(&url)
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(value.device_id, h.executor.info().device_id);
+    assert_eq!(value.binding.session_id, h.session);
+    assert_eq!(
+        value.binding.workspace_identity,
+        h.executor
+            .bind_session(
+                h.session,
+                OpenSession {
+                    workspace: h.workspace.path().to_string_lossy().into_owned()
+                }
+            )
+            .await
+            .unwrap()
+            .workspace_identity
+    );
+    assert!(value.applications.iter().all(|app| app.version.is_none()));
+    assert_eq!(value.platform, std::env::consts::OS);
+    assert!(h.executor.session_jobs(h.session).await.unwrap().is_empty());
+    let missing = h
+        .client
+        .get(format!(
+            "{}/v1/sessions/{}/environment",
+            h.base,
+            Uuid::new_v4()
+        ))
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    h.close().await;
+}
+
 impl Harness {
     async fn new() -> Self {
         let state = tempfile::tempdir().unwrap();
