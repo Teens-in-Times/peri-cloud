@@ -22,6 +22,8 @@ jobs:
       RUSTUP_TOOLCHAIN: 1.99.0
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install tested Rust toolchain
         run: rustup toolchain install 1.99.0 --profile minimal
       - name: Install Windows check components
@@ -61,6 +63,8 @@ jobs:
         run: bash ./scripts/cargo-rmcp-patched.sh clippy --locked -p peri-scheduler -p peri-cloud -p peri-executor --all-targets --no-deps -- -D warnings
       - name: Build optimized binaries
         run: bash ./scripts/cargo-rmcp-patched.sh build --release --locked -p peri-cloud --bin peri-cloud-host -p peri-executor --bin peri-executor
+      - name: Record exact native source and binary digests
+        run: python scripts/record-native-build.py target/release
       - name: Fetch verified upgrade baseline
         env:
           GH_TOKEN: ${{ github.token }}
@@ -89,6 +93,7 @@ jobs:
             target/release/peri-cloud-host.exe
             target/release/peri-executor
             target/release/peri-executor.exe
+            target/release/SOURCE.json
           if-no-files-found: error
           retention-days: 7
       - name: Linux release process smoke
