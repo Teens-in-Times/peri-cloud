@@ -70,6 +70,10 @@ impl Model for SummaryModel {
         request: ModelRequest,
         _: CancellationToken,
     ) -> ModelResult<ModelResponse> {
+        assert!(
+            request.tools.is_empty(),
+            "summary and recovery have no tool capabilities"
+        );
         self.requests.lock().unwrap().push(request);
         self.responses.lock().unwrap().pop_front().unwrap()
     }
@@ -143,9 +147,9 @@ async fn full_continuation_preserves_chunks_and_commits_complete_summary() {
         assert_eq!(requests[1].messages.len(), requests[0].messages.len() + 2);
         assert_eq!(requests[1].max_tokens, requests[0].max_tokens);
         let continuation_prompt = requests[1].messages.last().unwrap().text_content().unwrap();
-        assert!(continuation_prompt.contains("cut off"));
-        assert!(continuation_prompt.contains("Continue exactly from the end"));
-        assert!(continuation_prompt.contains("Do not call tools"));
+        assert!(continuation_prompt.contains("unfinished summary"));
+        assert!(continuation_prompt.contains("from the end"));
+        assert!(requests[1].tools.is_empty());
     }
     let stored = bound
         .resources

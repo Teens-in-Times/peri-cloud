@@ -165,6 +165,7 @@ async fn read_pool(f: &Fixture) -> sqlx::SqlitePool {
 #[tokio::test]
 async fn process_kill_preserves_wait_approval_native_submission_and_window_handoff() {
     for stage in ["wait", "approval", "submission", "rotation"] {
+        eprintln!("process kill and recovery stage: {stage}");
         let action = match stage {
             "wait" => call(
                 "wait_task",

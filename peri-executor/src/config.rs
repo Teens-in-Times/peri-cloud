@@ -10,10 +10,15 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{Error, Result};
-use peri_acp_types::device_executor::{ExecutorInfo, PROTOCOL_VERSION, WORKSPACE_READ_FEATURE};
+use peri_acp_types::device_executor::{
+    ExecutorInfo, ENVIRONMENT_READ_FEATURE, PROTOCOL_VERSION, WORKSPACE_READ_FEATURE,
+};
 
 fn features() -> Vec<String> {
-    vec![WORKSPACE_READ_FEATURE.to_owned()]
+    vec![
+        WORKSPACE_READ_FEATURE.to_owned(),
+        ENVIRONMENT_READ_FEATURE.to_owned(),
+    ]
 }
 
 #[derive(Serialize, Deserialize)]

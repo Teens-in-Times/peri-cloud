@@ -1,4 +1,5 @@
 //! Durable cloud workers. Task state, semantic notes, trace and user delivery are distinct.
+pub(crate) mod approval_inbox;
 pub(crate) mod approvals;
 pub(crate) mod continuity;
 mod deletion;

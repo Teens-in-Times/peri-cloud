@@ -28,6 +28,11 @@ async fn per_call_target_is_fixed_approved_exactly_and_unknown_receipts_are_quer
             2 => {
                 let target = tool_value(request, "target");
                 assert_eq!(target["authenticated"], true);
+                assert_eq!(target["environment"]["device_id"], device1.to_string());
+                assert_eq!(
+                    target["environment"]["binding"]["workspace"],
+                    target["target"]["workspace"]
+                );
                 *capture.lock() = target["target"]["target_id"].clone();
                 call(
                     "prepare_device",
@@ -419,5 +424,57 @@ async fn direct_calls_share_worker_mutation_ownership_but_other_device_and_chat_
         std::fs::read_to_string(f.workspaces[1].path().join("direct.txt")).unwrap(),
         "other device remains available"
     );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn duplicate_native_call_identity_is_rejected_without_reexecuting_the_tool() {
+    let f = Fixture::new_for(
+        vec![
+            call("Read", json!({"file_path":"source.txt"}), "stable-call"),
+            call("Read", json!({"file_path":"source.txt"}), "stable-call"),
+        ],
+        true,
+    )
+    .await;
+    std::fs::write(
+        f.workspaces[0].path().join("source.txt"),
+        "original evidence",
+    )
+    .unwrap();
+    let parent = f
+        .c()
+        .gateway
+        .open_browser_workspace(&f.c().browser, Uuid::new_v4(), f.devices[0].id, None)
+        .await
+        .unwrap();
+    let turn = f
+        .c()
+        .gateway
+        .submit_browser_task(
+            &f.c().browser,
+            parent,
+            Uuid::new_v4(),
+            "read requested evidence".into(),
+        )
+        .await
+        .unwrap();
+    f.settled(parent, turn.turn_id).await;
+    assert_eq!(
+        f.submissions[0].load(Ordering::SeqCst),
+        1,
+        "a repeated protocol call identity must not POST another executor request"
+    );
+    {
+        let requests = f.script.requests.lock();
+        assert!(requests[1]["messages"]
+            .to_string()
+            .contains("original evidence"));
+        assert_eq!(
+            requests.len(),
+            2,
+            "duplicate model tool IDs fail at the protocol boundary"
+        );
+    }
     f.finish().await;
 }

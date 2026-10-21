@@ -57,7 +57,13 @@ impl WorkerService {
         let raw = serde_json::to_string(&snapshot)?;
         let digest = format!("{:x}", sha2::Sha256::digest(raw.as_bytes()));
         let mut tx = self.store.pool.begin().await?;
-        let instruction_version:i64=sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM agent_task_messages WHERE task_id=? AND direction='parent'").bind(task.to_string()).fetch_one(&mut *tx).await?;
+        let instruction_version:i64=sqlx::query_scalar("SELECT COALESCE(MAX(message_seq),0) FROM agent_task_instruction_reads WHERE task_id=? AND window_id=?").bind(task.to_string()).bind(scope.session.to_string()).fetch_one(&mut *tx).await?;
+        if phase == "dispatching" {
+            let latest:i64=sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM agent_task_messages WHERE task_id=? AND direction='parent'").bind(task.to_string()).fetch_one(&mut *tx).await?;
+            if latest != instruction_version {
+                return Err(TaskError::Conflict);
+            }
+        }
         for call in calls {
             let encoded = serde_json::to_string(call)?;
             let hash = format!("{:x}", sha2::Sha256::digest(encoded.as_bytes()));

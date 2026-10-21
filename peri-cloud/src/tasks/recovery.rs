@@ -115,6 +115,7 @@ impl WorkerService {
             "pause_requested"
                 | "paused"
                 | "waiting_parent"
+                | "waiting_approval"
                 | "waiting_external"
                 | "waiting_capacity"
                 | "rotate_requested"

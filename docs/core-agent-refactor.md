@@ -68,3 +68,8 @@ README 指定的六个 crate 现有检查共 476 项通过；原 OAuth、QQ/OneB
 检查命令使用 `scripts/cargo-rmcp-patched.sh`，包含目标测试、`cargo fmt` 和 peri-cloud 的所有 target 严格 Clippy；Windows 内存限制下使用 `-j 1`。门户 JavaScript 语法与 source/test 文件行数边界也已检查。
 
 本轮验证使用 Windows 与模拟外部服务；没有进行真实 QQ 平台、线上模型或 Linux 现场部署验收。首版仍按整台设备协调修改，后台任务的进程崩溃沿用原恢复语义：保留未知执行，不自动重跑。
+
+## 后续装配扩展
+
+本页保留早期核心重构的阶段记录。后续已增加来源与版本清单、受控宏、来源预算、账号/管理员全局 Skill、项目 .agents/skills 及设备环境快照。SOUL 为助手级，项目按 AGENTS.md → CLAUDE.md 回退，不叠加两份主指令；见 [当前装配契约](context-assembly.md)。
+\n提示词规则由宿主承接：主会话类型化审批、完整活跃约束快照、原调用回执复用、空工具摘要、QQ Markdown 降级和生效 Skill 目录。实现边界见 [宿主契约](prompt-host-contracts.md)。\n

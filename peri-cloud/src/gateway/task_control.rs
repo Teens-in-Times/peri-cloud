@@ -134,7 +134,26 @@ impl Gateway {
     ) -> GatewayResult<TaskReceipt> {
         let principal = actor.principal().id;
         let gate = self.account_gate(principal.to_string());
-        let _guard = gate.lock().await;
+        let _guard = loop {
+            if self.owner.lock().closing {
+                return Err(GatewayError::Closing);
+            }
+            let guard = gate.lock().await;
+            self.identity.browser_scope(actor).await?;
+            let active = self.journal().active_turn(principal, session).await?;
+            if (active.is_none() && self.runtime.status().active_sessions.contains(&session))
+                || active
+                    .as_ref()
+                    .is_some_and(crate::tasks::approval_inbox::is_control_turn)
+            {
+                // This owned submission survives a disconnected HTTP waiter.
+                // Let the bounded control turn finish without holding its gate.
+                drop(guard);
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                continue;
+            }
+            break guard;
+        };
         self.identity.browser_scope(actor).await?;
         let route = self.browser_task_route(actor, session).await?;
         let key = format!("web:{request}");

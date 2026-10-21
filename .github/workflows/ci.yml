@@ -5,7 +5,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 jobs:
   cloud-executor:
@@ -22,6 +22,8 @@ jobs:
       RUSTUP_TOOLCHAIN: 1.99.0
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install tested Rust toolchain
         run: rustup toolchain install 1.99.0 --profile minimal
       - name: Install Windows check components
@@ -61,6 +63,27 @@ jobs:
         run: bash ./scripts/cargo-rmcp-patched.sh clippy --locked -p peri-scheduler -p peri-cloud -p peri-executor --all-targets --no-deps -- -D warnings
       - name: Build optimized binaries
         run: bash ./scripts/cargo-rmcp-patched.sh build --release --locked -p peri-cloud --bin peri-cloud-host -p peri-executor --bin peri-executor
+      - name: Record exact native source and binary digests
+        run: python scripts/record-native-build.py target/release
+      - name: Fetch verified upgrade baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/prepare-upgrade-baseline.py --output target/upgrade-baseline
+      - name: Rehearse isolated upgrade and backup restore
+        shell: bash
+        run: |
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          python scripts/smoke-upgrade.py --baseline "target/upgrade-baseline/peri-cloud-host$suffix" --candidate "target/release/peri-cloud-host$suffix" --output target/upgrade-rehearsal
+      - name: Preserve non-private upgrade report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: upgrade-report-${{ matrix.os }}
+          path: |
+            target/upgrade-rehearsal/report.json
+            target/upgrade-baseline/baseline.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Preserve verified native binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -70,6 +93,7 @@ jobs:
             target/release/peri-cloud-host.exe
             target/release/peri-executor
             target/release/peri-executor.exe
+            target/release/SOURCE.json
           if-no-files-found: error
           retention-days: 7
       - name: Linux release process smoke

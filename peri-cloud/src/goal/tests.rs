@@ -121,7 +121,7 @@ async fn goal_survives_reopen_and_is_scoped_to_its_principal() {
         .fetch_one(&journal.identity_pool())
         .await
         .unwrap();
-    assert_eq!(version, 23);
+    assert_eq!(version, 24);
 
     let controller = CloudGoalController::load(journal.identity_pool(), session, owner)
         .await

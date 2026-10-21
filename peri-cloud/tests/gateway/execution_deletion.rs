@@ -85,7 +85,7 @@ async fn deletion_notice_uses_actual_shell_semantics_and_precedes_nested_file_re
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             f.c().gateway.dispatch().await.unwrap();
-            if f.script.review_requests.lock().len() == 2 {
+            if f.script.review_requests.lock().len() == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -93,7 +93,7 @@ async fn deletion_notice_uses_actual_shell_semantics_and_precedes_nested_file_re
     })
     .await
     .unwrap();
-    assert!(f.script.review_requests.lock()[1]["messages"]
+    assert!(f.script.review_requests.lock()[0]["messages"]
         .to_string()
         .contains("discard.txt"));
     assert!(f.workspaces[0].path().join("discard.txt").exists());

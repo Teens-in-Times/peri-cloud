@@ -44,21 +44,13 @@ const SUMMARY_USER_PROMPT: &str = include_str!("descriptions/summary_user_prompt
 mod summary;
 
 /// 摘要恢复提示：从已有正文末尾续写，只输出缺失部分。
-const SUMMARY_RECOVERY_PROMPT: &str = "Your summary was cut off. Continue exactly from the end of your previous text, \
-including any unfinished word or tag. Output only the missing remainder; do not restart, repeat earlier sections, or add \
-analysis. Prioritize the essential facts that are still missing — the active request and its constraints, work status, \
-and the next step — instead of only closing tags. Do not call tools.";
+const SUMMARY_RECOVERY_PROMPT: &str = "Continue the unfinished summary from the end of its existing text. Prioritize missing active requirements, current work state, decisions and the next action.";
 
 /// 最后一次生成的提示：补齐必要内容并在预算内简短收尾。
-const SUMMARY_FINAL_PROMPT: &str = "Your summary is still incomplete. Continue exactly from the end of your previous text \
-and output only the missing remainder; do not restart or repeat earlier sections. This is your final response: finish \
-the remaining essential facts — the active request and constraints, work status, and the next step — concisely within \
-the output budget and close </summary>. There will be no further continuation. Do not call tools.";
+const SUMMARY_FINAL_PROMPT: &str = "Complete the remaining essential facts and finish the summary concisely within the remaining budget.";
 
-/// 从未取得正文时的重新生成提示（替换原摘要指令，目标已减半）。
-const SUMMARY_REGENERATION_PROMPT: &str = "Your previous response contained no usable summary text. Respond now with a \
-complete summary: output only <summary>...</summary>, with no analysis or preamble. Finish every priority section from \
-the instructions above and close the summary within the reduced target. Do not call tools.";
+/// 从未取得正文时的重新生成提示。
+const SUMMARY_REGENERATION_PROMPT: &str = "Write a concise, complete handoff of the current request, constraints, work state, key findings and next action.";
 
 // ─── Full Compact ───────────────────────────────────────────────────────────────
 
@@ -309,13 +301,19 @@ impl RecoveryConversation {
     fn request(&self, prefix: &[ModelMessage]) -> ModelRequest {
         let mut messages = prefix.to_vec();
         messages.extend(self.messages.iter().cloned());
-        ModelRequest::new(messages)
+        summary_request(messages)
     }
 
     /// 已有草稿的字节长度；没有 tokenizer 估算时只作为诊断量，不冒充 tokens。
     fn draft_bytes(&self) -> usize {
         self.chunks.len()
     }
+}
+
+/// Initial generation and recovery share this tool-free capability boundary.
+/// Tool-shaped responses are rejected by summary_text, never dispatched.
+fn summary_request(messages: Vec<ModelMessage>) -> ModelRequest {
+    ModelRequest::new(messages).with_tools(Vec::new())
 }
 
 /// 有界恢复循环：每次 Full 只允许 `summary_max_requests` 次逻辑生成。

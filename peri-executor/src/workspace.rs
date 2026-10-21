@@ -47,9 +47,14 @@ pub(crate) fn instructions(workspace: &str) -> Result<WorkspaceInstructions> {
     let main = INSTRUCTION_CANDIDATES
         .iter()
         .find_map(|candidate| instruction(root, candidate));
+    let local = instruction(root, "CLAUDE.local.md");
+    // SOUL belongs to the assistant, never to cwd. Main files are fallbacks,
+    // not additive rules; do not load CLAUDE.md when AGENTS.md is present.
+    let documents = main.iter().chain(local.iter()).cloned().collect();
     Ok(WorkspaceInstructions {
         main,
-        local: instruction(root, "CLAUDE.local.md"),
+        local,
+        documents,
     })
 }
 
@@ -63,6 +68,14 @@ pub(crate) fn skills(workspace: &str) -> WorkspaceSkills {
     scan(
         root,
         ".claude/skills",
+        0,
+        &mut paths,
+        &mut truncated,
+        &mut visited,
+    );
+    scan(
+        root,
+        ".agents/skills",
         0,
         &mut paths,
         &mut truncated,
@@ -111,6 +124,9 @@ fn scan(
     visited: &mut usize,
 ) {
     if *truncated || depth > MAX_SKILL_DEPTH {
+        return;
+    }
+    if !no_symlink_ancestors(root, relative).unwrap_or(false) {
         return;
     }
     *visited += 1;
@@ -203,13 +219,14 @@ fn valid_relative(relative: &str) -> bool {
 
 fn valid_skill_path(relative: &str) -> bool {
     if !valid_relative(relative)
-        || !relative.starts_with(".claude/skills/")
+        || !(relative.starts_with(".claude/skills/") || relative.starts_with(".agents/skills/"))
         || !relative.ends_with("/SKILL.md")
     {
         return false;
     }
     relative
         .strip_prefix(".claude/skills/")
+        .or_else(|| relative.strip_prefix(".agents/skills/"))
         .and_then(|rest| rest.strip_suffix("/SKILL.md"))
         .is_some_and(|dir| !dir.is_empty())
 }

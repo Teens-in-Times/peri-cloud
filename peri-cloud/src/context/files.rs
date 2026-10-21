@@ -6,7 +6,7 @@ use uuid::Uuid;
 const MAX_FILE: u64 = 32768;
 #[derive(Clone)]
 pub struct ContextFiles {
-    root: PathBuf,
+    pub(super) root: PathBuf,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,7 +28,14 @@ impl ContextFiles {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
-    async fn read(&self, name: &str) -> Result<Option<String>, ContextError> {
+    pub(super) async fn read(&self, name: &str) -> Result<Option<String>, ContextError> {
+        self.read_scoped(name, None).await
+    }
+    pub(super) async fn read_scoped(
+        &self,
+        name: &str,
+        scope: Option<&str>,
+    ) -> Result<Option<String>, ContextError> {
         if !valid_relative(name) {
             return Err(ContextError::Invalid);
         }
@@ -42,6 +49,9 @@ impl ContextFiles {
             .await
             .map_err(|_| ContextError::File)?;
         if !canonical.starts_with(&root) {
+            return Err(ContextError::Invalid);
+        }
+        if scope.is_some_and(|scope| !canonical.starts_with(root.join(scope))) {
             return Err(ContextError::Invalid);
         }
         let metadata = tokio::fs::metadata(&canonical)

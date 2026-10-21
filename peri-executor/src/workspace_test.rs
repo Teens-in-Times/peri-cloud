@@ -23,8 +23,17 @@ fn instructions_prefer_the_first_non_blank_candidate() {
     assert_eq!(instructions.local.unwrap().content, "local body");
 
     write(root.path(), "AGENTS.md", "agents body");
+    write(root.path(), "SOUL.md", "not a project instruction");
     let instructions = super::instructions(root.path().to_str().unwrap()).unwrap();
     assert_eq!(instructions.main.unwrap().path, "AGENTS.md");
+    assert_eq!(
+        instructions
+            .documents
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["AGENTS.md", "CLAUDE.local.md"]
+    );
 }
 
 #[test]

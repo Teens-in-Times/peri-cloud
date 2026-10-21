@@ -196,6 +196,12 @@ impl BaseTool for ResourceTool {
         }
         self.acquire().await?;
         let service = if let Some(service) = self.scope.service.upgrade() {
+            if let Some(id) = service
+                .native_existing(&self.scope, &self.remote, self.inner.name(), &input, &ctx)
+                .await?
+            {
+                return Ok(service.native_observe(id).await?);
+            }
             service
                 .confirm_native_review(
                     &self.scope,
@@ -222,6 +228,12 @@ impl BaseTool for ResourceTool {
         let operation = service
             .native_begin(&self.scope, &self.remote, self.inner.name(), &input, &ctx)
             .await?;
+        let operation = match operation {
+            super::native_operations::NativeAdmission::Dispatch(id) => id,
+            super::native_operations::NativeAdmission::Existing(id) => {
+                return Ok(service.native_observe(id).await?)
+            }
+        };
         let output = self.inner.invoke_output(input, ctx).await?;
         service.native_finish(operation, &output).await?;
         Ok(output)

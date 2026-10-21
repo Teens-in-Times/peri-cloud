@@ -38,6 +38,7 @@ tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
 ed25519-dalek = "3.0"
 chrono.workspace = true
 chrono-tz = "0.10"
+pulldown-cmark = { version = "0.13.4", default-features = false }
 
 [[bin]]
 name = "peri-account-portal"

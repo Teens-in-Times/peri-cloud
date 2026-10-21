@@ -20,7 +20,7 @@ mod observation_tests;
 #[path = "execution_parallel.rs"]
 mod parallel_tests;
 
-fn call(name: &str, args: Value, id: &str) -> String {
+pub(super) fn call(name: &str, args: Value, id: &str) -> String {
     let delta = json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});
     format!("data: {delta}\n\ndata: [DONE]\n\n")
 }

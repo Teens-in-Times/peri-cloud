@@ -128,6 +128,9 @@ impl MiddlewareChainAssembler for CloudChainAssembler {
         chain.add(Box::new(CloudBuiltinTools {
             web: ctx.web.clone(),
         }));
+        if let Some(environment) = ctx.workspace.as_ref().and_then(|w| w.environment.clone()) {
+            chain.add(Box::new(crate::workspace::EnvironmentContext(environment)));
+        }
         for slot in blueprint {
             match slot {
                 ChainSlot::Permission => {

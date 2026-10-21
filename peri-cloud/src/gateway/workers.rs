@@ -26,41 +26,20 @@ impl Gateway {
     ) -> Option<tokio_util::sync::CancellationToken> {
         self.runtime.turn_cancellation(principal, session, turn)
     }
-    pub(crate) async fn main_review(
+    /// Reuse the parent's durable event queue; no auxiliary reviewer/model session.
+    pub(crate) async fn notify_worker_approval(
         &self,
         record: &TaskRecord,
-        review: Uuid,
-        data: serde_json::Value,
-        cancellation: tokio_util::sync::CancellationToken,
-    ) -> crate::tasks::Result<crate::tasks::approvals::ReviewDecision> {
-        let agent = match self
-            .runtime
-            .attached_agent(record.principal, record.parent_session)
-        {
-            Some(agent) => agent,
-            None => {
-                let parent = self
-                    .journal()
-                    .session(record.principal, record.parent_session)
-                    .await
-                    .map_err(|_| crate::tasks::TaskError::Forbidden)?;
-                self.connector
-                    .open_conversation(record.principal, &parent.frozen)
-                    .await
-                    .map_err(|_| crate::tasks::TaskError::Unavailable)?
-            }
+        request: Uuid,
+        attempt: u8,
+    ) -> GatewayResult<()> {
+        let message = InboundMessage {
+            route: record.route.clone(),
+            event_id: format!("worker-approval:{request}:{attempt}"),
+            text: serde_json::json!({"source":"host_approval_event","task_id":record.id,"request_id":request,"instruction":"Review the pending request from the host task frame using decide_approval. Ordinary text is not an approval."}).to_string(),
+            reply_kind: super::ReplyKind::Proactive,
         };
-        agent
-            .review_operation(
-                self.journal().clone(),
-                record.principal,
-                review,
-                data,
-                cancellation,
-                self.limits().daily_model_requests,
-            )
-            .await
-            .map_err(|_| crate::tasks::TaskError::Unavailable)
+        self.enqueue_worker_event(record, &message).await
     }
     pub(crate) async fn queue_deletion_notice(
         &self,

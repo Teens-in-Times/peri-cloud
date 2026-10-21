@@ -345,7 +345,7 @@ async fn raw_pool(path: &std::path::Path) -> SqlitePool {
 }
 
 #[tokio::test]
-async fn schema_eight_migrates_to_nine_and_preserves_rows() {
+async fn schema_eight_migrates_to_current_and_preserves_rows() {
     let root = tempfile::tempdir().unwrap();
     let journal = CloudJournal::open(root.path()).await.unwrap();
     journal.close().await;
@@ -371,7 +371,7 @@ async fn schema_eight_migrates_to_nine_and_preserves_rows() {
         .await
         .unwrap();
     for sql in [
-        "DROP TABLE cloud_native_cancellations", "DROP TABLE cloud_native_operations", "DROP TABLE cloud_device_targets", "DROP TABLE agent_task_instruction_reads", "DROP TABLE agent_task_approvals", "DROP TABLE agent_task_runs", "DROP TABLE agent_task_operations", "DROP TABLE agent_task_checkpoints",
+        "DROP TABLE agent_task_approval_presentations", "DROP TABLE cloud_native_cancellations", "DROP TABLE cloud_native_operations", "DROP TABLE cloud_device_targets", "DROP TABLE agent_task_instruction_reads", "DROP TABLE agent_task_approvals", "DROP TABLE agent_task_runs", "DROP TABLE agent_task_operations", "DROP TABLE agent_task_checkpoints",
         "DROP TABLE agent_execution_windows", "DROP TABLE agent_execution_sessions",
         "DROP TABLE agent_task_trace", "DROP TABLE agent_task_messages",
         "DROP TABLE agent_device_leases", "DROP TABLE agent_tasks",
@@ -411,7 +411,7 @@ async fn schema_eight_migrates_to_nine_and_preserves_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 23);
+    assert_eq!(version, 24);
     let (application_id,): (i64,) = sqlx::query_as("PRAGMA application_id")
         .fetch_one(&pool)
         .await
@@ -436,14 +436,14 @@ async fn schema_eight_migrates_to_nine_and_preserves_rows() {
     journal.close().await;
     drop(journal);
 
-    // Reopening a schema-9 database is idempotent.
+    // Reopening the migrated database is idempotent.
     let journal = CloudJournal::open(root.path()).await.unwrap();
     let pool = raw_pool(&path).await;
     let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 23);
+    assert_eq!(version, 24);
     pool.close().await;
     journal.close().await;
 }

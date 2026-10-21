@@ -1,6 +1,6 @@
 Summarize this conversation snapshot so work can continue from the current state.
 
-Target at most {summary_target_tokens} output tokens for the entire response. This is a ceiling, not a length goal: use less when possible. Output only <summary>...</summary>, with no analysis or preamble. Finish every section and close the summary within the budget.
+Target at most {summary_target_tokens} output tokens for the entire response. This is a ceiling, not a length goal: use less when possible. Use concise prose to cover the highest-priority information within this budget.
 
 Preserve these essentials, in priority order:
 

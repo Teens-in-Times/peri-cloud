@@ -187,6 +187,7 @@ fn workspace(
     Arc::new(DeviceWorkspace {
         main: main.map(str::to_owned),
         local: None,
+        environment: None,
         skills,
         skills_available,
         reader: Arc::new(UnusedReader),
@@ -214,6 +215,7 @@ fn available_skills_install_the_tools_and_catalog() {
     context.workspace = Some(workspace(
         None,
         vec![WorkspaceSkill {
+            source: peri_acp_types::skills::SkillSource::Project,
             name: "review".into(),
             path: ".claude/skills/review/SKILL.md".into(),
         }],
@@ -233,6 +235,7 @@ fn failed_skill_discovery_installs_nothing() {
     context.workspace = Some(workspace(
         None,
         vec![WorkspaceSkill {
+            source: peri_acp_types::skills::SkillSource::Project,
             name: "review".into(),
             path: ".claude/skills/review/SKILL.md".into(),
         }],

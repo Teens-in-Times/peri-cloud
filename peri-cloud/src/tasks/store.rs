@@ -5,6 +5,7 @@ use sqlx::{Row, SqlitePool};
 pub(super) struct TaskStore {
     pub pool: SqlitePool,
 }
+
 impl TaskStore {
     pub async fn get(&self, owner: Uuid, id: Uuid) -> Result<TaskRecord> {
         let raw: String =
@@ -105,9 +106,9 @@ impl TaskStore {
         Ok(rows.into_iter().map(|row|serde_json::json!({"message_id":row.get::<i64,_>("seq"),"body":row.get::<String,_>("body")})).collect())
     }
     pub async fn parent_context(&self, task: Uuid) -> Result<Vec<serde_json::Value>> {
-        let rows=sqlx::query("SELECT seq,body,state FROM (SELECT seq,body,state FROM agent_task_messages WHERE task_id=? AND direction='parent' ORDER BY seq DESC LIMIT 8) ORDER BY seq")
+        let rows=sqlx::query("SELECT seq,body,state FROM agent_task_messages WHERE task_id=? AND direction='parent' ORDER BY seq")
             .bind(task.to_string()).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|row|{let body:String=row.get("body");serde_json::json!({"message_id":row.get::<i64,_>("seq"),"body_preview":clip(&body,200),"body_bytes":body.len(),"truncated":body.chars().count()>200,"state":row.get::<String,_>("state")})}).collect())
+        Ok(rows.into_iter().map(|row|{let body:String=row.get("body");serde_json::json!({"message_id":row.get::<i64,_>("seq"),"body":body,"truncated":false,"state":row.get::<String,_>("state")})}).collect())
     }
     pub async fn consume(&self, task: Uuid, window: Uuid, ids: &[i64]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
@@ -163,5 +164,51 @@ impl TaskStore {
         Ok(
             serde_json::json!({"entries":entries,"next_cursor":next,"has_more":remaining>0,"earliest_retained_cursor":earliest,"complete_history":false,"previews":true,"retention":"latest_1024_previews","raw":"inspect versioned operation or conversation details for retained canonical evidence"}),
         )
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn full_old_requirements_are_presented_and_new_input_remains_unread() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE agent_task_messages(seq INTEGER PRIMARY KEY,task_id TEXT,request_key TEXT,direction TEXT,body TEXT,state TEXT,UNIQUE(task_id,request_key))").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE agent_task_instruction_reads(task_id TEXT,window_id TEXT,message_seq INTEGER,PRIMARY KEY(task_id,window_id,message_seq))").execute(&pool).await.unwrap();
+        let store = TaskStore { pool };
+        let task = Uuid::new_v4();
+        let window = Uuid::new_v4();
+        let old = format!("{} MUST_KEEP_ORIGINAL_BOUNDARY", "requirement ".repeat(50));
+        for index in 0..10 {
+            store
+                .message(
+                    task,
+                    &index.to_string(),
+                    "parent",
+                    if index == 0 { &old } else { "supplement" },
+                )
+                .await
+                .unwrap();
+        }
+        let snapshot = store.parent_context(task).await.unwrap();
+        assert_eq!(snapshot.len(), 10);
+        assert_eq!(snapshot[0]["body"], old);
+        assert!(snapshot.iter().all(|entry| entry["truncated"] == false));
+        let ids: Vec<_> = snapshot
+            .iter()
+            .map(|entry| entry["message_id"].as_i64().unwrap())
+            .collect();
+        store.consume(task, window, &ids).await.unwrap();
+        assert!(!store.unread_instructions(task, window).await.unwrap());
+        store
+            .message(task, "new", "parent", "changed during inference")
+            .await
+            .unwrap();
+        assert!(store.unread_instructions(task, window).await.unwrap());
+        assert!(store
+            .unread_instructions(task, Uuid::new_v4())
+            .await
+            .unwrap());
     }
 }

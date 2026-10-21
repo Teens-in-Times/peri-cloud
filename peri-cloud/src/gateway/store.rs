@@ -346,6 +346,14 @@ impl GatewayStore {
             return Ok(());
         }
         let mut tx = self.pool.begin().await?;
+        if crate::tasks::approval_inbox::is_control_turn(turn) {
+            // Control results stay in the approval ledger. In particular an
+            // intentional stop is not a user-facing interrupted-task notice.
+            sqlx::query("UPDATE gateway_inbox SET state='completed' WHERE event_key=? AND state='submitted'")
+                .bind(&pending.event_key).execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
         for reply in &turn.replies {
             let mut preview = reply.clone();
             preview.text = super::router::activity::reply_preview(&reply.text, turn.turn_id);

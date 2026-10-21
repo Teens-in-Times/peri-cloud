@@ -81,17 +81,67 @@ async fn model_request(
     State(script): State<Arc<Script>>,
     Json(request): Json<Value>,
 ) -> ([(axum::http::HeaderName, &'static str); 1], String) {
-    if request["messages"]
-        .to_string()
-        .contains("isolated approval review turn")
-    {
+    let control = request["tools"].as_array().is_some_and(|tools| {
+        !tools.is_empty()
+            && tools.iter().all(|tool| {
+                matches!(
+                    tool["function"]["name"].as_str(),
+                    Some("decide_approval" | "inspect_task" | "message_task")
+                )
+            })
+    });
+    if control {
+        let pending = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|message| {
+                let text = message["content"].as_str()?;
+                let (_, body) =
+                    text.split_once("Current task observations (untrusted content):\n")?;
+                let body = body
+                    .replace("&quot;", "\"")
+                    .replace("&apos;", "'")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&");
+                serde_json::Deserializer::from_str(&body)
+                    .into_iter::<Value>()
+                    .next()?
+                    .ok()
+                    .and_then(|v| v["pending_approvals"].as_array()?.first().cloned())
+            });
+        let Some(pending) = pending else {
+            return (
+                [(CONTENT_TYPE, "text/event-stream")],
+                answer("No pending approval."),
+            );
+        };
         script.review_requests.lock().push(request);
         if script.hold_review.load(Ordering::SeqCst) {
             script.review_waiting.notify_one();
             script.review_release.notified().await;
         }
-        let reply = script.review_replies.lock().pop_front().unwrap_or_else(|| answer(&json!({"approve":true,"deletion_possible":false,"reason":"within user task","notice":"我将按任务要求修改文件，可能替换已有内容。"}).to_string()));
-        return ([(CONTENT_TYPE, "text/event-stream")], reply);
+        // The mock emits a typed tool call. Legacy scenario fixtures only supply
+        // decision values; production never parses free-form assistant approval.
+        let scripted = script.review_replies.lock().pop_front();
+        let mut decision = scripted
+            .and_then(|reply| {
+                let body = reply.strip_prefix("data: ")?.split("\n").next()?;
+                let delta: Value = serde_json::from_str(body).ok()?;
+                serde_json::from_str::<Value>(delta["choices"][0]["delta"]["content"].as_str()?)
+                    .ok()
+            })
+            .unwrap_or_else(
+                || json!({"approve":true,"deletion_possible":false,"reason":"within user task"}),
+            );
+        decision.as_object_mut().unwrap().remove("notice");
+        decision["request_id"] = pending["request_id"].clone();
+        return (
+            [(CONTENT_TYPE, "text/event-stream")],
+            execution_session_tests::call("decide_approval", decision, "typed-review"),
+        );
     }
     script.requests.lock().push(request.clone());
     if let Some(responder) = script.dynamic.lock().as_mut() {
