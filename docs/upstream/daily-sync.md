@@ -42,7 +42,7 @@ GitHub 对 `GITHUB_TOKEN` 创建的 PR 可能要求额外批准 workflow；token
 
 GitHub 的 **Allow GitHub Actions to create and approve pull requests** 是同一个开关，启用它会同时放开创建与审批的仓库能力。本流水线不调用 review/approval/merge API。[GitHub 设置说明](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository)
 
-2026-10-24 用户已允许开启仓库级开关，但 API 返回 409：组织策略禁止创建或审批 PR。当前凭据读取组织策略也返回 403，不能替组织管理员扩大权限。组织管理员须先允许该能力，再将仓库开关设为开启；保持默认 token 为 read。
+2026-10-24 用户允许开启仓库级开关；首次操作被组织策略以 409 拒绝，当前凭据也无组织管理权限。用户随后处理组织开关，仓库设置成功读回 `default_workflow_permissions=read`、`can_approve_pull_request_reviews=true`；发布 variable 已设为 `true`。没有扩充本机凭据 scope 或写入 PAT。
 
 独立的仓库 Actions variable `PERI_UPSTREAM_PUBLISH` 必须精确设为 `true` 才会执行发布 job，未设置时仅检测和产出报告。只有核验上述权限后才启用此 variable；将其设为 `false` 可立即退回只读检测。该开关不影响手工 `dry_run=true` 的只读保证。
 
@@ -52,6 +52,6 @@ GitHub 的 **Allow GitHub Actions to create and approve pull requests** 是同�
 
 本地使用临时 Git 仓库与 API mock，验证本地补丁保留、冲突不部分落盘、忽略文件/符号链接/非法路径保护、大小与 manifest 校验、patch 摘要与保护路径校验、原候选不覆盖，以及只推候选分支、只开草稿 PR 和触发 CI。工作流另经 actionlint 检查。
 
-2026-10-24：8 项本地隔离测试通过，actionlint 1.7.12 检查两个工作流通过；来源校验为 1345 个文件、1300 个完全一致、45 个已登记补丁。没有为本次 Python / 工作流改动重复运行整套 Rust 测试。
+2026-10-24：8 项本地隔离测试通过，actionlint 1.7.12 检查两个工作流通过；来源校验为 1345 个文件、1300 个完全一致、45 个已登记补丁。实际 fetch/prepare 拉取固定上游，返回 `unchanged`，head 与 pin 均为 `e598d17872bce487355e1bfa70f077743984760f`。没有为本次 Python / 工作流改动重复运行整套 Rust 测试。
 
 实际定时触发、GitHub token 开 PR 与首次新上游候选的端到端结果，应以 Actions 和 PR 记录为准；dry-run 成功不代表这些写入路径已验证。
