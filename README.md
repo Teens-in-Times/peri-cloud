@@ -145,4 +145,5 @@ QQ 原生命令发现、执行 API、扩展接口和兼容范围：[QQ CLI 命�
 2026-10-24 上游合并分支更新至 `e598d178`，接入原文归档回查和异步结果消费保护；Cloud schema 为 25。该分支需按 [同步记录](docs/upstream/peri-e598d178.md) 验证，不继承旧候选制品的验收结论，也未升级生产。
 相应的 [可编辑拓扑快照](docs/design/peri-workbench/execution-architecture-20261024.html) 新增压缩与归档子图，使用独立本地存档身份，保留旧画板。
 [独立维护盘点](docs/research/independent-maintenance-20261024.md) 对照已实现能力与 Skill / MCP、多设备、个人助手、硬窗口的缺口，评估上游成熟度、OpenAI 换窗思路及 TUI 复用成本。
+[路线图 Issues](https://github.com/Teens-in-Times/peri-cloud/issues/13) 已登记后续待办；[每日同步候选](docs/upstream/daily-sync.md) 每天尝试范围内三方同步，只开草稿 PR，人工决定合并。
 提示词规则由宿主承接：主会话类型化审批、完整活跃约束快照、原调用回执复用、空工具摘要、QQ Markdown 降级和生效 Skill 目录。实现边界见 [宿主契约](docs/prompt-host-contracts.md)。

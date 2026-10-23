@@ -1,0 +1,79 @@
+name: Daily upstream candidate
+on:
+  schedule:
+    # 09:17 Asia/Shanghai; GitHub schedules are best-effort, not a precise timer.
+    - cron: '17 1 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only prepare a report and patch; do not write branches, issues or PRs
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: upstream-candidate
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    outputs:
+      base_commit: ${{ steps.candidate.outputs.base_commit }}
+      state: ${{ steps.candidate.outputs.state }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare bounded three-way source candidate
+        id: candidate
+        shell: bash
+        run: |
+          head=$(python3 scripts/upstream_sync.py fetch --upstream "$RUNNER_TEMP/peri-upstream" --output "$RUNNER_TEMP/peri-candidate")
+          python3 scripts/upstream_sync.py prepare --upstream "$RUNNER_TEMP/peri-upstream" --head "$head" --output "$RUNNER_TEMP/peri-candidate"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = json.loads((Path(os.environ["RUNNER_TEMP"]) / "peri-candidate/report.json").read_text())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("state=" + data["state"] + "\nbase_commit=" + data["base_commit"] + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write("# Upstream candidate\n\n```json\n" + json.dumps(data, ensure_ascii=True, indent=2).replace("`", "\\u0060").replace("<", "\\u003c") + "\n```\n")
+          PY
+      - name: Report publication gate
+        env:
+          PUBLISH_ENABLED: ${{ vars.PERI_UPSTREAM_PUBLISH }}
+        run: |
+          if [ "$PUBLISH_ENABLED" != true ]; then
+            echo 'Draft publication is disabled pending repository/organization permissions. Detection and report artifacts remain available.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: upstream-candidate
+          path: ${{ runner.temp }}/peri-candidate/
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    needs: prepare
+    if: github.ref == 'refs/heads/main' && vars.PERI_UPSTREAM_PUBLISH == 'true' && !inputs.dry_run && needs.prepare.outputs.state != 'unchanged'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    steps:
+      # This job executes only trusted main scripts; never Cargo, npm, or upstream source.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.prepare.outputs.base_commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: upstream-candidate
+          path: ${{ runner.temp }}/peri-candidate
+      - name: Publish immutable draft or conflict report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/publish_upstream_sync.py --root . --artifact "${{ runner.temp }}/peri-candidate"

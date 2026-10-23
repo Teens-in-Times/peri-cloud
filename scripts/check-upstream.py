@@ -12,13 +12,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 from pathlib import Path
 import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_COMMIT = "e598d17872bce487355e1bfa70f077743984760f"
-DEFAULT_MANIFEST = ROOT / "docs/upstream/peri-e598d178.manifest"
+PIN = json.loads((ROOT / "docs/upstream/overlay.json").read_text(encoding="utf-8"))
+DEFAULT_COMMIT = PIN["revision"]
+DEFAULT_MANIFEST = ROOT / PIN["manifest"]
 DEFAULT_ALLOWLIST = ROOT / "docs/upstream/production-patches.txt"
 
 # Directories replaced or added from upstream.  peri-acp contributes prompts
