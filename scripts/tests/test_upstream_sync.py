@@ -130,7 +130,7 @@ class OverlayTests(unittest.TestCase):
         commit(self.root)
         with self.assertRaises(ValueError):
             sync.prepare(self.root, self.up, head, self.home / "drift")
-        put(self.up, "LICENSE", "fixture changed attribution")
+        put(self.up, "peri-acp-types/third_party/NOTICE.md", "fixture changed attribution")
         license_head = commit(self.up)
         result = sync.prepare(self.clone(), self.up, license_head, self.home / "license")
         self.assertEqual(result["state"], "blocked")

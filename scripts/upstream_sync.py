@@ -153,7 +153,10 @@ def prepare(root: Path, repo: Path, head: str, output: Path) -> dict:
     if ancestor.returncode == 1:
         report.update(state="blocked", reason="upstream history is not a descendant of the recorded pin")
         return write_report(output, report)
-    if git(repo, "diff", "--name-only", base, head, "--", "LICENSE", "NOTICE", "licenses").stdout:
+    changed_names = git(repo, "diff", "--name-only", "-z", base, head).stdout.split(b"\0")
+    attribution = re.compile(r"(?:licen[cs]e|copying|notice|authors|copyright)(?:[._-].*)?\Z", re.I)
+    if any(attribution.fullmatch(part) or part.casefold() == "licenses"
+           for name in changed_names if name for part in name.decode("utf-8").split("/")):
         report.update(state="blocked", reason="upstream license/attribution changed; manual review required")
         return write_report(output, report)
     old, new = tree(repo, base), tree(repo, head)
