@@ -8,7 +8,7 @@ use crate::mcp::builtin::runtime::{
     BUILTIN_CONVERGE_TIMEOUT,
 };
 use peri_acp_types::ports::McpPoolShutdownReport;
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 
 pub(super) enum ServiceShutdownState {
     Idle,
@@ -67,6 +67,20 @@ impl McpClientPool {
 
     pub(crate) fn own_service(&self, service: McpServiceWrapper) -> Arc<super::McpServiceOwner> {
         let _admission = self.lifecycle_registration.lock();
+        self.own_service_admitted(service)
+    }
+
+    /// Move the active service into the pool-retained cleanup owners atomically
+    /// with lifecycle admission. Like connection commit, always acquire the
+    /// lifecycle gate before the services map; callers must not hold either lock.
+    pub(crate) fn take_service_for_close(&self, name: &str) -> Option<Arc<super::McpServiceOwner>> {
+        let _admission = self.lifecycle_registration.lock();
+        let service = { self.services.lock().remove(name) }?;
+        Some(self.own_service_admitted(service))
+    }
+
+    /// The caller holds lifecycle_registration; never acquire it recursively.
+    fn own_service_admitted(&self, service: McpServiceWrapper) -> Arc<super::McpServiceOwner> {
         let owner = Arc::new(super::McpServiceOwner::new(service));
         if !self.is_open() {
             owner.begin_close();
@@ -75,6 +89,11 @@ impl McpClientPool {
         services.retain(|service| !service.is_stopped());
         services.push(owner.clone());
         owner
+    }
+
+    #[cfg(all(test, not(target_os = "emscripten")))]
+    pub(crate) fn retained_service_count(&self) -> usize {
+        self.shared_services.lock().len()
     }
 
     async fn close_shared_services(&self) -> usize {
@@ -127,7 +146,10 @@ impl McpClientPool {
         self.task_spawner
             .stop_instance_resource_subscriptions(server_name)
             .await;
-        self.clients.write().remove(server_name);
+        if let Some(handle) = self.clients.write().remove(server_name) {
+            handle.call_gate.revoke();
+        }
+        self.bump_catalog_generation();
         let service = { self.services.lock().remove(server_name) };
         if let Some(mut svc) = service {
             let _ = svc.close_with_timeout(SHUTDOWN_TIMEOUT).await;
@@ -159,13 +181,13 @@ impl McpClientPool {
     /// 池内名优先取 client 声明的 `name`；被其他归属（或本会话的上一代）占用时
     /// 追加 `_2`、`_3`…，避免覆盖既有条目。返回值是实际使用的池内名。
     ///
-    /// `connection_id` 与归属会话同批登记为连接的**声明身份**（M7）：持久化
-    /// cache origin 只按「声明会话 + 连接 ID + 当前句柄代号」计算，换代即失效
+    /// `server_id` 与归属会话同批登记为连接的**声明身份**（M7）：持久化
+    /// cache origin 只按「声明会话 + serverId + 当前句柄代号」计算，换代即失效
     /// 且不跨会话命中（凭据不进入该身份）。
     pub(crate) fn commit_acp_connection(
         self: &Arc<Self>,
         session_id: &str,
-        connection_id: &str,
+        server_id: &str,
         preferred_name: &str,
         mut handle: Arc<McpClientHandle>,
         service: McpServiceWrapper,
@@ -183,12 +205,13 @@ impl McpClientPool {
             name.clone(),
             super::AcpConnectionDeclaration {
                 session_id: session_id.to_string(),
-                connection_id: connection_id.to_string(),
+                server_id: server_id.to_string(),
             },
         );
         self.advance_handle_generation(&handle);
         self.services.lock().insert(name.clone(), service);
         self.clients.write().insert(name.clone(), handle);
+        self.bump_catalog_generation();
         Ok(name)
     }
 
@@ -282,6 +305,7 @@ impl McpClientPool {
         self.clients.write().insert(
             server_name.to_string(),
             Arc::new(McpClientHandle {
+                call_gate: Default::default(),
                 name: server_name.to_string(),
                 version: None,
                 connected_at: None,
@@ -314,6 +338,10 @@ impl McpClientPool {
             .store(1, std::sync::atomic::Ordering::Release);
         // 关闭事务开始：全部发现证据失效并唤醒等待方（它们在重读时看到 PoolClosed）。
         self.system_readiness.clear_all_evidence();
+        for handle in self.clients.read().values() {
+            handle.call_gate.revoke();
+        }
+        self.bump_catalog_generation();
         self.notifier.write().take();
         self.oauth_event_callback.write().take();
         self.pending_oauth_callbacks.lock().clear();
@@ -353,12 +381,13 @@ impl McpClientPool {
         service: McpServiceWrapper,
     ) -> Result<(), McpServiceWrapper> {
         let _admission = self.lifecycle_registration.lock();
-        if !self.is_open() {
+        if !self.is_open() || self.server_slot(&name).stopped.load(Ordering::Acquire) {
             return Err(service);
         }
         self.advance_handle_generation(&handle);
         self.services.lock().insert(name.clone(), service);
         self.clients.write().insert(name, handle);
+        self.bump_catalog_generation();
         Ok(())
     }
 

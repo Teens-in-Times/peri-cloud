@@ -32,7 +32,7 @@ use peri_acp_types::{
     interaction::UserInteractionBroker,
     mcp_skills::McpSkillRegistry,
     plugin::LoadedPlugin,
-    ports::{McpPoolPort, SessionMcpCapabilityPort, ToolSearchPort},
+    ports::{McpPoolPort, SessionMcpCatalogPort, ToolSearchPort},
     session::{MessageQueue, SessionInbox},
     session_resources::SessionResources,
     skills::SkillRoot,
@@ -103,23 +103,21 @@ pub struct StageBuildInput {
     pub cron_scheduler: Option<Arc<dyn CronSchedulerPort>>,
     /// MCP 连接池端口
     pub mcp_pool: Option<Arc<dyn McpPoolPort>>,
-    /// Deployment-scoped Dynamic MCP operation port.
-    pub dynamic_mcp: Option<Arc<dyn peri_acp_types::ports::DynamicMcpDeploymentPort>>,
-    /// Session-scoped Dynamic MCP capability source.
-    pub session_mcp_capability: Option<Arc<dyn SessionMcpCapabilityPort>>,
-    /// Session-owned checked projection lease holder, shared across stage builds.
-    pub dynamic_mcp_projection:
-        Arc<parking_lot::Mutex<Option<Arc<dyn peri_acp_types::ports::SessionMcpProjectionLease>>>>,
+    /// 当前会话 MCP pool 的只读目录来源。
+    pub session_mcp_catalog: Option<Arc<dyn SessionMcpCatalogPort>>,
     /// 工具搜索索引端口
     pub tool_search_index: Arc<dyn ToolSearchPort>,
     /// 共享工具注册表（deferred tools）
     pub shared_tools: Arc<RwLock<BTreeMap<String, Arc<dyn BaseTool>>>>,
-    /// 会话级 workflow 完成通知源（P5；见 `session::factory::AssemblyContext` 同名字段）
-    pub workflow_notifications: Option<Arc<peri_acp_types::workflow::WorkflowNotifications>>,
     /// 会话资源门面（transcript persistence 激活与 child 保存的唯一入口）
     pub session_resources: Option<Arc<dyn SessionResources>>,
     /// 当前会话 thread ID
     pub thread_id: Option<String>,
+    /// 会话级后台结果处理责任 owner（ACP 宿主跨 prompt 注入；None 时本地新建）。
+    pub async_result_mailbox: Option<Arc<crate::session::async_result_mailbox::AsyncResultMailbox>>,
+    /// Host-owned bounded consumption ledger, shared across ordinary user turns.
+    pub compact_exposure:
+        Arc<parking_lot::Mutex<crate::agent::compact_v2::exposure::ExposureLedger>>,
     // ── 注入面（原 ACP 特有构造）──
     /// 模型名称（GitAttribution / hook 注入用）
     pub model_name: String,
@@ -299,8 +297,6 @@ pub struct V2AgentOutput {
 pub enum StageBuildError {
     #[error("session tool catalog is invalid: {0}")]
     ToolCatalog(#[from] crate::session::tool_catalog::CatalogRefreshError),
-    #[error("dynamic MCP catalog registration failed: {0:?}")]
-    DynamicMcp(peri_acp_types::dynamic_mcp::DynamicMcpFailure),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -430,6 +426,7 @@ pub fn build_stage_context(
     let turn = session.start_turn();
     let transcript = session.transcript();
     let queue = session.queue().clone();
+    let async_result_mailbox = session.async_result_mailbox();
 
     // 创建 EventBus
     let (event_bus, event_handles) = EventBus::new(EventBusConfig::default());
@@ -479,12 +476,18 @@ pub fn build_stage_context(
     // 工具（`mcp__{server}__{tool}`）不进入共享 registry，无需剔除。
     let session_tools: SharedToolMap =
         build_session_tool_view(&shared_tools, chain.collect_tools(&cwd));
-    let tool_catalog = tools::register_tool_catalog(input, &session_tools)?;
+    let tool_catalog = tools::register_tool_catalog(
+        &session_tools,
+        input.meta_harness_disabled.clone(),
+        input.session_mcp_catalog.clone(),
+    )?;
 
     // 构造 StageContext（builder 构造晚于工具注入：chain 在
     // collect_tools 借用后被 move 进 builder，顺序不可调换）
     let builder = StageContext::builder(turn, transcript, queue)
         .with_agent_id(main_agent_id)
+        .with_async_result_mailbox(async_result_mailbox)
+        .with_compact_exposure(session.compact_exposure())
         .with_llm(react_llm)
         .with_tools(session_tools)
         .with_tool_catalog(tool_catalog)

@@ -63,12 +63,12 @@ impl Aggregation {
         if !command.confirmed {
             return Err(AggregateError::Invalid);
         }
-        let hash = format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&command.action).map_err(|_| AggregateError::Invalid)?
-            )
-        );
+        let hash = (Sha256::digest(
+            serde_json::to_vec(&command.action).map_err(|_| AggregateError::Invalid)?,
+        ))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
         let _guard = self.writes.lock().await;
         let pool = self.journal.identity_pool();
         if let Some(row) = sqlx::query(

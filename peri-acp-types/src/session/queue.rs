@@ -53,8 +53,9 @@ pub enum MessageSource {
     StopHookFeedback,
     /// Channel 消息（微信/Slack 等）
     ChannelMessage,
-    /// Dynamic MCP lifecycle notification.
-    DynamicMcpNotification,
+    /// MCP subscription or lifecycle notification.
+    #[serde(alias = "dynamic_mcp_notification")]
+    McpNotification,
     /// Hook 系统注入
     SystemInjected,
     /// Hook 的显式停止意图（continue:false）：经 Receive 唯一出口停止当前 run，
@@ -200,6 +201,11 @@ impl Default for MessageQueue {
 }
 
 impl MessageQueue {
+    /// 冻结交接引用，不消费消息、不改变唤醒或接纳序号。
+    pub fn snapshot(&self) -> Vec<QueuedMessage> {
+        self.state.messages.lock().iter().cloned().collect()
+    }
+
     /// 创建空队列
     pub fn new() -> Self {
         Self {

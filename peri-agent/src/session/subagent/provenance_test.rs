@@ -1,14 +1,41 @@
 //! Real SQLite spawn/compact/reopen/resume regression for read-only inherited history.
 use super::*;
-use crate::agent::compact_v2::{
-    micro_compact, run_compact, CompactConfig, CompactOutcome, ContextPressure,
-};
+use crate::agent::compact_v2::{run_compact, CompactConfig, CompactOutcome, ContextPressure};
 use crate::messages::MessageId;
 use peri_acp_types::projection::{
     MessageProjectionDirective, ProjectionAction, ProjectionActionEntry, ProjectionTarget,
 };
 use peri_acp_types::session_resources::{SessionResources, SessionStoreShutdownPort};
 use peri_acp_types::store::PersistedPayload;
+
+// The provenance scenario retains lossy directives and therefore grants recovery
+// explicitly, just as the production permission-filtered tool catalog must.
+struct RecoveryTool;
+#[async_trait::async_trait]
+impl crate::tools::BaseTool for RecoveryTool {
+    fn name(&self) -> &str {
+        "ReadContextArchive"
+    }
+    fn description(&self) -> &str {
+        "fixture archive recovery"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn is_direct(&self) -> bool {
+        true
+    }
+    fn context_retention(&self) -> crate::tools::ContextRetention {
+        crate::tools::ContextRetention::ArchiveRead
+    }
+    async fn invoke(
+        &self,
+        _: serde_json::Value,
+        _: crate::tools::ToolContext<'_>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        panic!("provenance fixture must not execute recovery")
+    }
+}
 
 struct SummaryModel;
 #[async_trait::async_trait]
@@ -55,6 +82,7 @@ fn directive(id: MessageId) -> MessageProjectionDirective {
             },
         }],
         superseded_by: None,
+        ..Default::default()
     }
 }
 
@@ -77,7 +105,7 @@ fn spawn_config(
             "fixture-scripted",
         ),
         chain_assembler: Arc::new(EmptyChainAssembler),
-        tools: vec![],
+        tools: vec![Arc::new(RecoveryTool)],
         tool_filter: Arc::new(|_| true),
         system_prompt: None,
         tool_invocation_resolver: None,
@@ -195,6 +223,29 @@ async fn test_sqlite_subagent_spawn_full_micro_cold_resume_preserves_provenance(
         spawned.session.transcript().read().ancestor_len(),
         parent_messages.len()
     );
+    // [M03 回归] snapshot 锚点仍在父消息尾部；inherited 逐条保持原 ID 顺序。
+    let snapshot_tail = parent_messages.last().unwrap().id().as_uuid().to_string();
+    let child_meta = store.load_session_meta(&child_id).await.unwrap();
+    assert_eq!(
+        child_meta.snapshot_at_message_id.as_deref(),
+        Some(snapshot_tail.as_str()),
+        "fork child 的 snapshot_at_message_id 必须指向父消息尾"
+    );
+    let child_snapshot = store.load_session_snapshot(&child_id).await.unwrap();
+    let inherited_ids = child_snapshot
+        .inherited
+        .payloads
+        .iter()
+        .map(PersistedPayload::id)
+        .collect::<Vec<_>>();
+    let expected_ids = parent_messages
+        .iter()
+        .map(BaseMessage::id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        inherited_ids, expected_ids,
+        "inherited payload 必须保持父消息的 ID 与顺序"
+    );
     compact(&spawned.session, &cwd).await;
     let own_tool = BaseMessage::tool_result("child-bash", "child-output-".repeat(1_000));
     {
@@ -210,15 +261,9 @@ async fn test_sqlite_subagent_spawn_full_micro_cold_resume_preserves_provenance(
             )],
         ));
         transcript.append(own_tool.clone());
-        assert!(
-            micro_compact(
-                &mut transcript,
-                &CompactConfig {
-                    micro_compact_stale_steps: 0,
-                    ..Default::default()
-                }
-            ) > 0
-        );
+        // Persisted own directives stay independent of the inherited parent's flags.
+        // Cold history alone is no longer exposure evidence for new Micro planning.
+        transcript.set_flags_projection(own_tool.id(), directive(own_tool.id()));
         assert!(transcript.flags(own_tool.id()).truncated);
         transcript.flush_persistence().await.unwrap();
         transcript.shutdown_persistence();
@@ -260,7 +305,7 @@ async fn test_sqlite_subagent_spawn_full_micro_cold_resume_preserves_provenance(
     let (reopened, reopened_shutdown) = reopened_resources.into_parts();
     let recording = RecordingLLM::new();
     let received = recording.received.clone();
-    let config = resume_config_with(
+    let mut config = resume_config_with(
         Arc::clone(&reopened),
         child_id.clone(),
         crate::session::test_resources::mock::model::fixture_source(
@@ -271,6 +316,7 @@ async fn test_sqlite_subagent_spawn_full_micro_cold_resume_preserves_provenance(
         None,
         None,
     );
+    config.tools.push(Arc::new(RecoveryTool));
     let resumed = SessionFactory::resume_subagent(Some(&parent), config)
         .await
         .unwrap();

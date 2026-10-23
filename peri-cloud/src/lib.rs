@@ -1,7 +1,10 @@
 //! Personal cloud agent host, independent of TUI and message channel.
 
 pub mod aggregation;
+mod approval_view;
+mod archive;
 mod assembly;
+mod async_results;
 pub mod commands;
 pub mod context;
 mod core;

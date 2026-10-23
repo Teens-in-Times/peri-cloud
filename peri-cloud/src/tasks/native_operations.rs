@@ -73,15 +73,15 @@ impl WorkerService {
             .privacy_epoch()
             .await
             .map_err(|_| TaskError::Unavailable)?;
-        let fingerprint = format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&(
-                remote.device_id(),
-                remote.binding(),
-                name,
-                input
-            ))?)
-        );
+        let fingerprint = (sha2::Sha256::digest(serde_json::to_vec(&(
+            remote.device_id(),
+            remote.binding(),
+            name,
+            input,
+        ))?))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
         if old.get::<String, _>("input_hash") != fingerprint
             || old.get::<Option<String>, _>("task_id") != scope.task.map(|id| id.to_string())
             || old.get::<i64, _>("context_generation") != state.context_generation as i64
@@ -132,15 +132,15 @@ impl WorkerService {
         let invocation = remote
             .invocation_id(ctx)
             .map_err(|_| TaskError::Forbidden)?;
-        let fingerprint = format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&(
-                remote.device_id(),
-                remote.binding(),
-                name,
-                input
-            ))?)
-        );
+        let fingerprint = (sha2::Sha256::digest(serde_json::to_vec(&(
+            remote.device_id(),
+            remote.binding(),
+            name,
+            input,
+        ))?))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
         let frozen = crate::state::FrozenSession {
             session_id: scope.session,
             principal_id: scope.principal,

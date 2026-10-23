@@ -201,7 +201,10 @@ impl WorkerService {
             return Err(TaskError::Invalid);
         }
         use sha2::Digest;
-        let fingerprint = format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&input)?));
+        let fingerprint = (sha2::Sha256::digest(serde_json::to_vec(&input)?))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         if let Some(existing) = self.store.existing(scope, key).await? {
             if existing.request_fingerprint != fingerprint {
                 return Err(TaskError::Conflict);

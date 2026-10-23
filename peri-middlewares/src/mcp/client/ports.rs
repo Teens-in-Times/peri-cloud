@@ -1,14 +1,38 @@
 use super::*;
+use peri_acp_types::plugin::McpSubscriptionsConfig;
 
 // 3.0 批 2 波 2：装配注入端口实现（ACP 侧只持 `Arc<dyn McpPoolPort>`）。
 // M-TUI 收口：`shutdown`（host/shutdown 命令面）与 `snapshot`（mcp/list
 // 命令面）为新增数据端口；TUI 不再直持池句柄与 watch channel。
 #[async_trait::async_trait]
 impl peri_acp_types::ports::McpPoolPort for McpClientPool {
+    async fn control_mcp(
+        self: Arc<Self>,
+        request: peri_acp_types::mcp_control::McpControlRequest,
+    ) -> Result<
+        peri_acp_types::mcp_control::McpControlResponse,
+        peri_acp_types::mcp_control::McpControlError,
+    > {
+        McpClientPool::control_mcp(self, request).await
+    }
+    fn catalog_source(
+        self: Arc<Self>,
+        session_id: &str,
+    ) -> Option<Arc<dyn peri_acp_types::mcp_control::SessionMcpCatalogPort>> {
+        Some(crate::mcp::control::catalog_source(self, session_id))
+    }
+    fn cancel_oauth_flow(&self, flow_id: &str) -> Result<bool, String> {
+        Ok(McpClientPool::cancel_oauth_flow(self, flow_id))
+    }
     fn verify_shared_environment_close(&self, root_session_id: &str) -> Result<(), String> {
         self.session_bindings
             .read()
             .verify_environment_close(root_session_id)
+    }
+
+    fn release_agent_session(&self, session_id: &str) -> Result<(), String> {
+        self.session_bindings.write().release(session_id);
+        Ok(())
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -27,6 +51,10 @@ impl peri_acp_types::ports::McpPoolPort for McpClientPool {
             .read()
             .manager(session_id)
             .is_some_and(|manager| manager.has_unsettled_external())
+    }
+
+    fn has_instance(&self, instance: &str) -> bool {
+        McpClientPool::get_client(self, instance).is_some()
     }
 
     fn bind_agent_session(
@@ -86,7 +114,12 @@ impl peri_acp_types::ports::McpPoolPort for McpClientPool {
     fn server_infos(&self) -> Result<Vec<McpServerInfo>, String> {
         Ok(McpClientPool::all_server_infos(self)
             .into_iter()
-            .map(mcp_server_info_projection)
+            .map(|info| {
+                let control = self.control_descriptor(&info.name);
+                let mut projected = mcp_server_info_projection(info);
+                projected.control = control;
+                projected
+            })
             .collect())
     }
 
@@ -119,44 +152,16 @@ impl peri_acp_types::ports::McpPoolPort for McpClientPool {
         McpClientPool::deliver_oauth_callback(self, server_name, code, state)
     }
 
-    fn deliver_dynamic_oauth_callback(
-        &self,
-        instance: DynamicMcpInstanceKey,
-        flow_id: &str,
-        code: String,
-        state: String,
-    ) -> Result<(), String> {
-        McpClientPool::deliver_dynamic_oauth_callback(self, instance, flow_id, code, state)
-    }
-
     fn cancel_oauth_callback(&self, server_name: &str) -> Result<bool, String> {
         Ok(McpClientPool::cancel_oauth_callback(self, server_name))
     }
 
-    fn cancel_dynamic_oauth_flow(
-        &self,
-        instance: DynamicMcpInstanceKey,
-        flow_id: &str,
-    ) -> Result<bool, String> {
-        Ok(McpClientPool::cancel_dynamic_oauth_flow(
-            self, instance, flow_id,
-        ))
-    }
-
-    async fn open_workspace_task_scope(&self, session_id: &str) -> Result<(), String> {
-        McpClientPool::open_workspace_task_scope(self, session_id).await
-    }
-
-    async fn close_workspace_task_scope(self: Arc<Self>, session_id: &str) -> Result<(), String> {
-        McpClientPool::close_workspace_task_scope(&self, session_id).await
-    }
-
     async fn close_agent_session_scope(self: Arc<Self>, session_id: &str) -> Result<(), String> {
-        McpClientPool::close_workspace_task_scope(&self, session_id).await
+        self.cancel_session_external_tasks(session_id).await
     }
 
-    async fn reconcile_closing_workspace_scope(&self, session_id: &str) -> Result<(), String> {
-        McpClientPool::reconcile_closing_workspace_scope(self, session_id).await
+    async fn cancel_session_external_tasks(&self, session_id: &str) -> Result<(), String> {
+        McpClientPool::cancel_session_external_tasks(self, session_id).await
     }
 
     fn bind_session_task_manager(&self, session_id: &str, manager: &Arc<dyn TaskManager>) {
@@ -250,11 +255,41 @@ impl peri_acp_types::ports::McpPoolPort for McpClientPool {
     }
 }
 
+/// `mcp/list` 单项列表上限：工具、资源、订阅资源各自最多透传 64 条。
+const MCP_LIST_MAX_ENTRIES: usize = 64;
+/// `mcp/list` 文本字段上限（清洗后的字符数）。
+const MCP_LIST_MAX_TEXT: usize = 160;
+
+/// 不可信 MCP 文本清洗：控制字符替换为空格、trim、截断到 160 字符。
+fn sanitize_mcp_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(MCP_LIST_MAX_TEXT)
+        .collect()
+}
+
+/// 可选文本清洗：空串归一为 None（描述/名称缺省语义）。
+fn sanitize_mcp_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|text| sanitize_mcp_text(&text))
+        .filter(|text| !text.is_empty())
+}
+
 /// `mcp/list` 契约投影：暴露面板需要的状态分类与排障字段（有界的
 /// `error_summary`、`url`；摘要已由 `ServerInfo` 侧 trim + 160 字符截断，
 /// 完整错误链不出投影），其余内部字段（source/plugin_source/cache_version
 /// 等）不透传。
+///
+/// 工具/资源/订阅资源同时做条目与文本双重有界：不可信 MCP server 返回的
+/// 名称与描述可能含控制字符或超长正文，进入面板前统一清洗；全量计数仍由
+/// `tool_count`/`resource_count` 承载。
 fn mcp_server_info_projection(info: ServerInfo) -> McpServerInfo {
+    let tool_count = info.tool_count;
+    let resource_count = info.resource_count;
     McpServerInfo {
         name: info.name,
         transport: info.transport_type,
@@ -270,13 +305,51 @@ fn mcp_server_info_projection(info: ServerInfo) -> McpServerInfo {
             OAuthStatus::Authorized => McpServerOAuthStatus::Authorized,
             OAuthStatus::NeedsAuthorization => McpServerOAuthStatus::NeedsAuthorization,
         },
-        tool_count: info.tool_count,
-        resource_count: info.resource_count,
+        tool_count,
+        resource_count,
+        tools: info
+            .tools
+            .into_iter()
+            .take(MCP_LIST_MAX_ENTRIES)
+            .map(|tool| McpToolInfo {
+                name: sanitize_mcp_text(&tool.name),
+                description: sanitize_mcp_optional(tool.description),
+            })
+            .collect(),
+        resources: info
+            .resources
+            .into_iter()
+            .take(MCP_LIST_MAX_ENTRIES)
+            .map(|resource| McpResourceInfo {
+                uri: sanitize_mcp_text(&resource.uri),
+                name: sanitize_mcp_optional(resource.name),
+                description: sanitize_mcp_optional(resource.description),
+            })
+            .collect(),
+        subscriptions: info.subscriptions.map(|subscriptions| {
+            let McpSubscriptionsConfig {
+                resources,
+                tools_list_changed,
+                prompts_list_changed,
+                resources_list_changed,
+            } = subscriptions;
+            McpSubscriptionsConfig {
+                resources: resources
+                    .into_iter()
+                    .take(MCP_LIST_MAX_ENTRIES)
+                    .map(|uri| sanitize_mcp_text(&uri))
+                    .collect(),
+                tools_list_changed,
+                prompts_list_changed,
+                resources_list_changed,
+            }
+        }),
         version: info.version,
         connected_at: info.connected_at,
         protocol_version: info.protocol_version,
         error_summary: info.error_summary,
         url: info.url,
+        control: Default::default(),
     }
 }
 
@@ -291,7 +364,6 @@ impl McpSubscriptionPort for McpClientPool {
 
     fn unregister_inbox(&self, session_id: &str) {
         self.session_bindings.write().unregister(session_id);
-        self.task_scope_tokens.write().remove(session_id);
     }
 
     fn as_any(&self) -> &dyn Any {

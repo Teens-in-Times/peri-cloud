@@ -124,6 +124,13 @@ async fn automatic_review_uses_exact_parameters_and_delivers_notice_before_the_w
         "PRIVATE_TOOL_CONTENT"
     );
     assert!(!f.script.review_requests.lock().is_empty());
+    let state = f
+        .c()
+        .journal
+        .session(f.c().browser.principal().id, parent)
+        .await
+        .unwrap();
+    assert!(state.history.iter().any(|payload| matches!(payload.as_message(),Some(peri_acp_types::messages::BaseMessage::Human {content:peri_acp_types::messages::MessageContent::Text(text),..}) if text=="delegate") && !state.history_flags.get(&payload.id()).is_some_and(|flags| flags.excluded)),"bounded approval must restore ordinary conversation history");
     f.finish().await;
 }
 

@@ -51,7 +51,7 @@ async fn policy_close_dimensions() {
     let cron_declared = mw_declared_tool_count("cron");
     let web_declared = mw_declared_tool_count("web");
     let artifact_declared = mw_declared_tool_count("artifact");
-    assert_eq!(cron_declared, 3, "用例前提（真值表数字）：cron 三工具");
+    assert_eq!(cron_declared, 4, "cron 包含启停工具");
 
     let mut cells = 0usize;
     for cron_open in [true, false] {
@@ -137,9 +137,8 @@ async fn policy_close_dimensions() {
             "[{label}] cron 的发现证据必须仍完整（不撤 ready）"
         );
         // 闸门仍放行：策略关闭不产生 fatal，也不撤 ready 候选。
-        let middleware = McpMiddleware::new(Arc::clone(&pool))
-            .with_tool_pool(Arc::clone(&pool))
-            .with_builtin_closures(closed.clone());
+        let middleware =
+            McpMiddleware::new(Arc::clone(&pool)).with_builtin_closures(closed.clone());
         let mut probe = StartupProbe::default();
         Middleware::before_react_start(&middleware, &mut probe)
             .await

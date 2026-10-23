@@ -6,9 +6,30 @@ impl CloudAgent {
         &self,
         request: CloudTurnRequest,
         model: Arc<dyn Model>,
-    ) -> CloudTurnResult {
+        personal: Option<crate::personal::PersonalScope>,
+    ) -> Result<CloudTurnResult, Error> {
         let mut transcript = MessageTranscript::new().with_own_payloads(request.history);
         transcript.set_flags_batch(request.history_flags);
+        transcript.enable_deployment_owned_compaction();
+        if let Some(scope) = personal.filter(|_| !self.is_worker()) {
+            let archive = crate::archive::CloudArchive::open(scope)
+                .await
+                .map_err(|_| Error::Context)?;
+            transcript.bind_deployment_archive(self.session_id.to_string(), archive);
+            transcript
+                .checkpoint_archive()
+                .await
+                .map_err(|_| Error::Context)?;
+        }
+        let mailbox = Arc::new(
+            peri_agent::session::async_result_mailbox::AsyncResultMailbox::new(
+                self.session_id.to_string(),
+                "cloud",
+            ),
+        );
+        crate::async_results::TurnResults::restore(&transcript, mailbox.clone())
+            .map_err(|_| Error::Context)?;
+        let protected = mailbox.protected_snapshot();
         let before = transcript.visible_messages().len();
         let empty = transcript.canonical_payloads().iter().all(|entry| {
             transcript.flags(entry.id()).excluded
@@ -30,35 +51,12 @@ impl CloudAgent {
             let summary = tokio::select! {
                 biased;
                 _ = request.cancellation.cancelled() => None,
-                result = peri_agent::agent::compact_v2::full::full_summary_only(
-                    &transcript, Some(model.as_ref()), &config,
+                result = peri_agent::agent::compact_v2::full::full_compact_inner_with_protected(
+                    &mut transcript, Some(model.as_ref()), &config, "", &protected,
                 ) => Some(result),
             };
             match summary {
-                Some(Ok(summary)) => {
-                    let flags = transcript
-                        .entries()
-                        .iter()
-                        .filter(|entry| {
-                            !transcript.flags(entry.id()).excluded
-                                && !matches!(entry.as_message(), Some(BaseMessage::System { .. }))
-                        })
-                        .map(|entry| {
-                            (
-                                entry.id(),
-                                MessageFlags {
-                                    excluded: true,
-                                    ..transcript.flags(entry.id())
-                                },
-                            )
-                        })
-                        .collect();
-                    transcript.set_flags_batch(flags);
-                    transcript.append(BaseMessage::human(format!(
-                        "{}\n\n{}",
-                        peri_agent::agent::compact_v2::CONTINUATION_HINT,
-                        summary
-                    )));
+                Some(Ok(_)) => {
                     (TurnStatus::Completed, format!("上下文已压缩。\n可见消息：{} → {}\n继续在当前会话发送任务即可。原始历史已保留，摘要不会修改设备、目录、权限或模型选择。", before, transcript.visible_messages().len()))
                 }
                 Some(Err(error)) => {
@@ -89,7 +87,7 @@ impl CloudAgent {
                 })
                 .collect()
         });
-        CloudTurnResult {
+        Ok(CloudTurnResult {
             status,
             replies: vec![ChatReply {
                 message_id: format!("compact:{}", request.turn_id),
@@ -99,7 +97,7 @@ impl CloudAgent {
             history_flags,
             internal_events: Vec::new(),
             unsettled_jobs,
-        }
+        })
     }
 }
 

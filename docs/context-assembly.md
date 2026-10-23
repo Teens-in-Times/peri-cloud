@@ -65,6 +65,8 @@ scripts/prepare-prompt-review.py 更新未改动的导出稿，会保留用户�
 
 ## 参考来源
 
+历史压缩与个人记忆是两条不同路径。主会话可用 Micro 投影收起旧工具交换，通过 ReadContextArchive 按引用、预算和游标回查；Full 摘要保留有效归档根。归档读取绑定当前会话，重新验证用户、上下文代次和隐私边界，隐藏推理不开放为工具结果。执行者继续以持久任务事实和原窗口交接恢复。接口及验收见 [归档同步记录](upstream/peri-e598d178.md)。
+
 本次吸收目录分层与按需加载的方式；Peri 的具体优先级、私聊边界和助手级 SOUL 按本项目约定实现。
 
 - [Claude Code Skills](https://code.claude.com/docs/en/skills)：个人/项目技能及按需正文。

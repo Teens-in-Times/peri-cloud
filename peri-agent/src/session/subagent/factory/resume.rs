@@ -9,7 +9,9 @@ use super::super::run_sync::{
     handoff_event_handler, new_sync_task_id, run_sync_subagent, run_sync_with_registered_handoff,
     SyncCompletion,
 };
-use super::super::types::{SubagentResumeConfig, SubagentRunMode, SubagentSpawned};
+use super::super::types::{
+    ChildRunOutcome, SubagentFailure, SubagentResumeConfig, SubagentRunMode, SubagentSpawned,
+};
 use super::super::v2_bridge::agent_id_from_child_thread;
 use super::claim::ResumeClaim;
 use super::context::{build_subagent_session_v2, derive_cancel_token, inherited_frozen_context};
@@ -90,12 +92,16 @@ pub(super) async fn resume_subagent_impl(
         frozen_date: frozen_date_cfg,
     } = config;
 
-    // 绑定校验用一次一致快照：child 的绑定必须与 owning parent 完全相同，且两者同根。
-    // 存在性是本函数的第一个校验分支：快照读取报 `NotFound` 即「thread not found」，
+    // 绑定校验只读 binding：不再为预检物化 child/parent 的有效正文。
+    // 注意：child 与 parent 是两次独立读取，不构成跨会话原子快照；这里只做
+    // 分类校验（存在性/绑定/同根）。执行正文由 claim 成功后唯一一次
+    // `load_active_snapshot` 读取，不能拿预检结果直接执行。
+    // 存在性是本函数的第一个校验分支：binding 读取报 `NotFound` 即「thread not found」，
     // 与后续 `ResumeClaim` 的状态校验分开报错（不能把「不存在」说成「仍处于运行态」）。
-    // 本步只消费 binding：读有效视图，不加载 own 正文。
-    let child_snapshot = match session_resources.load_active_snapshot(&thread_id).await {
-        Ok(snapshot) => snapshot,
+    let binding = match session_resources.load_session_binding(&thread_id).await {
+        Ok(peri_acp_types::session_resources::BindingState::Bound(binding)) => Some(binding),
+        // 无绑定（legacy / 外来登记 / 缺失）保留旧行为：不当作 bound child 处理。
+        Ok(_) => None,
         Err(error)
             if matches!(
                 error.kind(),
@@ -108,17 +114,11 @@ pub(super) async fn resume_subagent_impl(
         }
         Err(error) => return Err(error.into()),
     };
-    let binding = match &child_snapshot.binding {
-        peri_acp_types::session_resources::BindingState::Bound(binding) => Some(binding.clone()),
-        // 无绑定（legacy / 外来登记 / 缺失）保留旧行为：不当作 bound child 处理。
-        _ => None,
-    };
     if binding.is_some() {
         let parent_id = super::spawn::parent_thread_id_of(parent)
             .ok_or("bound child resume requires its owning parent session")?;
-        let parent_snapshot = session_resources.load_active_snapshot(&parent_id).await?;
-        let parent_binding = match &parent_snapshot.binding {
-            peri_acp_types::session_resources::BindingState::Bound(binding) => binding.clone(),
+        let parent_binding = match session_resources.load_session_binding(&parent_id).await? {
+            peri_acp_types::session_resources::BindingState::Bound(binding) => binding,
             _ => return Err("bound subagent parent has no execution binding".into()),
         };
         if binding.as_ref() != Some(&parent_binding) {
@@ -130,6 +130,15 @@ pub(super) async fn resume_subagent_impl(
             return Err("bound subagent belongs to another root session execution owner".into());
         }
     }
+    let preparation = parent
+        .and_then(|session| session.subagent_host())
+        .and_then(|host| {
+            host.task_manager
+                .as_ref()
+                .and_then(|manager| manager.child_owner(&thread_id))
+        })
+        .map(|owner| owner.prepare_resume())
+        .transpose()?;
     let ownership = task_manager
         .as_ref()
         .map(|manager| {
@@ -264,7 +273,7 @@ pub(super) async fn resume_subagent_impl(
         tool_filter,
         parent
             .and_then(|session| session.subagent_host())
-            .and_then(|host| host.session_mcp_capability.clone()),
+            .and_then(|host| host.session_mcp_catalog.clone()),
         Vec::new(), // skill_names 恒空（R-H1：恢复不重复注入 SkillPreload）
         frozen_claude_md,
         frozen_claude_local_md_cfg,
@@ -292,6 +301,7 @@ pub(super) async fn resume_subagent_impl(
             cancel_token,
             interrupted: true,
             pending_tasks: Vec::new(),
+            handoff: None,
         });
     }
 
@@ -305,6 +315,9 @@ pub(super) async fn resume_subagent_impl(
     ));
 
     // 8. 执行（run mode 由本次调用决定，issue 决策 8）
+    // 认领已写入 Active；准备门在进入执行前释放，避免与本次 run 的
+    // 执行 permit 互斥（并发的第二次 resume 由 claim/status 拒绝）。
+    drop(preparation);
     match run_mode {
         SubagentRunMode::Sync => {
             let run_thread_id = thread_id.clone();
@@ -345,9 +358,42 @@ pub(super) async fn resume_subagent_impl(
                 },
             )
             .await?;
-            let (interrupted, pending_tasks, pending_task_id) = match completion {
-                SyncCompletion::Finished(interrupted) => (interrupted, Vec::new(), None),
-                SyncCompletion::Pending(tasks) => (false, tasks, Some(sync_task_id)),
+            let (interrupted, pending_tasks, pending_task_id, handoff) = match completion {
+                SyncCompletion::Finished(ChildRunOutcome::Settled) => {
+                    (false, Vec::new(), None, None)
+                }
+                SyncCompletion::Finished(ChildRunOutcome::Interrupted) => {
+                    (true, Vec::new(), None, None)
+                }
+                SyncCompletion::Finished(ChildRunOutcome::HandedOff { receipt }) => {
+                    let tasks = receipt
+                        .tasks
+                        .iter()
+                        .map(|task| task.task_id.clone())
+                        .collect();
+                    (false, tasks, None, Some(receipt))
+                }
+                SyncCompletion::Finished(ChildRunOutcome::Failed { error, .. }) => {
+                    return Err(Box::new(SubagentFailure::new(
+                        thread_id.clone(),
+                        agent_name.clone(),
+                        error,
+                    )))
+                }
+                SyncCompletion::Finished(ChildRunOutcome::HandoffFailed { cause, failure }) => {
+                    return Err(Box::new(SubagentFailure::handoff_failed(
+                        thread_id.clone(),
+                        agent_name.clone(),
+                        cause,
+                        &failure,
+                    )))
+                }
+                SyncCompletion::Pending(pending) => (
+                    false,
+                    pending.pending_tasks,
+                    Some(sync_task_id),
+                    Some(pending.receipt),
+                ),
             };
             Ok(SubagentSpawned {
                 child_thread_id: thread_id,
@@ -356,6 +402,7 @@ pub(super) async fn resume_subagent_impl(
                 cancel_token,
                 interrupted,
                 pending_tasks,
+                handoff,
             })
         }
         SubagentRunMode::Background => {
@@ -407,6 +454,7 @@ pub(super) async fn resume_subagent_impl(
                 cancel_token,
                 interrupted: false,
                 pending_tasks: Vec::new(),
+                handoff: None,
             })
         }
     }

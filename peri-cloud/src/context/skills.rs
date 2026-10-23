@@ -134,7 +134,13 @@ impl ContextFiles {
             .read_scoped(&relative, Some(&scope))
             .await?
             .ok_or(ContextError::File)?;
-        let digest = format!("sha256:{:x}", Sha256::digest(content.as_bytes()));
+        let digest = format!(
+            "sha256:{}",
+            (Sha256::digest(content.as_bytes()))
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
         Ok(WorkspaceFile {
             path: path.into(),
             content,

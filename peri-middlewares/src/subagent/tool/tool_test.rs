@@ -93,7 +93,8 @@ fn make_subagent_tool(parent_tools: Vec<Arc<dyn BaseTool>>) -> SubAgentTool {
 /// （子代理 `skills:` 预载的唯一来源；未接线 ⇒ 缺口，不回落磁盘）。
 ///
 /// 条目用 legacy 形状（`content: Some(..)`、无 `resources[]` 绑定）：统一
-/// activation 在该形状下使用发现期正文——本夹具因此不需要真实 peer。
+/// activation 在该形状下使用发现期正文；仍提供已连接状态与调用 gate，
+/// 无需 RPC peer，不绕过连接代次检查。
 pub(crate) fn with_skill_registry(
     tool: SubAgentTool,
     server: &str,
@@ -102,7 +103,22 @@ pub(crate) fn with_skill_registry(
     use peri_acp_types::mcp_skills::{HandleToken, McpSkillRegistry};
     use peri_acp_types::skills::{SkillMetadata, SkillOrigin, SkillSource};
     let reg = std::sync::Arc::new(McpSkillRegistry::new());
-    let handle: HandleToken = std::sync::Arc::new(server.to_string());
+    let handle: HandleToken = std::sync::Arc::new(crate::mcp::client::McpClientHandle {
+        call_gate: Default::default(),
+        name: server.to_string(),
+        version: None,
+        cache_version: None,
+        connected_at: None,
+        protocol_version: None,
+        peer: None,
+        tools: vec![],
+        resources: vec![],
+        status: crate::mcp::client::ClientStatus::Connected,
+        oauth_status: Default::default(),
+        source: None,
+        url: None,
+        skills_capable: false,
+    });
     reg.mark_discovery_started(server, handle.clone());
     reg.mark_discovery_completed(
         server,
@@ -277,6 +293,7 @@ pub(crate) fn with_agent_catalog(
     pool.clients.write().insert(
         "workspace".to_string(),
         Arc::new(crate::mcp::McpClientHandle {
+            call_gate: Default::default(),
             name: "workspace".to_string(),
             version: None,
             connected_at: None,
@@ -393,7 +410,7 @@ async fn invoke_resolves_agent_from_argument_cwd_before_starting_factory() {
 
     // 1) 同 cwd 调用命中会话资源面的定义。
     let result = tool
-        .invoke(
+        .invoke_output(
             serde_json::json!({
                 "subagent_type": "actual-agent",
                 "prompt": "from bound face",
@@ -403,7 +420,12 @@ async fn invoke_resolves_agent_from_argument_cwd_before_starting_factory() {
         )
         .await
         .unwrap();
-    assert!(result.contains("echo: from bound face"));
+    assert!(result.text.contains("echo: from bound face"));
+    assert_eq!(
+        result.execution.as_ref().unwrap().status,
+        peri_agent::tools::ToolExecutionStatus::Completed
+    );
+    assert!(result.execution.as_ref().unwrap().task_id.is_none());
     assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
 
     // 2) 未命中：失败且**不启动 factory**（顺序契约不变）。
@@ -474,7 +496,7 @@ async fn background_invoke_uses_argument_cwd_for_loader_failure() {
     );
 
     let result = tool
-        .invoke(
+        .invoke_output(
             serde_json::json!({
                 "subagent_type": "background-agent",
                 "prompt": "bg",
@@ -486,8 +508,16 @@ async fn background_invoke_uses_argument_cwd_for_loader_failure() {
         .await
         .unwrap();
     assert!(
-        result.contains("Background") || result.contains("task_id") || result.contains("echo: bg"),
-        "资源面命中的定义必须可执行（无 task_manager 时同步回退）: {result}"
+        result.text.contains("Background")
+            || result.text.contains("task_id")
+            || result.text.contains("echo: bg"),
+        "资源面命中的定义必须可执行（无 task_manager 时同步回退）: {result:?}"
+    );
+    assert!(
+        result.execution.as_ref().is_none_or(
+            |execution| execution.status != peri_agent::tools::ToolExecutionStatus::Completed
+        ),
+        "后台启动不能伪造完成事实"
     );
     assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
 
@@ -540,6 +570,7 @@ async fn mcp_agent_suggestions_require_activation_and_connection() {
     pool.clients.write().insert(
         "offline".to_string(),
         Arc::new(McpClientHandle {
+            call_gate: Default::default(),
             name: "offline".to_string(),
             version: None,
             connected_at: None,
@@ -822,8 +853,6 @@ mod beta_default_test;
 
 #[path = "tool_test/bg_register_cancel_test.rs"]
 mod bg_register_cancel_test;
-#[path = "tool_test/dynamic_mcp_subagent_test.rs"]
-mod dynamic_mcp_subagent_test;
 #[path = "tool_test/events_contract_test.rs"]
 mod events_contract_test;
 #[path = "tool_test/fork_test.rs"]
@@ -902,3 +931,6 @@ async fn closed_agent_face_hides_and_blocks_activation_without_disk_fallback() {
     );
     let _ = ResourceScope::Project;
 }
+
+#[path = "tool_test/resume_archive_test.rs"]
+mod resume_archive_test;

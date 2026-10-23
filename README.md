@@ -125,7 +125,7 @@ chcp 65001   # Windows：让 PowerShell 中文输出按 UTF-8 解码
 
 ## 来源与许可
 
-本发行版整体采用 AGPL-3.0-only。来自 Peri 的上游代码保留原 Apache-2.0 声明和[完整许可文本](licenses/Apache-2.0.txt)。源代码基于 Peri 提交 `7d5295c7d6750461aaf6f8d860938268d537c2d6`，新增云端、执行器、远程工具协议和共享工具运行库，并修改必要的依赖模块。叠加范围、逐文件清单和生产补丁见 [上游升级记录](docs/upstream/peri-7d5295c7.md)。QQ 官方网关实现参考独立项目 Prism 的适配协议；按钮行为参考 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的网关实现。
+本发行版整体采用 AGPL-3.0-only。来自 Peri 的上游代码保留原 Apache-2.0 声明和[完整许可文本](licenses/Apache-2.0.txt)。源代码基于 Peri 提交 `e598d17872bce487355e1bfa70f077743984760f`，新增云端、执行器、远程工具协议和共享工具运行库，并修改必要的依赖模块。叠加范围、逐文件清单和生产补丁见 [上游升级记录](docs/upstream/peri-e598d178.md)。QQ 官方网关实现参考独立项目 Prism 的适配协议；按钮行为参考 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的网关实现。
 
 参见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。第三方依赖保留各自许可证。公开仓库采用新的源码快照，未包含原开发目录的 Git 历史、个人配置、聊天记录、凭据或运行数据库。
 
@@ -139,7 +139,10 @@ QQ 日常操作与交互审计：[QQ 优先交互说明](docs/qq-experience-audi
 
 QQ 原生命令发现、执行 API、扩展接口和兼容范围：[QQ CLI 命令](docs/qq-cli-commands.md)。
 
-本轮执行架构的逐项验证、故障恢复证据和实际限制见 [完整验收记录](docs/execution-continuity-verification.md)。最新可编辑实现拓扑为 [执行架构快照](docs/design/peri-workbench/execution-architecture-20261019.html)，使用独立存档身份，保留原画板修改。
+执行架构原验收的逐项验证、故障恢复证据和实际限制见 [完整验收记录](docs/execution-continuity-verification.md)。此前的 [执行架构快照](docs/design/peri-workbench/execution-architecture-20261019.html) 保留，最新快照见下方本次上游同步说明。
 
 上下文分段、助手级 SOUL、项目指令回退、全局／项目 Skill 与按需设备环境，见 [装配契约](docs/context-assembly.md)。提示词创作入口为 [带逐份说明的合订稿](docs/prompt-review/PROMPTS-EDIT.md)。
+2026-10-24 上游合并分支更新至 `e598d178`，接入原文归档回查和异步结果消费保护；Cloud schema 为 25。该分支需按 [同步记录](docs/upstream/peri-e598d178.md) 验证，不继承旧候选制品的验收结论，也未升级生产。
+相应的 [可编辑拓扑快照](docs/design/peri-workbench/execution-architecture-20261024.html) 新增压缩与归档子图，使用独立本地存档身份，保留旧画板。
+[独立维护盘点](docs/research/independent-maintenance-20261024.md) 对照已实现能力与 Skill / MCP、多设备、个人助手、硬窗口的缺口，评估上游成熟度、OpenAI 换窗思路及 TUI 复用成本。
 提示词规则由宿主承接：主会话类型化审批、完整活跃约束快照、原调用回执复用、空工具摘要、QQ Markdown 降级和生效 Skill 目录。实现边界见 [宿主契约](docs/prompt-host-contracts.md)。

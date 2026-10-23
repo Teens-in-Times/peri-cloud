@@ -17,8 +17,8 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_COMMIT = "7d5295c7d6750461aaf6f8d860938268d537c2d6"
-DEFAULT_MANIFEST = ROOT / "docs/upstream/peri-7d5295c7.manifest"
+DEFAULT_COMMIT = "e598d17872bce487355e1bfa70f077743984760f"
+DEFAULT_MANIFEST = ROOT / "docs/upstream/peri-e598d178.manifest"
 DEFAULT_ALLOWLIST = ROOT / "docs/upstream/production-patches.txt"
 
 # Directories replaced or added from upstream.  peri-acp contributes prompts

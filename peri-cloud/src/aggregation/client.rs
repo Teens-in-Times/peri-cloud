@@ -223,10 +223,11 @@ fn channel_view(value: &Value) -> AggregateResult<ChannelView> {
         response_time: value["response_time"].as_i64().unwrap_or_default(),
         revision: String::new(),
     };
-    view.revision = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&view).map_err(|_| AggregateError::Invalid)?)
-    );
+    view.revision =
+        (Sha256::digest(serde_json::to_vec(&view).map_err(|_| AggregateError::Invalid)?))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
     Ok(view)
 }
 fn public_url(input: &str) -> Option<String> {

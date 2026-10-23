@@ -6,10 +6,7 @@ use crate::mcp::builtin::{
     runtime::BuiltinSpawnError,
 };
 use crate::mcp::oauth_flow::OAuthFailureKind;
-use peri_acp_types::{
-    dynamic_mcp::{DynamicMcpIncarnationId, DynamicMcpInstanceKey, DynamicMcpLogicalKey},
-    plugin::McpSubscriptionsConfig,
-};
+use peri_acp_types::plugin::McpSubscriptionsConfig;
 use rmcp::model::SubscriptionFilter;
 
 fn controlled_service(
@@ -26,6 +23,7 @@ fn timing_out_service(close_count: Arc<std::sync::atomic::AtomicUsize>) -> McpSe
 
 fn connected_test_handle(name: &str) -> Arc<McpClientHandle> {
     Arc::new(McpClientHandle {
+        call_gate: Default::default(),
         name: name.to_string(),
         version: None,
         connected_at: None,
@@ -43,41 +41,53 @@ fn connected_test_handle(name: &str) -> Arc<McpClientHandle> {
 }
 
 #[test]
-fn task_scope_metadata_is_session_scoped_without_store_ownership() {
+fn task_owner_metadata_is_scoped_to_workspace_sources() {
     let pool = McpClientPool::new_pending();
-    let first = pool.task_scope_meta_for("workspace", "session-a").unwrap();
-    let repeated = pool.task_scope_meta_for("workspace", "session-a").unwrap();
-    let other = pool.task_scope_meta_for("workspace", "session-b").unwrap();
-    assert_eq!(first, repeated);
-    assert_ne!(first, other);
-    assert_eq!(
-        pool.task_scope_authority
-            .resolve_capability(&first)
-            .unwrap()
-            .session_id,
-        "session-a"
+    assert!(
+        pool.task_owner_meta_for("workspace", "session-a").is_none(),
+        "unknown source must not receive Peri metadata"
     );
+    let mut builtin = connected_test_handle("workspace");
+    Arc::get_mut(&mut builtin).unwrap().source = Some(crate::mcp::config::ConfigSource::Builtin {
+        instance: "workspace".into(),
+    });
+    pool.clients.write().insert("workspace".into(), builtin);
+    let meta = pool
+        .task_owner_meta_for("workspace", "session-a")
+        .expect("builtin workspace owner");
     assert_eq!(
-        pool.task_scope_authority
-            .resolve_capability(&other)
-            .unwrap()
-            .session_id,
-        "session-b"
+        meta.0
+             .0
+            .get(peri_mcp_core::task_owner::TASK_OWNER_META_KEY),
+        Some(&serde_json::json!("session-a"))
     );
 }
 
 #[test]
-fn remote_task_scope_metadata_survives_pool_recreation_without_store_ownership() {
+fn task_owner_metadata_covers_remote_workspace_and_skips_other_sources() {
     let pool = McpClientPool::new_pending();
-    let mut client = connected_test_handle("workspace");
-    Arc::get_mut(&mut client).unwrap().source =
+    let mut remote = connected_test_handle("remote");
+    Arc::get_mut(&mut remote).unwrap().source =
         Some(crate::mcp::config::ConfigSource::WorkspaceRemote);
-    pool.clients.write().insert("workspace".into(), client);
-    let meta = pool.task_scope_meta_for("workspace", "session-a").unwrap();
-    let authority = peri_mcp_core::task_scope::TaskScopeAuthority::trusted_connection();
+    pool.clients.write().insert("remote".into(), remote);
+    let meta = pool
+        .task_owner_meta_for("remote", "session-a")
+        .expect("remote workspace owner");
     assert_eq!(
-        authority.resolve_capability(&meta).unwrap().session_id,
-        "session-a"
+        meta.0
+             .0
+            .get(peri_mcp_core::task_owner::TASK_OWNER_META_KEY),
+        Some(&serde_json::json!("session-a"))
+    );
+
+    let mut web = connected_test_handle("web");
+    Arc::get_mut(&mut web).unwrap().source = Some(crate::mcp::config::ConfigSource::Builtin {
+        instance: "web".into(),
+    });
+    pool.clients.write().insert("web".into(), web);
+    assert!(
+        pool.task_owner_meta_for("web", "session-a").is_none(),
+        "non-workspace servers stay generic"
     );
 }
 
@@ -174,6 +184,7 @@ async fn test_server_infos_projects_version_and_connected_at() {
     pool.clients.write().insert(
         "s".into(),
         Arc::new(McpClientHandle {
+            call_gate: Default::default(),
             name: "s".into(),
             version: Some("1.2.3".into()),
             connected_at: Some("2026-10-11T06:32:05Z".into()),
@@ -202,6 +213,76 @@ async fn test_server_infos_projects_version_and_connected_at() {
     );
     assert_eq!(projected[0].protocol_version.as_deref(), Some("2026-07-28"));
 }
+
+/// `mcp/list` 投影的不可信文本边界：条目最多 64、控制字符清洗、空描述归一。
+#[test]
+fn test_server_infos_projection_bounds_and_sanitizes_untrusted_text() {
+    let pool = McpClientPool::new_pending();
+    let mut tools = Vec::new();
+    for index in 0..70 {
+        let mut tool = rmcp::model::Tool::default();
+        tool.name = format!("tool-{index}").into();
+        if index == 0 {
+            tool.description = Some("line\nbreak\ttext".into());
+        }
+        if index == 1 {
+            // 超长文本（200 字符）必须截断到 MCP_LIST_MAX_TEXT（160）。
+            tool.description = Some("d".repeat(200).into());
+        }
+        tools.push(tool);
+    }
+    let resources = (0..70)
+        .map(|index| {
+            let resource = rmcp::model::Resource::new(
+                format!("agent://builtin/a{index}/agent.md"),
+                format!("resource-{index}"),
+            );
+            if index == 0 {
+                resource.with_description("")
+            } else {
+                resource
+            }
+        })
+        .collect();
+    let mut handle = (*connected_test_handle("s")).clone();
+    handle.tools = tools;
+    handle.resources = resources;
+    pool.clients.write().insert("s".into(), Arc::new(handle));
+    pool.configs.write().insert(
+        "s".into(),
+        serde_json::from_value(serde_json::json!({
+            "command": "npx",
+            "subscriptions": {
+                "resources": (0..70)
+                    .map(|index| format!("file:///r{index}.md"))
+                    .collect::<Vec<_>>(),
+                "toolsListChanged": true,
+            }
+        }))
+        .expect("测试配置必须可解析"),
+    );
+
+    let projected = peri_acp_types::ports::McpPoolPort::server_infos(&pool).unwrap();
+    let server = &projected[0];
+    // 全量计数保留；投影条目有界。
+    assert_eq!(server.tool_count, 70);
+    assert_eq!(server.resource_count, 70);
+    assert_eq!(server.tools.len(), 64);
+    assert_eq!(server.resources.len(), 64);
+    // 控制字符替换为空格后不再含控制字符；空描述为 None。
+    let description = server.tools[0].description.as_deref().unwrap();
+    assert!(!description.chars().any(char::is_control));
+    assert!(description.contains("line break"));
+    // 超长文本按字符数截断到 160，避免无界载荷进入周期轮询。
+    let truncated = server.tools[1].description.as_deref().unwrap();
+    assert_eq!(truncated.chars().count(), 160, "描述必须截断到 160 字符");
+    assert!(truncated.chars().all(|ch| ch == 'd'));
+    assert_eq!(server.resources[0].description, None);
+    // 订阅资源同样有界；标志位保留。
+    let subscriptions = server.subscriptions.as_ref().unwrap();
+    assert_eq!(subscriptions.resources.len(), 64);
+    assert!(subscriptions.tools_list_changed);
+}
 #[tokio::test]
 async fn test_insert_failed() {
     let pool = Arc::new(McpClientPool::new_pending());
@@ -221,6 +302,7 @@ async fn test_remove_server() {
     pool.clients.write().insert(
         "a".into(),
         Arc::new(McpClientHandle {
+            call_gate: Default::default(),
             name: "a".into(),
             version: None,
             connected_at: None,
@@ -245,6 +327,7 @@ async fn test_get_tools_resources() {
     pool.clients.write().insert(
         "s".into(),
         Arc::new(McpClientHandle {
+            call_gate: Default::default(),
             name: "s".into(),
             version: None,
             connected_at: None,
@@ -363,87 +446,6 @@ async fn test_set_disabled_marks_handle_disabled() {
 }
 
 #[test]
-fn test_two_sessions_with_same_server_have_isolated_oauth_flows() {
-    let pool = McpClientPool::new_pending();
-    let connection = |session: &str, incarnation: &str| McpConnectionKey::Dynamic {
-        instance: DynamicMcpInstanceKey {
-            logical: DynamicMcpLogicalKey {
-                session_id: session.to_string(),
-                server_name: "docs".to_string(),
-            },
-            incarnation_id: DynamicMcpIncarnationId::from_string(incarnation),
-        },
-    };
-    let first = connection("session-a", "mcpinc_a");
-    let second = connection("session-b", "mcpinc_b");
-
-    assert_eq!(
-        pool.reserve_oauth_flow_scoped(first.clone(), "flow-a"),
-        OAuthStartDisposition::Started
-    );
-    assert_eq!(
-        pool.reserve_oauth_flow_scoped(second.clone(), "flow-b"),
-        OAuthStartDisposition::Started
-    );
-    assert_eq!(
-        pool.active_oauth_flow_scoped(&first).as_deref(),
-        Some("flow-a")
-    );
-    assert_eq!(
-        pool.active_oauth_flow_scoped(&second).as_deref(),
-        Some("flow-b")
-    );
-    assert_eq!(first.server_name(), "docs");
-    assert!(first.is_dynamic());
-    assert!(!pool.persistent_cache_allowed_for(&first));
-    assert!(!pool.persistent_cache_allowed_for(&second));
-}
-
-#[test]
-fn test_dynamic_oauth_callback_requires_full_instance_identity_and_rejects_late_l1() {
-    let pool = McpClientPool::new_pending();
-    let connection = |incarnation: &str| McpConnectionKey::Dynamic {
-        instance: DynamicMcpInstanceKey {
-            logical: DynamicMcpLogicalKey {
-                session_id: "session-a".to_string(),
-                server_name: "docs".to_string(),
-            },
-            incarnation_id: DynamicMcpIncarnationId::from_string(incarnation),
-        },
-    };
-    let l1 = connection("mcpinc_l1");
-    let l2 = connection("mcpinc_l2");
-    assert_eq!(
-        pool.reserve_oauth_flow_scoped(l1.clone(), "flow-l1"),
-        OAuthStartDisposition::Started
-    );
-    let (l1_tx, _l1_rx) = tokio::sync::oneshot::channel();
-    assert!(pool.register_oauth_callback_scoped(l1.clone(), "flow-l1", l1_tx));
-    pool.revoke_oauth_connection(&l1);
-
-    assert_eq!(
-        pool.reserve_oauth_flow_scoped(l2.clone(), "flow-l2"),
-        OAuthStartDisposition::Started
-    );
-    let (l2_tx, _l2_rx) = tokio::sync::oneshot::channel();
-    assert!(pool.register_oauth_callback_scoped(l2.clone(), "flow-l2", l2_tx));
-    assert!(pool
-        .deliver_oauth_callback_scoped(
-            &l1,
-            "flow-l1",
-            "late-code".to_string(),
-            "late-state".to_string(),
-        )
-        .is_err());
-    assert_eq!(
-        pool.active_oauth_flow_scoped(&l2).as_deref(),
-        Some("flow-l2")
-    );
-    assert!(!pool.cancel_oauth_flow_scoped(&l1, "flow-l1"));
-    assert!(pool.cancel_oauth_flow_scoped(&l2, "flow-l2"));
-}
-
-#[test]
 fn test_oauth_flow_reservation_is_idempotent_and_rejects_competing_identity() {
     let pool = McpClientPool::new_pending();
     assert_eq!(
@@ -518,6 +520,7 @@ async fn test_oauth_preflight_failure_emits_one_exact_terminal_event() {
                 .push((flow_id, server_name, failure_kind));
         }
     });
+    pool.reserve_oauth_flow("missing", "flow-1");
     let result = pool.start_oauth_flow("flow-1", "missing", false).await;
     assert!(matches!(result, Err(McpPoolError::NotConnected { .. })));
     assert_eq!(

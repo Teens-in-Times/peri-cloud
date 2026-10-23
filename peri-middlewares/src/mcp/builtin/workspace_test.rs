@@ -369,10 +369,6 @@ async fn bridge_accepts_workspace_owned_task_handle() {
 
     let (_dir, cwd) = workspace_dir();
     let context = crate::mcp::builtin::context::BuiltinInstanceContext::new(cwd.clone());
-    context
-        .task_scope_authority
-        .set(pool.task_scope_authority.clone())
-        .ok();
     let transport = crate::mcp::builtin::runtime::spawn_builtin_transport_with_context(
         "workspace",
         &context,
@@ -395,6 +391,7 @@ async fn bridge_accepts_workspace_owned_task_handle() {
     let tools = peer.list_all_tools().await.expect("tool list");
     let bash = tools.iter().find(|tool| tool.name == "Bash").expect("Bash");
     let handle = Arc::new(crate::mcp::client::McpClientHandle {
+        call_gate: Default::default(),
         name: "workspace".into(),
         version: None,
         connected_at: None,
@@ -419,13 +416,22 @@ async fn bridge_accepts_workspace_owned_task_handle() {
     pool.bind_session_task_manager("task-session", &manager);
     let bridge = crate::mcp::tool_bridge::McpToolBridge::new("workspace", bash, handle)
         .with_output_store(&pool, Some("task-session"));
-    let receipt = bridge
-        .invoke(
+    let output = bridge
+        .invoke_output(
             json!({"command":"sleep 0.2; printf bridge-ok", "run_in_background":true}),
             ToolContext::new(&[], &cwd).with_session_identity("task-session", "task-turn"),
         )
         .await
         .expect("bridge accepts Tasks response");
+    let evidence = output
+        .execution
+        .as_ref()
+        .expect("task response must carry execution facts");
+    assert_eq!(
+        evidence.status,
+        peri_agent::tools::ToolExecutionStatus::Running
+    );
+    let receipt = output.text;
     let task_id = receipt
         .split("Background task started: ")
         .nth(1)
@@ -434,6 +440,23 @@ async fn bridge_accepts_workspace_owned_task_handle() {
         .next()
         .expect("task id");
     assert!(task_id.starts_with("mcp-"));
+    assert_eq!(evidence.task_id.as_deref(), Some(task_id));
+    let completed = bridge
+        .invoke_output(
+            json!({"command":"printf sync-ok", "run_in_background":false}),
+            ToolContext::new(&[], &cwd).with_session_identity("task-session", "task-turn"),
+        )
+        .await
+        .expect("synchronous Bash completes");
+    let completed_evidence = completed
+        .execution
+        .expect("producer terminal facts survive MCP");
+    assert_eq!(
+        completed_evidence.status,
+        peri_agent::tools::ToolExecutionStatus::Completed
+    );
+    assert_eq!(completed_evidence.exit_code, Some(0));
+    assert!(completed_evidence.task_id.is_none());
     assert!(manager
         .snapshot()
         .tasks
@@ -449,143 +472,50 @@ async fn bridge_accepts_workspace_owned_task_handle() {
     let QueuedPayload::SystemReminder(reminder) = &notifications[0].payload else {
         panic!("expected task reminder")
     };
-    let owner_task_id = reminder.as_reminder().metadata["task_id"]
+    let session_task_id = reminder.as_reminder().metadata["task_id"]
+        .as_str()
+        .expect("completion carries the session task identity");
+    assert_eq!(session_task_id, task_id);
+    let remote_task_id = reminder.as_reminder().metadata["remote_task_id"]
         .as_str()
         .expect("completion carries the actionable Workspace task identity");
-    assert!(owner_task_id.starts_with("shell-"));
+    assert!(remote_task_id.starts_with("shell-"));
     assert!(reminder
         .as_reminder()
         .body
-        .contains(&owner_task_id.chars().take(8).collect::<String>()));
-    let mut params = rmcp::model::GetTaskParams::new(owner_task_id);
-    params.meta = pool.task_scope_meta_for("workspace", "task-session");
+        .contains(&session_task_id.chars().take(8).collect::<String>()));
+    let mut params = rmcp::model::GetTaskParams::new(remote_task_id);
+    params.meta = pool.task_owner_meta_for("workspace", "task-session");
     let task = peer.get_task(params).await.expect("query owned task").task;
-    assert_eq!(task.task.task_id, owner_task_id);
+    assert_eq!(task.task.task_id, remote_task_id);
     let rmcp::model::TaskPayload::Completed { result } = task.payload else {
         panic!("completion reminder must identify a completed task")
     };
     let result: BackgroundTaskResult =
         serde_json::from_value(result["structuredContent"].clone()).expect("shell result");
-    assert_eq!(result.task_id, owner_task_id);
+    assert_eq!(result.task_id, remote_task_id);
     assert!(result.success);
     let output_path = result
         .shell_output
         .expect("shell output evidence")
         .stdout_path
         .expect("readable stdout path");
-    let mut read = call("Read", json!({"file_path":output_path}));
-    read.meta = pool.task_scope_meta_for("workspace", "task-session");
+    let mut read = call("Read", json!({"file_path": &output_path}));
+    read.meta = pool.task_owner_meta_for("workspace", "task-session");
     let output = complete(peer.call_tool_once(read).await.expect("read task stdout"));
     assert_eq!(output.is_error, Some(false));
     assert!(first_text(&output)
         .expect("stdout text")
         .contains("bridge-ok"));
-    assert!(reminder.as_reminder().body.contains("stdout 输出文件"));
-    assert!(!reminder.as_reminder().body.contains("Task details:"));
-    pair.shutdown().await;
-    let _ = owner.shutdown().await;
-}
-
-#[tokio::test]
-async fn closing_workspace_scope_reconciles_without_live_agent_manager() {
-    let (mut owner, spawner) = crate::mcp::McpTaskOwner::new();
-    let pool = Arc::new(crate::mcp::McpClientPool::new_pending_with_spawner(spawner));
-    let (_dir, cwd) = workspace_dir();
-    let context = crate::mcp::builtin::context::BuiltinInstanceContext::new(cwd.clone());
-    context
-        .task_scope_authority
-        .set(pool.task_scope_authority.clone())
-        .ok();
-    let transport = crate::mcp::builtin::runtime::spawn_builtin_transport_with_context(
-        "workspace",
-        &context,
-        &std::collections::HashMap::new(),
-    )
-    .expect("builtin Workspace dispatch");
-    let (io, supervisor) = transport.into_parts();
-    let service = serve_client_auto(io, &McpCapabilityProfile::disabled(), HANDSHAKE_TIMEOUT)
-        .await
-        .expect("handshake deadline")
-        .expect("handshake");
-    let pair = Pair {
-        service,
-        supervisor,
-    };
-    let peer = pair.peer();
-    let mut config: crate::mcp::config::McpServerConfig =
-        serde_json::from_value(json!({})).expect("empty MCP config");
-    config.source = Some(crate::mcp::config::ConfigSource::Builtin {
-        instance: "workspace".into(),
-    });
-    pool.configs.write().insert("workspace".into(), config);
-    pool.clients.write().insert(
-        "workspace".into(),
-        Arc::new(crate::mcp::client::McpClientHandle {
-            name: "workspace".into(),
-            version: None,
-            connected_at: None,
-            protocol_version: None,
-            cache_version: None,
-            peer: Some(peer.clone()),
-            tools: vec![],
-            resources: vec![],
-            status: crate::mcp::client::ClientStatus::Connected,
-            oauth_status: Default::default(),
-            source: Some(crate::mcp::config::ConfigSource::Builtin {
-                instance: "workspace".into(),
-            }),
-            url: None,
-            skills_capable: false,
-        }),
-    );
-    let mut first_call = call(
-        "Bash",
-        json!({"command":"sleep 30", "run_in_background":true}),
-    );
-    first_call.meta = pool.task_scope_meta_for("workspace", "closing-session");
-    let scope = first_call.meta.clone().expect("trusted scope");
-    let before = peer
-        .send_request(rmcp::model::ClientRequest::CustomRequest(
-            rmcp::model::CustomRequest::new("workspace/taskSnapshot", Some(json!({"_meta":scope}))),
-        ))
-        .await
-        .expect("snapshot before close");
-    let rmcp::model::ServerResult::CustomResult(before) = before else {
-        panic!("scope snapshot result")
-    };
-    let close_epoch = before.0["epoch"].as_u64().expect("scope epoch");
-    let response = peer
-        .call_tool_once(first_call)
-        .await
-        .expect("start scoped Bash");
-    assert!(matches!(response, CallToolResponse::Task(_)));
-    pool.reconcile_closing_workspace_scope("closing-session")
-        .await
-        .expect("owner confirms all tasks terminal without Agent manager");
-    pool.open_workspace_task_scope("closing-session")
-        .await
-        .expect("same session scope opens after close settles");
-    let mut reopened = call(
-        "Bash",
-        json!({"command":"printf reopened", "run_in_background":true}),
-    );
-    reopened.meta = Some(scope.clone());
-    let response = peer
-        .call_tool_once(reopened)
-        .await
-        .expect("Bash accepted after reopen");
-    assert!(matches!(response, CallToolResponse::Task(_)));
     assert!(
-        peer.send_request(rmcp::model::ClientRequest::CustomRequest(
-            rmcp::model::CustomRequest::new(
-                "workspace/taskClose",
-                Some(json!({"_meta":scope,"epoch":close_epoch})),
-            ),
-        ))
-        .await
-        .is_err(),
-        "stale taskClose must not close reopened scope"
+        reminder
+            .as_reminder()
+            .body
+            .contains(&format!("stdout: {output_path}")),
+        "提醒正文必须内联可读取的 stdout 引用: {}",
+        reminder.as_reminder().body
     );
+    assert!(!reminder.as_reminder().body.contains("Task details:"));
     pair.shutdown().await;
     let _ = owner.shutdown().await;
 }

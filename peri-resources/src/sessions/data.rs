@@ -16,9 +16,9 @@ use peri_acp_types::history_window::{
 use peri_acp_types::messages::MessageId;
 use peri_acp_types::session_resources::{
     ActiveSessionSnapshot, BindingState, ChildSnapshot, ForkSnapshot, FrozenSnapshotBytes,
-    HistoryWindowPagePlan, HistoryWindowRows, NewSession, PersistenceRecovery, RewindBoundary,
-    RewindOutcome, SessionHistoryWindowBounds, SessionMetaPatch, SessionResourceResult,
-    SessionSnapshot,
+    FrozenState, HistoryWindowPagePlan, HistoryWindowRows, NewSession, PersistenceRecovery,
+    RewindBoundary, RewindOutcome, SessionHistoryWindowBounds, SessionMetaPatch,
+    SessionResourceResult, SessionSnapshot,
 };
 use peri_acp_types::store::{CompactionChange, MessageFlags, PersistedPayload};
 use peri_acp_types::system_reminder::TrustedSystemReminder;
@@ -159,6 +159,22 @@ pub(crate) trait SessionDataPort: Send + Sync {
         &self,
         id: &ThreadId,
     ) -> SessionResourceResult<ActiveSessionSnapshot>;
+
+    /// 轻量读取 frozen 原字节，不分页、不装入任何正文。
+    ///
+    /// 默认拒绝；生产后端必须覆写为单列读取，不得退化成完整/有效快照读取。
+    async fn load_frozen_state(&self, _id: &ThreadId) -> SessionResourceResult<FrozenState> {
+        Err(
+            peri_acp_types::session_resources::SessionResourceError::new(
+                peri_acp_types::session_resources::SessionResourceErrorKind::Unsupported,
+            ),
+        )
+    }
+
+    /// 后端是否实现窗口读取端口；默认 false，覆写者与窗口读取实现保持同一判据。
+    fn supports_history_window(&self) -> bool {
+        false
+    }
 
     /// 轻量绑定分类（不加载历史）：记录事实三种——绑定与本机登记一致、绑定指向的登记
     /// 已不存在（含子会话没有绑定行）、无绑定行。`LegacyConfirmed` 由门面按本机来源
@@ -305,6 +321,59 @@ pub(crate) trait SessionDataPort: Send + Sync {
                 peri_acp_types::session_resources::SessionResourceErrorKind::Unsupported,
             ),
         )
+    }
+
+    /// Resolve a frozen inherited archive grant. Source IDs/references are never credentials.
+    async fn inherited_archive_root(
+        &self,
+        _id: &ThreadId,
+        _source: &ThreadId,
+        _anchor: MessageId,
+    ) -> SessionResourceResult<peri_acp_types::context_archive::ArchiveRoot> {
+        Err(
+            peri_acp_types::session_resources::SessionResourceError::new(
+                peri_acp_types::session_resources::SessionResourceErrorKind::Unsupported,
+            ),
+        )
+    }
+
+    /// Bounded archive metadata access, including excluded anchors. Unsupported adapters fail closed.
+    async fn read_archive_metadata(
+        &self,
+        _id: &ThreadId,
+        _query: &peri_acp_types::context_archive::ArchiveMetadataQuery,
+    ) -> SessionResourceResult<peri_acp_types::context_archive::ArchiveMetadataPage> {
+        Err(
+            peri_acp_types::session_resources::SessionResourceError::new(
+                peri_acp_types::session_resources::SessionResourceErrorKind::Unsupported,
+            ),
+        )
+    }
+
+    /// Read only the requested canonical byte interval below a stable committed tail.
+    async fn read_archive_chunk(
+        &self,
+        _id: &ThreadId,
+        _query: &peri_acp_types::context_archive::ArchiveChunkQuery,
+    ) -> SessionResourceResult<peri_acp_types::context_archive::ArchiveChunk> {
+        Err(
+            peri_acp_types::session_resources::SessionResourceError::new(
+                peri_acp_types::session_resources::SessionResourceErrorKind::Unsupported,
+            ),
+        )
+    }
+
+    /// Read a bounded batch in request order. Adapters may combine it into one I/O.
+    async fn read_archive_chunks(
+        &self,
+        id: &ThreadId,
+        batch: &peri_acp_types::context_archive::ArchiveChunkBatch,
+    ) -> SessionResourceResult<Vec<peri_acp_types::context_archive::ArchiveChunk>> {
+        let mut chunks = Vec::with_capacity(batch.queries().len());
+        for query in batch.queries() {
+            chunks.push(self.read_archive_chunk(id, query).await?);
+        }
+        Ok(chunks)
     }
 
     /// 按给定 id 集合读取 flags（有界）：只查这些 id，不做全历史扫描。

@@ -156,15 +156,15 @@ impl MemoryStore {
             return Err(MemoryError::Invalid);
         }
         validate(&value)?;
-        let hash = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&(
-                expected_generation,
-                &value,
-                &source,
-                &self.scope
-            ))?)
-        );
+        let hash = (Sha256::digest(serde_json::to_vec(&(
+            expected_generation,
+            &value,
+            &source,
+            &self.scope,
+        ))?))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
         let mut tx = self.pool.begin().await?;
         self.scope.authorize(&mut tx, self.owner).await?;
         self.lock(&mut tx).await?;

@@ -220,7 +220,10 @@ impl TaskFrames {
             };
             json!({"tasks":summaries,"pending_approvals":approvals,"approval_guidance":guidance,"evidence_note":"Worker notes and results are attributed claims. Inspect relevant evidence to assess them."})
         };
-        let hash = format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&body)?));
+        let hash = (sha2::Sha256::digest(serde_json::to_vec(&body)?))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let already = {
             let current = self.transcript.read();
             current.canonical_payloads().iter().any(|payload| {

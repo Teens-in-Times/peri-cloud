@@ -145,7 +145,7 @@ parser.add_argument("--baseline", type=Path, required=True, help="Verified old h
 parser.add_argument("--candidate", type=Path, required=True, help="Candidate host binary")
 parser.add_argument("--output", type=Path, required=True, help="New disposable fixture directory")
 parser.add_argument("--baseline-schema", type=int, default=9)
-parser.add_argument("--candidate-schema", type=int, default=24)
+parser.add_argument("--candidate-schema", type=int, default=25)
 args = parser.parse_args()
 baseline, candidate, output = args.baseline.resolve(), args.candidate.resolve(), args.output.resolve()
 require(baseline.is_file() and candidate.is_file(), "Host binary missing")
@@ -183,6 +183,7 @@ with Host(candidate, output / "candidate-start", candidate_state) as host:
     require(after["application_id"] == before["application_id"], "Database lineage changed")
     require(after["preserved"] == before["preserved"], "Legacy account/authorization/history rows changed")
     require("agent_task_approval_presentations" in after["tables"], "Approval migration missing")
+    require("cloud_archive_entries" in after["tables"], "Context archive migration missing")
     with sqlite3.connect((candidate_state / "cloud.sqlite").as_uri() + "?mode=ro", uri=True) as db:
         memory = db.execute("SELECT content,source_json FROM memory_items WHERE deleted=0").fetchall()
         require(len(memory) == 1 and memory[0][0] == LEGACY_MEMORY

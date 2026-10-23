@@ -379,7 +379,7 @@ impl CloudAgent {
                         ));
                     }
                     if resolved.entry.fullname == "core:compact" {
-                        return Ok(self.compact_turn(request, model).await);
+                        return self.compact_turn(request, model, personal).await;
                     }
                     if matches!(
                         resolved.entry.fullname.as_str(),
@@ -633,14 +633,40 @@ impl CloudAgent {
         let initial_ids: HashSet<_> = request.history.iter().map(PersistedPayload::id).collect();
         let transcript = session.transcript();
         let prior_context = request.history.iter().any(|p| p.as_message().is_some());
+        let archive = match personal
+            .as_ref()
+            .filter(|_| !self.is_worker() && !approval_control)
         {
-            let mut current = transcript.write();
-            *current = MessageTranscript::new().with_own_payloads(request.history);
+            Some(scope) => Some(
+                crate::archive::CloudArchive::open(scope.clone())
+                    .await
+                    .map_err(|_| Error::Context)?,
+            ),
+            None => None,
+        };
+        {
+            let mut current = MessageTranscript::new().with_own_payloads(request.history);
             // The cloud journal is the canonical store. Keep archived entries in
             // the hot transcript so the end-of-turn settlement preserves them.
             current.enable_deployment_owned_compaction();
             current.set_flags_batch(request.history_flags);
+            if let Some(archive) = &archive {
+                current.bind_deployment_archive(self.session_id.to_string(), archive.clone());
+                current
+                    .checkpoint_archive()
+                    .await
+                    .map_err(|_| Error::Context)?;
+            }
+            *transcript.write() = current;
         }
+        let approval_view = approval_control.then(|| {
+            crate::approval_view::ApprovalView::mask(&mut transcript.write(), personal.as_ref())
+        });
+        let mut task_results = crate::async_results::TurnResults::restore(
+            &transcript.read(),
+            session.async_result_mailbox(),
+        )
+        .map_err(|_| Error::Context)?;
         if let Some(scope) = personal.filter(|s| s.private_memory) {
             chain.add(Box::new(crate::memory::frames::MemoryFrames {
                 scope,
@@ -700,6 +726,12 @@ impl CloudAgent {
                 )
             });
         }
+        if let Some(archive) = archive {
+            tool_map.insert(
+                "ReadContextArchive".into(),
+                Arc::new(crate::archive::ArchiveTool(archive)),
+            );
+        }
         let catalog = Arc::new(
             SessionToolCatalog::try_new(tool_map.clone(), None).map_err(|_| Error::ToolCatalog)?,
         );
@@ -720,6 +752,7 @@ impl CloudAgent {
         let mut metadata = HashMap::new();
         metadata.insert("session_id".into(), self.session_id.to_string());
         let mut builder = StageContext::builder(turn, transcript.clone(), session.queue().clone())
+            .with_async_result_mailbox(session.async_result_mailbox())
             .with_llm(llm)
             .with_tools(tools)
             .with_tool_catalog(catalog)
@@ -756,11 +789,17 @@ impl CloudAgent {
                 serde_json::json!({"source":"execution_agent","turn_id":request.turn_id}),
             )
             .map_err(|_| Error::Context)?;
-            context.session.queue.push(QueuedMessage::system_reminder(
-                peri_agent::session::MessageKind::Defer,
-                MessageSource::SubAgentComplete,
-                frame,
-            ));
+            let delivery_id = MessageId::from(request.turn_id);
+            task_results.expect(delivery_id);
+            context
+                .session
+                .queue
+                .push(QueuedMessage::system_reminder_with_delivery_id(
+                    peri_agent::session::MessageKind::Defer,
+                    MessageSource::SubAgentComplete,
+                    frame,
+                    delivery_id,
+                ));
         } else {
             context.session.queue.push(QueuedMessage::prompt(
                 if self.scheduled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -790,10 +829,19 @@ impl CloudAgent {
             }
         };
         let (outcome, internal_events) = tokio::join!(execution, drain_events(handles, task_scope));
+        task_results
+            .settle(&mut transcript.write())
+            .map_err(|_| Error::Context)?;
+        if let Some(view) = approval_view {
+            view.restore(&mut transcript.write());
+        }
         shared_tools.write().clear();
         let status = match outcome {
             LoopResult::Completed => TurnStatus::Completed,
             LoopResult::Interrupted => TurnStatus::Interrupted,
+            LoopResult::SettlementDue { .. } | LoopResult::HookStopped { .. } => {
+                TurnStatus::Interrupted
+            }
             LoopResult::Error(error) => {
                 // Provider errors may carry request/body data. Log category only.
                 tracing::warn!(session_id = %self.session_id, error_category = ?std::mem::discriminant(&error), "cloud turn failed");

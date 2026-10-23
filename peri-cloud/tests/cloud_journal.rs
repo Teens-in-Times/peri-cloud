@@ -371,6 +371,7 @@ async fn schema_eight_migrates_to_current_and_preserves_rows() {
         .await
         .unwrap();
     for sql in [
+        "DROP TABLE cloud_archive_entries",
         "DROP TABLE agent_task_approval_presentations", "DROP TABLE cloud_native_cancellations", "DROP TABLE cloud_native_operations", "DROP TABLE cloud_device_targets", "DROP TABLE agent_task_instruction_reads", "DROP TABLE agent_task_approvals", "DROP TABLE agent_task_runs", "DROP TABLE agent_task_operations", "DROP TABLE agent_task_checkpoints",
         "DROP TABLE agent_execution_windows", "DROP TABLE agent_execution_sessions",
         "DROP TABLE agent_task_trace", "DROP TABLE agent_task_messages",
@@ -401,17 +402,85 @@ async fn schema_eight_migrates_to_current_and_preserves_rows() {
         .execute(&pool)
         .await
         .unwrap();
+    let legacy_binding = binding(principal);
+    let original = vec![
+        PersistedPayload::Message(BaseMessage::human("original long evidence")),
+        PersistedPayload::Message(BaseMessage::human("private excluded evidence")),
+    ];
+    let legacy_projection = peri_acp_types::projection::MessageProjectionDirective {
+        policy_version: 2,
+        entries: Vec::new(),
+        ..Default::default()
+    };
+    let legacy_state = peri_cloud::state::SessionState {
+        frozen: legacy_binding.clone(),
+        permission_mode: PermissionMode::Default as u8,
+        history: original.clone(),
+        history_flags: HashMap::from([
+            (
+                original[0].id(),
+                MessageFlags {
+                    truncated: true,
+                    projection: Some(legacy_projection.clone()),
+                    ..Default::default()
+                },
+            ),
+            (
+                original[1].id(),
+                MessageFlags {
+                    excluded: true,
+                    truncated: true,
+                    projection: Some(legacy_projection),
+                },
+            ),
+        ]),
+        unsettled_jobs: None,
+        revision: 11,
+        context_generation: 7,
+    };
+    sqlx::query("INSERT INTO cloud_sessions(id,principal,state_json) VALUES(?,?,?)")
+        .bind(legacy_binding.session_id.to_string())
+        .bind(principal.to_string())
+        .bind(serde_json::to_string(&legacy_state).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
     pool.close().await;
 
     let journal = CloudJournal::open(root.path())
         .await
         .unwrap_or_else(|error| panic!("open after downgrade: {error:?}"));
     let pool = raw_pool(&path).await;
+    let migrated = journal
+        .session(principal, legacy_binding.session_id)
+        .await
+        .unwrap();
+    assert_eq!(migrated.frozen, legacy_binding);
+    assert_eq!(
+        migrated
+            .history
+            .iter()
+            .map(peri_acp_types::store::serialize_persisted_payload)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        original
+            .iter()
+            .map(peri_acp_types::store::serialize_persisted_payload)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    );
+    assert!(!migrated.history_flags[&original[0].id()].truncated);
+    assert!(migrated.history_flags[&original[0].id()]
+        .projection
+        .is_none());
+    assert!(migrated.history_flags[&original[1].id()].excluded);
+    assert!(migrated.unsettled_jobs.is_none());
+    assert_eq!((migrated.revision, migrated.context_generation), (11, 7));
     let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     let (application_id,): (i64,) = sqlx::query_as("PRAGMA application_id")
         .fetch_one(&pool)
         .await
@@ -443,7 +512,7 @@ async fn schema_eight_migrates_to_current_and_preserves_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     pool.close().await;
     journal.close().await;
 }

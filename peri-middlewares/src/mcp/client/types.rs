@@ -1,7 +1,6 @@
 //! 客户端句柄、状态与 scoped connection identity；由 client 保持原导出路径。
 
 use crate::mcp::config::ConfigSource;
-use peri_acp_types::dynamic_mcp::DynamicMcpInstanceKey;
 use rmcp::{
     model::{Resource, Tool},
     service::{Peer, RoleClient},
@@ -60,6 +59,12 @@ pub struct ServerInfo {
     pub cache_status: Option<String>,
     pub tool_count: usize,
     pub resource_count: usize,
+    /// 工具/资源的有界投影（`mcp/list` 面板数据源）；全量计数仍是
+    /// `tool_count`/`resource_count`。
+    pub tools: Vec<peri_acp_types::ports::McpToolInfo>,
+    pub resources: Vec<peri_acp_types::ports::McpResourceInfo>,
+    /// 配置声明的订阅项；None = 未配置。
+    pub subscriptions: Option<peri_acp_types::plugin::McpSubscriptionsConfig>,
     /// OAuth 授权状态
     pub oauth_status: OAuthStatus,
     /// 配置来源
@@ -89,6 +94,7 @@ pub enum McpPoolError {
 /// 单个 MCP 服务器的客户端句柄
 #[derive(Clone)]
 pub struct McpClientHandle {
+    pub call_gate: crate::mcp::McpCallGate,
     pub name: String,
     pub version: Option<String>,
     pub cache_version: Option<String>,
@@ -117,9 +123,6 @@ pub(crate) enum McpConnectionKey {
     Static {
         server_name: String,
     },
-    Dynamic {
-        instance: DynamicMcpInstanceKey,
-    },
     /// 会话级 ACP（MCP over ACP）连接：持久化 cache 只按声明会话 + 连接身份 +
     /// 连接代命中（M7）。见 [`AcpConnectionIdentity`]。
     Acp {
@@ -130,23 +133,23 @@ pub(crate) enum McpConnectionKey {
 
 /// 会话级 ACP 连接的持久化 cache 身份（M7）。
 ///
-/// 三个字段都是**非凭据**的 opaque 值：`connection_id` 是 ACP `mcp/connect`
-/// 返回的连接句柄，`generation` 是池内的句柄代号。凭据（token / header / env）
+/// 三个字段都是**非凭据**的 opaque 值：`server_id` 是 client 在会话 setup 中
+/// 声明的 `serverId`，`generation` 是池内的句柄代号。凭据（token / header / env）
 /// 从不进入本结构，也不写入日志或 cache 键。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct AcpConnectionIdentity {
     pub(crate) session_id: String,
-    pub(crate) connection_id: String,
+    pub(crate) server_id: String,
     pub(crate) generation: u64,
 }
 
 impl AcpConnectionIdentity {
     /// cache origin 的连接段：换代（generation 变化）或更换声明（session /
-    /// connection 变化）都会得到不同 origin，旧缓存自然 miss。
+    /// serverId 变化）都会得到不同 origin，旧缓存自然 miss。
     pub(crate) fn cache_origin_segment(&self) -> String {
         format!(
             "acp:{}:{}:{}",
-            self.session_id, self.connection_id, self.generation
+            self.session_id, self.server_id, self.generation
         )
     }
 }
@@ -156,10 +159,6 @@ impl McpConnectionKey {
         Self::Static {
             server_name: server_name.into(),
         }
-    }
-
-    pub(crate) fn dynamic(instance: DynamicMcpInstanceKey) -> Self {
-        Self::Dynamic { instance }
     }
 
     pub(crate) fn acp(server_name: impl Into<String>, identity: AcpConnectionIdentity) -> Self {
@@ -172,16 +171,11 @@ impl McpConnectionKey {
     pub(crate) fn server_name(&self) -> &str {
         match self {
             Self::Static { server_name } => server_name,
-            Self::Dynamic { instance } => &instance.logical.server_name,
             Self::Acp { server_name, .. } => server_name,
         }
     }
 
-    pub(crate) fn is_dynamic(&self) -> bool {
-        matches!(self, Self::Dynamic { .. })
-    }
-
-    /// 会话级 ACP 连接身份（静态 / dynamic 连接为 `None`）。
+    /// 会话级 ACP 连接身份（静态 连接为 `None`）。
     pub(crate) fn acp_identity(&self) -> Option<&AcpConnectionIdentity> {
         match self {
             Self::Acp { identity, .. } => Some(identity),

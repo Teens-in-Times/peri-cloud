@@ -11,6 +11,7 @@ use super::super::types::{
 };
 use super::super::v2_bridge::{build_v2_subagent_context, V2SubagentContext};
 use crate::agent::{CompactConfig, ContextBudget};
+use crate::session::tool_catalog::ToolFilterPolicy;
 use crate::session::{FrozenContext, MessageQueue, Session};
 use crate::tools::{BaseTool, ToolInvocationResolver};
 use peri_acp_types::session_resources::SessionResources;
@@ -43,7 +44,7 @@ pub(super) async fn build_subagent_session_v2(
     chain_assembler: Arc<dyn SubagentChainAssembler>,
     tools: Vec<Arc<dyn BaseTool>>,
     tool_filter: crate::session::tool_catalog::ToolFilter,
-    session_mcp_capability: Option<Arc<dyn peri_acp_types::ports::SessionMcpCapabilityPort>>,
+    session_mcp_catalog: Option<Arc<dyn peri_acp_types::ports::SessionMcpCatalogPort>>,
     skill_names: Vec<String>,
     frozen_claude_md: Option<String>,
     frozen_claude_local_md: Option<String>,
@@ -63,10 +64,24 @@ pub(super) async fn build_subagent_session_v2(
     let legacy_embedded_instructions = frozen.legacy_embedded_instructions;
     let cancel_arc: Arc<CancellationToken> = Arc::new(cancel_token.clone());
     let mut host = parent_host.as_deref().cloned().unwrap_or_default();
-    let binding = host
-        .mcp_pool
+    let parent_manager = host.task_manager.clone();
+    let existing_owner = parent_manager
         .as_ref()
-        .and_then(|pool| pool.agent_session_binding(&child_thread_id));
+        .and_then(|manager| manager.child_owner(&child_thread_id));
+    let binding = existing_owner
+        .as_ref()
+        .map(|owner| {
+            let inbox = peri_acp_types::session::SessionInbox::new(Arc::new(owner.queue.clone()));
+            (
+                inbox.handle(),
+                owner.manager.clone() as Arc<dyn peri_acp_types::tasks::TaskManager>,
+            )
+        })
+        .or_else(|| {
+            host.mcp_pool
+                .as_ref()
+                .and_then(|pool| pool.agent_session_binding(&child_thread_id))
+        });
     let queue = binding
         .as_ref()
         .map(|(inbox, _)| inbox.queue().clone())
@@ -78,6 +93,13 @@ pub(super) async fn build_subagent_session_v2(
         cancel_arc,
         queue,
     );
+    // 子 agent 拥有独立作用域：共享 TaskManager 不代表共享结果消费确认。
+    session.set_async_result_mailbox(Arc::new(
+        crate::session::async_result_mailbox::AsyncResultMailbox::new(
+            child_thread_id.clone(),
+            child_thread_id.clone(),
+        ),
+    ));
     host.session_resources = session_resources.clone();
     host.close_state = Arc::default();
     host.task_manager = Some(match binding {
@@ -88,17 +110,43 @@ pub(super) async fn build_subagent_session_v2(
         }
         None => Arc::new(crate::agent::async_tasks::TaskManager::new()),
     });
+    host.child_owner = match existing_owner {
+        Some(owner) => Some(owner),
+        None => match &host.task_manager {
+            Some(manager) => {
+                let parent_id = host
+                    .parent_thread_id
+                    .clone()
+                    .unwrap_or_else(|| child_thread_id.clone());
+                let owner = super::super::resource_owner::ParkedChildOwner::new(
+                    child_thread_id.clone(),
+                    parent_id,
+                    manager.clone(),
+                    session.queue().clone(),
+                    session_resources.clone(),
+                    host.mcp_pool.as_ref().map(Arc::downgrade),
+                );
+                // 父宿主可寻址即登记；嵌入/无父路径仍由 child host 自身持有 owner，
+                // 关闭时可取消资源并显式报告缺失的 canonical 能力。
+                if let Some(parent) = &parent_manager {
+                    parent.register_child_owner(owner.clone())?;
+                }
+                Some(owner)
+            }
+            None => None,
+        },
+    };
     host.parent_thread_id = Some(child_thread_id.clone());
     host.on_bg_complete = Some(crate::session::bg_complete::task_bg_complete_callback(
-        crate::agent::async_tasks::delivery::SessionTerminalDelivery::for_queue(
+        crate::agent::async_tasks::delivery::SessionTerminalDelivery::for_queue_with_mailbox(
             session.queue().clone(),
+            session.async_result_mailbox(),
         ),
     ));
     if let (Some(pool), Some(manager)) = (&host.mcp_pool, &host.task_manager) {
         let inbox = peri_acp_types::session::SessionInbox::new(Arc::new(session.queue().clone()));
         pool.bind_agent_session(&child_thread_id, inbox.handle(), manager.clone());
     }
-    session.set_subagent_host(host);
 
     // transcript 绑定（ancestor 先于 with_persistence，顺序不可反）
     {
@@ -116,6 +164,12 @@ pub(super) async fn build_subagent_session_v2(
             None => with_ancestor,
         };
     }
+
+    if let Some(owner) = &host.child_owner {
+        let writer = session.transcript().read().persist_tx_handle();
+        owner.set_writer(writer);
+    }
+    session.set_subagent_host(host);
 
     // 子链装配（frozen 数据注入链上下文；链序由 assembler 实现方保持）。
     // meta_harness_disabled 从 frozen 状态投影（spawn/resume 两条路径都复制
@@ -140,9 +194,10 @@ pub(super) async fn build_subagent_session_v2(
     // `Prebuilt`（嵌入/测试已装配 ReactLLM）原样透传。
     let chain = Arc::new(chain);
     let contribution_chain = Arc::clone(&chain);
-    let llm = llm.into_react_llm(
+    let llm = llm.with_session_id(child_thread_id.clone()).into_react_llm(
         &identity_system,
         external_instructions,
+        session.store().frozen.environment_prompt.clone(),
         legacy_embedded_instructions,
         Arc::new(move || contribution_chain.collect_prompt_contributions()),
         // 归一化：身份 System 随 transcript 持久化（spawn 6b 写入；旧会话的历史
@@ -154,6 +209,16 @@ pub(super) async fn build_subagent_session_v2(
 
     // StageContext 构造（v2_bridge 迁移；tool_invocation_resolver 参数化；
     // 复用上面预创建的 session——transcript 已装载 ancestor 并绑定持久化）
+    // bind_tools 也消费有效策略，避免工具发现/调用绑定先收到父会话已关闭的能力。
+    let tool_filter = ToolFilterPolicy::with_mcp_policy(
+        session
+            .store()
+            .frozen
+            .meta_harness
+            .disabled_middlewares
+            .clone(),
+        tool_filter,
+    );
     let tools = tools
         .into_iter()
         .filter(|tool| tool_filter(tool.as_ref()))
@@ -164,7 +229,7 @@ pub(super) async fn build_subagent_session_v2(
         Arc::clone(&chain),
         chain_assembler.bind_tools(&session, tools, Arc::clone(&tool_filter)),
         tool_filter,
-        session_mcp_capability,
+        session_mcp_catalog,
         &cwd,
         cancel_token,
         tool_invocation_resolver,
@@ -194,6 +259,8 @@ pub(super) fn inherited_frozen_context(
     FrozenContext {
         system_prompt: identity_system.map(Arc::from).unwrap_or_default(),
         external_instructions: parent.and_then(|p| p.store().frozen.external_instructions.clone()),
+        environment_prompt: parent.and_then(|p| p.store().frozen.environment_prompt.clone()),
+        legacy_embedded_environment: false,
         legacy_embedded_instructions: parent
             .is_some_and(|p| p.store().frozen.legacy_embedded_instructions),
         claude_md: frozen_claude_md

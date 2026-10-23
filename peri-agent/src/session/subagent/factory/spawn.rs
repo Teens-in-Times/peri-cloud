@@ -11,7 +11,8 @@ use super::super::run_sync::{
     SyncCompletion,
 };
 use super::super::types::{
-    ForkDirectiveKind, SubagentRunMode, SubagentSpawnConfig, SubagentSpawned,
+    ChildRunOutcome, ForkDirectiveKind, SubagentFailure, SubagentRunMode, SubagentSpawnConfig,
+    SubagentSpawned,
 };
 use super::super::v2_bridge::agent_id_from_child_thread;
 use super::context::{build_subagent_session_v2, derive_cancel_token, inherited_frozen_context};
@@ -165,10 +166,12 @@ pub(super) async fn spawn_subagent_impl(
     let cancel_policy = cancel_policy.as_cancel_policy();
     let cancel_token = derive_cancel_token(parent, cancel_token_cfg, cancel_policy);
 
+    // 父历史在本函数内只被继承区消费一次：先固定 snapshot 位于父消息尾，再把
+    // Vec 直接交给 PersistedPayload，避免同时持有原 Vec 与逐条 clone 的副本。
+    let snapshot_id = parent_messages.last().map(|m| m.id());
     let mut inherited = InheritedContext {
         payloads: parent_messages
-            .iter()
-            .cloned()
+            .into_iter()
             .map(PersistedPayload::Message)
             .collect(),
         flags: Default::default(),
@@ -269,7 +272,6 @@ pub(super) async fn spawn_subagent_impl(
             return Err(peri_acp_types::workspace::WorkspaceError::ExecutionBindingMismatch.into());
         }
         let root_id = super::execution_root(store.as_ref(), &parent_id).await?;
-        let snapshot_id = parent_messages.last().map(|m| m.id());
         let child = peri_acp_types::session_resources::ChildSnapshot {
             target: peri_acp_types::session_resources::NewSession {
                 thread_id: child_thread_id.clone(),
@@ -319,7 +321,7 @@ pub(super) async fn spawn_subagent_impl(
         tool_filter,
         parent
             .and_then(|session| session.subagent_host())
-            .and_then(|host| host.session_mcp_capability.clone()),
+            .and_then(|host| host.session_mcp_catalog.clone()),
         skill_names,
         frozen_claude_md,
         frozen_claude_local_md,
@@ -404,9 +406,42 @@ pub(super) async fn spawn_subagent_impl(
                 },
             )
             .await?;
-            let (interrupted, pending_tasks, pending_task_id) = match completion {
-                SyncCompletion::Finished(interrupted) => (interrupted, Vec::new(), None),
-                SyncCompletion::Pending(tasks) => (false, tasks, Some(sync_task_id)),
+            let (interrupted, pending_tasks, pending_task_id, handoff) = match completion {
+                SyncCompletion::Finished(ChildRunOutcome::Settled) => {
+                    (false, Vec::new(), None, None)
+                }
+                SyncCompletion::Finished(ChildRunOutcome::Interrupted) => {
+                    (true, Vec::new(), None, None)
+                }
+                SyncCompletion::Finished(ChildRunOutcome::HandedOff { receipt }) => {
+                    let tasks = receipt
+                        .tasks
+                        .iter()
+                        .map(|task| task.task_id.clone())
+                        .collect();
+                    (false, tasks, None, Some(receipt))
+                }
+                SyncCompletion::Finished(ChildRunOutcome::Failed { error, .. }) => {
+                    return Err(Box::new(SubagentFailure::new(
+                        child_thread_id.clone(),
+                        agent_name.clone(),
+                        error,
+                    )))
+                }
+                SyncCompletion::Finished(ChildRunOutcome::HandoffFailed { cause, failure }) => {
+                    return Err(Box::new(SubagentFailure::handoff_failed(
+                        child_thread_id.clone(),
+                        agent_name.clone(),
+                        cause,
+                        &failure,
+                    )))
+                }
+                SyncCompletion::Pending(pending) => (
+                    false,
+                    pending.pending_tasks,
+                    Some(sync_task_id),
+                    Some(pending.receipt),
+                ),
             };
             Ok(SubagentSpawned {
                 child_thread_id,
@@ -415,6 +450,7 @@ pub(super) async fn spawn_subagent_impl(
                 cancel_token,
                 interrupted,
                 pending_tasks,
+                handoff,
             })
         }
         SubagentRunMode::Background => {
@@ -449,6 +485,7 @@ pub(super) async fn spawn_subagent_impl(
                 cancel_token,
                 interrupted: false,
                 pending_tasks: Vec::new(),
+                handoff: None,
             })
         }
     }

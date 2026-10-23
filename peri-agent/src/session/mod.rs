@@ -22,9 +22,11 @@
 //! cron 主路径由 `AcpSession.cron_bridge`（session 级）持有，跨 turn 存活；
 //! `set_async_owners` 仅 print fallback 使用。
 
+pub mod async_result_mailbox;
 pub mod async_router;
 pub mod bg_complete;
 pub mod config;
+pub mod cron_events;
 pub mod exec;
 pub mod factory;
 /// 对象级内存计量与诊断采样（S1）；只读诊断，不参与业务语义。
@@ -43,7 +45,6 @@ pub mod transcript;
 pub(crate) mod test_resources;
 pub mod turn;
 pub mod user_input_mailbox;
-pub mod workflow_completion;
 
 pub use config::{PermissionMode, SessionConfig, ThinkingConfig};
 /// MessageFlags 已下沉 peri-acp-types（store 契约），此处 re-export 保持兼容。
@@ -85,6 +86,10 @@ pub struct Session {
     /// 收件箱（独立于 Transcript，会话内持续可变）
     queue: MessageQueue,
     user_input_mailbox: RwLock<Option<Arc<user_input_mailbox::UserInputMailbox>>>,
+    /// 会话级后台结果处理责任 owner；跨 prompt 复用，由宿主装配注入。
+    async_result_mailbox: RwLock<Arc<async_result_mailbox::AsyncResultMailbox>>,
+    compact_exposure:
+        RwLock<Arc<parking_lot::Mutex<crate::agent::compact_v2::exposure::ExposureLedger>>>,
     /// 可变配置（Arc 共享，外部写入，循环读取）
     config: Arc<SessionConfig>,
     /// 异步 owner 容器（set-once，RwLock 保护）。
@@ -114,6 +119,10 @@ impl Session {
             transcript,
             queue,
             user_input_mailbox: RwLock::new(None),
+            async_result_mailbox: RwLock::new(Arc::new(
+                async_result_mailbox::AsyncResultMailbox::default(),
+            )),
+            compact_exposure: RwLock::new(Arc::default()),
             config,
             async_owners: None,
             subagent_host: parking_lot::RwLock::new(None),
@@ -142,6 +151,10 @@ impl Session {
             transcript,
             queue,
             user_input_mailbox: RwLock::new(None),
+            async_result_mailbox: RwLock::new(Arc::new(
+                async_result_mailbox::AsyncResultMailbox::default(),
+            )),
+            compact_exposure: RwLock::new(Arc::default()),
             config,
             async_owners: None,
             subagent_host: parking_lot::RwLock::new(None),
@@ -178,6 +191,10 @@ impl Session {
             transcript,
             queue,
             user_input_mailbox: RwLock::new(None),
+            async_result_mailbox: RwLock::new(Arc::new(
+                async_result_mailbox::AsyncResultMailbox::default(),
+            )),
+            compact_exposure: RwLock::new(Arc::default()),
             config,
             // v2 路径启用 async owner 容器（RwLock，允许后续 set_async_owners 注入）
             async_owners: Some(parking_lot::RwLock::new(None)),
@@ -202,6 +219,30 @@ impl Session {
 
     pub fn set_user_input_mailbox(&self, mailbox: Arc<user_input_mailbox::UserInputMailbox>) {
         *self.user_input_mailbox.write() = Some(mailbox);
+    }
+
+    /// 绑定会话级结果处理责任 owner（跨 prompt 复用）。
+    pub fn set_async_result_mailbox(&self, mailbox: Arc<async_result_mailbox::AsyncResultMailbox>) {
+        *self.async_result_mailbox.write() = mailbox;
+    }
+
+    /// 会话级结果处理责任 owner。
+    pub fn async_result_mailbox(&self) -> Arc<async_result_mailbox::AsyncResultMailbox> {
+        Arc::clone(&self.async_result_mailbox.read())
+    }
+
+    /// 会话运行期有界消费账本；冷创建不恢复旧执行证据。
+    pub fn compact_exposure(
+        &self,
+    ) -> Arc<parking_lot::Mutex<crate::agent::compact_v2::exposure::ExposureLedger>> {
+        Arc::clone(&self.compact_exposure.read())
+    }
+
+    pub(crate) fn set_compact_exposure(
+        &self,
+        ledger: Arc<parking_lot::Mutex<crate::agent::compact_v2::exposure::ExposureLedger>>,
+    ) {
+        *self.compact_exposure.write() = ledger;
     }
 
     /// 子 agent 运行时宿主（L3）。executor/builder 在主 session 创建后注入；

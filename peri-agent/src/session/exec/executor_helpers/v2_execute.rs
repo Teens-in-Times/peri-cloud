@@ -111,6 +111,8 @@ pub struct V2ExecuteRequest {
     // ── 会话数据 ──
     pub session_id: String,
     pub user_input_mailbox: Option<Arc<crate::session::user_input_mailbox::UserInputMailbox>>,
+    /// 会话级后台结果处理责任 owner；None 时本次执行创建本地 owner。
+    pub async_result_mailbox: Option<Arc<crate::session::async_result_mailbox::AsyncResultMailbox>>,
     pub cwd: String,
     pub cancel: CancellationToken,
     pub session_resources: Option<Arc<dyn SessionResources>>,
@@ -247,6 +249,20 @@ pub async fn build_and_execute_agent_v2(req: V2ExecuteRequest) -> ExecOutcome {
     v2_out.context.session.user_input_mailbox = req.user_input_mailbox.clone();
     if let Some(mailbox) = &req.user_input_mailbox {
         v2_out.session.set_user_input_mailbox(mailbox.clone());
+    }
+    if let Some(mailbox) = &req.async_result_mailbox {
+        v2_out.session.set_async_result_mailbox(Arc::clone(mailbox));
+        v2_out.context.session.async_result_mailbox = Arc::clone(mailbox);
+        // 显式用户继续（非自动 continuation，或队列交接的用户输入）恢复被 Stop
+        // 暂停或被阶段失败阻塞的处理责任。
+        let explicit_continue = !req.continuation
+            || req
+                .user_input_mailbox
+                .as_ref()
+                .is_some_and(|mailbox| mailbox.has_handed_off_inputs());
+        if explicit_continue {
+            mailbox.resume_scope();
+        }
     }
     if let Some(cache) = new_cache {
         (req.store_llm)(cache);
@@ -505,7 +521,12 @@ pub async fn build_and_execute_agent_v2(req: V2ExecuteRequest) -> ExecOutcome {
         .await;
     }
 
-    if matches!(&loop_result, LoopResult::Completed) {
+    // HookStopped 在主会话按 Completed 语义结束：保留原先的 MQ steering
+    // continuation 行为；子 Agent 的 HookStopped 已在 child runner 内消费。
+    if matches!(
+        &loop_result,
+        LoopResult::Completed | LoopResult::HookStopped { .. }
+    ) {
         let queue = v2_out.session.queue();
         if queue.has_ensure_processing() {
             if let Some(ref tx) = req.continuation_notify {
@@ -513,6 +534,7 @@ pub async fn build_and_execute_agent_v2(req: V2ExecuteRequest) -> ExecOutcome {
                     session_id: req.session_id.clone(),
                     kind: BgTaskKind::Agent,
                     mq_steering: true,
+                    pending_result: false,
                 });
                 tracing::debug!(
                     session_id = %req.session_id,
@@ -743,10 +765,14 @@ fn internal_failure_terminal(failure: ExecutionFailure) -> LoopTerminal {
 /// Phase 9 纯分类器：一次同时决定 Prompt、Turn 和 fatal failure。
 ///
 /// 分类契约（spec/history/2026-08.md 2026-08-18 条目 Commit 1）：
-/// - `Completed` / 用户 cancel / `Interrupted` / `MaxIterationsExceeded` →
-///   failure 为 `None`（它们已有标准 `StopReason` 表达，不应升级为请求失败）；
+/// - `Completed` / `HookStopped` / 用户 cancel / `Interrupted` /
+///   `MaxIterationsExceeded` → failure 为 `None`（它们已有标准 `StopReason`
+///   表达，不应升级为请求失败）；
 /// - 其他 `LoopResult::Error` → failure 为安全的窄投影：LLM 错误保留脱敏、
 ///   限长后的原始含义和可选 HTTP status，其他错误使用安全用户文案。
+///
+/// `HookStopped` 只终止当前 run 的模型请求；主会话与 `Completed` 一样正常
+/// 结束（子 Agent 的交接语义在 runner 消费该结果后已经完成）。
 ///
 /// fatal 判定与 `AgentExecutionFailed` 发射条件共享（fatal ↔ 发射私有事件），
 /// public message 由 [`ExecutionFailure::from_agent_error`] 统一生成。
@@ -754,7 +780,10 @@ pub(crate) fn classify_loop_terminal(
     loop_result: &LoopResult,
     sampled_cancel: bool,
 ) -> LoopTerminal {
-    if matches!(loop_result, LoopResult::Completed) {
+    if matches!(
+        loop_result,
+        LoopResult::Completed | LoopResult::HookStopped { .. }
+    ) {
         return LoopTerminal {
             ok: true,
             stop_reason: PromptStopReason::EndTurn,
@@ -801,8 +830,15 @@ pub(crate) fn classify_loop_terminal(
             turn_error_kind: Some(TurnErrorKind::LlmFailure),
         };
     }
+    // `SettlementDue` 只应由 child loop 产生并由 child runner 消费；主 executor
+    // 若收到它，说明调用边界被混用。显式失败而不是 panic，也不伪装成正常结束。
+    if matches!(loop_result, LoopResult::SettlementDue { .. }) {
+        return internal_failure_terminal(ExecutionFailure::internal(
+            "child settlement result reached the main executor",
+        ));
+    }
     let LoopResult::Error(error) = loop_result else {
-        unreachable!("Completed and Interrupted were classified above")
+        unreachable!("Completed, HookStopped, Interrupted and classified errors were handled above")
     };
     LoopTerminal {
         ok: false,

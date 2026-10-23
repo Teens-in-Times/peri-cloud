@@ -115,6 +115,9 @@ const SELECT_META_SQL: &str = concat!(
     " FROM threads s WHERE s.id = ?1"
 );
 
+/// 恢复准入的轻量 frozen 读取：只取一列，不拉绑定、继承区或任何正文。
+const SELECT_FROZEN_SQL: &str = "SELECT s.frozen_context FROM threads s WHERE s.id = ?1";
+
 const SELECT_CHILDREN_SQL: &str = concat!(
     "SELECT ",
     meta_columns!(),
@@ -315,6 +318,11 @@ pub(super) fn select_session_statement(id: &str) -> StatementSpec {
 /// 会话 metadata 行（不含大字段）。
 pub(super) fn select_meta_statement(id: &str) -> StatementSpec {
     StatementSpec::new(SELECT_META_SQL, vec![Value::Text(id.to_owned())])
+}
+
+/// 恢复准入的 frozen 单列读取。
+pub(super) fn select_frozen_statement(id: &str) -> StatementSpec {
+    StatementSpec::new(SELECT_FROZEN_SQL, vec![Value::Text(id.to_owned())])
 }
 
 /// 直接子会话 metadata。
@@ -593,6 +601,9 @@ const INSERT_BINDING_SQL: &str =
         (SELECT discovery_snapshot FROM session_bindings WHERE thread_id = ?7)), 'creation_snapshot')";
 
 /// 继承区写入：与本机 child 路径同一份语句（创建行之后单独写一次，INSERT 不多带一列）。
+///
+/// 不在这里写 `inherited_*_index` 派生行：远端读取一次性取完整列，从不查询派生索引；
+/// 索引缺行是合法状态（本地读取会回退扫描并按需回填）。
 const UPDATE_INHERITED_SQL: &str = "UPDATE threads SET inherited_context = ?1 WHERE id = ?2";
 
 /// 历史行插入：列清单与本机 `messages` 一致（含 `role`），顺序由 `rowid` 承载。
@@ -791,6 +802,55 @@ pub(super) fn revoke_draft_statements(id: &str) -> Vec<StatementSpec> {
     .collect()
 }
 
+/// 草稿撤销的 inherited 索引删除：与三条 canonical 删除共用同一 `frozen_context IS NULL`
+/// 判据，payload 先于 snapshot（R08）。
+const DELETE_DRAFT_INHERITED_PAYLOADS_SQL: &str =
+    "DELETE FROM inherited_payload_index WHERE snapshot_id IN
+    (SELECT snapshot_id FROM inherited_snapshot_index WHERE thread_id = ?1)
+    AND EXISTS (SELECT 1 FROM threads WHERE id = ?1 AND frozen_context IS NULL)";
+const DELETE_DRAFT_INHERITED_SNAPSHOT_SQL: &str = "DELETE FROM inherited_snapshot_index
+    WHERE thread_id = ?1 AND EXISTS (SELECT 1 FROM threads WHERE id = ?1 AND frozen_context IS NULL)";
+
+/// 把 inherited 派生索引删除插入撤销批次中**线程删除之前**。
+///
+/// `has_snapshot`/`has_payload` 由调用方探测可选表；缺表时跳过，旧库删除不因此失败。
+/// payload 行只能经 snapshot 的 `snapshot_id` 定位，所以缺 snapshot 表时两者都跳过。
+pub(super) fn with_inherited_index_deletes(
+    mut effects: Vec<StatementSpec>,
+    id: &str,
+    has_snapshot: bool,
+    has_payload: bool,
+    draft_guard: bool,
+) -> Vec<StatementSpec> {
+    if !has_snapshot {
+        return effects;
+    }
+    let mut derived = Vec::with_capacity(2);
+    if has_payload {
+        derived.push(StatementSpec::new(
+            if draft_guard {
+                DELETE_DRAFT_INHERITED_PAYLOADS_SQL
+            } else {
+                canonical::DELETE_INHERITED_PAYLOADS_BY_THREAD_SQL
+            },
+            vec![Value::Text(id.to_owned())],
+        ));
+    }
+    derived.push(StatementSpec::new(
+        if draft_guard {
+            DELETE_DRAFT_INHERITED_SNAPSHOT_SQL
+        } else {
+            canonical::DELETE_INHERITED_SNAPSHOT_BY_THREAD_SQL
+        },
+        vec![Value::Text(id.to_owned())],
+    ));
+    // 批次最后一条必须是线程删除（撤销流程用 `counts.last()` 判断判据是否成立）。
+    let thread_delete = effects.pop();
+    effects.extend(derived);
+    effects.extend(thread_delete);
+    effects
+}
+
 /// 历史行的插入语句：flags 与内容一次写入（fork 目标由门面完成 ID 重映射，本层不重跑算法）。
 pub(super) fn insert_message_statement(
     thread_id: &str,
@@ -863,38 +923,5 @@ pub(super) fn binding_relative_text(binding: &SessionBinding) -> SessionResource
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 远端两条撤销入口的判据点：write-once（fork 补偿）不叠加 frozen 判据，
-    /// 两阶段草稿的三条删除全部带 `frozen_context IS NULL`。
-    #[test]
-    fn revocation_statements_split_by_entry_point() {
-        // 两阶段草稿：判据在每一条删除上（同一批内不会出现「历史删了、会话行还在」）。
-        let draft = revoke_draft_statements("s");
-        assert_eq!(draft.len(), 3);
-        for statement in &draft {
-            assert!(
-                statement.sql.contains("frozen_context IS NULL"),
-                "草稿撤销的每条删除都必须带未提交判据: {}",
-                statement.sql
-            );
-            assert!(
-                statement.sql.starts_with("DELETE"),
-                "只允许删除语句: {}",
-                statement.sql
-            );
-        }
-        // write-once：撤销未发布创建（fork 等）不叠加 frozen 判据——目标创建即带 frozen，
-        // 补偿就是把它整条删掉。
-        let write_once = revoke_session_statements("s");
-        assert_eq!(write_once.len(), 3);
-        for statement in &write_once {
-            assert!(
-                !statement.sql.contains("frozen_context"),
-                "write-once 撤销不得叠加 frozen 判据: {}",
-                statement.sql
-            );
-        }
-    }
-}
+#[path = "session_sql_test.rs"]
+mod tests;

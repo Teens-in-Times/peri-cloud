@@ -40,7 +40,10 @@ impl Vault {
         digest.update(origin.as_bytes());
         digest.update([0]);
         digest.update(device_id.as_bytes());
-        let key = format!("{:x}", digest.finalize());
+        let key = (digest.finalize())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]

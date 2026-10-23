@@ -614,6 +614,66 @@ async fn test_full_compact_sqlite_persists_lifecycle_and_preserves_ancestor_and_
 }
 
 #[tokio::test]
+async fn test_full_rejects_retained_catalog_growth_before_any_durable_or_hot_change() {
+    use peri_acp_types::context_archive::{
+        build_catalog, validate_projection_metadata, ARCHIVE_MAX_METADATA_BYTES,
+    };
+    let bound = crate::session::test_resources::TestSession::open().await;
+    let mut transcript =
+        MessageTranscript::new().with_persistence(bound.resources(), bound.thread_id.clone());
+    let message = make_human("canonical history remains available");
+    let id = message.id();
+    let catalog = build_catalog(
+        bound.thread_id.clone(),
+        "full-near-budget".into(),
+        id,
+        &[PersistedPayload::Message(message.clone())],
+        String::new(),
+    )
+    .unwrap();
+    let mut directive = MessageProjectionDirective {
+        policy_version: PROJECTION_POLICY_VERSION,
+        archive_catalog: Some(catalog),
+        ..Default::default()
+    };
+    let size = serde_json::to_vec(&directive).unwrap().len();
+    directive.archive_catalog.as_mut().unwrap().receipt =
+        "x".repeat(ARCHIVE_MAX_METADATA_BYTES - size);
+    validate_projection_metadata(&directive).unwrap();
+    transcript.append(message);
+    transcript.set_flags_projection(id, directive);
+    transcript.flush_persistence().await.unwrap();
+    let revision = transcript.view_revision();
+    let flags = transcript.flags(id);
+    let error = full_compact_inner(
+        &mut transcript,
+        Some(&FullLifecycleModel),
+        &CompactConfig::default(),
+        "/tmp",
+    )
+    .await
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Full archive metadata cannot be read"));
+    assert_eq!(transcript.view_revision(), revision);
+    assert_eq!(transcript.flags(id), flags);
+    assert_eq!(transcript.len(), 1);
+    assert!(!transcript.compaction_commit_state().is_uncertain());
+    let stored = bound
+        .resources()
+        .load_session_snapshot(&bound.thread_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.payloads.len(),
+        1,
+        "failed Full must not append its summary"
+    );
+    assert_eq!(stored.flags[&id], flags);
+}
+
+#[tokio::test]
 async fn test_full_compact_history_read_only_backend_leaves_memory_and_store_unchanged() {
     let dir = tempfile::tempdir().expect("创建临时目录失败");
     let file_path = dir.path().join("full-lifecycle.rs");
@@ -669,10 +729,8 @@ async fn test_full_compact_history_read_only_backend_leaves_memory_and_store_unc
     .expect_err("只读能力面必须明确拒绝 lifecycle");
 
     assert!(
-        error
-            .to_string()
-            .contains("compact persistence did not commit"),
-        "应返回 lifecycle 未提交错误，实际: {error}"
+        error.to_string().contains("NotApplied"),
+        "确定拒绝必须保留 NotApplied 证据，实际: {error}"
     );
     assert_eq!(
         transcript
@@ -717,8 +775,8 @@ async fn test_full_compact_empty_transcript_skips() {
     // 由于 full_compact_inner 需要 LLM，这里用 Micro 代替测试空 transcript
     let mut t = MessageTranscript::new();
     let config = CompactConfig::default();
-    let affected = crate::agent::compact_v2::micro::micro_compact(&mut t, &config);
+    let affected = crate::agent::compact_v2::micro::micro_compact(&mut t, &config)
+        .await
+        .unwrap();
     assert_eq!(affected, 0);
 }
-
-// ── 辅助函数测试 ───────────────────────────────────────────────────────────

@@ -198,8 +198,9 @@ async fn test_save_new_session_requires_a_registered_workspace() {
         .await
         .unwrap();
     let workspace = workspace(&store, directory.path()).await;
+    // 项目不是执行准入身份；未注册的 workspace 归属行仍然必须被拒绝。
     let unknown = ResolvedWorkspace {
-        project_id: peri_acp_types::workspace::ProjectId::new(),
+        workspace_id: peri_acp_types::workspace::WorkspaceId::new(),
         ..workspace
     };
     let input = session("s-unknown", "/tmp", &unknown, frozen("unknown"));
@@ -214,6 +215,36 @@ async fn test_save_new_session_requires_a_registered_workspace() {
     );
     // 未注册的绑定不能留下半条会话行。
     assert!(data.load_snapshot(&"s-unknown".to_owned()).await.is_err());
+}
+
+/// [回归测试] 写入绑定必须引用已登记项目；项目不参与准入，但写入不得凭空引用。
+#[tokio::test]
+async fn test_save_new_session_requires_a_registered_project() {
+    let (_store, data, directory) = database().await;
+    let store = SqliteThreadStore::new(directory.path().join("threads.db"))
+        .await
+        .unwrap();
+    let workspace = workspace(&store, directory.path()).await;
+    let unknown = ResolvedWorkspace {
+        project_id: peri_acp_types::workspace::ProjectId::new(),
+        ..workspace
+    };
+    let input = session("s-unknown-project", "/tmp", &unknown, frozen("unknown"));
+
+    let error = data.save_new_session(&input).await.unwrap_err();
+    assert!(
+        matches!(
+            error.kind(),
+            peri_acp_types::session_resources::SessionResourceErrorKind::Workspace(
+                peri_acp_types::workspace::WorkspaceError::InvalidBinding
+            )
+        ),
+        "{error}"
+    );
+    assert!(data
+        .load_snapshot(&"s-unknown-project".to_owned())
+        .await
+        .is_err());
 }
 
 // ─── 读取：一致快照与轻量投影 ──────────────────────────────────────────────────
@@ -565,6 +596,16 @@ async fn test_save_child_uses_root_frozen_bytes_and_enforces_relationships() {
     let loaded = data.load_snapshot(&"s-child".to_owned()).await.unwrap();
     assert_eq!(loaded.meta.parent_thread_id.as_deref(), Some("s-root"));
     assert_eq!(loaded.inherited.payloads.len(), 1);
+    // 创建路径必须同时落下派生索引：命中从第一次读取就可用，逻辑长度来自写时序列化。
+    let indexed: (i64, Option<i64>) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(logical_len) FROM inherited_payload_index
+         WHERE snapshot_id IN (SELECT snapshot_id FROM inherited_snapshot_index)",
+    )
+    .fetch_one(&store.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(indexed.0, 1);
+    assert!(indexed.1.is_some());
     assert_eq!(
         loaded.frozen,
         FrozenState::Present(FrozenSnapshotBytes::new(r#"{"version":1,"marker":"root"}"#))

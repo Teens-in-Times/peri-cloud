@@ -1,4 +1,5 @@
 use super::*;
+use serial_test::serial;
 
 // ─── SubAgent v2 集成测试（4 场景）──────────────────────────────────────
 //
@@ -19,6 +20,7 @@ use super::*;
 /// - mock LLM 收到的 messages 包含 `BaseMessage::System` 内容含 "FORK-CONTEXT-SP"（验证 BUG-B fork 路径）
 /// - mock LLM 收到的 messages 包含全部 3 条父消息（按顺序透传，验证 BUG-C）
 #[tokio::test]
+#[serial]
 async fn test_integration_fork_parent_messages_passthrough() {
     let host = HostFixture::open("fixture-iv2-passthrough").await;
     // Arrange: 3 条父消息（Human/AI 交替 + 1 条 system context）
@@ -56,6 +58,7 @@ async fn test_integration_fork_parent_messages_passthrough() {
     );
 
     // Act: fork 模式触发端到端路径
+    super::super::invocation::reset_current_messages_calls();
     let result = t
         .invoke(
             serde_json::json!({
@@ -66,6 +69,11 @@ async fn test_integration_fork_parent_messages_passthrough() {
         )
         .await
         .unwrap();
+    assert_eq!(
+        super::super::invocation::current_messages_calls(),
+        1,
+        "fork 必须恰物化一次父历史"
+    );
 
     // Assert 0: 执行成功（v2 loop 正常完成）
     assert!(
@@ -675,309 +683,6 @@ async fn test_integration_sync_cascade_cancel_returns_interrupted_marker() {
 
 /// P0-2：background non-fork 必须通过实际 `invoke_background` 路径，由 loop 在
 /// Receive 后唯一执行 before_agent。测试使用 registry 和 bg event sender，不轮询或 sleep。
-#[tokio::test]
-async fn test_p0_2_background_defined_skill_preload_once_after_parent_cancel() {
-    use peri_agent::agent::events::ExecutorEvent;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::mpsc;
 
-    let dir = tempdir().unwrap();
-    let agents_dir = dir.path().join(".claude").join("agents");
-    let skills_dir = dir.path().join(".claude").join("skills").join("p0-2-skill");
-    std::fs::create_dir_all(&agents_dir).unwrap();
-    std::fs::create_dir_all(&skills_dir).unwrap();
-    std::fs::write(
-        agents_dir.join("p0-2-bg.md"),
-        "---\nname: p0-2-bg\ndescription: P0-2 background agent\nskills:\n  - p0-2-skill\n---\n\nRun the task.\n",
-    )
-    .unwrap();
-    // 磁盘文件是**反例**（W4b：子链预载只查 MCP registry，不读盘）。
-    std::fs::write(
-        skills_dir.join("SKILL.md"),
-        "---\nname: p0-2-skill\ndescription: P0-2 skill\n---\n\nDISK CONTENT MUST NOT BE READ\n",
-    )
-    .unwrap();
-
-    let llm_calls = Arc::new(AtomicUsize::new(0));
-    let preload_count = Arc::new(std::sync::Mutex::new(0));
-    let llm_calls_clone = Arc::clone(&llm_calls);
-    let preload_count_clone = Arc::clone(&preload_count);
-    #[derive(Clone)]
-    struct BackgroundSkillLLM {
-        calls: Arc<AtomicUsize>,
-        preload_count: Arc<std::sync::Mutex<usize>>,
-    }
-    impl BackgroundSkillLLM {
-        async fn respond(
-            &self,
-            request: peri_model::ModelRequest,
-            cancellation: tokio_util::sync::CancellationToken,
-        ) -> Vec<peri_model::ModelResult<peri_model::ModelStreamEvent>> {
-            use crate::subagent::test_support::*;
-            let _ = &cancellation;
-            let messages = base_messages(&request);
-            let defined = defined_tools(&request);
-            let _tools: Vec<&dyn BaseTool> = defined.iter().map(|t| t as &dyn BaseTool).collect();
-
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            assert!(
-                messages
-                    .iter()
-                    .any(|message| message.content().contains("p0-2 background prompt")),
-                "before_agent must observe the prompt only after Receive"
-            );
-            *self.preload_count.lock().unwrap() = messages
-                .iter()
-                .filter(|message| message.content().contains("P0-2 BACKGROUND SKILL MARKER"))
-                .count();
-            text_events("p0-2 background done")
-        }
-    }
-    crate::subagent::test_support::fixture_model_impl!(BackgroundSkillLLM);
-
-    let parent_cancel = AgentCancellationToken::new();
-    let registry = Arc::new(peri_agent::agent::async_tasks::TaskManager::new());
-    let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<ExecutorEvent>();
-    let host = HostFixture::open_in_with_background(
-        dir.path(),
-        "fixture-iv2-skillpreload",
-        Arc::clone(&registry),
-        bg_tx.clone(),
-    )
-    .await;
-    let tool = host.bind(
-        SubAgentTool::new(
-            Arc::new(vec![]),
-            None,
-            Arc::new(move |_: Option<&str>| {
-                crate::subagent::test_support::fixture_source(
-                    std::sync::Arc::new(BackgroundSkillLLM {
-                        calls: Arc::clone(&llm_calls_clone),
-                        preload_count: Arc::clone(&preload_count_clone),
-                    }),
-                    "fixture-scripted",
-                )
-            }),
-            dir.path().to_str().unwrap().to_string(),
-        )
-        .with_cancel(parent_cancel.clone())
-        .with_task_manager(registry)
-        .with_bg_event_sender(bg_tx),
-    );
-    let tool = host.bind(with_agent_face(tool, dir.path()).await);
-    let tool = super::with_skill_registry(
-        tool,
-        "workspace",
-        &[("p0-2-skill", "P0-2 BACKGROUND SKILL MARKER\n")],
-    );
-
-    let started = tool
-        .invoke(
-            serde_json::json!({
-                "subagent_type": "p0-2-bg",
-                "run_in_background": true,
-                "prompt": "p0-2 background prompt",
-                "cwd": dir.path().to_str().unwrap(),
-            }),
-            host.context(&[]),
-        )
-        .await
-        .expect("background defined subagent should start");
-    assert!(started.contains("Background task"));
-    parent_cancel.cancel();
-    host.cancel_parent();
-
-    let mut lifecycle = Vec::new();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while let Some(event) = bg_rx.recv().await {
-            match event {
-                ExecutorEvent::SubagentStarted { is_background, .. } => {
-                    assert!(is_background);
-                    lifecycle.push("started");
-                }
-                ExecutorEvent::SubagentStopped { .. } => lifecycle.push("stopped"),
-                ExecutorEvent::BackgroundTaskCompleted(result) => {
-                    assert!(result.success);
-                    assert!(result.output.contains("p0-2 background done"));
-                    lifecycle.push("completed");
-                    break;
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("background defined subagent must complete within the bounded receiver timeout");
-
-    assert_eq!(lifecycle, ["started", "stopped", "completed"]);
-    assert_eq!(llm_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        *preload_count.lock().unwrap(),
-        1,
-        "explicit skill preload must occur exactly once on execute_bg.rs"
-    );
-}
-
-/// 验证语义优先级（define.rs:399-403 的逻辑：background 优先 → 走 invoke_background_fork）。
-///
-/// 关键断言：
-/// - 调用返回值包含 "Background task"（证明走了 background 路径）
-/// - bg_event_sender 接收到 SubagentStarted（is_background=true）
-/// - background registry 中注册了任务（task_id 前缀为 "bg-"）
-/// - 捕获的 mock LLM prompt 包含 `<fork_directive>`（英文模板，BgForkDirectiveKind::Fork）
-///   而非 `<bg_fork_directive>`（中文模板）——证明 directive kind 正确
-#[tokio::test]
-async fn test_integration_fork_plus_background_priority() {
-    use peri_agent::agent::events::ExecutorEvent;
-    use tokio::sync::mpsc;
-
-    // Arrange: 捕获 LLM 收到的 prompt（用于验证 directive kind）
-    let prompt_capture: Arc<std::sync::Mutex<String>> =
-        Arc::new(std::sync::Mutex::new(String::new()));
-    let prompt_capture_clone = Arc::clone(&prompt_capture);
-
-    #[derive(Clone)]
-    struct PromptCaptureLLM {
-        captured: Arc<std::sync::Mutex<String>>,
-    }
-    impl PromptCaptureLLM {
-        async fn respond(
-            &self,
-            request: peri_model::ModelRequest,
-            cancellation: tokio_util::sync::CancellationToken,
-        ) -> Vec<peri_model::ModelResult<peri_model::ModelStreamEvent>> {
-            use crate::subagent::test_support::*;
-            let _ = &cancellation;
-            let messages = base_messages(&request);
-            let defined = defined_tools(&request);
-            let _tools: Vec<&dyn BaseTool> = defined.iter().map(|t| t as &dyn BaseTool).collect();
-
-            // 找到最后一条 Human 消息（fork directive 在 prompt queue 里）
-            if let Some(last_human) = messages
-                .iter()
-                .rev()
-                .find(|m| matches!(m, BaseMessage::Human { .. }))
-            {
-                *self.captured.lock().unwrap() = last_human.content();
-            }
-            text_events("bg-fork done")
-        }
-    }
-    crate::subagent::test_support::fixture_model_impl!(PromptCaptureLLM);
-
-    let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<ExecutorEvent>();
-    let registry = Arc::new(peri_agent::agent::async_tasks::TaskManager::new());
-
-    let parent_messages: Arc<RwLock<Vec<BaseMessage>>> = Arc::new(RwLock::new(Vec::new()));
-    parent_messages
-        .write()
-        .push(BaseMessage::human("ctx for bg fork"));
-
-    let host = HostFixture::open_with_background(
-        "fixture-iv2-independent",
-        Arc::clone(&registry),
-        bg_tx.clone(),
-    )
-    .await;
-    let t = host.bind(
-        SubAgentTool::new(
-            Arc::new(vec![]),
-            None,
-            Arc::new(move |_: Option<&str>| {
-                crate::subagent::test_support::fixture_source(
-                    std::sync::Arc::new(PromptCaptureLLM {
-                        captured: Arc::clone(&prompt_capture_clone),
-                    }),
-                    "fixture-scripted",
-                )
-            }),
-            "/tmp".to_string(),
-        )
-        .with_parent_messages(parent_messages)
-        .with_task_manager(Arc::clone(&registry))
-        .with_bg_event_sender(bg_tx),
-    );
-
-    // Act: 同时 fork=true + run_in_background=true（优先级测试）
-    let result = t
-        .invoke(
-            serde_json::json!({
-                "fork": true,
-                "run_in_background": true,
-                "prompt": "do both"
-            }),
-            host.context(&[]),
-        )
-        .await
-        .unwrap();
-
-    // Assert 1: 走 background 路径（返回值包含 "Background task"）
-    assert!(
-        result.contains("Background task"),
-        "fork+bg should prioritize background path: {}",
-        result
-    );
-
-    // Assert 2: 从返回值中提取 task_id，验证前缀为 "bg-"
-    // 格式: "Background task bg-{uuid} started..."
-    let task_id = result
-        .split("Background task ")
-        .nth(1)
-        .and_then(|s| s.split_whitespace().next())
-        .expect("task_id should be parseable from result");
-    assert!(
-        task_id.starts_with("bg-"),
-        "task_id should have 'bg-' prefix (background spawn), got: {}",
-        task_id
-    );
-
-    // Assert 3: registry 中注册了任务（active_count >= 1）
-    assert!(
-        registry.active_count() >= 1,
-        "background fork should be registered in BackgroundTaskRegistry"
-    );
-
-    // Assert 4: bg_event_sender 收到 SubagentStarted（is_background=true）
-    let started_ev = tokio::time::timeout(std::time::Duration::from_secs(2), bg_rx.recv())
-        .await
-        .expect("should receive SubagentStarted within timeout")
-        .expect("channel should not be closed");
-    match started_ev {
-        ExecutorEvent::SubagentStarted { is_background, .. } => {
-            assert!(
-                is_background,
-                "SubagentStarted should have is_background=true for fork+bg"
-            );
-        }
-        other => panic!("expected SubagentStarted first, got: {:?}", other),
-    }
-
-    // Assert 5: 等待 background task 完成，捕获 LLM 收到的 prompt
-    // 验证 directive kind = Fork（英文 `<fork_directive>`，非中文 `<bg_fork_directive>`）
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            match bg_rx.recv().await {
-                Some(ExecutorEvent::BackgroundTaskCompleted(_)) => break,
-                Some(_) => continue,
-                None => break,
-            }
-        }
-    })
-    .await;
-
-    let captured_prompt = prompt_capture.lock().unwrap().clone();
-    assert!(
-        captured_prompt.contains("<fork_directive>"),
-        "fork+bg should use Fork directive kind (English <fork_directive>), got: {}",
-        captured_prompt
-    );
-    assert!(
-        !captured_prompt.contains("<bg_fork_directive>"),
-        "fork+bg should NOT use Bg directive kind (Chinese <bg_fork_directive>), got: {}",
-        captured_prompt
-    );
-    assert!(
-        captured_prompt.contains("do both"),
-        "fork directive should wrap original prompt 'do both'"
-    );
-}
+#[path = "integration_background_v2_test.rs"]
+mod tail;

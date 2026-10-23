@@ -40,21 +40,21 @@ Write the brief's required tools next to the resolved target tools for every sta
 | target | runs commands | why |
 | --- | --- | --- |
 | `coder` | yes | 未声明 `tools`，继承基础工具；`disallowedTools` 只移除 `Agent` |
-| `explorer` | no | 显式 `tools: [Read, Grep, Glob]`（只读）；`disallowedTools` 只移除 `Agent` |
+| `explorer` | no | 显式 `tools: [Read, Grep, Glob, ReadContextArchive]`（只读）；`disallowedTools` 只移除 `Agent` |
 | `general-purpose` | yes | `tools: "*"` |
 | `plan` | yes | 未声明 `tools`，继承基础工具；`disallowedTools` 只移除 `Agent` |
 | `verification` | yes | 未声明 `tools`，继承基础工具；`disallowedTools` 只移除 `Agent` |
 | `web-researcher` | yes | 未声明 `tools`，继承基础工具；`disallowedTools` 只移除 `Agent` |
 
-The table is a claim about the shipped definitions (`mcp-packages/workspace/src/resources/builtin/agents/*.md`, readable as `agent://<scope>/<id>/agent.md`) and is locked against them by `resources/builtin_skill_capability_test.rs`; change a definition and the table must change with it. 该表只描述定义是否允许 Bash，不保证当前父工具集真的提供 Bash；运行时还会移除不可继承工具。派发前须核对实际可用工具，不能把表格当作完整运行时权限证明。
+The table is a claim about the shipped definitions (`mcp-packages/workspace/src/resources/builtin/agents/*.md` and `mcp-packages/web/src/agents/*.md`, readable as `agent://<scope>/<id>/agent.md`) and is locked against them by `resources/builtin_skill_capability_test.rs`; change a definition and the table must change with it. 该表只描述定义是否允许 Bash，不保证当前父工具集真的提供 Bash；运行时还会移除不可继承工具。派发前须核对实际可用工具，不能把表格当作完整运行时权限证明。
 
 workflow 的 `allowedTools: []` 与省略该字段一样，不收窄工具；这不同于 Agent 定义中的 `tools: []`（零工具）。需要限制 stage 时，显式列出非空工具白名单。必需工具不在有效集合中就是派发错误，例如要求运行命令却设置 `allowedTools: ['Read']`；引擎不会替派发方校验 brief 所需工具，必须在启动前发现缺口。
 
 Fail fast with the first probe: an agent's first action must exercise one of the brief's required tools — one command for a command-running brief, one read for a read-only one — never a long exploration first. A probe that reports the tool missing ends that stage: report the gap (the selected target has no `Bash` after tool filtering), do not keep going, do not narrate the command in place of running it, and do not widen the definition's permissions to make the stage work.
 
 ```javascript
-// ✅ 只读 brief 派给 explorer：所需工具 `Read`/`Grep`/`Glob` 都在，且任务约束仍要求只读
-() => agent('列出派发路径的调用点', { label: 'recon', agentType: 'explorer', allowedTools: ['Read', 'Grep', 'Glob'] })
+// ✅ 只读 brief 派给 explorer：读取与历史回查工具 `Read`/`Grep`/`Glob`/`ReadContextArchive` 都在，且任务约束仍要求只读
+() => agent('列出派发路径的调用点', { label: 'recon', agentType: 'explorer', allowedTools: ['Read', 'Grep', 'Glob', 'ReadContextArchive'] })
 
 // ✅ 需要命令证据时派给当前继承 Bash 的 plan；brief 仍限定其只执行指定检查
 () => agent('运行 cargo test 并报告结果', { agentType: 'plan', allowedTools: ['Bash'] })
