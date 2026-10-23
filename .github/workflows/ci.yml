@@ -21,13 +21,21 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       NO_PROXY: 127.0.0.1,localhost
       RUSTUP_TOOLCHAIN: 1.99.0
-      PERI_UPGRADE_BASELINE: ${{ runner.temp }}/peri-upgrade-baseline-${{ github.run_id }}-${{ github.run_attempt }}
-      PERI_UPGRADE_REHEARSAL: ${{ runner.temp }}/peri-upgrade-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Prepare disposable upgrade paths
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / ("peri-upgrade-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"])
+          root.mkdir()
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write("PERI_UPGRADE_BASELINE=" + str(root / "baseline") + "\n")
+              output.write("PERI_UPGRADE_REHEARSAL=" + str(root / "rehearsal") + "\n")
       # Fetch authenticated assets before any candidate code/build scripts run.
       - name: Fetch verified upgrade baseline
         env:
