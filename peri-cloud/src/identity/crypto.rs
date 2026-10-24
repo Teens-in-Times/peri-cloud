@@ -16,7 +16,10 @@ pub(crate) fn hash(domain: &str, input: &str) -> String {
     digest.update(domain.as_bytes());
     digest.update([0]);
     digest.update(input.as_bytes());
-    format!("{:x}", digest.finalize())
+    (digest.finalize())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 pub(crate) fn equal(left: &str, right: &str) -> bool {

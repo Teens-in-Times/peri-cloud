@@ -42,6 +42,16 @@ pub(crate) struct Fence {
     encoded: String,
 }
 
+pub(crate) fn archive_fence(scope: &PersonalScope) -> Option<(u64, u64, Option<i64>)> {
+    scope.memory_fence.read().as_ref().map(|fence| {
+        (
+            fence.stamp.privacy_epoch,
+            fence.stamp.session_generation,
+            fence.stamp.expires_at,
+        )
+    })
+}
+
 async fn load(scope: &PersonalScope) -> MemoryResult<Loaded> {
     let store = MemoryStore::new(&scope.journal, scope.principal, scope.max_bytes);
     // The single SQLite connection serializes transactions, but callers can
@@ -127,7 +137,10 @@ async fn load(scope: &PersonalScope) -> MemoryResult<Loaded> {
     Err(MemoryError::Conflict)
 }
 fn digest(value: &impl Serialize) -> MemoryResult<String> {
-    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
+    Ok((Sha256::digest(serde_json::to_vec(value)?))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>())
 }
 fn stamp(payload: &PersistedPayload) -> Option<Stamp> {
     match payload {

@@ -27,6 +27,21 @@ fn unsupported(behavior: &str) -> SessionResourceError {
 
 #[async_trait]
 impl SessionResources for MockSessionResources {
+    async fn read_archive_metadata(
+        &self,
+        _session: &ThreadId,
+        _query: &peri_acp_types::context_archive::ArchiveMetadataQuery,
+    ) -> SessionResourceResult<peri_acp_types::context_archive::ArchiveMetadataPage> {
+        let gate = self.archive_probe_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.wait().await;
+            return Err(unsupported("injected archive probe failure"));
+        }
+        Err(SessionResourceError::new(
+            SessionResourceErrorKind::Unsupported,
+        ))
+    }
+
     async fn inspect_availability(
         &self,
         _session: Option<&ThreadId>,
@@ -142,14 +157,26 @@ impl SessionResources for MockSessionResources {
     }
 
     async fn load_session_binding(&self, id: &ThreadId) -> SessionResourceResult<BindingState> {
-        // 替身不建模本机登记：已登记的会话按「有绑定」回答，未登记按真实门面语义报
-        // `NotFound`（不冒充 legacy 或「没有绑定」）。
-        match self.region(id).and_then(|region| region.meta) {
-            Some(meta) => Ok(BindingState::Bound(fixture_binding(&meta.cwd))),
-            None => Err(SessionResourceError::new(
+        // 与生产门面同口径：绑定只来自记录的 binding 区；无 binding 但有父会话
+        // 的 region 归为外部/未注册，其余未登记会话仍按真实语义报 `NotFound`。
+        // 直接读区数据，不经过 `region()`：预检契约不含历史，不能在这里克隆 payload。
+        let regions = self.regions.lock().unwrap();
+        let Some(region) = regions.get(id) else {
+            return Err(SessionResourceError::new(
                 SessionResourceErrorKind::NotFound,
-            )),
-        }
+            ));
+        };
+        Ok(match region.binding.as_ref() {
+            Some(binding) => BindingState::Bound(binding.clone()),
+            None if region
+                .meta
+                .as_ref()
+                .is_some_and(|meta| meta.parent_thread_id.is_some()) =>
+            {
+                BindingState::ExternalOrUnregistered
+            }
+            None => BindingState::Missing,
+        })
     }
 
     async fn validate_bound_workspace(
@@ -231,6 +258,11 @@ impl SessionResources for MockSessionResources {
         reminder: &peri_acp_types::system_reminder::TrustedSystemReminder,
     ) -> SessionResourceResult<bool> {
         self.ensure_writable()?;
+        let gate = self.reminder_append_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
         self.with_region(id, |region| {
             if let Some(existing) = region
                 .payloads
@@ -333,6 +365,11 @@ impl SessionResources for MockSessionResources {
         self.ensure_writable()?;
         let mut injection = self.injection.lock().unwrap();
         injection.compaction_calls += 1;
+        if injection.uncertain_compaction {
+            return Err(SessionResourceError::persistence_uncertain(Some(
+                session_id.clone(),
+            )));
+        }
         if injection.fail_compaction {
             drop(injection);
             return Err(SessionResourceError::new(
@@ -409,12 +446,20 @@ impl SessionResources for MockSessionResources {
             for removed_id in &removed {
                 region.flags.remove(removed_id);
             }
-            // 有效视图重建与边界删除同属一次提交：mock 也一并生效，只清 excluded 位。
-            for cleared_id in &cleared {
-                if let Some(flags) = region.flags.get_mut(cleared_id) {
-                    flags.excluded = false;
-                }
-            }
+            let retained: Vec<_> = region
+                .payloads
+                .iter()
+                .map(|payload| {
+                    (
+                        payload.id(),
+                        region.flags.get(&payload.id()).cloned().unwrap_or_default(),
+                        matches!(payload.as_message(), Some(BaseMessage::System { .. })),
+                    )
+                })
+                .collect();
+            let updates =
+                peri_acp_types::store::history::rewind_projection_updates(&retained, &cleared);
+            peri_acp_types::store::history::apply_flag_updates(&mut region.flags, &updates);
         });
         Ok(RewindOutcome::Applied)
     }

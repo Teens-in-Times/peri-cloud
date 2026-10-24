@@ -14,13 +14,12 @@ use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::acp_mcp::{AcpMcpError, AcpMcpInbound, AcpMcpServerSpec};
+use crate::acp_mcp::{AcpMcpError, AcpMcpInbound, AcpMcpRegistry, AcpMcpServerSpec};
 use crate::agents::AgentCatalogEntry;
 use crate::command_registry::CommandRegistry;
-use crate::dynamic_mcp::{
-    CanonicalDynamicMcpAction, DynamicMcpCatalogTool, DynamicMcpFailure, DynamicMcpInstanceKey,
-    DynamicMcpNotification, DynamicMcpResponse, DynamicMcpShutdownReport, ResolvedSecret,
-    SecretRef, SessionMcpCapabilitySnapshot,
+pub use crate::mcp_control::SessionMcpCatalogPort;
+use crate::mcp_control::{
+    McpControlError, McpControlRequest, McpControlResponse, McpServerControl,
 };
 use crate::mcp_skills::McpSkillRegistry;
 use crate::skills::SkillMetadata;
@@ -90,6 +89,28 @@ pub enum McpServerOAuthStatus {
     NeedsAuthorization,
 }
 
+/// `mcp/list` 暴露的单个工具投影。
+///
+/// 有界投影：`McpServerInfo::tools` 至多 64 条，`name`/`description` 已完成
+/// 控制字符清洗与 160 字符截断；全量计数仍以
+/// [`McpServerInfo::tool_count`] 为准。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct McpToolInfo {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// `mcp/list` 暴露的单个资源投影。
+///
+/// 有界投影语义同 [`McpToolInfo`]；全量计数以
+/// [`McpServerInfo::resource_count`] 为准。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct McpResourceInfo {
+    pub uri: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
 /// 单个 MCP 服务器的状态投影（`mcp/list` 命令面数据源）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerInfo {
@@ -99,6 +120,14 @@ pub struct McpServerInfo {
     pub oauth_status: McpServerOAuthStatus,
     pub tool_count: usize,
     pub resource_count: usize,
+    /// 工具的有界投影（至多 64 条、文本 160 字符）；全量计数见
+    /// [`Self::tool_count`]。
+    pub tools: Vec<McpToolInfo>,
+    /// 资源的有界投影（至多 64 条、文本 160 字符）；全量计数见
+    /// [`Self::resource_count`]。
+    pub resources: Vec<McpResourceInfo>,
+    /// 服务器配置声明的订阅项；None = 未配置。
+    pub subscriptions: Option<crate::plugin::McpSubscriptionsConfig>,
     /// server 自报版本（initialize 响应的 `serverInfo.version`）；未知为 None。
     pub version: Option<String>,
     /// 当前连接建立时刻（RFC3339 UTC）；从未成功连接为 None。
@@ -110,6 +139,7 @@ pub struct McpServerInfo {
     pub error_summary: Option<String>,
     /// 服务器 URL（HTTP 传输）；stdio/builtin 传输为 None。
     pub url: Option<String>,
+    pub control: McpServerControl,
 }
 
 /// `mcp/oauth_start` 的启动结果（与 middlewares 内部
@@ -189,6 +219,25 @@ impl Drop for McpResourceSubscription {
 /// `McpClientPool`，路径不变。
 #[async_trait::async_trait]
 pub trait McpPoolPort: Send + Sync {
+    /// Control a server in this pool after the host has admitted the session request.
+    async fn control_mcp(
+        self: Arc<Self>,
+        _request: McpControlRequest,
+    ) -> Result<McpControlResponse, McpControlError> {
+        Err(McpControlError::unsupported())
+    }
+    /// Current immutable MCP catalog for the given session's visibility scope.
+    fn catalog_source(
+        self: Arc<Self>,
+        _session_id: &str,
+    ) -> Option<Arc<dyn SessionMcpCatalogPort>> {
+        None
+    }
+    /// Cancel an exact active OAuth flow in this pool.
+    fn cancel_oauth_flow(&self, _flow_id: &str) -> Result<bool, String> {
+        Err("MCP OAuth flow unavailable".into())
+    }
+
     /// 还原具体实现（downcast 还原点，供 middlewares 装配面与装配面宿主使用）。
     fn as_any(&self) -> &dyn Any;
 
@@ -214,6 +263,11 @@ pub trait McpPoolPort: Send + Sync {
         Err("Incomplete: shared environment child ownership unknown".into())
     }
 
+    /// 资源 owner 完成消息与任务结清后释放子会话绑定；失败不得宣称已关闭。
+    fn release_agent_session(&self, _session_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Revert recorded file changes in the session's trusted Workspace owner.
     /// Implementations must reject unavailable owners and report every failed change.
     async fn rewind_files(
@@ -227,6 +281,15 @@ pub trait McpPoolPort: Send + Sync {
     /// Whether this session has MCP Tasks whose terminal notification is pending.
     fn has_active_tasks(&self, _session_id: &str) -> bool {
         false
+    }
+
+    /// 池内是否存在指定实例的注册句柄（仅连接状态，不读取 MCP 业务数据）。
+    ///
+    /// 宿主生命周期（如 workflow 消费者）必须在实例实际装配后才启动。默认
+    /// `true` 保持未声明该能力的替换实现的既有行为；`McpClientPool` 按客户端
+    /// 表精确回答。
+    fn has_instance(&self, _instance: &str) -> bool {
+        true
     }
 
     /// Synchronously close task/callback/commit admission before external task
@@ -284,19 +347,6 @@ pub trait McpPoolPort: Send + Sync {
         Err("MCP OAuth flow unavailable".into())
     }
 
-    /// 以完整 dynamic identity 投递授权码；实现不得退化为裸 server name。
-    ///
-    /// 默认实现返回错误（替换前类型还原失败即报错）。
-    fn deliver_dynamic_oauth_callback(
-        &self,
-        _instance: DynamicMcpInstanceKey,
-        _flow_id: &str,
-        _code: String,
-        _state: String,
-    ) -> Result<(), String> {
-        Err("MCP OAuth flow unavailable".into())
-    }
-
     /// 取消静态 server 的进行中授权（`mcp/oauth_cancel`），返回是否确有取消。
     ///
     /// 默认实现返回错误（替换前类型还原失败即报错）。
@@ -304,37 +354,16 @@ pub trait McpPoolPort: Send + Sync {
         Err("MCP OAuth flow unavailable".into())
     }
 
-    /// 取消指定 dynamic instance 的进行中授权，返回是否确有取消。
-    ///
-    /// 默认实现返回错误（替换前类型还原失败即报错）。
-    fn cancel_dynamic_oauth_flow(
-        &self,
-        _instance: DynamicMcpInstanceKey,
-        _flow_id: &str,
-    ) -> Result<bool, String> {
-        Err("MCP OAuth flow unavailable".into())
-    }
+    // ── Workspace task owner ─────────────────────────────────────────────
 
-    // ── Workspace task scope ─────────────────────────────────────────────
-
+    /// 子会话释放：取消已知 external task 并等待进程收口。默认跳过。
     async fn close_agent_session_scope(self: Arc<Self>, _session_id: &str) -> Result<(), String> {
         Err("Incomplete: agent session scope close capability unavailable".into())
     }
-    //
-    // 默认实现同「替换前类型还原失败 ⇒ 跳过」：不参与 scope 生命周期。
 
-    /// 在 Store 清除持久 close intent 后重新开启已关闭的 scope。默认跳过。
-    async fn open_workspace_task_scope(&self, _session_id: &str) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// 会话关闭：栅栏新工作、发现既有任务、经 TaskManager 路由取消。默认跳过。
-    async fn close_workspace_task_scope(self: Arc<Self>, _session_id: &str) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// 会话已不在内存（重入 close）时对账既有 scope 并收口。默认跳过。
-    async fn reconcile_closing_workspace_scope(&self, _session_id: &str) -> Result<(), String> {
+    /// 会话释放：取消该会话 TaskManager 已登记的 external task 并等待 settled。
+    /// 默认无操作（无 runtime 投影的池没有可取消的任务）。
+    async fn cancel_session_external_tasks(&self, _session_id: &str) -> Result<(), String> {
         Ok(())
     }
 
@@ -494,50 +523,53 @@ impl dyn McpPoolPort {
 
 /// ACP 侧 agent→client 发送网关（MCP over ACP 的传输切片）。
 ///
-/// 由 host 按 ACP 连接提供（`AcpTransport` 的请求/通知子集）；middlewares 的
-/// 桥接 transport 经它把内层 MCP 消息投递为 `mcp/message`。实现不得在失败时
-/// 静默吞掉消息：投递失败必须返回错误，由桥接按连接失败处理。
+/// 由 host 按 ACP 连接提供（`AcpTransport` 的请求子集）；middlewares 的
+/// 桥接 transport 经它把内层 MCP 请求投递为 `mcp/message`。schema 1.10 起
+/// `mcp/message` 只有 agent → client 的请求方向与 client → agent 的通知方向，
+/// 网关只承担前者。实现不得在失败时静默吞掉消息：投递失败必须返回错误，
+/// 由桥接按连接失败处理。
 #[async_trait::async_trait]
 pub trait AcpMcpGatewayPort: Send + Sync {
     /// 发送 `mcp/message` 请求并等待内层 MCP 结果。
+    /// cancellation 触发时发送官方 ACP 请求取消并释放本地 pending；必须有界返回。
+    /// 网关保存 peri-N 与实际外层 JSON-RPC ID 的关联，不能混用两者。
     async fn request(
         &self,
         method: &str,
         params: serde_json::Value,
+        cancellation: CancellationToken,
     ) -> Result<serde_json::Value, AcpMcpError>;
-
-    /// 发送 `mcp/message` 通知（无响应）。
-    async fn notify(&self, method: &str, params: serde_json::Value) -> Result<(), AcpMcpError>;
 }
 
 /// 会话级 MCP over ACP 服务端口（`peri-middlewares` 实现）。
 ///
-/// 一个端口服务一个 ACP 连接的多个会话：`attach` 注册 client 在会话 setup 中
-/// 声明的 server 并后台建连（连接就绪后工具经 MCP 池进入 deferred 发现）；
-/// `request` / `notify` 路由 client 反向下发的 `mcp/message`；`close_session`
-/// 在会话结束（close / 删除 / transport 关闭 / 进程退出）时断开该会话全部连接。
+/// 每个端口持有会话级池；`attach` 使用连接级共享注册表注册 client 在 setup 中
+/// 声明的 server 并后台完成发现（工具经 MCP 池进入 deferred 发现）；
+/// `notify` 路由 client 反向下发的 `mcp/message` 通知；`close_session`
+/// 在会话结束（close / 删除 / transport 关闭 / 进程退出）时移除该会话的
+/// 声明与池条目。
 #[async_trait::async_trait]
 pub trait AcpMcpServerPort: Send + Sync {
-    /// 注册并后台连接会话声明的 acp 型 server。
+    /// 注册并后台发现会话声明的 acp 型 server。
     ///
-    /// 同会话同 `server_id` 重复声明按幂等处理（已连接或正在连接的跳过）。
-    /// 建连失败不影响调用方：失败在池状态面可见，不阻塞会话建立。
-    fn attach(&self, gateway: Arc<dyn AcpMcpGatewayPort>, servers: Vec<AcpMcpServerSpec>);
-
-    /// 处理 client 下发的 `mcp/message` 请求，返回内层 MCP 结果。
-    async fn request(&self, inbound: AcpMcpInbound) -> Result<serde_json::Value, AcpMcpError>;
+    /// 同会话同 `server_id` 重复声明按幂等处理（已发现或正在发现的跳过）。
+    /// 发现失败不影响调用方：失败在池状态面可见，不阻塞会话建立。
+    /// 跨会话 serverId 冲突同步返回 CODE_UNAVAILABLE，不发起发现。
+    fn attach(
+        &self,
+        registry: Arc<AcpMcpRegistry>,
+        gateway: Arc<dyn AcpMcpGatewayPort>,
+        servers: Vec<AcpMcpServerSpec>,
+    ) -> Result<(), AcpMcpError>;
 
     /// 处理 client 下发的 `mcp/message` 通知。
     async fn notify(&self, inbound: AcpMcpInbound) -> Result<(), AcpMcpError>;
 
-    /// 该服务是否承载指定连接（入站 `mcp/message` 的定位依据）。
-    ///
-    /// 入站消息只带 `connectionId`、不带 `sessionId`，而 MCP 池是会话级的
-    /// （宿主装配每个会话各持一份连接事实），因此宿主需要在各会话服务间
-    /// 定位承载者：只有 `true` 的那个才能路由该消息。
-    fn owns_connection(&self, connection_id: &str) -> bool;
+    /// 该服务是否存在指定 serverId 的活跃桥接（状态观测，不作为宿主路由依据）。
+    /// 宿主必须通过连接级 AcpMcpRegistry 定位唯一归属会话。
+    fn owns_server(&self, server_id: &str) -> bool;
 
-    /// 关闭会话的全部 ACP MCP 连接（发送 `mcp/disconnect`、移除池条目）。幂等。
+    /// 移除会话的全部 ACP MCP 声明与池条目。幂等。
     async fn close_session(&self, session_id: &str);
 }
 
@@ -565,134 +597,6 @@ impl dyn ToolSearchPort {
             }
         }
     }
-}
-
-/// Deployment-scoped Dynamic MCP operation and shutdown port.
-#[async_trait::async_trait]
-pub trait DynamicMcpDeploymentPort: Send + Sync {
-    async fn execute(
-        &self,
-        session_id: &str,
-        action: CanonicalDynamicMcpAction,
-    ) -> Result<DynamicMcpResponse, DynamicMcpFailure>;
-
-    /// Register the canonical session catalog used for pre-commit name collision
-    /// rejection. Registration must happen before any load can be admitted.
-    fn register_catalog(
-        &self,
-        session_id: &str,
-        tools: Vec<DynamicMcpCatalogTool>,
-    ) -> Result<(), DynamicMcpFailure>;
-
-    fn capability(&self, session_id: &str) -> Arc<dyn SessionMcpCapabilityPort>;
-
-    fn close_registration(&self, session_id: &str) -> Arc<dyn SessionCloseRegistration>;
-
-    /// Validate that an opaque Dynamic MCP identity still names the current live
-    /// incarnation. OAuth RPCs must call this before touching scoped flow APIs.
-    fn accepts_instance(&self, _instance: &DynamicMcpInstanceKey) -> bool {
-        false
-    }
-
-    /// Bind a weak, checked notification target for one live session. Rebinding
-    /// replaces the previous lease; dropping the returned sink disables delivery.
-    fn bind_notification_sink(
-        &self,
-        _session_id: &str,
-        _sink: std::sync::Weak<dyn DynamicMcpNotificationSinkPort>,
-    ) -> bool {
-        false
-    }
-
-    /// Deliver an OAuth authorization URL only through the checked sink bound to
-    /// the originating session. Implementations must reject stale instances and
-    /// must never fall back to a deployment-global transport.
-    fn notify_authorization_needed(
-        &self,
-        _instance: &DynamicMcpInstanceKey,
-        _flow_id: &str,
-        _authorization_url: &str,
-    ) -> bool {
-        false
-    }
-
-    fn begin_shutdown(&self);
-
-    async fn close_session(&self, session_id: &str) -> DynamicMcpShutdownReport;
-
-    async fn shutdown(&self) -> DynamicMcpShutdownReport;
-}
-
-/// Session-local immutable capability source shared by the main agent and all
-/// of its subagents.
-pub trait SessionMcpCapabilityPort: Send + Sync {
-    fn snapshot(&self) -> Arc<SessionMcpCapabilitySnapshot>;
-
-    /// Bind the existing session MCP read/discovery registries to this checked
-    /// capability source, preserving the source pool's builtin policy. The
-    /// returned lease owns no parallel capability registry: it only projects
-    /// the effective handles into the existing MCP
-    /// pool, skill registry and command registry.
-    fn bind_projection(
-        &self,
-        _static_pool: Arc<dyn McpPoolPort>,
-        _skill_registry: Arc<crate::mcp_skills::McpSkillRegistry>,
-        _command_registry: Arc<crate::command_registry::CommandRegistry>,
-    ) -> Arc<dyn SessionMcpProjectionLease> {
-        panic!("session MCP capability does not support checked projection")
-    }
-}
-
-/// Incarnation-checked adapter from a session capability view to the existing
-/// MCP tools/resources/skills/commands production registries.
-pub trait SessionMcpProjectionLease: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-
-    /// Refresh the effective server view. Returns false after session close.
-    fn refresh(&self) -> bool;
-
-    /// Close projection admission and remove every dynamic projection. Idempotent.
-    fn close(&self);
-}
-
-/// Idempotent session-close lease. ACP may call this without understanding the
-/// Dynamic MCP state machine.
-#[async_trait::async_trait]
-pub trait SessionCloseRegistration: Send + Sync {
-    async fn revoke_and_cleanup(&self) -> DynamicMcpShutdownReport;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum SecretResolveError {
-    #[error("secret reference was not found")]
-    NotFound,
-    #[error("secret reference access was denied")]
-    Denied,
-    #[error("secret resolver is unavailable")]
-    Unavailable,
-}
-
-/// Production implementations must resolve opaque references only after HITL.
-#[async_trait::async_trait]
-pub trait SecretResolverPort: Send + Sync {
-    async fn resolve(&self, reference: &SecretRef) -> Result<ResolvedSecret, SecretResolveError>;
-}
-
-/// Checked session-specific Dynamic MCP notification sink. Implementations must
-/// reject stale incarnation writes and must never broadcast as a fallback.
-pub trait DynamicMcpNotificationSinkPort: Send + Sync {
-    fn notify(&self, notification: DynamicMcpNotification) -> bool;
-
-    fn notify_authorization_needed(
-        &self,
-        _instance: &DynamicMcpInstanceKey,
-        _flow_id: &str,
-        _authorization_url: &str,
-    ) -> bool {
-        false
-    }
-
-    fn accepts(&self, instance: &DynamicMcpInstanceKey) -> bool;
 }
 
 /// Agent 候选目录端口：主提示词 `{{available_agents}}` 渲染经此取候选

@@ -3,9 +3,7 @@ use crate::mcp::client::ClientStatus;
 use rmcp::handler::server::ServerHandler;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-#[path = "tool_bridge_invocation_fixture_test.rs"]
-mod current_invocation_fixture;
-use current_invocation_fixture::CurrentInvocationFixture;
+use crate::mcp::current_invocation_fixture::CurrentInvocationFixture;
 
 fn make_tool(name: &str, description: Option<&str>) -> Tool {
     let json = serde_json::json!({
@@ -21,6 +19,7 @@ fn make_tool(name: &str, description: Option<&str>) -> Tool {
 
 fn make_disconnected_handle(name: &str) -> Arc<McpClientHandle> {
     Arc::new(McpClientHandle {
+        call_gate: Default::default(),
         name: name.to_string(),
         version: None,
         connected_at: None,
@@ -270,6 +269,7 @@ fn test_build_tool_bridges_filters_app_only_tool_from_model_catalog() {
     pool.clients.write().insert(
         "apps".to_string(),
         Arc::new(McpClientHandle {
+            call_gate: Default::default(),
             name: "apps".to_string(),
             version: None,
             connected_at: None,
@@ -301,6 +301,7 @@ fn test_build_tool_bridges_empty_pool() {
 
 fn connected_handle(name: &str, tools: Vec<Tool>) -> Arc<McpClientHandle> {
     Arc::new(McpClientHandle {
+        call_gate: Default::default(),
         name: name.to_string(),
         version: None,
         connected_at: None,
@@ -573,6 +574,7 @@ async fn builtin_tool_call_surfaces_timeout_error_after_bridge_deadline() {
         "cron",
         &tool,
         Arc::new(McpClientHandle {
+            call_gate: Default::default(),
             name: "cron".to_string(),
             version: None,
             connected_at: None,
@@ -793,6 +795,7 @@ async fn raw_result_fixture(
         "raw-fixture",
         &tool,
         Arc::new(McpClientHandle {
+            call_gate: Default::default(),
             name: "raw-fixture".to_string(),
             version: None,
             connected_at: None,

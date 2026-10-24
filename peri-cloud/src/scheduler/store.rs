@@ -22,22 +22,22 @@ pub(crate) struct Firing {
 impl Firing {
     pub fn fingerprint(&self) -> ScheduleResult<String> {
         use sha2::{Digest, Sha256};
-        Ok(format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&(
-                self.principal,
-                self.event.id,
-                &self.event.task,
-                self.event.planned_at,
-                &self.route,
-                self.schedule.mode,
-                self.schedule.notify,
-                &self.schedule.prompt,
-                self.schedule.binding,
-                self.schedule.device_id,
-                &self.schedule.workspace
-            ))?)
-        ))
+        Ok((Sha256::digest(serde_json::to_vec(&(
+            self.principal,
+            self.event.id,
+            &self.event.task,
+            self.event.planned_at,
+            &self.route,
+            self.schedule.mode,
+            self.schedule.notify,
+            &self.schedule.prompt,
+            self.schedule.binding,
+            self.schedule.device_id,
+            &self.schedule.workspace,
+        ))?))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>())
     }
 }
 impl ScheduleStore {

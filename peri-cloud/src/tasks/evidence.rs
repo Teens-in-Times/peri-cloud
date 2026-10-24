@@ -25,7 +25,13 @@ pub(super) fn chunk(
     chars: usize,
     expected: Option<&str>,
 ) -> Result<Value> {
-    let version = format!("sha256:{:x}", sha2::Sha256::digest(text.as_bytes()));
+    let version = format!(
+        "sha256:{}",
+        (sha2::Sha256::digest(text.as_bytes()))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
     if expected.is_some_and(|v| v != version) {
         return Err(TaskError::Conflict);
     }

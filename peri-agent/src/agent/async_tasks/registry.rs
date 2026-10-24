@@ -188,7 +188,9 @@ impl Default for BackgroundTaskRegistry {
 }
 
 impl BackgroundTaskRegistry {
-    pub const SHELL_LIMIT: usize = 5;
+    /// 后台 shell 并发上限。多 Agent 会话共享同一实例，5 槽易被长驻任务占满；
+    /// 2026-10-19 按容量决策调整为 20。
+    pub const SHELL_LIMIT: usize = 20;
     pub const WORKFLOW_LIMIT: usize = 3;
 
     /// per-kind 并发上限：`None` = 不限额。
@@ -408,13 +410,24 @@ impl BackgroundTaskRegistry {
         self.cancelled_tasks_waiting_cleanup.lock().remove(task_id)
     }
 
+    pub(super) fn has_pending_delivery(&self, task_id: &str) -> bool {
+        self.pending_deliveries.lock().contains_key(task_id)
+    }
+
+    pub(super) fn has_pending_deliveries(&self) -> bool {
+        !self.pending_deliveries.lock().is_empty()
+    }
+
     /// Unsettled tasks for the bounded-wait handoff record: public identity plus
     /// the scope owner that will reconcile them. Empty = nothing pending.
     pub(super) fn pending_handoff_tasks(&self) -> Vec<super::handoff::PendingHandoffTask> {
         let tasks = self.tasks.lock();
+        let pending_deliveries = self.pending_deliveries.lock();
         let mut pending: Vec<_> = tasks
             .values()
-            .filter(|task| is_active_status(&task.status))
+            .filter(|task| {
+                is_active_status(&task.status) || pending_deliveries.contains_key(&task.id)
+            })
             .map(|task| super::handoff::PendingHandoffTask {
                 task_id: task.id.clone(),
                 kind: task.kind,

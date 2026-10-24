@@ -18,6 +18,7 @@ use crate::mcp::{ClientStatus, McpClientHandle, McpClientPool, McpMiddleware, To
 /// 构造一个「已连接」的假 MCP client（工具名按传入列表）。
 fn connected_handle(server: &str, tools: &[&str]) -> Arc<McpClientHandle> {
     Arc::new(McpClientHandle {
+        call_gate: Default::default(),
         name: server.to_string(),
         version: None,
         connected_at: None,
@@ -67,10 +68,15 @@ fn pool_with_builtin_instances() -> Arc<McpClientPool> {
         "artifact".to_string(),
         connected_handle("artifact", &["artifact"]),
     );
-    pool.clients.write().insert(
-        "cron".to_string(),
-        connected_handle("cron", &["cron_register", "cron_list", "cron_remove"]),
-    );
+    let cron_tools: Vec<&str> = peri_acp_types::builtin_mcp::find("cron")
+        .unwrap()
+        .tools
+        .iter()
+        .map(|tool| tool.original_name)
+        .collect();
+    pool.clients
+        .write()
+        .insert("cron".to_string(), connected_handle("cron", &cron_tools));
     let workspace_tools: Vec<&str> = peri_acp_types::builtin_mcp::find("workspace")
         .expect("workspace 已实现（wave 3）")
         .tools
@@ -102,9 +108,8 @@ fn pool_with_builtin_instances() -> Arc<McpClientPool> {
 fn collected_tool_names(pool: &Arc<McpClientPool>, disabled: &[&str]) -> Vec<String> {
     let disabled: std::collections::HashSet<String> =
         disabled.iter().map(|name| name.to_string()).collect();
-    let middleware = McpMiddleware::new(Arc::clone(pool))
-        .with_tool_pool(Arc::clone(pool))
-        .with_builtin_closures(closed_instances(&disabled));
+    let middleware =
+        McpMiddleware::new(Arc::clone(pool)).with_builtin_closures(closed_instances(&disabled));
     middleware
         .collect_tools("/tmp/contract-test")
         .into_iter()
@@ -119,9 +124,8 @@ fn collected_tool_names(pool: &Arc<McpClientPool>, disabled: &[&str]) -> Vec<Str
 fn builtin_tools_are_collected_with_declared_direct() {
     let pool = pool_with_builtin_instances();
     let disabled: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let middleware = McpMiddleware::new(Arc::clone(&pool))
-        .with_tool_pool(Arc::clone(&pool))
-        .with_builtin_closures(closed_instances(&disabled));
+    let middleware =
+        McpMiddleware::new(Arc::clone(&pool)).with_builtin_closures(closed_instances(&disabled));
     let tools = middleware.collect_tools("/tmp/contract-test");
 
     let direct_of = |name: &str| -> Option<bool> {
@@ -137,6 +141,15 @@ fn builtin_tools_are_collected_with_declared_direct() {
                 Some(declaration.direct),
                 "{} 的 direct 必须等于注册表声明（IF-D13）",
                 declaration.effective_name
+            );
+            assert_eq!(
+                tools
+                    .iter()
+                    .find(|tool| tool.name() == declaration.effective_name)
+                    .unwrap()
+                    .visible_to_model(),
+                declaration.model_visible,
+                "宿主专用工具不得进入模型可见目录"
             );
         }
     }
@@ -203,7 +216,7 @@ fn unknown_policy_key_does_not_close_any_instance() {
 fn empty_closures_keep_every_builtin_tool() {
     let pool = pool_with_builtin_instances();
     let with_empty_closures = collected_tool_names(&pool, &[]);
-    let middleware = McpMiddleware::new(Arc::clone(&pool)).with_tool_pool(Arc::clone(&pool));
+    let middleware = McpMiddleware::new(Arc::clone(&pool));
     let without_closures: Vec<String> = middleware
         .collect_tools("/tmp/contract-test")
         .into_iter()

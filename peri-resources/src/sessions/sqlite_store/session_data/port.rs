@@ -215,14 +215,10 @@ impl SessionDataPort for SqliteSessionData {
                 SessionResourceErrorKind::Workspace(WorkspaceError::UnverifiedLegacyOwner),
             ));
         }
-        sqlx::query(
-            "INSERT OR IGNORE INTO projects(id, locator, object_identity) VALUES (?1, ?2, ?1)",
-        )
-        .bind(binding.project_id.to_string())
-        .bind(workspace.root.to_string_lossy().into_owned())
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| write_failure(error.into()))?;
+        // 接纳不制造项目：workspace 归属行由 resolve_workspace 建立，项目必须已登记。
+        workspace_store::require_project_exists(&mut tx, binding.project_id)
+            .await
+            .map_err(write_failure)?;
         // The workspace owner was established by resolve_workspace.
         // Adoption may attach its immutable evidence, but must not fabricate a
         // workspace owner or change the session's logical workspace.
@@ -368,6 +364,22 @@ impl SessionDataPort for SqliteSessionData {
         })
     }
 
+    async fn load_frozen_state(&self, id: &ThreadId) -> SessionResourceResult<FrozenState> {
+        // 单列读取：恢复准入只需要 frozen 原文，不触碰 payload/flags/inherited。
+        let mut connection = self
+            .database
+            .pool
+            .acquire()
+            .await
+            .map_err(|error| map_sqlx(&error))?;
+        frozen_state_on(&mut connection, id).await
+    }
+
+    fn supports_history_window(&self) -> bool {
+        // 本机 SQLite 覆写了 bounds/page/body 全部窗口读取端口。
+        true
+    }
+
     async fn load_binding(&self, id: &ThreadId) -> SessionResourceResult<BindingState> {
         // 与 `load_snapshot` 同一条分类规则、同一次读取视图，只是不读历史与 frozen。
         let mut connection = self
@@ -502,6 +514,30 @@ impl SessionDataPort for SqliteSessionData {
         id: &ThreadId,
     ) -> SessionResourceResult<HashMap<MessageId, u64>> {
         self.read_active_entry_positions(id).await
+    }
+
+    async fn inherited_archive_root(
+        &self,
+        id: &ThreadId,
+        source: &ThreadId,
+        anchor: MessageId,
+    ) -> SessionResourceResult<peri_acp_types::context_archive::ArchiveRoot> {
+        self.read_inherited_archive_root(id, source, anchor).await
+    }
+
+    async fn read_archive_metadata(
+        &self,
+        id: &ThreadId,
+        query: &peri_acp_types::context_archive::ArchiveMetadataQuery,
+    ) -> SessionResourceResult<peri_acp_types::context_archive::ArchiveMetadataPage> {
+        self.read_archive_metadata_page(id, query).await
+    }
+    async fn read_archive_chunk(
+        &self,
+        id: &ThreadId,
+        query: &peri_acp_types::context_archive::ArchiveChunkQuery,
+    ) -> SessionResourceResult<peri_acp_types::context_archive::ArchiveChunk> {
+        self.read_archive_body_chunk(id, query).await
     }
 
     async fn load_message_flags(
@@ -705,10 +741,10 @@ impl SessionDataPort for SqliteSessionData {
             .map(|id| id.as_uuid().to_string());
         let inherited = child
             .inherited
-            .to_json()
+            .to_json_with_spans()
             .map_err(|_| corrupt("inherited context is not serializable"))?;
         // 发布前校验引用边界，损坏的继承区不能落库。
-        InheritedContext::from_json(&inherited)
+        InheritedContext::from_json(&inherited.json)
             .map_err(|_| corrupt("inherited context has invalid message references"))?;
         let mut tx = self
             .database
@@ -763,11 +799,22 @@ impl SessionDataPort for SqliteSessionData {
             .await
             .map_err(write_failure)?;
         sqlx::query("UPDATE threads SET inherited_context = ?1 WHERE id = ?2")
-            .bind(&inherited)
+            .bind(&inherited.json)
             .bind(child.target.thread_id.as_str())
             .execute(&mut *tx)
             .await
             .map_err(|error| map_sqlx(&error))?;
+        // 列文本与派生索引同事务：命中路径从创建时就可用，不必等第一次布局扫描回填。
+        if let Some(write) = super::inherited_index::SnapshotWrite::from_serialization(
+            &child.target.thread_id,
+            Some(child.parent_id.as_str()),
+            &inherited,
+        ) {
+            write
+                .replace(&mut tx)
+                .await
+                .map_err(|error| map_sqlx(&error))?;
+        }
         tx.commit()
             .await
             .map_err(|_| commit_failure(Some(child.target.thread_id.clone())))?;

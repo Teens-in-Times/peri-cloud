@@ -165,10 +165,10 @@ impl Gateway {
         {
             return Ok(existing.into());
         }
-        let fingerprint = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&(session, prompt.as_str()))?)
-        );
+        let fingerprint = (Sha256::digest(serde_json::to_vec(&(session, prompt.as_str()))?))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let existing = sqlx::query_as::<_, (String, String)>(
             "SELECT principal,request_hash FROM control_operations WHERE id=?",
         )

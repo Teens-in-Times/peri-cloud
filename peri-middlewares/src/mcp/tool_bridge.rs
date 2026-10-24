@@ -47,7 +47,7 @@ pub struct McpToolBridge {
     server_generation: u64,
     client: Arc<McpClientHandle>,
     binding_leases: Option<Arc<super::apps::McpAppBindingRegistry>>,
-    admission: Option<super::dynamic::admission::DynamicMcpAdmissionGate>,
+    admission: Option<super::connection_gate::McpCallGate>,
     output_pool: Option<std::sync::Weak<McpClientPool>>,
     output_session_id: Option<String>,
 }
@@ -153,48 +153,12 @@ impl McpToolBridge {
             model_visible,
             direct: false,
             server_generation: 0,
+            admission: Some(client.call_gate.clone()),
             client,
             binding_leases: None,
-            admission: None,
             output_pool: None,
             output_session_id: None,
         }
-    }
-
-    pub fn new_dynamic(
-        server_name: &str,
-        tool: &Tool,
-        client: Arc<McpClientHandle>,
-        admission: super::dynamic::admission::DynamicMcpAdmissionGate,
-    ) -> Result<Self, ToolCallError> {
-        let tool_name = tool.name.to_string();
-        if !valid_name_component(server_name) || !valid_name_component(&tool_name) {
-            return Err(ToolCallError::Unavailable {
-                server: server_name.to_string(),
-            });
-        }
-        let description = bounded_tool_description(
-            server_name,
-            tool.description.as_ref().map(|value| value.as_ref()),
-        );
-        let model_visible =
-            super::apps::tool_visibility(tool).model && !declared_model_hidden(&client, &tool_name);
-        Ok(Self {
-            server_name: server_name.to_string(),
-            full_name: effective_mcp_tool_name(server_name, &tool_name),
-            tool_name,
-            description,
-            input_schema: serde_json::to_value(&*tool.input_schema)
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
-            model_visible,
-            direct: false,
-            server_generation: 0,
-            client,
-            binding_leases: None,
-            admission: Some(admission),
-            output_pool: None,
-            output_session_id: None,
-        })
     }
 
     pub fn with_output_store(
@@ -251,13 +215,6 @@ impl McpToolBridge {
     pub(crate) fn client_handle(&self) -> &Arc<McpClientHandle> {
         &self.client
     }
-}
-
-fn valid_name_component(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 #[async_trait]
@@ -378,19 +335,13 @@ impl BaseTool for McpToolBridge {
         let arguments = input.as_object().cloned().unwrap_or_default();
         let mut request = rmcp::model::CallToolRequestParams::new(self.tool_name.clone())
             .with_arguments(arguments);
-        // per-call 会话身份（`peri/taskScope` 能力令牌）随源接线：workspace 工具面
-        // 与 builtin `workflow` 实例面共用同一签发面（design `workflow-mcp` §3
-        // 「per-call 身份沿用 `_meta["peri/taskScope"]`」，为 workflow 源接线）。
-        let task_scope_source = matches!(
+        // per-call 会话身份（`peri/taskOwner`）随源接线：只有 Workspace 实例
+        // 按直接发起会话隔离后台任务，其他 server 不注入 Peri 元数据。
+        if let Some(owner) = super::client::task_owner_metadata::task_owner_meta(
             self.client.source.as_ref(),
-            Some(super::config::ConfigSource::Builtin { instance })
-                if instance == "workspace" || instance == "workflow"
-        ) || matches!(
-            self.client.source.as_ref(),
-            Some(super::config::ConfigSource::WorkspaceRemote)
-        );
-        if task_scope_source {
-            request.meta = pool.task_scope_meta_for(&self.server_name, session_id);
+            session_id,
+        ) {
+            request.meta = Some(owner);
         }
         request.meta = Some(super::invocation::request_meta(&ctx, request.meta)?);
 
@@ -500,18 +451,20 @@ impl BaseTool for McpToolBridge {
                                 }));
                     }
                 }
-                // 回执只承诺可达的投递：有 canonical 路由 = 持久送达
-                // （resume 后仍可见）；否则只声称活跃期送达。
+                // 回执只承诺可达的投递：有 canonical 路由 = 结果到达时持久记录；
+                // 否则只声称活跃期送达。结果尚未产生，不得提前声称已写入 transcript，
+                // 也不承诺进程重启后恢复后台执行。
                 let delivery_note = if delivery.is_some() {
-                    "Its completion reminder is committed to the initiating session's \
-                             transcript and stays visible after resume."
+                    "Its completion result will be delivered to the initiating session when it \
+                     arrives; the delivered result is recorded at that point."
                 } else {
-                    "Its completion reminder is delivered to the initiating session \
-                             while that session is live."
+                    "Its completion result will be delivered to the initiating session \
+                     while that session is live."
                 };
-                return Ok(peri_agent::tools::ToolOutput::from_legacy(format!(
-                    "Background task started: {public_id}. {delivery_note}"
-                )));
+                return Ok(super::tool_execution::task_started(
+                    public_id,
+                    delivery_note,
+                ));
             }
             _ => {
                 return Err(Box::new(ToolCallError::CallFailed {
@@ -661,7 +614,7 @@ impl BaseTool for McpToolBridge {
             format_output(pool.as_deref(), session_id, formatted, false).await
         };
         // 远端 JSON-RPC error 的原始载荷尚未在协议失败分支接线，见该分支注释。
-        Ok(peri_agent::tools::ToolOutput::from_raw_result(text, raw))
+        super::tool_execution::complete(self, text, raw)
     }
 }
 
@@ -817,6 +770,7 @@ mod direct_flag_tests {
 
     fn make_handle(server: &str, tools: Vec<Tool>, status: ClientStatus) -> Arc<McpClientHandle> {
         Arc::new(McpClientHandle {
+            call_gate: Default::default(),
             name: server.to_string(),
             version: None,
             connected_at: None,
@@ -835,6 +789,7 @@ mod direct_flag_tests {
 
     fn make_builtin_handle(instance: &str) -> Arc<McpClientHandle> {
         Arc::new(McpClientHandle {
+            call_gate: Default::default(),
             name: instance.to_string(),
             version: None,
             connected_at: None,

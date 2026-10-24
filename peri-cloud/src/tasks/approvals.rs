@@ -168,8 +168,11 @@ impl WorkerService {
         }
         let body = serde_json::to_string(context)?;
         let key = format!(
-            "question:{turn}:{:x}",
-            sha2::Sha256::digest(body.as_bytes())
+            "question:{turn}:{}",
+            (sha2::Sha256::digest(body.as_bytes()))
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         );
         let receipt = self.store.message(task, &key, "worker", &body).await?;
         self.wait_for_parent(scope, cancel).await?;
@@ -325,18 +328,18 @@ impl WorkerService {
             .session(scope.principal, scope.session)
             .await
             .map_err(|_| TaskError::Forbidden)?;
-        let hash = format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&(
-                scope.principal,
-                record.id,
-                scope.session,
-                worker.frozen.device_id,
-                turn,
-                watermark,
-                items
-            ))?)
-        );
+        let hash = (sha2::Sha256::digest(serde_json::to_vec(&(
+            scope.principal,
+            record.id,
+            scope.session,
+            worker.frozen.device_id,
+            turn,
+            watermark,
+            items,
+        ))?))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
         let id = Uuid::new_v4();
         let expires = now() + 90;
         sqlx::query("INSERT OR IGNORE INTO agent_task_approvals(id,task_id,principal,parent_session,window_id,turn_id,request_hash,instruction_watermark,expires_at,request_json,state,decision_json) VALUES(?,?,?,?,?,?,?,?,?,?,'reviewing',NULL)")

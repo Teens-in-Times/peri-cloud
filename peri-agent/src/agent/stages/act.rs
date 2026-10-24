@@ -13,17 +13,22 @@ use crate::error::AgentResult;
 /// emit TurnCompleted（迭代边界提交信号）：从 transcript 读快照，供成功/失败路径共用，
 /// 保证 TUI committed 视图与 transcript 一致（S5.3：run_after_agent / dispatch_tools
 /// 失败时最终回答或工具结果可能已写入 transcript，必须提交迭代边界再传播错误）。
-fn emit_turn_completed(ctx: &StageContext) {
+async fn emit_turn_completed(ctx: &StageContext) {
     let finalized_messages = ctx.session.transcript.read().visible_snapshot();
-    ctx.runtime
+    let outcome = ctx
+        .runtime
         .event_bus
-        .emit_render(RenderEvent::TurnCompleted {
+        .emit_render_reliable(RenderEvent::TurnCompleted {
             turn_id: ctx.turn_id(),
             agent_id: ctx.session.agent_id,
             steps: ctx.session.turn.current_step(),
             elapsed_secs: 0.0,
             finalized_messages,
-        });
+        })
+        .await;
+    if outcome == peri_acp_types::event_v2::EmitOutcome::Closed {
+        tracing::warn!(turn_id = %ctx.turn_id(), "TurnCompleted 接收端关闭；总线已记录需重同步");
+    }
 }
 
 fn emit_goal_snapshot(ctx: &StageContext) {
@@ -42,6 +47,50 @@ fn emit_goal_snapshot(ctx: &StageContext) {
         continuation_count: goal.continuation_count,
         blocked_reason: goal.blocked_reason,
     });
+}
+
+/// 有效响应提交后结清本次请求的后台结果。
+///
+/// 先等待持久化 barrier：只有正文确实落盘，主模型响应才算有效提交。barrier 失败
+/// 时保留处理责任（Blocked）并把本次执行判失败，不得把未落盘内容当成已覆盖。
+async fn settle_result_receipt(
+    ctx: &StageContext,
+    receipt: Option<&crate::session::async_result_mailbox::RequestReceipt>,
+    response_id: Option<crate::messages::MessageId>,
+    exposure: &crate::agent::compact_v2::exposure::RequestExposure,
+) -> AgentResult<()> {
+    let flush_tx = ctx.session.transcript.read().persist_tx_handle();
+    if let Some(tx) = flush_tx {
+        if let Err(error) = crate::session::MessageTranscript::flush_via_tx(&tx).await {
+            if let Some(receipt) = receipt {
+                ctx.session.async_result_mailbox.block_attempt(
+                    receipt,
+                    "act",
+                    &format!("transcript persistence barrier failed: {error:#}"),
+                );
+            }
+            return Err(crate::error::AgentError::Other(anyhow::anyhow!(
+                "transcript persistence barrier failed after model response: {error:#}"
+            )));
+        }
+    }
+    ctx.compact.exposure.lock().confirm(exposure);
+    let Some(receipt) = receipt else {
+        return Ok(());
+    };
+    if let Err(error) = ctx
+        .session
+        .async_result_mailbox
+        .cover_after_commit(receipt, response_id)
+    {
+        // Stop/挂起或另一个 attempt 已接管：责任不由本次响应结清，本轮也不因此失败。
+        tracing::warn!(
+            request_id = %receipt.request_id(),
+            error = %error,
+            "async result receipt is no longer current; coverage deferred"
+        );
+    }
+    Ok(())
 }
 
 /// 运行 Act 阶段
@@ -93,7 +142,7 @@ pub async fn run_act(input: ActInput) -> AgentResult<ActOutput> {
                 // 镜像修复（S5.3）：dispatch 失败（cancel / middleware 错误）时
                 // transcript 可能已含本轮消息（阶段 B 提交后），先 emit TurnCompleted
                 // 再传播错误，保持 TUI committed 视图与 transcript 一致。
-                emit_turn_completed(ctx);
+                emit_turn_completed(ctx).await;
                 emit_goal_snapshot(ctx);
                 return Err(e);
             }
@@ -104,13 +153,20 @@ pub async fn run_act(input: ActInput) -> AgentResult<ActOutput> {
         // 迭代边界提交信号：emit TurnCompleted 携带 transcript 快照，让 TUI 同步规范状态
         // （避免下一次迭代文本渲染在本次工具调用之前）
         //
-        // 必须用 emit_render（而非 emit_state）——TurnCompleted 与同迭代的
+        // 必须用 emit_render_reliable（而非 state 通道）——TurnCompleted 与同迭代的
         // TextChunk/ToolStarted/ToolEnded 共享 render_tx 通道，FIFO 保证顺序。
         // 若放到 state_tx 独立通道，TUI forwarder 的 biased select! 会优先消费
         // 下一迭代的 TextChunk，把本轮 TurnCompleted 拖到后面，导致 partial 混合
         // 两轮内容，渲染出"新文本在旧工具之前"的顺序错乱（详见 RenderEvent::TurnCompleted）。
-        emit_turn_completed(ctx);
+        emit_turn_completed(ctx).await;
         emit_goal_snapshot(ctx);
+        if input.reasoning.stream_interruption.is_none() {
+            settle_result_receipt(ctx, input.receipt.as_ref(), None, &input.exposure).await?;
+            ctx.compact
+                .exposure
+                .lock()
+                .confirm_closed(closed_calls(&outcome.results));
+        }
 
         Ok(ActOutput {
             has_tool_calls: true,
@@ -134,8 +190,16 @@ pub async fn run_act(input: ActInput) -> AgentResult<ActOutput> {
         // 空内容不写入规范历史：中断无正文时只保留续跑提醒，不制造空 assistant
         // 消息——空 text block 会被 provider 拒绝（Anthropic 400），使本可续跑的
         // 断流变成下一轮硬失败。判空沿用 `MessageContent::is_empty()`（不 trim）。
-        if !ai_msg.message_content().is_empty() {
+        let committed = !ai_msg.message_content().is_empty();
+        if committed {
             ctx.session.transcript.write().append(ai_msg);
+        } else if let Some(receipt) = input.receipt.as_ref() {
+            // 空回复没有有效提交：保留责任并显式阻塞，不能让 InFlight 永久占用。
+            ctx.session.async_result_mailbox.block_attempt(
+                receipt,
+                "act",
+                "empty final response was not committed",
+            );
         }
 
         // 非流式时 emit TextChunk（流式由 LLM 适配器直接 emit）
@@ -153,7 +217,7 @@ pub async fn run_act(input: ActInput) -> AgentResult<ActOutput> {
         if input.reasoning.stop_reason == peri_model::StopReason::MaxTokens
             || input.reasoning.stream_interruption.is_some()
         {
-            emit_turn_completed(ctx);
+            emit_turn_completed(ctx).await;
             emit_goal_snapshot(ctx);
             return Ok(ActOutput {
                 has_tool_calls: false,
@@ -184,7 +248,7 @@ pub async fn run_act(input: ActInput) -> AgentResult<ActOutput> {
                 // S5.3：最终回答已 append 到 transcript（:97），先 emit TurnCompleted
                 // （从 transcript 读快照，RwLock 无死锁风险——append 已释放锁），
                 // 再传播错误，避免 TUI committed 视图与 transcript/持久化不一致。
-                emit_turn_completed(ctx);
+                emit_turn_completed(ctx).await;
                 emit_goal_snapshot(ctx);
                 return Err(e);
             }
@@ -192,9 +256,20 @@ pub async fn run_act(input: ActInput) -> AgentResult<ActOutput> {
 
         // 迭代边界提交信号：emit TurnCompleted 携带 transcript 快照（含本轮最终回答）
         //
-        // 必须用 emit_render（详见上方工具路径 同款注释）——保证与同迭代 Render 事件 FIFO。
-        emit_turn_completed(ctx);
+        // 必须走可靠 render FIFO（详见上方工具路径注释），不能迁到独立 state 通道。
+        emit_turn_completed(ctx).await;
         emit_goal_snapshot(ctx);
+
+        // 只有真正写入正文的最终回答才是有效提交；空响应、截断与中断都不结清。
+        if committed {
+            settle_result_receipt(
+                ctx,
+                input.receipt.as_ref(),
+                Some(ai_msg_id),
+                &input.exposure,
+            )
+            .await?;
+        }
 
         Ok(ActOutput {
             has_tool_calls: false,
@@ -208,3 +283,34 @@ pub async fn run_act(input: ActInput) -> AgentResult<ActOutput> {
 #[cfg(test)]
 #[path = "act_test.rs"]
 mod tests;
+
+// Retention controls reuse, never completion. Only typed terminal evidence closes a call.
+fn closed_calls(
+    results: &[(
+        crate::agent::react::ToolCall,
+        crate::agent::react::ToolResult,
+    )],
+) -> Vec<String> {
+    use crate::tools::ToolExecutionStatus;
+    results
+        .iter()
+        .filter_map(|(call, result)| {
+            if result.effective_error_code.is_some() || result.rejection_cause.is_some() {
+                return None;
+            }
+            result
+                .execution
+                .as_ref()
+                .filter(|evidence| {
+                    evidence.task_id.is_none()
+                        && matches!(
+                            evidence.status,
+                            ToolExecutionStatus::Completed
+                                | ToolExecutionStatus::Failed
+                                | ToolExecutionStatus::Cancelled
+                        )
+                })
+                .map(|_| call.id.clone())
+        })
+        .collect()
+}

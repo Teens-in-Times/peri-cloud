@@ -34,10 +34,11 @@ impl Gateway {
             identity: self.identity.web_identity(actor).await?,
             conversation_id: super::web_chat::WEB_CONVERSATION.into(),
         };
-        let fingerprint = format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&("conversation.select", target))?)
-        );
+        let fingerprint =
+            (sha2::Sha256::digest(serde_json::to_vec(&("conversation.select", target))?))
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
         if let Some(row) = sqlx::query(
             "SELECT principal,request_hash,state,result_json FROM control_operations WHERE id=?",
         )

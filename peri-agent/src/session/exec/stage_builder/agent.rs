@@ -151,6 +151,13 @@ pub(crate) fn build_agent(
     let mut base_llm = AgentModelBridge::new(base_model)
         .with_system(system_prompt)
         .with_external_instructions(frozen.external_instructions.clone())
+        .with_environment_prompt(
+            if frozen.legacy_embedded_environment && agent_overrides.is_none() {
+                None
+            } else {
+                frozen.environment_prompt.clone()
+            },
+        )
         .with_legacy_prompt_provenance(
             frozen.legacy_embedded_instructions,
             agent_overrides.is_some(),
@@ -258,8 +265,6 @@ fn project_assembly(input: &StageBuildInput, turn: TurnAssembly) -> AssemblyCont
         command_registry: input.command_registry.clone(),
         cron_scheduler: input.cron_scheduler.clone(),
         mcp_pool: input.mcp_pool.clone(),
-        dynamic_mcp: input.dynamic_mcp.clone(),
-        dynamic_mcp_projection: Arc::clone(&input.dynamic_mcp_projection),
         session_id: input.session_id.clone(),
         tool_search_index: input.tool_search_index.clone(),
         shared_tools: input.shared_tools.clone(),
@@ -273,7 +278,6 @@ fn project_assembly(input: &StageBuildInput, turn: TurnAssembly) -> AssemblyCont
         // LangMiddleware 的语言内容源 = 冻结语言，保证链收集与渲染一致）。
         agent_overrides,
         language: input.language.clone(),
-        workflow_notifications: input.workflow_notifications.clone(),
         event_handler,
         task_manager,
         bg_event_tx,

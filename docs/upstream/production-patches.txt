@@ -38,3 +38,21 @@ peri-resources/Cargo.toml
 peri-resources/src/sessions/discovery.rs
 peri-js-runtime/Cargo.toml
 peri-workflow/Cargo.toml
+
+# Deployment archive port and source/test module size limits.
+peri-acp-types/src/event.rs
+peri-agent/src/agent/compact_v2/micro.rs
+peri-agent/src/agent/stages/archive_capability.rs
+peri-agent/src/agent/stages/loop_iteration_test.rs
+peri-agent/src/agent/stages/micro_facts.rs
+peri-agent/src/context_archive.rs
+peri-agent/src/lib.rs
+peri-agent/src/session/subagent/resume_cases_test.rs
+peri-middlewares/src/subagent/tool/tool_test/integration_v2_test.rs
+peri-middlewares/src/subagent/tool/tool_test.rs
+peri-resources/src/sessions/remote/session_sql.rs
+peri-resources/src/sessions/sqlite_store/schema_test.rs
+# Windows-specific test imports and Unix-only fixture fields.
+peri-resources/src/sessions/sqlite_store/database.rs
+peri-workflow/src/tool_test.rs
+mcp-packages/common/src/shell_lifecycle_test.rs

@@ -176,6 +176,7 @@ impl GateFixture {
         let service = self.pool.retain_service(service);
         let peer = service.peer().clone();
         let handle = Arc::new(McpClientHandle {
+            call_gate: Default::default(),
             name: name.to_string(),
             version: None,
             connected_at: None,
@@ -242,7 +243,7 @@ fn bridge_names(tools: &[std::sync::Arc<dyn BaseTool>]) -> Vec<(String, bool)> {
 }
 
 /// 就绪后闸门放行并暂存**整批**静态 bridge：必需项 direct、其余 deferred，
-/// 且候选只取自 deployment `tool_pool`（session projection 的伪 Connected 不参与）。
+/// 且候选只取自同一 session pool。
 #[tokio::test]
 async fn system_mcp_ready_stages_candidate_with_direct_required_tool() {
     let mut fixture = GateFixture::new();
@@ -258,12 +259,7 @@ async fn system_mcp_ready_stages_candidate_with_direct_required_tool() {
         .await;
     fixture.ready("sys", generation);
 
-    let projection = Arc::new(McpClientPool::new_empty());
-    projection.clients.write().insert(
-        "dyn".to_string(),
-        make_connected_handle_with_tool("dyn", "shadow"),
-    );
-    let mw = McpMiddleware::new(Arc::clone(&projection)).with_tool_pool(Arc::clone(fixture.pool()));
+    let mw = McpMiddleware::new(Arc::clone(fixture.pool()));
 
     let mut probe = StartupGateProbe::default();
     Middleware::before_react_start(&mw, &mut probe)
@@ -444,12 +440,12 @@ async fn system_mcp_timeout_is_fatal() {
     fixture.shutdown().await;
 }
 
-/// 准入事实源是 deployment `tool_pool`：session projection 的连接证据不得放行。
+/// 配置声明不能替代真实连接的准入证据。
 ///
 /// 投影池刻意用**同名** server 且伪 `Connected`：若闸门误读投影池，得到的会是
 /// `NegotiationIncomplete`（无真实协议证据）而不是 deployment 侧的 Timeout。
 #[tokio::test]
-async fn system_mcp_gate_uses_deployment_pool_not_session_projection() {
+async fn system_mcp_gate_requires_actual_connection_evidence() {
     let fixture = GateFixture::new();
     fixture.config(
         "sys",
@@ -457,12 +453,7 @@ async fn system_mcp_gate_uses_deployment_pool_not_session_projection() {
     );
     fixture.publish_loaded();
 
-    let projection = Arc::new(McpClientPool::new_empty());
-    projection.clients.write().insert(
-        "sys".to_string(),
-        make_connected_handle_with_tool("sys", "Read"),
-    );
-    let mw = McpMiddleware::new(Arc::clone(&projection)).with_tool_pool(Arc::clone(fixture.pool()));
+    let mw = McpMiddleware::new(Arc::clone(fixture.pool()));
 
     let mut probe = StartupGateProbe::default();
     let error = Middleware::before_react_start(&mw, &mut probe)
@@ -526,7 +517,7 @@ async fn startup_error_text_folds_control_chars_and_preserves_credentials() {
 // ─── collect_tools 的整批替换与 deferred 回退 ────────────────────────────────
 
 /// 就绪后收集：prepared 整批**替换**初始 Vec，必需项 direct 且只注册一次；
-/// resource / discover 仍原样追加。
+/// archive / resource / discover 独立追加。
 #[tokio::test]
 async fn collect_tools_replaces_initial_bridges_without_duplicate_registration() {
     let mut fixture = GateFixture::new();
@@ -554,11 +545,14 @@ async fn collect_tools_replaces_initial_bridges_without_duplicate_registration()
         .collect();
 
     assert_eq!(
-        &names[names.len() - 2..],
-        ["mcp_read_resource", "DiscoverMCP"],
-        "resource / discover 仍原样追加: {names:?}"
+        &names[names.len() - 3..],
+        ["ReadContextArchive", "mcp_read_resource", "DiscoverMCP"],
+        "archive / resource / discover 独立追加: {names:?}"
     );
-    let bridges = &collected[..names.len() - 2];
+    let archive = &collected[names.len() - 3];
+    assert!(archive.is_direct());
+    assert!(archive.mcp_server_name().is_none());
+    let bridges = &collected[..names.len() - 3];
     assert_eq!(bridges.len(), 3, "整批静态 bridge 恰好一次: {names:?}");
     for name in ["Read", "mcp__sys__Glob", "mcp__aux__Write"] {
         assert_eq!(
@@ -599,7 +593,20 @@ async fn collect_tools_keeps_deferred_bridges_until_manifest_loaded() {
         .find(|tool| tool.name() == "mcp__sys__Read")
         .expect("deferred bridge 仍应存在");
     assert!(!read.is_direct(), "清单未发布不得提升 direct");
-    assert_eq!(collected.len(), 3, "1 static bridge + resource + discover");
+    assert_eq!(
+        collected.len(),
+        4,
+        "1 static bridge + archive + resource + discover"
+    );
+    assert_eq!(
+        collected
+            .iter()
+            .filter(|tool| tool.is_direct())
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>(),
+        vec!["ReadContextArchive"],
+        "未准入的外部工具仍不得进入 direct 集合"
+    );
 
     fixture.shutdown().await;
 }
@@ -620,7 +627,11 @@ async fn collect_tools_falls_back_to_deferred_when_required_tool_missing() {
     assert!(collected
         .iter()
         .all(|tool| tool.mcp_server_name() != Some("sys")));
-    assert_eq!(collected.len(), 2, "只剩 resource + discover");
+    assert_eq!(
+        collected.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+        vec!["ReadContextArchive", "mcp_read_resource", "DiscoverMCP"],
+        "缺少 required 工具时只保留独立的 archive / resource / discover"
+    );
 
     fixture.shutdown().await;
 }
@@ -684,7 +695,7 @@ async fn collect_tools_waits_for_zero_tool_system_server_discovery() {
 /// 也不自行触发发现；`before_agent` 仍按原语义触发（幂等增量挂点保留）。
 #[tokio::test]
 async fn successful_gate_preserves_discovery_and_status_notifications() {
-    let pool = Arc::new(McpClientPool::new_empty());
+    let (mut owner, pool) = owned_discovery_pool();
     insert_skill_handle(
         &pool,
         "srv",
@@ -732,6 +743,10 @@ async fn successful_gate_preserves_discovery_and_status_notifications() {
         reg.all_skills().is_empty(),
         "真实空目录 peer 必须收尾为合法空目录"
     );
+    pool.begin_shutdown();
+    owner.begin_shutdown();
+    owner.shutdown().await;
+    assert!(pool.shutdown().await.is_complete());
 }
 
 /// 失败不留下可复用的半成品：同一 middleware 连续两次准入，第二次按当次句柄

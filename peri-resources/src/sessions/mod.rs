@@ -5,6 +5,8 @@
 //! 契约类型（`ThreadStore` trait / `ThreadMeta` / `BaseMessage` / `MessageFlags`）位于
 //! peri-acp-types（接口契约归 peri-acp-types），本模块仅实现，不解释业务语义。
 
+mod archive;
+mod archive_fork;
 mod canonical;
 mod data;
 #[cfg(not(target_os = "emscripten"))]
@@ -58,7 +60,7 @@ use std::{path::PathBuf, sync::Arc};
 /// 只解析默认数据库位置；不创建目录、数据库或连接。
 #[cfg(not(target_os = "emscripten"))]
 fn default_database_path() -> Option<PathBuf> {
-    dirs_next::home_dir().map(|home| home.join(".peri").join("threads").join("threads.db"))
+    dirs::home_dir().map(|home| home.join(".peri").join("threads").join("threads.db"))
 }
 
 /// crate 内的只读打开 seam：按显式路径或默认路径打开已存在的会话库，返回门面实例。
@@ -107,7 +109,7 @@ pub async fn open_store_and_facade_for_tests(
     SqliteThreadStore::open_shared(db_path).await
 }
 
-// dirs-next uses the Windows profile known folder, so HOME cannot isolate these tests there.
+// dirs uses the Windows profile known folder, so HOME cannot isolate these tests there.
 #[cfg(all(test, unix))]
 #[path = "default_path_test.rs"]
 mod default_path_tests;

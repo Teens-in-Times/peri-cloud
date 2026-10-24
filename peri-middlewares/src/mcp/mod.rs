@@ -12,8 +12,9 @@ pub mod callback_server;
 pub mod client;
 pub mod client_oauth;
 pub mod config;
+pub(crate) mod connection_gate;
+pub(crate) mod control;
 pub mod discover_tool;
-pub mod dynamic;
 // ClientInitializeError 来自 rmcp crate（504 bytes），无法修改其定义
 #[allow(clippy::result_large_err)]
 pub mod initialize;
@@ -28,8 +29,13 @@ pub mod session_invocation;
 pub(crate) mod skill_activation;
 pub(crate) mod skill_discovery;
 pub(crate) mod system_tools;
+// 进程内 standalone serving（`peri mcp-start <instance>`）：通用 serve 在
+// `peri-mcp-common`，实例构造在 `builtin/standalone.rs`。
+#[cfg(not(target_os = "emscripten"))]
+pub mod standalone;
 pub mod task_scope;
 pub mod tool_bridge;
+mod tool_execution;
 mod tool_request;
 pub mod transport;
 
@@ -51,6 +57,7 @@ pub use config::{
     load_merged_config, remove_server_from_config, set_server_disabled, ConfigSource,
     McpConfigError, McpConfigFile, McpServerConfig, OAuthConfig,
 };
+pub use connection_gate::McpCallGate;
 pub use middleware::McpMiddleware;
 pub use oauth_flow::{
     OAuthCallbackResult, OAuthFailureKind, OAuthFlowError, OAuthFlowEvent, OAuthFlowManager,
@@ -58,8 +65,7 @@ pub use oauth_flow::{
 pub use resource_tool::McpResourceTool;
 pub use rmcp::model::{Resource, Tool};
 pub use task_scope::{
-    DynamicMcpTaskKind, McpTaskKey, McpTaskOwner, McpTaskShutdownReport, McpTaskSpawner,
-    TaskAdmissionError,
+    McpTaskKey, McpTaskOwner, McpTaskShutdownReport, McpTaskSpawner, TaskAdmissionError,
 };
 pub use tool_bridge::{build_tool_bridges, McpToolBridge, ToolCallError};
 // D-02：crate 内 seam 测试（主 plan §6 W5）。模块名参与 `cargo test` 过滤，
@@ -108,3 +114,9 @@ mod workspace_recovery_tests;
 #[cfg(test)]
 #[path = "builtin_cron_runtime_test.rs"]
 mod builtin_cron_runtime_tests;
+
+mod context_archive;
+
+#[cfg(test)]
+#[path = "tool_bridge_invocation_fixture_test.rs"]
+mod current_invocation_fixture;

@@ -7,6 +7,7 @@
 //! Receive 是循环入口，也是退出判断点：队列空 + 无 idle 等待时退出。
 
 pub mod act;
+mod archive_capability;
 mod async_context;
 pub mod compact;
 mod compact_progress;
@@ -18,6 +19,7 @@ mod null_llm;
 mod queue_to_transcript;
 pub mod reason;
 pub mod receive;
+pub use receive::{ReceiveInput, ReceiveOutput};
 pub mod tool_dispatch;
 pub use invocation_context::{
     ExecutionEntryOrigin, InvocationContext, ModelTurnFacts, PostHookSkipSink,
@@ -58,254 +60,24 @@ pub type SharedToolMap = Arc<RwLock<BTreeMap<String, Arc<dyn BaseTool>>>>;
 pub enum LoopResult {
     /// 正常结束（无更多消息）
     Completed,
+    /// 本次 child 收尾窗口到期，不再准入新语义迭代；由 runner 交接资源。
+    /// `unprocessed_tool_calls` 是已准入 Act 产生、尚未被下一次 Reason 读取的
+    /// tool call 身份；它们只存在于 transcript，不在 MQ。
+    SettlementDue { unprocessed_tool_calls: Vec<String> },
+    /// hook 显式停止（PostToolBatch `continue:false`）：不再发起模型请求。
+    /// 已准入 Act 的 tool call 只存在于 transcript，必须随结果交给 runner。
+    HookStopped { unprocessed_tool_calls: Vec<String> },
     /// 被中断
     Interrupted,
     /// 错误
     Error(crate::error::AgentError),
 }
 
-// ─── 阶段间共享上下文子结构 ─────────────────────────────────────────────────
-
-/// 会话级实体（生命周期 = 整个 Agent Session）
-#[derive(Clone)]
-pub struct SessionHandle {
-    pub turn: Arc<TurnContext>,
-    pub transcript: Arc<RwLock<MessageTranscript>>,
-    pub queue: MessageQueue,
-    pub user_input_mailbox: Option<Arc<crate::session::user_input_mailbox::UserInputMailbox>>,
-    pub agent_id: AgentId,
-    /// metrics/tracing 用键值对（不作为 middleware hook 的隐式共享协议）
-    pub session_context: Arc<RwLock<HashMap<String, String>>>,
-}
-
-/// LLM 调用 + 工具执行运行时服务
-#[derive(Clone)]
-pub struct RuntimeServices {
-    pub llm: Arc<dyn ReactLLM + Send + Sync>,
-    /// Mutable middleware working view. Dispatch never resolves from this map.
-    pub tools: SharedToolMap,
-    /// Session-local immutable catalog publisher.
-    pub tool_catalog: Arc<SessionToolCatalog>,
-    /// 每个 dispatch 使用其工具表 snapshot 的 canonical invocation resolver。
-    pub tool_invocation_resolver: Arc<dyn ToolInvocationResolver>,
-    pub middleware_chain: Arc<MiddlewareChain>,
-    pub event_bus: Arc<EventBus>,
-    /// Deferred tools 外部注册表（ExecuteExtraTool 代理执行用）
-    pub shared_tools: Option<SharedToolMap>,
-}
-
-/// Compact 系统上下文（含跨阶段计数器）
-#[derive(Clone)]
-pub struct CompactContext {
-    pub context_budget: Option<ContextBudget>,
-    pub compact_config: Option<CompactConfig>,
-    pub compact_llm: Option<Arc<dyn peri_model::Model>>,
-    pub compact_pre_hook: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub compact_post_hook: Option<Arc<dyn Fn(bool, usize) + Send + Sync>>,
-    /// 会话级 Token 追踪器（Compact 写 reset/estimated_tokens，Act 读用于 StateSnapshot）
-    pub token_tracker: Arc<RwLock<crate::agent::token::TokenTracker>>,
-    /// 连续工具失败计数（tool_dispatch 递增/重置，Act 读用于 StateSnapshot）
-    pub consecutive_failures: Arc<AtomicU32>,
-    /// Compact 连续失败计数（run_compact 内部递增/重置，仅用于 Compact 降级跳过决策）
-    pub compact_consecutive_failures: Arc<AtomicU32>,
-    pub(crate) budget_recovery: Arc<parking_lot::Mutex<compact_progress::CompactBudgetRecovery>>,
-}
-
-// ─── 阶段间共享上下文 ───────────────────────────────────────────────────────
-
-/// 阶段间共享的会话资源引用
-///
-/// 所有阶段通过此结构体访问 Session 实体，不直接持有 Session。
-///
-/// **P2 扩展**：加入 LLM / 工具 / 中间件链 / EventBus / Compact 等运行时依赖，
-/// 让 stages 可以自驱完整 ReAct 循环，由 [`run_react_loop`] 入口统一驱动。
-#[derive(Clone)]
-pub struct StageContext {
-    pub session: SessionHandle,
-    pub runtime: RuntimeServices,
-    pub compact: CompactContext,
-    pub async_ctx: AsyncContext,
-    /// 当前 session 的 Goal 只读/控制投影源。
-    pub goal_controller: Option<Arc<dyn peri_acp_types::goal::GoalController>>,
-    /// Recall 累加器（跨 middleware hook 共享）。
-    ///
-    /// 每次 middleware hook 都会构造临时 [`AgentContext`]，
-    /// 调用结束后由 middleware_runner 把 AgentContext 内部
-    /// recall_buffer drain 到本缓冲区，循环结束后由 executor 统一取出。
-    pub recall_buffer: Arc<RwLock<Vec<String>>>,
-    /// Reason 准备阶段的模型视图复用槽（生命周期由 `run_reason` 显式划定：
-    /// 入口 reset、取到请求快照后 release）。
-    pub(crate) model_view: Arc<ModelViewScope>,
-}
-
-impl StageContext {
-    /// canonical session 身份投影（`session_context["session_id"]`）。
-    ///
-    /// **单一权威**：调用期事实（`InvocationContext`）与 middleware 状态
-    /// （`AgentContext`）都从这里取 session 身份，不得各自复写投影规则。
-    ///
-    /// **缺失即 `None`**：`session_id` 是 ACP 会话身份，只有真实会话才能给出
-    /// （主 agent 在 `StageContext` 构造期写入；子 agent 自建 session 没有
-    /// thread 绑定时不写）。`agent_id` 是执行实例身份，不是会话身份，**不得**
-    /// 用作回退——否则会铸造出「可信会话归属」的事实，让审批的 fail-closed
-    /// 守卫（`interaction_owner::untrusted_owner_error`）变成死分支。
-    pub(crate) fn project_session_id(&self) -> Option<String> {
-        self.session
-            .session_context
-            .read()
-            .get("session_id")
-            .cloned()
-    }
-
-    /// 测试最小上下文：仅传会话实体，运行时依赖按测试行为填充。
-    ///
-    /// **注意**：此构造函数仅用于单元测试。生产代码请用 `StageContextBuilder`。
-    #[cfg(test)]
-    pub fn new(
-        turn: TurnContext,
-        transcript: Arc<RwLock<MessageTranscript>>,
-        queue: MessageQueue,
-    ) -> Self {
-        let turn_arc = Arc::new(turn);
-        let tools_map: SharedToolMap = Arc::new(RwLock::new(BTreeMap::new()));
-        let mw_chain = Arc::new(MiddlewareChain::new());
-        let ebus = Arc::new(EventBus::new(Default::default()).0);
-        let ttracker = Arc::new(parking_lot::RwLock::new(
-            crate::agent::token::TokenTracker::default(),
-        ));
-        let tool_fail = Arc::new(AtomicU32::new(0));
-        let compact_fail = Arc::new(AtomicU32::new(0));
-        let sctx = Arc::new(RwLock::new(std::collections::HashMap::new()));
-        let rbuf = Arc::new(RwLock::new(Vec::new()));
-        Self {
-            session: SessionHandle {
-                turn: turn_arc,
-                transcript,
-                queue,
-                user_input_mailbox: None,
-                agent_id: AgentId::new(),
-                session_context: sctx,
-            },
-            runtime: RuntimeServices {
-                llm: Arc::new(NullReactLLM),
-                tools: Arc::clone(&tools_map),
-                tool_catalog: Arc::new(SessionToolCatalog::new(BTreeMap::new(), None)),
-                tool_invocation_resolver: Arc::new(DirectToolInvocationResolver),
-                middleware_chain: mw_chain,
-                event_bus: ebus,
-                shared_tools: None,
-            },
-            compact: CompactContext {
-                context_budget: None,
-                compact_config: None,
-                compact_llm: None,
-                compact_pre_hook: None,
-                compact_post_hook: None,
-                token_tracker: ttracker,
-                consecutive_failures: tool_fail,
-                compact_consecutive_failures: compact_fail,
-                budget_recovery: Arc::new(parking_lot::Mutex::new(Default::default())),
-            },
-            async_ctx: AsyncContext {
-                idle_wait_enabled: false,
-                idle_should_wait: None,
-                pending_handoff: None,
-                handoff_deadline: None,
-                idle_registry: None,
-                idle_suspended_flag: None,
-                hook_stop_requested: None,
-            },
-            goal_controller: None,
-            recall_buffer: rbuf,
-            model_view: Arc::new(ModelViewScope::default()),
-        }
-    }
-
-    /// 创建 builder（生产代码推荐路径）
-    pub fn builder(
-        turn: TurnContext,
-        transcript: Arc<RwLock<MessageTranscript>>,
-        queue: MessageQueue,
-    ) -> StageContextBuilder {
-        StageContextBuilder {
-            session: SessionHandle {
-                turn: Arc::new(turn),
-                transcript,
-                queue,
-                user_input_mailbox: None,
-                agent_id: AgentId::new(),
-                session_context: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            },
-            runtime: RuntimeServices {
-                llm: Arc::new(NullReactLLM),
-                tools: Arc::new(RwLock::new(BTreeMap::new())),
-                tool_catalog: Arc::new(SessionToolCatalog::new(BTreeMap::new(), None)),
-                tool_invocation_resolver: Arc::new(DirectToolInvocationResolver),
-                middleware_chain: Arc::new(MiddlewareChain::new()),
-                event_bus: Arc::new(EventBus::new(Default::default()).0),
-                shared_tools: None,
-            },
-            compact: CompactContext {
-                context_budget: None,
-                compact_config: None,
-                compact_llm: None,
-                compact_pre_hook: None,
-                compact_post_hook: None,
-                token_tracker: Arc::new(parking_lot::RwLock::new(
-                    crate::agent::token::TokenTracker::default(),
-                )),
-                consecutive_failures: Arc::new(AtomicU32::new(0)),
-                compact_consecutive_failures: Arc::new(AtomicU32::new(0)),
-                budget_recovery: Arc::new(parking_lot::Mutex::new(Default::default())),
-            },
-            async_ctx: AsyncContext {
-                idle_wait_enabled: false,
-                idle_should_wait: None,
-                pending_handoff: None,
-                handoff_deadline: None,
-                idle_registry: None,
-                idle_suspended_flag: None,
-                hook_stop_requested: None,
-            },
-            goal_controller: None,
-        }
-    }
-
-    /// 便捷访问：当前 turn_id
-    pub fn turn_id(&self) -> crate::session::turn::TurnId {
-        self.session.turn.turn_id()
-    }
-
-    /// 便捷访问：当前 cwd
-    pub fn cwd(&self) -> &str {
-        &self.session.turn.cwd
-    }
-
-    /// 取出可见消息快照（已过滤 excluded 标记）
-    pub fn visible_messages(&self) -> Vec<BaseMessage> {
-        self.session
-            .transcript
-            .read()
-            .visible_messages()
-            .into_iter()
-            .cloned()
-            .collect()
-    }
-}
-
-// ─── StageContextBuilder ────────────────────────────────────────────────────
-
-/// StageContext 构建器
-///
-/// 必填：turn / transcript / queue / llm（生产场景）
-/// 可选：tools / middleware_chain / event_bus / budget / compact_config 等
-pub struct StageContextBuilder {
-    session: SessionHandle,
-    runtime: RuntimeServices,
-    compact: CompactContext,
-    async_ctx: AsyncContext,
-    goal_controller: Option<Arc<dyn peri_acp_types::goal::GoalController>>,
-}
+mod context;
+mod micro_facts;
+pub use context::{
+    CompactContext, RuntimeServices, SessionHandle, StageContext, StageContextBuilder,
+};
 
 // ─── Compact 阶段类型 ────────────────────────────────────────────────────────
 
@@ -320,28 +92,6 @@ pub struct CompactInput {
 pub struct CompactOutput {
     /// 是否执行了 compact（用于事件追踪）
     pub compacted: bool,
-}
-
-// ─── Receive 阶段类型 ────────────────────────────────────────────────────────
-
-/// Receive 阶段输入
-pub struct ReceiveInput {
-    pub context: StageContext,
-}
-
-/// Receive 阶段输出
-pub struct ReceiveOutput {
-    /// 本轮消费的消息数量（含不唤醒循环的 Info）
-    pub consumed_count: usize,
-    /// 本轮消费的可驱动语义续跑消息数量（Prompt / Defer）
-    pub wake_up_count: usize,
-    /// 预算不足而保留在队列中的后续新增 EnsureProcessing 输入数量。
-    pub budget_deferred_count: usize,
-    /// 本次消费的非空用户 Human 消息身份，供首次输入准备精准处理。
-    pub input_message_ids: Vec<crate::messages::MessageId>,
-    /// 本轮消费到 hook 的显式停止意图（`continue:false`）：循环必须经 Receive
-    /// 唯一退出口结束，不得再发起额外模型请求。
-    pub stop_requested: bool,
 }
 
 // ─── Reason 阶段类型 ─────────────────────────────────────────────────────────
@@ -362,6 +112,9 @@ pub struct ReasonOutput {
     pub catalog: Arc<SessionToolCatalogSnapshot>,
     /// LLM 请求使用的消息快照（用于调试/追踪；Arc 共享，避免传递时再拷贝）
     pub messages_snapshot: std::sync::Arc<Vec<BaseMessage>>,
+    pub exposure: crate::agent::compact_v2::exposure::RequestExposure,
+    /// 本次请求实际投影到的后台结果；提交成功后由 Act 结清。
+    pub receipt: Option<crate::session::async_result_mailbox::RequestReceipt>,
 }
 
 // ─── Act 阶段类型 ────────────────────────────────────────────────────────────
@@ -371,8 +124,11 @@ pub struct ActInput {
     pub context: StageContext,
     /// Reason 阶段的推理结果
     pub reasoning: crate::agent::react::Reasoning,
+    pub exposure: crate::agent::compact_v2::exposure::RequestExposure,
     /// Exact catalog pinned by Reason.
     pub catalog: Arc<SessionToolCatalogSnapshot>,
+    /// Reason 记录的请求覆盖范围；只有有效提交后才能结清。
+    pub receipt: Option<crate::session::async_result_mailbox::RequestReceipt>,
 }
 
 /// Act 阶段输出
@@ -452,6 +208,35 @@ fn enqueue_truncation_continuation(context: &StageContext) {
     );
 }
 
+/// 阶段失败时保留后台结果的处理责任：用户 Stop 进入 Suspended，其它失败进入
+/// Blocked，等待显式继续。这里不自动重试，也不把未覆盖当成已交付。
+fn record_stage_failure(context: &StageContext, stage: &str, failure: &LoopResult) {
+    match failure {
+        LoopResult::Interrupted => context
+            .session
+            .async_result_mailbox
+            .suspend_scope("cancelled"),
+        LoopResult::Error(error) => context
+            .session
+            .async_result_mailbox
+            .block_uncovered(stage, &error.to_string()),
+        // 非失败出口：Hook stop 已在退出点挂起，结算到期由 child runner 交接，
+        // 都不在这里改写处理责任。
+        LoopResult::Completed
+        | LoopResult::SettlementDue { .. }
+        | LoopResult::HookStopped { .. } => {}
+    }
+}
+
+/// 用户中断的唯一出口：先挂起未结清责任，再返回 Interrupted。
+fn interrupted(context: &StageContext) -> LoopResult {
+    context
+        .session
+        .async_result_mailbox
+        .suspend_scope("cancelled");
+    LoopResult::Interrupted
+}
+
 /// 执行单个 ReAct 阶段：emit StageStarted → 调用阶段函数 → emit StageEnded → Ok/Err 分发。
 ///
 /// Receive/Compact/Reason/Act 四阶段共享同一「事件观测 + 错误传播」样板，
@@ -514,6 +299,15 @@ where
 /// 控制流：Receive → Compact → Reason → Act → (回 Receive)。
 /// Receive 是循环入口，也是退出判断点。
 /// 返回循环最终结果（Completed / Interrupted / Error）。
+/// child 收尾截止：到期后不再消费新输入或准入新语义迭代。
+pub(crate) fn settlement_due(context: &StageContext) -> bool {
+    context
+        .async_ctx
+        .child_settlement
+        .as_ref()
+        .is_some_and(|window| window.expired())
+}
+
 pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> LoopResult {
     let mut loop_state = LoopState::default();
     let mut semantic_iterations = 0usize;
@@ -529,7 +323,12 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
         'rcra: loop {
             // 检查 cancel
             if context.session.turn.is_cancelled() {
-                return LoopResult::Interrupted;
+                return interrupted(&context);
+            }
+            if settlement_due(&context) {
+                return LoopResult::SettlementDue {
+                    unprocessed_tool_calls: context.async_ctx.unprocessed_tool_calls.lock().clone(),
+                };
             }
 
             // ── Receive（循环入口，也是退出判断点）──
@@ -549,8 +348,21 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
             };
 
             // Hook 显式停止意图（PostToolBatch `continue:false`）：Receive 是循环的
-            // 唯一退出口；消费到停止意图直接以 Completed 结束，不再发起模型请求。
+            // 唯一退出口；消费到停止意图返回 `HookStopped`，不再发起模型请求。
+            // 子 Agent 由 runner 按未推理义务交接；主会话由 executor 映射为正常
+            // Done。停止意图已绑定执行身份，旧 run 的 Stop 不会终止新执行。
             if receive_out.stop_requested {
+                // Stop 优先：未处理结果进入 Suspended，不得保留 Ready 触发自动续跑。
+                context
+                    .session
+                    .async_result_mailbox
+                    .suspend_scope("hook stop");
+                // 同批已提交但不会推理的消息保留为交接义务。
+                context
+                    .async_ctx
+                    .received_after_deadline
+                    .lock()
+                    .extend(receive_out.process_message_ids.clone());
                 if let Some(flag) = &context.async_ctx.hook_stop_requested {
                     flag.store(true, Ordering::Release);
                 }
@@ -558,7 +370,21 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
                     consumed = receive_out.consumed_count,
                     "Receive: hook stop intent consumed; exiting run without further model request"
                 );
-                return LoopResult::Completed;
+                return LoopResult::HookStopped {
+                    unprocessed_tool_calls: context.async_ctx.unprocessed_tool_calls.lock().clone(),
+                };
+            }
+
+            // Receive 的持久化等待可能跨过 D：已落库结果保留，但不再准入新语义迭代。
+            if settlement_due(&context) {
+                context
+                    .async_ctx
+                    .received_after_deadline
+                    .lock()
+                    .extend(receive_out.process_message_ids.clone());
+                return LoopResult::SettlementDue {
+                    unprocessed_tool_calls: context.async_ctx.unprocessed_tool_calls.lock().clone(),
+                };
             }
 
             // 退出判断：本轮没有可唤醒消息且上一轮无工具调用 → 检查是否该退出。
@@ -568,6 +394,9 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
             if receive_out.wake_up_count == 0
                 && receive_out.budget_deferred_count == 0
                 && !loop_state.has_tool_calls
+                // 续跑请求可能没有队列消息：Ready 结果必须进入本次请求处理，
+                // 不能以“队列为空”为由提前退出并留下自动续跑候选。
+                && !context.session.async_result_mailbox.has_ready()
             {
                 // 竞态保护：退出前再检查一次队列是否有新消息到达
                 if context.session.queue.has_required_for_run(&execution) {
@@ -610,12 +439,17 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
                     if let Some(flag) = &context.async_ctx.idle_suspended_flag {
                         flag.store(true, Ordering::Release);
                     }
-                    context.runtime.event_bus.emit_render(
-                        crate::agent::events_v2::RenderEvent::TurnSuspended {
+                    let outcome = context
+                        .runtime
+                        .event_bus
+                        .emit_render_reliable(crate::agent::events_v2::RenderEvent::TurnSuspended {
                             turn_id: context.turn_id(),
                             agent_id: context.session.agent_id,
-                        },
-                    );
+                        })
+                        .await;
+                    if outcome == peri_acp_types::event_v2::EmitOutcome::Closed {
+                        tracing::warn!(turn_id = %context.turn_id(), "TurnSuspended 接收端关闭；总线已记录需重同步");
+                    }
                     let cancel_fut = context.session.turn.cancel_token.cancelled();
                     tokio::pin!(cancel_fut);
                     // 有界等待：界本身必须能唤醒挂起的 loop，否则只有偶发
@@ -658,7 +492,7 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
                             if let Some(mailbox) = &context.session.user_input_mailbox {
                                 mailbox.leave_idle();
                             }
-                            return LoopResult::Interrupted;
+                            return interrupted(&context);
                         }
                         _ = context.session.queue.await_wake_for_run(&execution) => {
                             // 醒来：无论由注入 prompt 还是 bg Defer 触发，先复位
@@ -670,7 +504,7 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
                                 mailbox.leave_idle();
                             }
                             if context.session.turn.is_cancelled() {
-                                return LoopResult::Interrupted;
+                                return interrupted(&context);
                             }
                             tracing::debug!(
                                 turn_id = %context.session.turn.turn_id(),
@@ -743,11 +577,14 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
                     .as_ref()
                     .and_then(|probe| probe())
                 {
-                    crate::agent::async_tasks::handoff::write_pending_handoff(
+                    if let Err(error) = crate::agent::async_tasks::handoff::write_pending_handoff(
                         &context.session,
                         &handoff,
                     )
-                    .await;
+                    .await
+                    {
+                        return LoopResult::Error(anyhow::anyhow!(error).into());
+                    }
                 }
                 break 'rcra;
             }
@@ -763,9 +600,11 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
                     initial_input_watermark,
                     "ReAct v2 循环达到最大语义迭代次数"
                 );
-                return LoopResult::Error(crate::error::AgentError::MaxIterationsExceeded(
+                let failure = LoopResult::Error(crate::error::AgentError::MaxIterationsExceeded(
                     max_iterations,
                 ));
+                record_stage_failure(&context, "max_iterations", &failure);
+                return failure;
             }
             semantic_iterations += 1;
             context.session.turn.advance_step();
@@ -782,7 +621,7 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
                         .await
                 {
                     if matches!(e, crate::error::AgentError::Interrupted) {
-                        return LoopResult::Interrupted;
+                        return interrupted(&context);
                     }
                     tracing::warn!(error = %e, "[v2] before_agent hook failed");
                 }
@@ -790,9 +629,11 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
                 middleware_runner::run_before_input(&context, &receive_out.input_message_ids).await
             {
                 if matches!(error, crate::error::AgentError::Interrupted) {
-                    return LoopResult::Interrupted;
+                    return interrupted(&context);
                 }
-                return LoopResult::Error(error);
+                let failure = LoopResult::Error(error);
+                record_stage_failure(&context, "before_input", &failure);
+                return failure;
             }
 
             // ── 启动闸门 hook（首批输入准备完成后、Compact 前执行一次）──
@@ -802,10 +643,12 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
             if !loop_state.react_start_has_run {
                 match middleware_runner::run_before_react_start(&context).await {
                     Ok(()) => loop_state.react_start_has_run = true,
-                    Err(crate::error::AgentError::Interrupted) => return LoopResult::Interrupted,
+                    Err(crate::error::AgentError::Interrupted) => return interrupted(&context),
                     Err(error) => {
                         tracing::warn!(error = %error, "[v2] before_react_start hook failed");
-                        return LoopResult::Error(error);
+                        let failure = LoopResult::Error(error);
+                        record_stage_failure(&context, "before_react_start", &failure);
+                        return failure;
                     }
                 }
             }
@@ -827,6 +670,7 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
             })
             .await
             {
+                record_stage_failure(&context, "compact", &e);
                 return e;
             }
 
@@ -841,8 +685,14 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
             .await
             {
                 Ok(out) => out,
-                Err(e) => return e,
+                Err(e) => {
+                    record_stage_failure(&context, "reason", &e);
+                    return e;
+                }
             };
+
+            // Reason 成功后上一批义务已被读取；失败时仍保留供 runner 交接。
+            context.async_ctx.unprocessed_tool_calls.lock().clear();
 
             // 完整工具仍照常执行；无工具截断必须与自然完成区分，不能靠空队列判成功。
             let truncated_without_tools = reason_out.reasoning.stop_reason
@@ -856,31 +706,50 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
                 .filter(|_| !reason_out.reasoning.needs_tool_call());
 
             // ── Act ──
+            let unprocessed_tool_calls: Vec<String> = reason_out
+                .reasoning
+                .tool_calls
+                .iter()
+                .map(|call| call.id.clone())
+                .collect();
             let act_out = match run_stage(&context, Stage::Act, || async {
                 act::run_act(ActInput {
                     context: context.clone(),
                     reasoning: reason_out.reasoning,
                     catalog: reason_out.catalog,
+                    receipt: reason_out.receipt,
+                    exposure: reason_out.exposure,
                 })
                 .await
             })
             .await
             {
                 Ok(out) => out,
-                Err(e) => return e,
+                Err(e) => {
+                    record_stage_failure(&context, "act", &e);
+                    return e;
+                }
             };
 
             loop_state.has_tool_calls = act_out.has_tool_calls;
+            *context.async_ctx.unprocessed_tool_calls.lock() = if act_out.has_tool_calls {
+                unprocessed_tool_calls
+            } else {
+                Vec::new()
+            };
             if let Some(interruption) = stream_interruption {
                 if context.session.turn.is_cancelled() {
-                    return LoopResult::Interrupted;
+                    return interrupted(&context);
                 }
                 loop_state.stream_recoveries += 1;
                 if loop_state.stream_recoveries >= interruption.max_attempts as usize {
-                    return LoopResult::Error(crate::error::AgentError::StreamRecoveryExhausted {
-                        attempts: loop_state.stream_recoveries,
-                        source: interruption.error,
-                    });
+                    let failure =
+                        LoopResult::Error(crate::error::AgentError::StreamRecoveryExhausted {
+                            attempts: loop_state.stream_recoveries,
+                            source: interruption.error,
+                        });
+                    record_stage_failure(&context, "stream_recovery", &failure);
+                    return failure;
                 }
                 enqueue_stream_interruption_continuation(&context);
             }
@@ -895,9 +764,11 @@ pub async fn run_react_loop(context: StageContext, max_iterations: usize) -> Loo
                         model = %context.runtime.llm.model_name(),
                         "连续无工具截断耗尽续跑预算，终止本轮"
                     );
-                    return LoopResult::Error(crate::error::AgentError::OutputTruncated {
+                    let failure = LoopResult::Error(crate::error::AgentError::OutputTruncated {
                         attempts: loop_state.consecutive_truncations,
                     });
+                    record_stage_failure(&context, "output_truncated", &failure);
+                    return failure;
                 }
                 enqueue_truncation_continuation(&context);
             } else {
@@ -948,3 +819,11 @@ mod bounded_wait_exit_tests;
 #[cfg(test)]
 #[path = "model_view_test.rs"]
 mod model_view_tests;
+
+#[cfg(test)]
+#[path = "micro_exposure_test.rs"]
+mod micro_exposure_tests;
+
+#[cfg(test)]
+#[path = "micro_turn_exposure_test.rs"]
+mod micro_turn_exposure_tests;

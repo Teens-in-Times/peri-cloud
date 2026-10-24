@@ -84,6 +84,10 @@ pub struct SubAgentTool {
 
 #[async_trait]
 impl BaseTool for SubAgentTool {
+    fn context_retention(&self) -> peri_agent::tools::ContextRetention {
+        peri_agent::tools::ContextRetention::Report
+    }
+
     fn name(&self) -> &str {
         TOOL_AGENT
     }
@@ -133,7 +137,7 @@ impl BaseTool for SubAgentTool {
                 },
                 "subagent_type": {
                     "type": "string",
-                    "description": "The agent ID from the available agents list (e.g., 'code-reviewer', 'explorer'). Must exactly match an agent definition file at .claude/agents/{subagent_type}.md or .claude/agents/{subagent_type}/agent.md. REQUIRED for NEW sub-agents unless fork=true (when not provided and fork is not set, the call will fail). Ignored when resume_thread_id is provided (resume takes priority over subagent_type / fork)"
+                    "description": "Exact agent ID from the available catalog or a current loader suggestion. The loader resolves definitions from project configuration, enabled plugins, built-in providers, or MCP resources; a project-local definition file is not required. REQUIRED for NEW sub-agents unless fork=true (when not provided and fork is not set, the call will fail). Ignored when resume_thread_id is provided (resume takes priority over subagent_type / fork)"
                 },
                 "model": {
                     "type": "string",
@@ -173,6 +177,15 @@ impl BaseTool for SubAgentTool {
         input: serde_json::Value,
         ctx: peri_agent::tools::ToolContext<'_>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.invoke_output(input, ctx).await?.text)
+    }
+
+    async fn invoke_output(
+        &self,
+        input: serde_json::Value,
+        ctx: peri_agent::tools::ToolContext<'_>,
+    ) -> Result<peri_agent::tools::ToolOutput, Box<dyn std::error::Error + Send + Sync>> {
+        use peri_agent::tools::{ToolExecutionEvidence, ToolExecutionStatus, ToolOutput};
         let InvocationArgs {
             resume_thread_id,
             prompt,
@@ -217,7 +230,8 @@ impl BaseTool for SubAgentTool {
                     parent_tool_call_id.clone(),
                     approval_owner,
                 )
-                .await;
+                .await
+                .map(ToolOutput::from_legacy);
         }
 
         // 非 resume 路径：prompt 必填（required:[] 后由运行时校验兜底）
@@ -231,8 +245,6 @@ impl BaseTool for SubAgentTool {
         if is_fork {
             crate::subagent::fork::fork_context_usage_gate(ctx.context_usage)?;
         }
-
-        let current_messages = self.current_messages(ctx.messages);
 
         let is_mcp_agent = subagent_type
             .as_deref()
@@ -262,23 +274,33 @@ impl BaseTool for SubAgentTool {
         // task_manager 缺失时维持既有语义：落回同步路径（与显式 true 一致）。
         let run_in_background = run_in_background && host.task_manager.is_some();
         if resume_thread_id.is_none() && run_in_background {
+            // 只有 fork 消费父历史；命名子 agent 的后台路径从零构建 transcript。
+            // 在分支内物化，避免命名路径把不会使用的父正文副本带过整个 spawn。
+            let parent_messages = if is_fork {
+                self.current_messages(ctx.messages)
+            } else {
+                Vec::new()
+            };
             return self
                 .invoke_background(
                     prompt,
                     subagent_type,
                     cwd,
                     is_fork,
-                    current_messages,
+                    parent_messages,
                     model.as_deref(),
                     parent_tool_call_id.clone(),
                 )
-                .await;
+                .await
+                .map(ToolOutput::from_legacy);
         }
 
         if is_fork {
+            let parent_messages = self.current_messages(ctx.messages);
             return self
-                .invoke_fork(&prompt, &cwd, current_messages, parent_tool_call_id.clone())
-                .await;
+                .invoke_fork(&prompt, &cwd, parent_messages, parent_tool_call_id.clone())
+                .await
+                .map(ToolOutput::from_legacy);
         }
 
         let agent_id = match &subagent_type {
@@ -341,42 +363,47 @@ impl BaseTool for SubAgentTool {
         let spawned = self.spawn(config).await?;
 
         if let Some(pending) = spawned.pending_message() {
-            return Ok(pending);
+            return Ok(ToolOutput::from_legacy(pending));
         }
 
         // Interrupted 语义与迁移前一致；文本携带 child_thread_id——主 agent 凭此
         // 找回执行现场（会话资源门面为 None 的测试路径同样带 id：spawned.child_thread_id 恒可用）
         if spawned.interrupted {
-            return Ok(format!(
+            return Ok(ToolOutput::from_legacy(format!(
                 "child_thread_id: {}\nSub-agent execution was interrupted, resume with Agent(resume_thread_id: {})",
                 spawned.child_thread_id, spawned.child_thread_id
-            ));
+            )));
         }
 
-        if host.session_resources.is_some() {
-            Ok(format!(
-                "child_thread_id: {}
-{}",
-                spawned.child_thread_id,
-                format_subagent_result(&peri_agent::agent::react::AgentOutput {
-                    text: extract_last_ai_text(&spawned.session),
-                    steps: 0,
-                    tool_calls: Vec::new(),
-                    stop_reason: None,
-                    block_continue: None,
-                })
-            ))
+        let report = format_subagent_result(&peri_agent::agent::react::AgentOutput {
+            text: extract_last_ai_text(&spawned.session),
+            steps: 0,
+            tool_calls: Vec::new(),
+            stop_reason: None,
+            block_continue: None,
+        });
+        let text = if host.session_resources.is_some() {
+            format!("child_thread_id: {}\n{}", spawned.child_thread_id, report)
         } else {
-            Ok(format_subagent_result(
-                &peri_agent::agent::react::AgentOutput {
-                    text: extract_last_ai_text(&spawned.session),
-                    steps: 0,
-                    tool_calls: Vec::new(),
-                    stop_reason: None,
-                    block_continue: None,
-                },
-            ))
-        }
+            report
+        };
+        // This synchronous factory branch returned after child settlement. A retained
+        // task ID still means responsibility survives, even if the text sounds final.
+        let status = if spawned.task_id.is_none() {
+            ToolExecutionStatus::Completed
+        } else {
+            ToolExecutionStatus::Running
+        };
+        Ok(ToolOutput::with_execution(
+            text,
+            ToolExecutionEvidence {
+                status,
+                exit_code: None,
+                output_ref: None,
+                output_truncated: false,
+                task_id: spawned.task_id.clone(),
+            },
+        ))
     }
 }
 

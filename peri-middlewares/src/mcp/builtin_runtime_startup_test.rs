@@ -51,6 +51,23 @@ async fn production_startup_path_connects_both_builtin_instances() {
             "{} 的 live tools/list 必须按声明顺序返回注册表工具",
             instance.name
         );
+        let bridges: Vec<_> = build_typed_tool_bridges(&pool)
+            .into_iter()
+            .filter(|tool| tool.builtin_mcp_instance() == Some(instance.name))
+            .collect();
+        assert_eq!(bridges.len(), instance.tools.len());
+        for bridge in bridges {
+            let declaration = instance
+                .tools
+                .iter()
+                .find(|tool| tool.effective_name == bridge.name())
+                .unwrap();
+            assert_eq!(
+                bridge.visible_to_model(),
+                declaration.model_visible,
+                "真实 MCP 连接的宿主工具可见性必须与注册表一致"
+            );
+        }
         assert!(
             matches!(handle.source, Some(ConfigSource::Builtin { .. })),
             "{} 的句柄必须保留 builtin 身份",
@@ -330,9 +347,8 @@ async fn closure_matrix_four_faces_on_real_builtin_pool() {
         expected_servers.sort();
 
         // 面①：闸门候选。
-        let middleware = McpMiddleware::new(Arc::clone(&pool))
-            .with_tool_pool(Arc::clone(&pool))
-            .with_builtin_closures(closed.clone());
+        let middleware =
+            McpMiddleware::new(Arc::clone(&pool)).with_builtin_closures(closed.clone());
         let mut probe = StartupProbe::default();
         Middleware::before_react_start(&middleware, &mut probe)
             .await
@@ -543,9 +559,7 @@ async fn closing_web_keeps_artifact_capability_and_real_call() {
     );
 
     // 能力面：目录与 parent_tools 提供面都只剩 artifact。
-    let middleware = McpMiddleware::new(Arc::clone(&pool))
-        .with_tool_pool(Arc::clone(&pool))
-        .with_builtin_closures(closed.clone());
+    let middleware = McpMiddleware::new(Arc::clone(&pool)).with_builtin_closures(closed.clone());
     let collected = tool_names(&middleware.collect_tools(&cwd));
     let web_tools = declared_effective_names(find("web").expect("web 已实现"));
     let artifact_tools = declared_effective_names(find("artifact").expect("artifact 已实现"));

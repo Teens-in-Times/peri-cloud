@@ -4,10 +4,36 @@
 //! RCRA 重构后，Receive 是循环入口和唯一消息消费点，不再有 End 阶段单独消费 Defer。
 
 use crate::agent::events_v2::{ObserveEvent, RenderEvent, StateEvent};
-use crate::agent::stages::{append_messages_to_transcript, ReceiveInput, ReceiveOutput};
+use crate::agent::stages::append_messages_to_transcript;
+use crate::agent::stages::StageContext;
 use crate::session::{MessageKind, MessageSource, QueuedMessage, QueuedPayload};
 use peri_acp_types::event::ExecutorEvent;
 use peri_acp_types::session::MessageDisposition;
+
+// ─── Receive 阶段类型 ────────────────────────────────────────────────────────
+
+/// Receive 阶段输入
+pub struct ReceiveInput {
+    pub context: StageContext,
+}
+
+/// Receive 阶段输出
+pub struct ReceiveOutput {
+    /// 本轮消费的消息数量（含不唤醒循环的 Info）
+    pub consumed_count: usize,
+    /// 本轮消费的可驱动语义续跑消息数量（Prompt / Defer）
+    pub wake_up_count: usize,
+    /// 预算不足而保留在队列中的后续新增 EnsureProcessing 输入数量。
+    pub budget_deferred_count: usize,
+    /// 本次消费的非空用户 Human 消息身份，供首次输入准备精准处理。
+    pub input_message_ids: Vec<crate::messages::MessageId>,
+    /// 本轮已 canonical 提交、且本应驱动语义迭代的消息身份；由 loop 在
+    /// 判定收尾截止时统一登记为未推理义务，避免 Receive 内部 check-then-check 竞态。
+    pub process_message_ids: Vec<crate::messages::MessageId>,
+    /// 本轮消费到 hook 的显式停止意图（`continue:false`）：循环必须经 Receive
+    /// 唯一退出口结束，不得再发起额外模型请求。
+    pub stop_requested: bool,
+}
 
 fn synthetic_defer_text(message: &QueuedMessage) -> Option<String> {
     match (&message.kind, &message.payload) {
@@ -33,9 +59,12 @@ pub(super) async fn run_receive_with_budget(
 ) -> crate::error::AgentResult<ReceiveOutput> {
     let execution = input.context.session.turn.execution_binding();
     let consumed = input.context.session.queue.drain_batch(64);
-    let stop_requested = consumed
-        .iter()
-        .any(|message| message.source == MessageSource::HookStopIntent);
+    // 停止意图只在产生它的执行中生效；resume 后新执行看到的旧 Stop 按
+    // Suppressed 处理（下方统一移入 suppressed，不写 transcript，也不停新 run）。
+    let stop_requested = consumed.iter().any(|message| {
+        message.source == MessageSource::HookStopIntent
+            && message.policy.disposition(&execution) != MessageDisposition::Suppressed
+    });
     let (deferred, consumed): (Vec<_>, Vec<_>) = consumed.into_iter().partition(|message| {
         !stop_requested
             && exhausted_after.is_some_and(|watermark| {
@@ -66,6 +95,15 @@ pub(super) async fn run_receive_with_budget(
         .iter()
         .filter(|message| message.policy.disposition(&execution) == MessageDisposition::Process)
         .count();
+    let process_message_ids: Vec<_> = consumed
+        .iter()
+        .filter(|message| message.policy.disposition(&execution) == MessageDisposition::Process)
+        .filter_map(|message| {
+            message
+                .delivery_id
+                .or_else(|| message.message().map(crate::messages::BaseMessage::id))
+        })
+        .collect();
 
     // emit MessageQueueDrained（langfuse v2 遥测）
     {
@@ -101,11 +139,17 @@ pub(super) async fn run_receive_with_budget(
             let mut newly_committed = true;
             if let Some(delivery_id) = msg.delivery_id {
                 let QueuedPayload::SystemReminder(reminder) = &msg.payload else {
+                    // 确定性错误：重放同一条消息只会再次失败并阻塞后续输入。
+                    tracing::warn!(
+                        delivery_id = %delivery_id.as_uuid(),
+                        "terminal delivery without canonical reminder suppressed"
+                    );
+                    input.context.session.queue.suppress(msg.clone());
                     input
                         .context
                         .session
                         .queue
-                        .push_batch(consumed[index..].to_vec());
+                        .push_batch(consumed[index + 1..].to_vec());
                     return Err(anyhow::anyhow!("delivery ID requires a canonical reminder").into());
                 };
                 let (already_present, port) = {
@@ -117,11 +161,19 @@ pub(super) async fn run_receive_with_budget(
                             ..
                         }) if stored.as_reminder() == reminder.as_reminder() => true,
                         Some(_) => {
+                            // 身份冲突是确定性的：同一 ID 的不同内容无法共存，
+                            // 重放只会反复失败并阻塞后续输入。保留已有规范项，
+                            // 把冲突消息送入 suppressed 诊断记录后继续推进。
+                            tracing::warn!(
+                                delivery_id = %delivery_id.as_uuid(),
+                                "conflicting canonical terminal delivery ID suppressed"
+                            );
+                            input.context.session.queue.suppress(msg.clone());
                             input
                                 .context
                                 .session
                                 .queue
-                                .push_batch(consumed[index..].to_vec());
+                                .push_batch(consumed[index + 1..].to_vec());
                             return Err(anyhow::anyhow!(
                                 "conflicting canonical terminal delivery ID"
                             )
@@ -181,6 +233,14 @@ pub(super) async fn run_receive_with_budget(
                                     .transcript
                                     .write()
                                     .mirror_committed_reminder(delivery_id, reminder.clone());
+                            } else {
+                                // 保护约束被破坏：该结果仍在 mailbox 中，派生模型视图
+                                // 会按记录重新投影；这里留下可关联诊断，不回灌全部历史。
+                                tracing::warn!(
+                                    delivery_id = %delivery_id.as_uuid(),
+                                    "protected async result canonical reminder is excluded; \
+                                     derived model view will re-append it"
+                                );
                             }
                         }
                         Err(error) => {
@@ -204,22 +264,66 @@ pub(super) async fn run_receive_with_budget(
                 let mut transcript = input.context.session.transcript.write();
                 append_messages_to_transcript(&mut transcript, vec![msg.clone()]);
             }
+            // 只有正式终态结果才建立处理责任；cron 等带 delivery_id 的普通输入
+            // 仍由队列与既有激活规则负责，不能混入结果保护集合。
+            // 只有规范写入成功（或匹配到同一待处理记录）后才进入 Ready。
+            let terminal_result = matches!(
+                msg.source,
+                MessageSource::ShellComplete
+                    | MessageSource::SubAgentComplete
+                    | MessageSource::WorkflowComplete
+                    | MessageSource::McpNotification
+            );
+            if let Some(delivery_id) = msg.delivery_id.filter(|_| terminal_result) {
+                if let QueuedPayload::SystemReminder(reminder) = &msg.payload {
+                    if let Err(error) = input
+                        .context
+                        .session
+                        .async_result_mailbox
+                        .mark_canonical_ready(
+                            delivery_id,
+                            reminder,
+                            msg.source.clone(),
+                            msg.admission_sequence,
+                        )
+                    {
+                        // 身份冲突是确定性的：重放同一消息只会再次失败并阻塞
+                        // 后续输入。已提交的规范项保持不变，冲突消息落诊断。
+                        tracing::warn!(
+                            delivery_id = %delivery_id.as_uuid(),
+                            error = %error,
+                            "conflicting canonical terminal delivery identity suppressed"
+                        );
+                        input.context.session.queue.suppress(msg.clone());
+                        input
+                            .context
+                            .session
+                            .queue
+                            .push_batch(consumed[index + 1..].to_vec());
+                        return Err(anyhow::anyhow!(error).into());
+                    }
+                }
+            }
             if !newly_committed {
                 continue;
             }
             if let QueuedPayload::SystemReminder(reminder) = &msg.payload {
-                input
+                let outcome = input
                     .context
                     .runtime
                     .event_bus
-                    .emit_state(StateEvent::ProtocolEvent {
+                    .emit_state_reliable(StateEvent::ProtocolEvent {
                         turn_id: input.context.turn_id(),
                         agent_id: input.context.session.agent_id,
                         event: Box::new(ExecutorEvent::SystemReminder {
                             reminder: reminder.as_reminder().clone(),
                             source_agent_id: None,
                         }),
-                    });
+                    })
+                    .await;
+                if outcome == peri_acp_types::event_v2::EmitOutcome::Closed {
+                    tracing::warn!(turn_id = %input.context.turn_id(), "ProtocolEvent 接收端关闭；总线已记录需重同步");
+                }
             } else if let Some(text) = synthetic_defer_text(msg) {
                 input
                     .context
@@ -267,6 +371,7 @@ pub(super) async fn run_receive_with_budget(
         wake_up_count,
         budget_deferred_count,
         input_message_ids: user_ids,
+        process_message_ids,
         // hook 的显式停止意图：本轮消费到就必须经 Receive 唯一退出口结束。
         stop_requested,
     })
@@ -277,3 +382,7 @@ pub(super) async fn run_receive_with_budget(
 #[cfg(test)]
 #[path = "receive_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "receive_delivery_test.rs"]
+mod delivery_tests;

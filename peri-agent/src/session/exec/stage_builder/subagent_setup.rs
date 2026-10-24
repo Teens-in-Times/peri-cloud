@@ -47,6 +47,7 @@ pub(super) fn attach_subagent_host(
     {
         let host = SubagentHost {
             close_state: Arc::default(),
+            child_owner: None,
             mcp_pool: input.mcp_pool.clone(),
             session_resources: thread_persistence.session_resources.clone(),
             task_manager: Some(task_manager.clone()),
@@ -67,7 +68,7 @@ pub(super) fn attach_subagent_host(
             frozen_skill_summary: Some(Arc::new(
                 frozen_session.v2_frozen().skill_summary.to_string(),
             )),
-            session_mcp_capability: input.session_mcp_capability.clone(),
+            session_mcp_catalog: input.session_mcp_catalog.clone(),
         };
         session.set_subagent_host(host);
         // 父 v2 session 注入 SubAgentMiddleware（与 set_parent_agent_id 同点；

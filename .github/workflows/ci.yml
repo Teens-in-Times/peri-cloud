@@ -2,6 +2,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
@@ -24,6 +25,22 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Prepare disposable upgrade paths
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / ("peri-upgrade-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"])
+          root.mkdir()
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write("PERI_UPGRADE_BASELINE=" + str(root / "baseline") + "\n")
+              output.write("PERI_UPGRADE_REHEARSAL=" + str(root / "rehearsal") + "\n")
+      # Fetch authenticated assets before any candidate code/build scripts run.
+      - name: Fetch verified upgrade baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/prepare-upgrade-baseline.py --output "${{ env.PERI_UPGRADE_BASELINE }}"
       - name: Install tested Rust toolchain
         run: rustup toolchain install 1.99.0 --profile minimal
       - name: Install Windows check components
@@ -65,23 +82,19 @@ jobs:
         run: bash ./scripts/cargo-rmcp-patched.sh build --release --locked -p peri-cloud --bin peri-cloud-host -p peri-executor --bin peri-executor
       - name: Record exact native source and binary digests
         run: python scripts/record-native-build.py target/release
-      - name: Fetch verified upgrade baseline
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python scripts/prepare-upgrade-baseline.py --output target/upgrade-baseline
       - name: Rehearse isolated upgrade and backup restore
         shell: bash
         run: |
           suffix=""
           if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
-          python scripts/smoke-upgrade.py --baseline "target/upgrade-baseline/peri-cloud-host$suffix" --candidate "target/release/peri-cloud-host$suffix" --output target/upgrade-rehearsal
+          python scripts/smoke-upgrade.py --baseline "$PERI_UPGRADE_BASELINE/peri-cloud-host$suffix" --candidate "target/release/peri-cloud-host$suffix" --output "$PERI_UPGRADE_REHEARSAL"
       - name: Preserve non-private upgrade report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: upgrade-report-${{ matrix.os }}
           path: |
-            target/upgrade-rehearsal/report.json
-            target/upgrade-baseline/baseline.json
+            ${{ env.PERI_UPGRADE_REHEARSAL }}/report.json
+            ${{ env.PERI_UPGRADE_BASELINE }}/baseline.json
           if-no-files-found: error
           retention-days: 7
       - name: Preserve verified native binaries

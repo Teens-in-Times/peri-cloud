@@ -124,12 +124,17 @@ mod schema_upgrade;
 mod schema_upgrade_tests;
 
 #[cfg(test)]
+#[path = "schema_upgrade_additive_test.rs"]
+mod schema_upgrade_additive_tests;
+
+#[cfg(test)]
 #[path = "schema_probe_test.rs"]
 mod schema_probe_tests;
 
 #[cfg(test)]
 #[path = "schema_upgrade_input_test.rs"]
 mod schema_upgrade_input_tests;
+mod session_archive;
 mod session_catalog;
 mod session_codec;
 mod session_data;

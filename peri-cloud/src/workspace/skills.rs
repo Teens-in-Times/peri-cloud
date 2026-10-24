@@ -24,8 +24,11 @@ pub(super) fn effective(skill: &WorkspaceSkill) -> bool {
 fn skill_id(skill: &WorkspaceSkill) -> String {
     use sha2::Digest;
     format!(
-        "skill:{:x}",
-        sha2::Sha256::digest(format!("{:?}:{}:{}", skill.source, skill.name, skill.path))
+        "skill:{}",
+        (sha2::Sha256::digest(format!("{:?}:{}:{}", skill.source, skill.name, skill.path)))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     )
 }
 

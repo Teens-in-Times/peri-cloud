@@ -2,3 +2,5 @@
 *.exe binary
 *.zip binary
 *.gz binary
+# Unified-diff context lines contain a required leading space, including empty lines.
+*.patch whitespace=-blank-at-eol

@@ -24,6 +24,10 @@
 pub struct BuiltinMcpTool {
     /// 原始工具名（如 `WebSearch`）：配置、readiness 与 `system_mcp_tools`
     /// 都在**原始名**上精确匹配。
+    pub context_retention: crate::tools::ContextRetention,
+    /// Trusted builtin contract: a Complete response settles this operation.
+    /// Task-capable tools such as Bash must instead carry typed execution evidence.
+    pub completes_on_response: bool,
     pub original_name: &'static str,
     /// 模型面名称（direct 使用原名，如 `WebSearch`）。
     /// 必须与 `mcp::builtin::effective_tool_name()` 的输出逐字相等（由
@@ -59,6 +63,8 @@ pub struct BuiltinMcpInstance {
 /// `web` 实例的工具声明（顺序即声明段顺序）。
 const WEB_TOOLS: &[BuiltinMcpTool] = &[
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::Recomputable,
+        completes_on_response: true,
         original_name: "WebSearch",
         effective_name: "WebSearch",
         direct: true,
@@ -68,6 +74,8 @@ const WEB_TOOLS: &[BuiltinMcpTool] = &[
         ),
     },
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::Recomputable,
+        completes_on_response: true,
         original_name: "WebFetch",
         effective_name: "WebFetch",
         direct: true,
@@ -80,6 +88,8 @@ const WEB_TOOLS: &[BuiltinMcpTool] = &[
 
 /// `artifact` 实例的工具声明。
 const ARTIFACT_TOOLS: &[BuiltinMcpTool] = &[BuiltinMcpTool {
+    context_retention: crate::tools::ContextRetention::SideEffectReceipt,
+    completes_on_response: true,
     original_name: "artifact",
     effective_name: "artifact",
     direct: true,
@@ -92,11 +102,13 @@ const ARTIFACT_TOOLS: &[BuiltinMcpTool] = &[BuiltinMcpTool {
 
 /// `cron` 实例的工具声明（顺序即声明段顺序）。
 ///
-/// 三个工具一律 deferred（`direct: false`）且无提示词声明模板（A4：声明段零变化）；
-/// `cron_register` / `cron_list` / `cron_remove` 的在用执行实现是
+/// Cron 工具一律 deferred（`direct: false`）且无提示词声明模板（A4：声明段零变化）；
+/// `cron_register` / `cron_list` / `cron_remove` / `cron_toggle` 的在用执行实现是
 /// `mcp-packages/cron/src/tools.rs` 的同名 `BaseTool`，由 `CronMcpServer` 映射。
 const CRON_TOOLS: &[BuiltinMcpTool] = &[
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::SideEffectReceipt,
+        completes_on_response: true,
         original_name: "cron_register",
         effective_name: "mcp__cron__cron_register",
         direct: false,
@@ -104,6 +116,8 @@ const CRON_TOOLS: &[BuiltinMcpTool] = &[
         prompt_declaration: None,
     },
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::Recomputable,
+        completes_on_response: true,
         original_name: "cron_list",
         effective_name: "mcp__cron__cron_list",
         direct: false,
@@ -111,10 +125,30 @@ const CRON_TOOLS: &[BuiltinMcpTool] = &[
         prompt_declaration: None,
     },
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::SideEffectReceipt,
+        completes_on_response: true,
         original_name: "cron_remove",
         effective_name: "mcp__cron__cron_remove",
         direct: false,
         model_visible: true,
+        prompt_declaration: None,
+    },
+    BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::SideEffectReceipt,
+        completes_on_response: true,
+        original_name: "cron_toggle",
+        effective_name: "mcp__cron__cron_toggle",
+        direct: false,
+        model_visible: true,
+        prompt_declaration: None,
+    },
+    BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::PreviewOnly,
+        completes_on_response: false,
+        original_name: "cron_acknowledge",
+        effective_name: "mcp__cron__cron_acknowledge",
+        direct: false,
+        model_visible: false,
         prompt_declaration: None,
     },
 ];
@@ -130,6 +164,8 @@ const CRON_TOOLS: &[BuiltinMcpTool] = &[
 /// 的渲染仍归 `tool_search/declaration.rs`，本表不得改写模板文本。
 const WORKSPACE_TOOLS: &[BuiltinMcpTool] = &[
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::Recomputable,
+        completes_on_response: true,
         original_name: "Read",
         effective_name: "Read",
         direct: true,
@@ -139,6 +175,8 @@ const WORKSPACE_TOOLS: &[BuiltinMcpTool] = &[
         ),
     },
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::SideEffectReceipt,
+        completes_on_response: true,
         original_name: "Write",
         effective_name: "Write",
         direct: true,
@@ -148,6 +186,8 @@ const WORKSPACE_TOOLS: &[BuiltinMcpTool] = &[
         ),
     },
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::SideEffectReceipt,
+        completes_on_response: true,
         original_name: "Edit",
         effective_name: "Edit",
         direct: true,
@@ -157,6 +197,8 @@ const WORKSPACE_TOOLS: &[BuiltinMcpTool] = &[
         ),
     },
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::Recomputable,
+        completes_on_response: true,
         original_name: "Glob",
         effective_name: "Glob",
         direct: true,
@@ -166,6 +208,8 @@ const WORKSPACE_TOOLS: &[BuiltinMcpTool] = &[
         ),
     },
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::Recomputable,
+        completes_on_response: true,
         original_name: "Grep",
         effective_name: "Grep",
         direct: true,
@@ -175,6 +219,8 @@ const WORKSPACE_TOOLS: &[BuiltinMcpTool] = &[
         ),
     },
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::Recomputable,
+        completes_on_response: true,
         original_name: "folder_operations",
         effective_name: "folder_operations",
         direct: true,
@@ -184,6 +230,8 @@ const WORKSPACE_TOOLS: &[BuiltinMcpTool] = &[
         ),
     },
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::SideEffectReceipt,
+        completes_on_response: false,
         original_name: "Bash",
         effective_name: "Bash",
         direct: true,
@@ -207,6 +255,8 @@ const WORKSPACE_TOOLS: &[BuiltinMcpTool] = &[
 /// 文本（与 `cron` 三项同形），声明段不因迁移变化。
 const WORKFLOW_TOOLS: &[BuiltinMcpTool] = &[
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::PreviewOnly,
+        completes_on_response: false,
         original_name: "Workflow",
         effective_name: "mcp__workflow__Workflow",
         direct: false,
@@ -214,6 +264,8 @@ const WORKFLOW_TOOLS: &[BuiltinMcpTool] = &[
         prompt_declaration: None,
     },
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::Recomputable,
+        completes_on_response: true,
         original_name: "WorkflowStatus",
         effective_name: "mcp__workflow__WorkflowStatus",
         direct: false,
@@ -221,6 +273,8 @@ const WORKFLOW_TOOLS: &[BuiltinMcpTool] = &[
         prompt_declaration: None,
     },
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::SideEffectReceipt,
+        completes_on_response: false,
         original_name: "WorkflowKill",
         effective_name: "mcp__workflow__WorkflowKill",
         direct: false,
@@ -228,8 +282,55 @@ const WORKFLOW_TOOLS: &[BuiltinMcpTool] = &[
         prompt_declaration: None,
     },
     BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::PreviewOnly,
+        completes_on_response: false,
         original_name: "WorkflowAgentResult",
         effective_name: "mcp__workflow__WorkflowAgentResult",
+        direct: false,
+        model_visible: false,
+        prompt_declaration: None,
+    },
+    BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::PreviewOnly,
+        completes_on_response: false,
+        original_name: "WorkflowAgentClaim",
+        effective_name: "mcp__workflow__WorkflowAgentClaim",
+        direct: false,
+        model_visible: false,
+        prompt_declaration: None,
+    },
+    BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::PreviewOnly,
+        completes_on_response: false,
+        original_name: "WorkflowConsumerReady",
+        effective_name: "mcp__workflow__WorkflowConsumerReady",
+        direct: false,
+        model_visible: false,
+        prompt_declaration: None,
+    },
+    BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::PreviewOnly,
+        completes_on_response: false,
+        original_name: "WorkflowCompletionAck",
+        effective_name: "mcp__workflow__WorkflowCompletionAck",
+        direct: false,
+        model_visible: false,
+        prompt_declaration: None,
+    },
+    BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::PreviewOnly,
+        completes_on_response: false,
+        original_name: "WorkflowClose",
+        effective_name: "mcp__workflow__WorkflowClose",
+        direct: false,
+        model_visible: false,
+        prompt_declaration: None,
+    },
+    BuiltinMcpTool {
+        context_retention: crate::tools::ContextRetention::PreviewOnly,
+        completes_on_response: false,
+        original_name: "WorkflowTaskObserved",
+        effective_name: "mcp__workflow__WorkflowTaskObserved",
         direct: false,
         model_visible: false,
         prompt_declaration: None,

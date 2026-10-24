@@ -116,7 +116,10 @@ async fn recovery_queries_original_receipt_and_never_resubmits_a_missing_or_know
     snapshot.history.truncate(write_at + 1);
     snapshot.unsettled_jobs = None;
     let raw = serde_json::to_string(&snapshot).unwrap();
-    let hash = format!("{:x}", Sha256::digest(raw.as_bytes()));
+    let hash = (Sha256::digest(raw.as_bytes()))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     let old = f.cloud.take().unwrap();
     old.stop().await;
     drop(old);

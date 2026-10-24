@@ -18,7 +18,7 @@ use sqlx::SqlitePool;
 pub(in crate::sessions) struct SqliteSessionDatabase {
     pub(super) pool: SqlitePool,
     pub(super) read_only: bool,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) db_path: PathBuf,
 }
 
@@ -27,7 +27,7 @@ impl SqliteSessionDatabase {
         Self {
             pool,
             read_only,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             db_path: _db_path,
         }
     }

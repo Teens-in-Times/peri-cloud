@@ -2,7 +2,8 @@
 
 use super::{ClientStatus, McpClientHandle, McpClientPool, OAuthStatus, ServerInfo};
 use peri_acp_types::plugin::ConfigSource;
-use std::sync::Arc;
+use peri_acp_types::ports::{McpResourceInfo, McpToolInfo};
+use std::sync::{atomic::Ordering, Arc};
 
 /// 传输形态三分类（IF-D11）：builtin 身份来自运行时标记 `source`，其余保持既有推断。
 ///
@@ -42,6 +43,34 @@ pub(super) fn mcp_error_summary(status: &ClientStatus) -> Option<String> {
     (!summary.is_empty()).then_some(summary)
 }
 
+/// 句柄工具 → 面板投影；条目/文本上限在 ACP 端口投影侧统一执行。
+fn handle_tool_projection(handle: &McpClientHandle) -> Vec<McpToolInfo> {
+    handle
+        .tools
+        .iter()
+        .map(|tool| McpToolInfo {
+            name: tool.name.to_string(),
+            description: tool
+                .description
+                .as_ref()
+                .map(|description| description.to_string()),
+        })
+        .collect()
+}
+
+/// 句柄资源 → 面板投影；空名称归一为 None。
+fn handle_resource_projection(handle: &McpClientHandle) -> Vec<McpResourceInfo> {
+    handle
+        .resources
+        .iter()
+        .map(|resource| McpResourceInfo {
+            uri: resource.uri.clone(),
+            name: (!resource.name.trim().is_empty()).then(|| resource.name.clone()),
+            description: resource.description.clone(),
+        })
+        .collect()
+}
+
 /// MCP 状态变化 → 通知文本（每台一行：上线带工具数，失败报名字 + 错误）。
 pub(crate) fn status_change_text(name: &str, status: &ClientStatus, tool_count: usize) -> String {
     match status {
@@ -78,6 +107,7 @@ impl McpClientPool {
                 .unwrap_or((None, None));
             let old_status = pool.clients.read().get(name).map(|c| c.status.clone());
             let handle = Arc::new(McpClientHandle {
+                call_gate: Default::default(),
                 name: name.to_string(),
                 version: None,
                 connected_at: None,
@@ -94,6 +124,7 @@ impl McpClientPool {
             });
             pool.advance_handle_generation(&handle);
             pool.clients.write().insert(name.to_string(), handle);
+            pool.bump_catalog_generation();
             old_status
         };
         // 新失败代际取代旧证据：等待方立即重读并得到 ConnectionFailed/ToolDiscoveryFailed。
@@ -127,6 +158,7 @@ impl McpClientPool {
                 .unwrap_or((None, None));
             let old_status = pool.clients.read().get(name).map(|c| c.status.clone());
             let handle = Arc::new(McpClientHandle {
+                call_gate: Default::default(),
                 name: name.to_string(),
                 version: None,
                 connected_at: None,
@@ -143,6 +175,7 @@ impl McpClientPool {
             });
             pool.advance_handle_generation(&handle);
             pool.clients.write().insert(name.to_string(), handle);
+            pool.bump_catalog_generation();
             old_status
         };
         // 需要授权是确定事实，不是「连接中」：本代证据失效并唤醒等待方。
@@ -156,8 +189,10 @@ impl McpClientPool {
     }
 
     pub fn server_infos(&self) -> Vec<ServerInfo> {
-        self.clients
-            .read()
+        let clients = self.clients.read();
+        // 订阅项来自配置：与 clients 一样只持一次读锁，避免逐项重复加锁。
+        let configs = self.configs.read();
+        clients
             .values()
             .map(|h| ServerInfo {
                 name: h.name.clone(),
@@ -172,6 +207,11 @@ impl McpClientPool {
                 cache_status: self.cache_status_for(&h.name),
                 tool_count: h.tools.len(),
                 resource_count: h.resources.len(),
+                tools: handle_tool_projection(h),
+                resources: handle_resource_projection(h),
+                subscriptions: configs
+                    .get(&h.name)
+                    .and_then(|config| config.subscriptions.clone()),
                 oauth_status: h.oauth_status.clone(),
                 source: h.source.clone(),
                 url: h.url.clone(),
@@ -182,8 +222,7 @@ impl McpClientPool {
 
     /// 返回所有 MCP 服务器信息（合并 configs + clients）
     ///
-    /// config 中有但 clients 中没有的 server 会被标记为 Uninitialized。
-    /// 这覆盖了连接失败后被移除、运行时新增配置、以及 disabled 后被清理等场景。
+    /// 尚无连接句柄的配置按控制槽投影：已停止为 Disconnected，其余为 Uninitialized。
     pub fn all_server_infos(&self) -> Vec<ServerInfo> {
         let clients = self.clients.read();
         let configs = self.configs.read();
@@ -205,6 +244,11 @@ impl McpClientPool {
                 cache_status: self.cache_status_for(&h.name),
                 tool_count: h.tools.len(),
                 resource_count: h.resources.len(),
+                tools: handle_tool_projection(h),
+                resources: handle_resource_projection(h),
+                subscriptions: configs
+                    .get(&h.name)
+                    .and_then(|config| config.subscriptions.clone()),
                 oauth_status: h.oauth_status.clone(),
                 source: h.source.clone(),
                 url: h.url.clone(),
@@ -212,9 +256,15 @@ impl McpClientPool {
             });
         }
 
-        // 遍历 configs，补充 clients 中不存在的条目（标记为 Uninitialized）
+        // 无连接句柄时，停止状态仍以控制槽为准。
         for (name, sc) in configs.iter() {
             if !clients.contains_key(name) {
+                let status = if self.server_slot(name).stopped.load(Ordering::Acquire) {
+                    ClientStatus::Disconnected
+                } else {
+                    ClientStatus::Uninitialized
+                };
+                let status_label = mcp_status_label(&status).to_string();
                 result.push(ServerInfo {
                     version: None,
                     connected_at: None,
@@ -223,12 +273,15 @@ impl McpClientPool {
                     name: name.clone(),
                     transport_type: transport_type_of(sc.source.as_ref(), sc.url.as_deref())
                         .to_string(),
-                    status: ClientStatus::Uninitialized,
-                    status_label: "uninitialized".to_string(),
+                    status,
+                    status_label,
                     error_summary: None,
                     cache_status: self.cache_status_for(name),
                     tool_count: 0,
                     resource_count: 0,
+                    tools: Vec::new(),
+                    resources: Vec::new(),
+                    subscriptions: sc.subscriptions.clone(),
                     oauth_status: OAuthStatus::default(),
                     source: sc.source.clone(),
                     url: sc.url.clone(),

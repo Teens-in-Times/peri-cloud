@@ -14,6 +14,7 @@ pub(crate) mod process;
 #[cfg(target_os = "emscripten")]
 #[path = "client/process_wasm.rs"]
 pub(crate) mod process;
+mod queries;
 // System MCP 启动准入 seam：清单发布与闸门已接线（`initialize` / `middleware`），
 // 仍有三处冻结但尚无生产读取方的成员——`DiscoveryEvidence::is_complete`（只有测试在问）、
 // `NegotiatedSystemMcp::handle`（协商结果保留句柄，消费方只读 `requirement`/`generation`）、
@@ -25,7 +26,7 @@ mod rewind;
 mod service;
 mod status;
 mod subscription;
-mod task_scope_metadata;
+pub(crate) mod task_owner_metadata;
 mod transport;
 mod types;
 
@@ -42,12 +43,11 @@ use oauth::{OAuthFlowKey, PendingOAuthCallback};
 use peri_acp_types::{
     builtin_mcp::find,
     command_registry::CommandRegistry,
-    dynamic_mcp::DynamicMcpInstanceKey,
     mcp::McpSubscriptionPort,
     mcp_skills::McpSkillRegistry,
     ports::{
-        McpBuiltinWorkspaceState, McpOAuthStartDisposition, McpPoolShutdownReport,
-        McpServerConnectionStatus, McpServerInfo, McpServerOAuthStatus,
+        McpBuiltinWorkspaceState, McpOAuthStartDisposition, McpPoolShutdownReport, McpResourceInfo,
+        McpServerConnectionStatus, McpServerInfo, McpServerOAuthStatus, McpToolInfo,
     },
     session::InboxHandle,
     skills::SkillMetadata,
@@ -93,6 +93,8 @@ pub use types::{
 
 /// MCP 客户端连接池
 pub struct McpClientPool {
+    pub(crate) control: super::control::PoolControl,
+    pub(crate) catalog_generation: std::sync::atomic::AtomicU64,
     cache_policy: std::sync::OnceLock<McpCachePolicy>,
     workspace_scope: std::sync::OnceLock<peri_acp_types::workspace::WorkspaceId>,
     pub(super) configuration_snapshot: std::sync::OnceLock<Arc<peri_config::ConfigurationSnapshot>>,
@@ -172,9 +174,6 @@ pub struct McpClientPool {
     /// SessionManager（peri-acp）经 `McpSubscriptionPort` 注册；订阅通知到达
     /// 时向全部注册 inbox 推送 Defer 消息并唤醒 idle agent。
     pub(crate) session_bindings: parking_lot::RwLock<session_bindings::SessionBindings>,
-    /// One session runtime handle per session; task records remain owned by Agent.
-    pub(crate) task_scope_authority: peri_mcp_core::task_scope::TaskScopeAuthority,
-    pub(crate) task_scope_tokens: parking_lot::RwLock<HashMap<String, String>>,
     /// 跨进程的 MCP Resource Cache；是否写入由响应 scope 与安全上下文共同决定。
     pub(crate) resource_cache: super::resource_cache::McpResourceCache,
     /// 进程启动时冻结的 deployment capability profile；初始连接和重连复用。
@@ -188,18 +187,18 @@ pub struct McpClientPool {
     /// 无条目的 server 对所有会话可见（配置来源与 dynamic 投影的既有语义）；
     /// 有条目的仅在归属会话内可见（工具桥接与状态面据此过滤）。
     pub(crate) acp_owners: parking_lot::RwLock<HashMap<String, String>>,
-    /// 会话级 ACP 连接的**声明身份**（M7）：池内 server name → 连接 ID + 归属。
+    /// 会话级 ACP 连接的**声明身份**（M7）：池内 server name → `serverId` + 归属。
     /// 与 `acp_owners` 同批写入、同批移除；持久化 cache 只按它 + 当前句柄代号
     /// 计算 origin，凭据从不进入本结构。
     pub(crate) acp_connections: parking_lot::RwLock<HashMap<String, AcpConnectionDeclaration>>,
 }
 
-/// 会话级 ACP 连接的声明事实（非凭据）：`connection_id` 是 ACP `mcp/connect`
-/// 返回的 opaque 连接句柄，随会话关闭失效。
+/// 会话级 ACP 连接的声明事实（非凭据）：`server_id` 是 client 在会话 setup 中
+/// 声明的 `serverId`（`mcp/message` 的寻址依据），随会话关闭失效。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AcpConnectionDeclaration {
     pub(crate) session_id: String,
-    pub(crate) connection_id: String,
+    pub(crate) server_id: String,
 }
 
 /// builtin 实例上下文槽（A33）：上下文与「initialize 已开始」标志由**同一短锁**保护
@@ -271,6 +270,8 @@ impl McpClientPool {
         capability_profile: super::apps::McpCapabilityProfile,
     ) -> Self {
         Self {
+            control: Default::default(),
+            catalog_generation: std::sync::atomic::AtomicU64::new(1),
             cache_policy: std::sync::OnceLock::new(),
             workspace_scope: std::sync::OnceLock::new(),
             configuration_snapshot: std::sync::OnceLock::new(),
@@ -310,8 +311,6 @@ impl McpClientPool {
             pending_oauth_callbacks: parking_lot::Mutex::new(HashMap::new()),
             active_oauth_flows: parking_lot::Mutex::new(HashMap::new()),
             session_bindings: parking_lot::RwLock::new(session_bindings::SessionBindings::default()),
-            task_scope_authority: peri_mcp_core::task_scope::TaskScopeAuthority::new(),
-            task_scope_tokens: parking_lot::RwLock::new(HashMap::new()),
             resource_cache: super::resource_cache::McpResourceCache::new(),
             capability_profile,
             app_binding_leases: Arc::new(super::apps::McpAppBindingRegistry::default()),
@@ -354,12 +353,13 @@ impl McpClientPool {
 
     /// 装入一个**已经建立连接**的客户端句柄（跨 crate 集成测试夹具；`test-support`）。
     ///
-    /// 生产路径的句柄注册归 `run_initialize` / 动态 MCP 连接面；本入口只让测试能
+    /// 生产路径的句柄注册归 `run_initialize` / MCP 控制面；本入口只让测试能
     /// 构造「真实 peer + 真实池」的夹具，返回该句柄的服务端世代。
     #[cfg(feature = "test-support")]
     pub fn install_client_for_tests(&self, handle: Arc<McpClientHandle>) -> u64 {
         let generation = self.advance_handle_generation(&handle);
         self.clients.write().insert(handle.name.clone(), handle);
+        self.bump_catalog_generation();
         generation
     }
 
@@ -387,10 +387,11 @@ impl McpClientPool {
     pub(crate) fn install_acp_connection_for_test(
         self: &Arc<Self>,
         session_id: &str,
-        connection_id: &str,
+        server_id: &str,
         name: &str,
     ) -> Arc<McpClientHandle> {
         let handle = Arc::new(McpClientHandle {
+            call_gate: Default::default(),
             name: name.to_string(),
             version: None,
             connected_at: None,
@@ -412,7 +413,7 @@ impl McpClientPool {
             name.to_string(),
             AcpConnectionDeclaration {
                 session_id: session_id.to_string(),
-                connection_id: connection_id.to_string(),
+                server_id: server_id.to_string(),
             },
         );
         self.advance_handle_generation(&handle);
@@ -590,9 +591,6 @@ impl McpClientPool {
         if slot.context.is_some() {
             return Err(BuiltinContextError::AlreadyInjected);
         }
-        let _ = context
-            .task_scope_authority
-            .set(self.task_scope_authority.clone());
         slot.context = Some(context);
         Ok(())
     }
@@ -901,82 +899,6 @@ impl McpClientPool {
         };
         let cancel = tokio_util::sync::CancellationToken::new();
         super::skill_discovery::snapshot_via_skills_list(peer, &handle.name, cancel).await
-    }
-
-    pub fn get_tools(&self, name: &str) -> Vec<Tool> {
-        self.clients
-            .read()
-            .get(name)
-            .map(|h| h.tools.clone())
-            .unwrap_or_default()
-    }
-    pub fn get_resources(&self, name: &str) -> Vec<Resource> {
-        self.clients
-            .read()
-            .get(name)
-            .map(|h| h.resources.clone())
-            .unwrap_or_default()
-    }
-    pub fn get_client(&self, name: &str) -> Option<Arc<McpClientHandle>> {
-        self.clients.read().get(name).cloned()
-    }
-    /// 会话可见的连接句柄（[`Self::get_client`] 的 ACP 归属过滤版）。
-    pub fn get_client_visible_to(
-        &self,
-        name: &str,
-        session_id: Option<&str>,
-    ) -> Option<Arc<McpClientHandle>> {
-        if session_id.is_some_and(|session_id| !self.is_visible_to_session(name, session_id)) {
-            return None;
-        }
-        self.get_client(name)
-    }
-    pub fn get_all_clients(&self) -> Vec<Arc<McpClientHandle>> {
-        self.clients
-            .read()
-            .values()
-            .filter(|c| matches!(c.status, ClientStatus::Connected))
-            .cloned()
-            .collect()
-    }
-    /// 会话可见的连接句柄（[`Self::get_all_clients`] 的 ACP 归属过滤版）。
-    ///
-    /// `session_id` 为 `None` 表示不过滤（部署面视图：面板、命令面、池关闭）。
-    pub fn get_all_clients_visible_to(
-        &self,
-        session_id: Option<&str>,
-    ) -> Vec<Arc<McpClientHandle>> {
-        let mut clients = self.get_all_clients();
-        if let Some(session_id) = session_id {
-            clients.retain(|client| self.is_visible_to_session(&client.name, session_id));
-        }
-        clients
-    }
-    pub fn has_resources(&self) -> bool {
-        self.clients
-            .read()
-            .values()
-            .any(|c| matches!(c.status, ClientStatus::Connected) && !c.resources.is_empty())
-    }
-    pub fn resource_summary(&self) -> String {
-        self.clients
-            .read()
-            .values()
-            .filter(|c| matches!(c.status, ClientStatus::Connected) && !c.resources.is_empty())
-            .map(|c| {
-                format!(
-                    "- server \"{}\": {} ({} resources)",
-                    c.name,
-                    c.resources
-                        .iter()
-                        .map(|r| r.uri.clone())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    c.resources.len()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 }
 

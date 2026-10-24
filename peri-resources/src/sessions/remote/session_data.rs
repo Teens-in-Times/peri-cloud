@@ -56,7 +56,7 @@ use peri_acp_types::history_page::{
 use peri_acp_types::messages::MessageId;
 use peri_acp_types::session_resources::{
     ActiveSessionSnapshot, BindingState, ChildSnapshot, ForkSnapshot, FrozenSnapshotBytes,
-    NewSession, PersistenceRecovery, RewindBoundary, RewindOutcome, SessionMetaPatch,
+    FrozenState, NewSession, PersistenceRecovery, RewindBoundary, RewindOutcome, SessionMetaPatch,
     SessionResourceError, SessionResourceErrorKind, SessionResourceResult, SessionSnapshot,
 };
 use peri_acp_types::store::{CompactionChange, MessageFlags, PersistedPayload};
@@ -658,6 +658,42 @@ impl SessionDataPort for RemoteSessionData {
         id: &ThreadId,
     ) -> SessionResourceResult<ActiveSessionSnapshot> {
         self.read_active_snapshot(id).await
+    }
+
+    async fn load_frozen_state(&self, id: &ThreadId) -> SessionResourceResult<FrozenState> {
+        self.read_frozen_state(id).await
+    }
+
+    async fn inherited_archive_root(
+        &self,
+        id: &ThreadId,
+        source: &ThreadId,
+        anchor: MessageId,
+    ) -> SessionResourceResult<peri_acp_types::context_archive::ArchiveRoot> {
+        self.read_inherited_archive_root(id, source, anchor).await
+    }
+
+    async fn read_archive_metadata(
+        &self,
+        id: &ThreadId,
+        query: &peri_acp_types::context_archive::ArchiveMetadataQuery,
+    ) -> SessionResourceResult<peri_acp_types::context_archive::ArchiveMetadataPage> {
+        self.read_archive_metadata_page(id, query).await
+    }
+    async fn read_archive_chunk(
+        &self,
+        id: &ThreadId,
+        query: &peri_acp_types::context_archive::ArchiveChunkQuery,
+    ) -> SessionResourceResult<peri_acp_types::context_archive::ArchiveChunk> {
+        self.read_archive_body_chunk(id, query).await
+    }
+
+    async fn read_archive_chunks(
+        &self,
+        id: &ThreadId,
+        batch: &peri_acp_types::context_archive::ArchiveChunkBatch,
+    ) -> SessionResourceResult<Vec<peri_acp_types::context_archive::ArchiveChunk>> {
+        self.read_archive_body_chunks(id, batch).await
     }
 
     async fn load_message_flags(

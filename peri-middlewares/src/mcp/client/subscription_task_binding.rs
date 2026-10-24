@@ -14,6 +14,10 @@ use std::sync::Arc;
 impl McpClientPool {
     /// Deliver a terminal reminder to the session that initiated the task.
     ///
+    /// `result.task_id` is the session-local public id (same as the start receipt
+    /// and Tasks panel); `remote_task_id` is the MCP owner's id, kept in metadata
+    /// for `tasks/get` and other owner-side operations.
+    ///
     /// Delivery is the canonical commit (idempotent by delivery ID); the queue
     /// push only wakes a live initiator. A registered session inbox is preferred
     /// for the wake because it carries the executor wake handle; otherwise the
@@ -28,12 +32,22 @@ impl McpClientPool {
         kind: BgTaskKind,
         delivery_id: peri_acp_types::messages::MessageId,
         delivery: Option<&Arc<dyn peri_acp_types::tasks::TaskTerminalDelivery>>,
+        remote_task_id: &str,
     ) -> Result<(), String> {
         let is_shell = kind == BgTaskKind::Shell;
+        let outcome = result.outcome_label();
+        // 标题与正文共用同一终态标签：失败/超时/unresolved 不得显示为已完成。
+        let summary = if is_shell {
+            format!("Shell task {outcome}")
+        } else if outcome == "succeeded" {
+            "MCP task completed".to_string()
+        } else {
+            format!("MCP task {outcome}")
+        };
         let source = if is_shell {
             MessageSource::ShellComplete
         } else {
-            MessageSource::DynamicMcpNotification
+            MessageSource::McpNotification
         };
         let reminder = TrustedSystemReminderFactory::for_producer()
             .construct(SystemReminder {
@@ -70,10 +84,11 @@ impl McpClientPool {
                 } else {
                     result.output.clone()
                 },
-                summary: Some("MCP task completed".into()),
+                summary: Some(summary),
                 metadata: json!({
                     "server": server,
                     "task_id": result.task_id,
+                    "remote_task_id": remote_task_id,
                     "initiator": target_session,
                     "task_owner": owner_session,
                     "delivery": "initiator",
@@ -157,10 +172,10 @@ impl McpClientPool {
             .ok_or_else(|| "session task manager unavailable".to_owned())?;
         let raw_id_for_cancel = raw_task_id.to_owned();
         let meta = scoped_workspace
-            .then(|| self.task_scope_meta_for(server, session_id))
+            .then(|| self.task_owner_meta_for(server, session_id))
             .flatten();
         if scoped_workspace && meta.is_none() {
-            return Err("workspace task scope unavailable".into());
+            return Err("workspace task owner unavailable".into());
         }
         let weak_for_cancel = Arc::downgrade(self);
         let server_for_cancel = server.to_owned();
@@ -191,16 +206,19 @@ impl McpClientPool {
         let owner_session = session_id.to_owned();
         let target_session = initiator_session_id.to_owned();
         let server_name = server.to_owned();
-        let terminal_raw_id = raw_task_id.to_owned();
+        let remote_task_id = raw_task_id.to_owned();
         let on_terminal = Arc::new(
             move |result: &BackgroundTaskResult,
                   delivery_id: peri_acp_types::messages::MessageId| {
-                let mut result = result.clone();
-                result.task_id = terminal_raw_id.clone();
+                // `settle_external` 在调用本回调前已把 task_id 设为会话侧公共 id
+                // （`mcp-...`，与回执/任务面板一致）。远端 id（`shell-...`）另行
+                // 以 `remote_task_id` 投递，继续用于 `tasks/get` 等 owner 操作。
+                let result = result.clone();
                 let delivery = delivery.clone();
                 let target_session = target_session.clone();
                 let owner_session = owner_session.clone();
                 let server_name = server_name.clone();
+                let remote_task_id = remote_task_id.clone();
                 let weak = weak.clone();
                 Box::pin(async move {
                     let pool = weak
@@ -214,6 +232,7 @@ impl McpClientPool {
                         kind,
                         delivery_id,
                         delivery.as_ref(),
+                        &remote_task_id,
                     )
                     .await
                 })

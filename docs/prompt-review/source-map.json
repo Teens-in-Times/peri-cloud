@@ -1,5 +1,5 @@
 {
-  "source_commit": "242d9bdbc6de8dc7cc215740cd0ad08e6867f9da",
+  "source_commit": "cd6945d72228672e0ffe495fa54aafc8ede1f055",
   "files": [
     {
       "file": "02-main.md",
@@ -40,7 +40,7 @@
       "sources": [
         {
           "path": "peri-cloud/src/tasks/approvals.rs",
-          "sha256": "f1f98c71b3ff2fd49ecc8e8705f1e85b2617f987e21bf0e9d3f0bd4299652798"
+          "sha256": "d990e63179ea279e6c34ba74ea330f19cd911d0959d11c563a3eecee575d6417"
         },
         {
           "path": "peri-cloud/prompts/approval.md",
@@ -55,7 +55,7 @@
       "sources": [
         {
           "path": "peri-cloud/src/memory/frames.rs",
-          "sha256": "39d54286ed7cd752e0d671ced704a980a5d68f346a437db4e54f31d9fe13c329"
+          "sha256": "218ba086836f9755c1f4c3972a0460e5fe4935ee00da0b530b2e30a451d8a43a"
         },
         {
           "path": "peri-cloud/prompts/memory.md",
@@ -92,7 +92,7 @@
       "sources": [
         {
           "path": "peri-agent/src/agent/compact_v2/full.rs",
-          "sha256": "2d7cf3679059542de82d024f5bcc674f95b905af33af5a4a6a2e1f8882ecfec0"
+          "sha256": "88f11441deb481a5f2748c2516668533365f1177822d1b6f9228425bec549ce0"
         }
       ],
       "export_sha256": "6b2ace74e9ac72653d28a1ebdcbef4696da0542edfbc891bfa1ae29eb31244ec"
@@ -118,7 +118,7 @@
       "sources": [
         {
           "path": "peri-cloud/src/tasks/middleware.rs",
-          "sha256": "db6eddc2510df1e8f08e6d532690f9650d457a196138ee62e1c02e7831d4b086"
+          "sha256": "bc8dc30639fec6fe400fbf71379f0e0b8f6aeed930632a605b72425362bcea81"
         }
       ],
       "export_sha256": "00faa3fbfc5728fcf429a0d0a21f4040212c5d3ea2f1e1bcaf80b67edf6b4cc8"
@@ -129,7 +129,7 @@
       "sources": [
         {
           "path": "peri-cloud/src/tasks/recovery.rs",
-          "sha256": "b49e4c5ed58597378952f67769e7a30e1b86cca77cc829f33cd61bbf125aacaf"
+          "sha256": "b005389d5cd03ad63ef339a6564b496452bb1acb847b88dc9952ddbf734dd32b"
         }
       ],
       "export_sha256": "1367c486f2804a692936e19687fc11f369081e4c1a77c02d4873477d58dbda24"
@@ -146,7 +146,7 @@
       "sources": [
         {
           "path": "peri-cloud/src/workspace/skills.rs",
-          "sha256": "45abfc75d9240d85a2a64baf3128cc5b6b5cd81337ed144f97386cacfa0bfa3e"
+          "sha256": "e8c9851ce56e33b3cb80c2f89eb05c0df9da62d28c47f95e50147ee1edb7f129"
         }
       ],
       "export_sha256": "d9c3a71af4f980fba758f659116679e10822d5b15b28fa2334690d6af87089a7"
@@ -872,7 +872,7 @@
           "sha256": "a1e7d9ade95cf9cb224a9e92a5d6538d465a363ebd84a78330094c69f148d77e"
         }
       ],
-      "export_sha256": "4fa7486df3b68b4a6ccc388dd0b7b7e30d045a809a93d31e82c03364480bfc30"
+      "export_sha256": "4812df42e6706609e1882b1e8ca8a951a4f5e02e8c2105cdeb63b65530a09819"
     },
     {
       "file": "README.md",
@@ -884,7 +884,7 @@
       "file": "PROMPTS-EDIT.md",
       "kind": "review-combined",
       "sources": [],
-      "export_sha256": "93fba07dd29eb5450f33c8a81df0d4cf6fe465b19de785bce7edba79a9c8db78"
+      "export_sha256": "14029b8023b462784d5609e8cb5cb8bd3766690b0d6f007e883c7d786d5ba1e0"
     },
     {
       "file": "14-capability-loading.md",
@@ -930,6 +930,17 @@
         }
       ],
       "export_sha256": "3013764e9f901339ace43fe957dc4f77833f8fcd7cce3020ee5cfd6cf080a640"
+    },
+    {
+      "file": "tools/peri-cloud--archive-tool.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-cloud/src/archive/tool.rs",
+          "sha256": "2e82815188ea05d74450ac772d38c81211043ef9ef726ebb48ad073f19d8c56e"
+        }
+      ],
+      "export_sha256": "583330079d496f8a1e0abb558cee2f3f12ed41b5011165fb1073d32e6e7459b2"
     }
   ],
   "source_snapshot": "working tree, source hashes recorded per document"

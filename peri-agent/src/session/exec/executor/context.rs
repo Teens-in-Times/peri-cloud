@@ -197,6 +197,12 @@ pub struct SessionContext {
     // ── session: session identity & transport ──────────────────────────────
     pub session_id: String,
     pub user_input_mailbox: Option<Arc<crate::session::user_input_mailbox::UserInputMailbox>>,
+    /// 会话级后台结果处理责任 owner（ACP 宿主跨 prompt 注入；None 时由本次执行
+    /// 建立本地 owner，保证无宿主路径也有等价语义）。
+    pub async_result_mailbox: Option<Arc<crate::session::async_result_mailbox::AsyncResultMailbox>>,
+    /// Host-owned runtime consumption evidence; never serialized or restored.
+    pub compact_exposure:
+        Arc<parking_lot::Mutex<crate::agent::compact_v2::exposure::ExposureLedger>>,
     pub cancel: AgentCancellationToken,
     pub broker: Arc<dyn UserInteractionBroker>,
     pub permission_mode: Arc<peri_acp_types::permission::SharedPermissionMode>,
@@ -215,10 +221,7 @@ pub struct SessionContext {
     pub hook_groups: Vec<Vec<peri_acp_types::hooks::RegisteredHook>>,
     pub cron_scheduler: Option<Arc<dyn peri_acp_types::cron::CronSchedulerPort>>,
     pub mcp_pool: Option<Arc<dyn peri_acp_types::ports::McpPoolPort>>,
-    pub dynamic_mcp: Option<Arc<dyn peri_acp_types::ports::DynamicMcpDeploymentPort>>,
-    pub session_mcp_capability: Option<Arc<dyn peri_acp_types::ports::SessionMcpCapabilityPort>>,
-    pub dynamic_mcp_projection:
-        Arc<parking_lot::Mutex<Option<Arc<dyn peri_acp_types::ports::SessionMcpProjectionLease>>>>,
+    pub session_mcp_catalog: Option<Arc<dyn peri_acp_types::ports::SessionMcpCatalogPort>>,
     pub tool_search_index: Arc<dyn peri_acp_types::ports::ToolSearchPort>,
     /// Agent 候选目录端口（prompt 渲染 `{{available_agents}}` 经此访问；
     /// W5：实现是会话级 MCP Agent registry 的只读投影，不再扫盘）。
@@ -226,10 +229,6 @@ pub struct SessionContext {
     pub shared_tools: Arc<
         parking_lot::RwLock<std::collections::BTreeMap<String, Arc<dyn crate::tools::BaseTool>>>,
     >,
-
-    // ── workflow: workflow agents ──────────────────────────────────────────
-    /// 会话级 workflow 完成通知源（None = 本会话无 workflow 面）。
-    pub workflow_notifications: Option<Arc<peri_acp_types::workflow::WorkflowNotifications>>,
 
     // ── 事件端口（原 controller；ACP 宿主适配 Controller）──────────────────
     /// 事件发射端口（`Controller::publish_event` 适配；补打 session_id/session_seq）。

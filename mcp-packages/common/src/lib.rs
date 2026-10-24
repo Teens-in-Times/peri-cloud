@@ -1,12 +1,13 @@
 //! Shared behavior used by the independently packaged builtin MCP instances.
 
 pub use peri_mcp_core::agent_definition;
+pub mod context_archive;
 pub mod failure;
 mod helpers;
 mod numeric;
 pub mod process_env;
 pub mod result_mapping;
-pub use peri_mcp_core::task_scope;
+pub use peri_mcp_core::task_owner;
 
 pub use helpers::{invoke_tool_call, list_tools_of, rmcp_tool_from_base, server_info};
 pub use numeric::parse_optional_u64;
@@ -14,6 +15,8 @@ pub use numeric::parse_optional_u64;
 pub mod shell;
 mod shell_executor;
 pub mod shell_output;
+#[cfg(not(target_os = "emscripten"))]
+pub mod standalone;
 
 #[cfg(all(test, unix))]
 mod shell_session_complete_test;

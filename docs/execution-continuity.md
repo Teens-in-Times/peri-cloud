@@ -1,6 +1,6 @@
 # 执行会话、轮次与上下文窗口
 
-实施状态：schema 19 接入可复用会话、检查点、轮次续接、协作等待及窗口轮换；schema 20 接入 [主助手自动审批](task-approvals.md) 和删除前通知。按调用跨设备执行和结构化验收仍属于后续阶段；完整目标尚未交付。阶段记录见 [实施计划](execution-continuity-plan.md)。
+实施状态：schema 19 接入可复用会话、检查点、轮次续接、协作等待及窗口轮换；schema 20 接入 [主助手自动审批](task-approvals.md) 和删除前通知。后续已实现[按调用跨设备执行](device-invocations.md)与[产物及结构化验收](task-deliverables.md)，实际验收与限制见[完整验证记录](execution-continuity-verification.md)。schema 25 的上游适配见[本轮同步记录](upstream/peri-e598d178.md)。[实施计划](execution-continuity-plan.md)保留阶段历史，不作为当前功能缺席的依据。
 
 ## 身份与复用
 

@@ -140,10 +140,10 @@ impl Gateway {
         let gate = self.account_gate(principal.to_string());
         let _guard = gate.lock().await;
         self.identity.browser_scope(actor).await?;
-        let hash = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&(session, text))?)
-        );
+        let hash = (Sha256::digest(serde_json::to_vec(&(session, text))?))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let saved = sqlx::query_as::<_, (String, String, String, String, String)>(
             "SELECT principal,request_hash,state,result_json,kind FROM control_operations WHERE id=?",
         )

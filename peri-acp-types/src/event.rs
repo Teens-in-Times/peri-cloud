@@ -93,7 +93,7 @@ pub trait EventSink: Send + Sync {
 /// 事件发布端口（L5：执行体迁入 Agent 层的统一发射面）。
 ///
 /// 实现方为 ACP/Controller 适配层（语义对齐 `Controller::publish_event`：
-/// 补打 session_id / session_seq 后扇出弹出队列 + 订阅广播）；Agent 层执行体
+/// 补打 session_id / session_seq 后广播到订阅者）；Agent 层执行体
 /// （`session::exec::*`）经本端口发射，不触碰 Controller 实现。
 pub trait EventPublisher: Send + Sync {
     /// 发射一条协议化前事件（携带事件源身份 [`crate::runtime::UnstampedEvent`]）。
@@ -128,6 +128,11 @@ pub enum SubscriptionError {
 /// 阻塞接收 / `try_recv` 排干在途事件，两态语义对齐 §9 事件契约 Broadcast 类。
 #[async_trait::async_trait]
 pub trait EventSubscriber: Send + Sync {
+    /// 当前订阅所属会话的内存健康度；无宿主绑定时由泵自行维护。
+    fn health_handle(&self) -> Option<std::sync::Arc<crate::event_v2::BusHealth>> {
+        None
+    }
+
     /// 接收下一条事件。
     async fn recv(&mut self) -> Result<EventMessage, SubscriptionError>;
 
@@ -180,31 +185,78 @@ pub struct ShellOutput {
     pub exit_code: Option<i32>,
 }
 
+/// `abandon_external` 写入 `output` 的放弃标记（owner 不可观测，终态未解析）。
+///
+/// 见 `peri-agent/src/agent/async_tasks/manager.rs::abandon_external`。
+const UNRESOLVED_OUTPUT_MARKER: &str = "abandoned as unresolved";
+/// 取消/中断收尾写入 `output` 的标记。
+///
+/// - shell：`settle_completed` 的取消清理；
+/// - subagent：`background.rs` 的 `LoopResult::Interrupted`。
+const CANCELLED_OUTPUT_MARKERS: &[&str] = &[
+    "Shell command cancelled",
+    "Background sub-agent was interrupted",
+];
+
+/// 命令/提示摘要上界（字符数）。超出时截断并显式标注。
+const NOTIFICATION_SUMMARY_LIMIT: usize = 200;
+/// 诊断上界（字符数）。超出时截断并显式标注。
+const NOTIFICATION_DIAGNOSTIC_LIMIT: usize = 400;
+
 impl BackgroundTaskResult {
-    /// 格式化为注入到 LLM 消息流的通知文本
+    /// 终态标签：通知正文与提醒标题的单一权威。
+    ///
+    /// 映射顺序固定，避免失败/超时被投影成成功：
+    /// `success && !timed_out` → `succeeded`；显式放弃标记 → `unresolved`；
+    /// `timed_out` → `timed_out`；显式取消标记 → `cancelled`；其余 → `failed`。
+    /// 取消收尾不携带 `timed_out`，因此取消标记在超时判定之后仍能命中。
+    ///
+    /// 本 DTO 尚无显式终态字段：`unresolved`（外部 owner 不可观测后放弃）与
+    /// `cancelled`（用户取消后的收尾）由 peri-agent 的终态产出点写入 `output`。
+    /// 这里只投影这两个既有标记；DTO 增加显式终态字段后删除标记匹配。
+    pub fn outcome_label(&self) -> &'static str {
+        if self.success && !self.timed_out {
+            return "succeeded";
+        }
+        if self.output.contains(UNRESOLVED_OUTPUT_MARKER) {
+            return "unresolved";
+        }
+        if self.timed_out {
+            return "timed_out";
+        }
+        if CANCELLED_OUTPUT_MARKERS
+            .iter()
+            .any(|marker| self.output.contains(marker))
+        {
+            return "cancelled";
+        }
+        "failed"
+    }
+
+    /// 格式化为注入到 LLM 消息流的自足通知文本。
+    ///
+    /// 关联线索不依赖原始启动工具调用仍在上下文：完整公开 `task_id`、有界命令
+    /// 摘要、终态、已知 `exit_code`、stdout/stderr 引用全部内联。完整 ID、状态、
+    /// 已知退出码与输出引用不截断；命令和诊断过长时截断并标注。
     pub fn to_notification(&self) -> String {
-        let short_id: String = self.task_id.chars().take(8).collect();
-        let mut text = if let Some(shell) = &self.shell_output {
-            let state = if self.timed_out {
-                "超时被终止"
-            } else if self.success {
-                "已完成"
-            } else {
-                "执行失败"
-            };
-            let exit = shell
-                .exit_code
-                .map_or_else(|| "退出码未知".to_string(), |code| format!("退出码 {code}"));
-            let mut text = format!(
-                "[后台任务 {short_id} {state}] Agent: {} | {exit}",
-                self.agent_name
-            );
-            if let Some(path) = &shell.stdout_path {
-                text.push_str(&format!("\nstdout 输出文件：{path}"));
-            }
-            if let Some(path) = &shell.stderr_path {
-                text.push_str(&format!("\nstderr 输出文件：{path}"));
-            }
+        let state = self.outcome_label();
+        let mut text = String::from("后台任务结果");
+        text.push_str(&format!("\ntask_id: {}", self.task_id));
+        text.push_str(&format!("\nagent: {}", self.agent_name));
+        if self.is_shell_task() {
+            text.push_str(&format!(
+                "\ncommand: {}",
+                bounded_notification_field(&self.prompt_summary, NOTIFICATION_SUMMARY_LIMIT)
+            ));
+        }
+        text.push_str(&format!("\nstate: {state}"));
+        text.push_str(&format!("\nexit_code: {}", self.exit_code_label()));
+        text.push_str(&format!("\nstdout: {}", self.stdout_reference()));
+        text.push_str(&format!("\nstderr: {}", self.stderr_reference()));
+        if let Some(diagnostic) = self.notification_diagnostic(state) {
+            text.push_str(&format!("\ndiagnostic: {diagnostic}"));
+        }
+        if let Some(shell) = &self.shell_output {
             if shell.complete {
                 // 指引指代 builtin 文件工具时必须用**模型面名字**（裸名已无提供面）；
                 // 查表未命中的兜底不含工具名，不得回落到裸名。
@@ -218,27 +270,12 @@ impl BackgroundTaskResult {
             } else {
                 text.push_str("\n输出文件不完整或不可用，请检查文件路径和错误信息后再读取。");
             }
-            if let Some(error) = &shell.error {
-                text.push_str(&format!("\n落盘诊断：{error}"));
-            }
-            text
         } else if self.success {
-            format!(
-                "[后台任务 {} 已完成] Agent: {} | 工具调用: {} | 耗时: {}ms\n结果:\n{}",
-                short_id, self.agent_name, self.tool_calls_count, self.duration_ms, self.output,
-            )
-        } else if self.timed_out {
-            format!(
-                "[后台任务 {} 超时被终止]（进程组已终止，逃逸子进程可能存活） Agent: {}\n错误:\n{}",
-                short_id, self.agent_name, self.output,
-            )
-        } else {
-            format!(
-                "[后台任务 {} 执行失败] Agent: {}\n错误:\n{}",
-                short_id, self.agent_name, self.output,
-            )
-        };
-        // child_thread_id 存在时追加恢复提示行（success/timed_out/failure 三分支统一）：
+            // 非 shell 任务（subagent 等）没有输出文件，结果正文是唯一交付。
+            text.push_str("\nresult:\n");
+            text.push_str(&self.output);
+        }
+        // child_thread_id 存在时追加恢复提示行：
         // 主 agent 从 bg 完成/失败通知中得知被中断的 subagent 可凭 thread_id 恢复
         if let Some(id) = &self.child_thread_id {
             text.push_str(&format!(
@@ -252,6 +289,85 @@ impl BackgroundTaskResult {
         }
         text
     }
+
+    fn is_shell_task(&self) -> bool {
+        self.shell_output.is_some() || self.agent_name == "bg-shell"
+    }
+
+    fn exit_code_label(&self) -> String {
+        // `None` 表示信号终止或等待失败；绝不从 success 反推数值。
+        self.shell_output
+            .as_ref()
+            .and_then(|shell| shell.exit_code)
+            .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+    }
+
+    fn stdout_reference(&self) -> &str {
+        self.shell_output
+            .as_ref()
+            .and_then(|shell| shell.stdout_path.as_deref())
+            .unwrap_or("unknown")
+    }
+
+    fn stderr_reference(&self) -> &str {
+        self.shell_output
+            .as_ref()
+            .and_then(|shell| shell.stderr_path.as_deref())
+            .unwrap_or("unknown")
+    }
+
+    fn notification_diagnostic(&self, state: &str) -> Option<String> {
+        let mut parts = Vec::new();
+        match state {
+            "unresolved" => parts.push(
+                "结果未知：任务终态不可观测，远端副作用未知；不要假定远端已停止，需要时直接检查 owner。"
+                    .to_string(),
+            ),
+            "cancelled" => parts.push("任务已取消，未按正常完成交付。".to_string()),
+            "timed_out" if self.shell_output.is_some() => parts
+                .push("超时被终止；进程组已终止，逃逸子进程可能存活。".to_string()),
+            "timed_out" => parts.push("任务超时终止。".to_string()),
+            "failed" => {
+                if self.shell_output.is_some() {
+                    // shell 输出只留在文件：正文重复原文会突破通知大小边界，
+                    // 也违背“通知只携带状态/命令/输出位置”的约束。
+                    parts.push("任务失败；请结合 exit_code 与 stderr 输出文件诊断。".to_string());
+                } else {
+                    parts.push(bounded_notification_field(
+                        &self.output,
+                        NOTIFICATION_DIAGNOSTIC_LIMIT,
+                    ));
+                }
+            }
+            _ => {}
+        }
+        if let Some(error) = self
+            .shell_output
+            .as_ref()
+            .and_then(|shell| shell.error.as_deref())
+        {
+            parts.push(format!(
+                "落盘诊断：{}",
+                bounded_notification_field(error, NOTIFICATION_DIAGNOSTIC_LIMIT)
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join("；"))
+    }
+}
+
+/// 单行化并按字符数截断字段；空值显示 `unknown`，截断显式标注。
+fn bounded_notification_field(text: &str, limit: usize) -> String {
+    let normalized = text.replace(['\r', '\n'], " ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    if trimmed.chars().count() <= limit {
+        return trimmed.to_string();
+    }
+    let mut bounded: String = trimmed.chars().take(limit).collect();
+    bounded.push_str("…[truncated]");
+    bounded
 }
 
 /// Compact 保留的文件信息摘要
@@ -262,78 +378,8 @@ pub struct CompactFileInfo {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{BackgroundTaskResult, ShellOutput};
-
-    #[test]
-    fn background_failure_notification_contains_safe_model_facts() {
-        let failure = crate::error::SafeSubagentFailure::new(
-            "child-123",
-            crate::error::SafeModelErrorDiagnostic::from_model(
-                peri_model::ModelError::http_status(429, "provider.example", Some("req-123"))
-                    .diagnostic(),
-            ),
-        )
-        .expect("safe child failure");
-        let result = BackgroundTaskResult {
-            task_id: "task-123".into(),
-            agent_name: "worker".into(),
-            prompt_summary: "prompt summary".into(),
-            success: false,
-            output: "An LLM API error occurred (HTTP 429). Please try again.".into(),
-            tool_calls_count: 1,
-            duration_ms: 1,
-            timed_out: false,
-            child_thread_id: Some("child-123".into()),
-            subagent_failure: Some(failure),
-            shell_output: None,
-        };
-        let notification = result.to_notification();
-        assert!(notification.contains("model_error_status: 429"));
-        assert!(notification.contains("model_error_request_id: req-123"));
-        assert!(!notification.contains("prompt summary"));
-    }
-
-    #[test]
-    fn shell_notification_is_short_and_serde_compatible() {
-        let result = BackgroundTaskResult {
-            task_id: "shell-123456789".into(),
-            agent_name: "bg-shell".into(),
-            prompt_summary: "printf secret".into(),
-            success: true,
-            output: "x".repeat(200_000),
-            tool_calls_count: 0,
-            duration_ms: 3,
-            timed_out: false,
-            child_thread_id: None,
-            subagent_failure: None,
-            shell_output: Some(Box::new(ShellOutput {
-                stdout_path: Some("/tmp/stdout.log".into()),
-                stderr_path: Some("/tmp/stderr.log".into()),
-                complete: true,
-                error: None,
-                exit_code: Some(0),
-            })),
-        };
-        let notification = result.to_notification();
-        assert!(notification.len() < 2_000);
-        assert!(!notification.contains("secret"));
-        assert!(!notification.contains(&"x".repeat(1_000)));
-        // 读取指引必须指**模型面名字**（裸名已无提供面）：逐字断言冻结字面量，
-        // 不用查表派生期望值（与实现同源派生会在「归一改坏」时自洽通过）。
-        assert!(
-            notification.contains("请使用 `Read` 工具按需读取"),
-            "通知必须用模型面名字引导读取: {notification}"
-        );
-        let mut legacy = serde_json::to_value(&result).expect("serialize");
-        legacy
-            .as_object_mut()
-            .expect("object")
-            .remove("shell_output");
-        let decoded: BackgroundTaskResult = serde_json::from_value(legacy).expect("legacy decode");
-        assert!(decoded.shell_output.is_none());
-    }
-}
+#[path = "event_notification_test.rs"]
+mod tests;
 
 /// Todo 列表条目（用于 ExecutorEvent::TodoUpdate）
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -838,8 +884,8 @@ pub enum ExecutorEvent {
 /// - 发射点（Agent EventBus 消费侧）构造 [`crate::runtime::UnstampedEvent`]
 ///   身份与 v1 payload（[`ExecutorEvent`]），经 `Controller::publish_event`
 ///   统一发射——Controller 经 Runtime 补打 `session_id` / `session_seq` 后
-///   扇出到弹出队列与订阅广播
-/// - ACP 协议化消费侧（`Controller::subscribe` / `Controller::pop_events`）
+///   广播到订阅者
+/// - ACP 协议化消费侧（`Controller::subscribe`）
 ///   接收本载体，按 `envelope.session_id` 过滤后做 v1 协议化映射
 ///
 /// `event` 为 `Option`：会话销毁路径（`Controller::destroy_session`）drain 出的

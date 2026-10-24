@@ -63,6 +63,7 @@ fn test_receive_input_output_contract() {
         wake_up_count: 0,
         budget_deferred_count: 0,
         input_message_ids: Vec::new(),
+        process_message_ids: Vec::new(),
         stop_requested: false,
     };
     assert_eq!(output.consumed_count, 0);
@@ -78,9 +79,11 @@ fn test_reason_input_output_contract() {
     };
     let reasoning = crate::agent::react::Reasoning::with_answer("thinking", "answer");
     let output = ReasonOutput {
+        exposure: Default::default(),
         reasoning,
         catalog: ctx.runtime.tool_catalog.snapshot(),
         messages_snapshot: std::sync::Arc::new(vec![]),
+        receipt: None,
     };
     assert!(!output.reasoning.needs_tool_call());
     assert!(output.messages_snapshot.is_empty());
@@ -91,9 +94,11 @@ fn test_act_input_output_contract() {
     let ctx = make_stage_context();
     let reasoning = crate::agent::react::Reasoning::with_answer("thinking", "done");
     let _input = ActInput {
+        exposure: Default::default(),
         context: ctx.clone(),
         reasoning,
         catalog: ctx.runtime.tool_catalog.snapshot(),
+        receipt: None,
     };
 
     let output_with_tools = ActOutput {
@@ -274,3 +279,6 @@ mod startup_gate_tests;
 
 #[path = "compaction_loop_test.rs"]
 mod compaction_loop_tests;
+
+#[path = "stop_intent_test.rs"]
+mod stop_intent_tests;

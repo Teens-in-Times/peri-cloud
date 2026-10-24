@@ -7,7 +7,9 @@ use peri_acp_types::tools::{BaseTool, ToolContext};
 use serial_test::serial;
 
 use super::*;
-use crate::preflight::{preflight_validate_script, validate_script_with};
+use crate::preflight::preflight_validate_script;
+#[cfg(unix)]
+use crate::preflight::validate_script_with;
 use crate::protocol::{AgentRunParams, AgentRunResult, Usage};
 use crate::registry::{WorkflowRunStatus, WorkflowTaskRegistry};
 use crate::runner::AgentExecutor;

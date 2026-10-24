@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
 use peri_acp_types::session::{MessageQueue, SessionAccessPort};
 use peri_acp_types::tasks::{BgTaskKind, TaskTerminalDelivery};
 
@@ -15,6 +17,16 @@ use crate::session::factory::OnBgCompleteFn;
 
 pub fn queue_terminal_delivery(queue: MessageQueue) -> Arc<dyn TaskTerminalDelivery> {
     crate::agent::async_tasks::delivery::SessionTerminalDelivery::for_queue(queue)
+}
+
+/// 绑定会话级结果处理责任 owner 的终态投递路由。
+pub fn queue_terminal_delivery_with_mailbox(
+    queue: MessageQueue,
+    mailbox: Arc<crate::session::async_result_mailbox::AsyncResultMailbox>,
+) -> Arc<dyn TaskTerminalDelivery> {
+    crate::agent::async_tasks::delivery::SessionTerminalDelivery::for_queue_with_mailbox(
+        queue, mailbox,
+    )
 }
 
 /// 由 `(SessionAccessPort, session_id)` 构造 **session 级** `on_bg_complete` 回调。
@@ -54,6 +66,40 @@ struct Publication {
     status: PublicationStatus,
 }
 
+/// 去重表只需要身份指纹，不需要保留完整结果正文。
+///
+/// 对完整结果取固定长度摘要：通知文本对大输出只保留文件引用，
+/// 不能作为冲突判定的内容边界；结果对象才包含完整 output。
+///
+/// 使用流式写入避免为大输出额外分配完整序列化缓冲区。
+struct Sha256Writer(Sha256);
+
+impl std::io::Write for Sha256Writer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn publication_fingerprint(
+    result: &BackgroundTaskResult,
+    kind: BgTaskKind,
+) -> Result<String, String> {
+    let mut writer = Sha256Writer(Sha256::new());
+    serde_json::to_writer(&mut writer, &(kind, result)).map_err(|error| error.to_string())?;
+    let digest = writer.0.finalize();
+    let mut fingerprint = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(fingerprint, "{byte:02x}");
+    }
+    Ok(fingerprint)
+}
+
 fn publication_callback(resolve: DeliveryResolver) -> OnBgCompleteFn {
     let publications = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::<
         String,
@@ -64,8 +110,8 @@ fn publication_callback(resolve: DeliveryResolver) -> OnBgCompleteFn {
             crate::agent::async_tasks::delivery::terminal_delivery_id(&result.task_id, "terminal");
         let identity = delivery_id.as_uuid().to_string();
         let reminder = background_result_reminder(result, kind);
-        let fingerprint =
-            serde_json::to_string(reminder.as_reminder()).map_err(|error| error.to_string())?;
+        // 去重表只保存摘要指纹，不保存结果正文。
+        let fingerprint = publication_fingerprint(result, kind)?;
         let mut state = publications.lock();
         if let Some(prior) = state.get(&identity) {
             if prior.fingerprint != fingerprint {
@@ -98,7 +144,7 @@ fn publication_callback(resolve: DeliveryResolver) -> OnBgCompleteFn {
             BgTaskKind::Agent => peri_acp_types::session::MessageSource::SubAgentComplete,
             BgTaskKind::Shell => peri_acp_types::session::MessageSource::ShellComplete,
             BgTaskKind::Workflow => peri_acp_types::session::MessageSource::WorkflowComplete,
-            BgTaskKind::Mcp => peri_acp_types::session::MessageSource::DynamicMcpNotification,
+            BgTaskKind::Mcp => peri_acp_types::session::MessageSource::McpNotification,
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             resolve()?.accept(delivery_id, &reminder, source)

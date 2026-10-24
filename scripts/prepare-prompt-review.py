@@ -124,6 +124,9 @@ ARCHITECTURE = """# 项目架构参考
 | 设备环境 | 绑定设备的环境说明；跨设备准备也会返回目标环境 | 如何选择工具、核实版本、使用目标 shell |
 | 任务 / 审批 / 记忆事实 | 带来源的消息帧或工具结果，随当前任务与授权变化 | 阅读与判断方法；事实本身由宿主填充 |
 | Skill / MCP 正文 | 先发现目录，相关时再按需加载 | 专门领域的操作知识，不预先堆入所有正文 |
+| 历史归档引用 | 上下文中的收起回执；使用 ReadContextArchive 有界回查 | 只在需要原始证据时检索，与长期个人记忆分开 |
+
+审批使用独立的有界上下文视图，主要包含当前授权记忆、审批事实和协调工具。审批轨迹保留在宿主记录中，不作为普通聊天的连续正文；主助手仍可按需查询相关任务与证据。
 
 基座中的配置性文本适合保持稳定。任务进度、最新补充、设备观测和加载的资料属于动态上下文，避免把它们复制进角色正文。项目和技能目录按工作区绑定加载；文件发生变化后，不应假定既有会话已自动重新读取。
 
@@ -256,6 +259,8 @@ def main():
         path.write_text(text.rstrip() + "\n", encoding="utf-8", newline="\n")
         entry["sources"] = [{"path": s, "sha256": digest(ROOT / s)} for s in sources]
         entry["export_sha256"] = digest(path)
+    archive_tool_source = "peri-cloud/src/archive/tool.rs"
+    put("tools/peri-cloud--archive-tool.md", tool_contract(archive_tool_source), [archive_tool_source], "active-tool-contract")
     put("01-host-base.md", read("peri-cloud/prompts/base.md"), ["peri-cloud/prompts/base.md"], "active-default")
     for name, source in [("02-main.md", "peri-cloud/prompts/main.md"), ("03-worker.md", "peri-cloud/prompts/worker.md")]:
         put(name, read(source), [source], "active-role")

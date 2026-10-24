@@ -116,7 +116,14 @@ async fn forget_cuts_off_tool_recollections_summaries_and_survives_rewind() {
         "summary: tool result contained FORGOTTEN_MARKER",
     ));
     store.forget(item.id, 1, MemorySource::web()).await.unwrap();
+    // A stale assembled frame must not seed a fresh archive under the new privacy epoch.
+    assert!(crate::archive::CloudArchive::open(scope.clone())
+        .await
+        .is_err());
     frames.refresh().await.unwrap();
+    assert!(crate::archive::CloudArchive::open(scope.clone())
+        .await
+        .is_ok());
     assert!(!view(&frames).contains("FORGOTTEN_MARKER"));
     let history = frames.transcript.read().canonical_payloads();
     assert!(history.iter().any(|p| p.as_message().is_some()));

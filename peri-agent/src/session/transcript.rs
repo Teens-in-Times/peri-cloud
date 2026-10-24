@@ -23,7 +23,7 @@ use crate::agent::compact_v2::projection::MessageProjectionDirective;
 use crate::messages::{BaseMessage, MessageId};
 use crate::thread::ThreadId;
 
-use peri_acp_types::session_resources::{RewindBoundary, SessionResources};
+use peri_acp_types::session_resources::SessionResources;
 use peri_acp_types::store::history;
 use peri_acp_types::store::{MessageFlags, PersistedPayload};
 use peri_acp_types::system_reminder::{ReminderAudience, TrustedSystemReminder};
@@ -32,6 +32,9 @@ use persistence::{PersistenceBudget, Reservation};
 
 #[path = "transcript_view.rs"]
 mod view;
+
+#[path = "transcript/rewind.rs"]
+mod rewind;
 
 pub use view::TranscriptRevision;
 
@@ -62,6 +65,10 @@ impl CompactionCommitState {
         self.0.store(1, Ordering::SeqCst);
     }
 
+    fn restore(&self, state: u8) {
+        self.0.store(state, Ordering::SeqCst);
+    }
+
     fn mark_committed(&self) {
         self.0.store(2, Ordering::SeqCst);
     }
@@ -78,11 +85,6 @@ pub enum PersistOp {
     /// 追加新消息（canonical payload）
     Append {
         payload: PersistedPayload,
-        reserved: Reservation,
-    },
-    /// Transcript rewind 至指定 id（保留目标本身，删除其后记录）
-    RewindTo {
-        id: MessageId,
         reserved: Reservation,
     },
     /// 更新消息标记（投影变更集）
@@ -105,6 +107,7 @@ pub enum PersistOp {
 mod entry;
 mod persistence;
 mod persistence_port;
+pub(crate) use persistence_port::FlushError;
 
 pub use entry::{StagedData, TranscriptEntry};
 
@@ -144,6 +147,7 @@ pub struct MessageTranscript {
     /// Deployment owns canonical persistence: compaction commits stay in the
     /// hot transcript until the deployment settles its own journal.
     deployment_owned_compaction: bool,
+    deployment_archive: Option<Arc<dyn crate::context_archive_storage::DeploymentArchive>>,
     /// 待持久化预算（与 writer 共享）：条数/字节有界，预留失败即 sticky 失败。
     budget: Option<Arc<PersistenceBudget>>,
     /// 实例身份（见 [`TranscriptRevision`]）
@@ -194,6 +198,7 @@ impl MessageTranscript {
             compaction_commit_state: CompactionCommitState::default(),
             session_resources: None,
             deployment_owned_compaction: false,
+            deployment_archive: None,
             budget: None,
             view_instance: view::next_instance_id(),
             view_revision: 0,
@@ -205,6 +210,45 @@ impl MessageTranscript {
     /// ThreadStore and never release archived entries before settlement.
     pub fn enable_deployment_owned_compaction(&mut self) {
         self.deployment_owned_compaction = true;
+    }
+
+    pub fn bind_deployment_archive(
+        &mut self,
+        id: ThreadId,
+        archive: Arc<dyn crate::context_archive_storage::DeploymentArchive>,
+    ) {
+        self.enable_deployment_owned_compaction();
+        self.thread_id = Some(id);
+        self.deployment_archive = Some(archive);
+    }
+
+    pub fn archive_port(
+        &self,
+    ) -> Option<(
+        Arc<dyn crate::context_archive_storage::ArchiveStorage>,
+        ThreadId,
+    )> {
+        let id = self.thread_id.clone()?;
+        if let Some(archive) = &self.deployment_archive {
+            let storage: Arc<dyn crate::context_archive_storage::ArchiveStorage> = archive.clone();
+            return Some((storage, id));
+        }
+        Some((
+            Arc::new(crate::context_archive_storage::SessionArchiveStorage(
+                self.session_resources.clone()?,
+            )),
+            id,
+        ))
+    }
+
+    pub async fn checkpoint_archive(&self) -> anyhow::Result<()> {
+        self.flush_persistence().await?;
+        if let (Some(archive), Some(id)) = (&self.deployment_archive, &self.thread_id) {
+            archive
+                .checkpoint(id, &self.canonical_payloads(), &self.flags)
+                .await?;
+        }
+        Ok(())
     }
 
     fn push_loaded_payload(&mut self, payload: PersistedPayload) {
@@ -652,7 +696,15 @@ impl MessageTranscript {
             _ => return Err(anyhow!("compact lifecycle requires persistence")),
         };
 
+        let appended_ids: HashSet<_> = lifecycle
+            .appended_messages
+            .iter()
+            .map(BaseMessage::id)
+            .collect();
         for (id, _) in &lifecycle.flag_updates {
+            if appended_ids.contains(id) {
+                continue;
+            }
             if !self.id_index.contains_key(id) {
                 return Err(anyhow!(
                     "compact lifecycle flag target id {id:?} not found in transcript"
@@ -679,13 +731,26 @@ impl MessageTranscript {
         // 顺序固定：先 flush 既有积压，再提交一次完整 compaction 行为（摘要、flags、
         // 计数与缓存视图同一事务），成功后才改内存。失败/未证明时保留磁盘事实并让
         // 热态保持失效（`is_uncertain`），不把内存视图推进到磁盘前面。
+        let previous_state = self.compaction_commit_state.0.load(Ordering::SeqCst);
         self.compaction_commit_state.mark_pending();
         if let Some((store, thread_id)) = &persistence {
             self.flush_persistence().await?;
             if let Err(error) = store.apply_compaction(thread_id, &lifecycle).await {
-                return Err(anyhow!(
-                    "compact persistence did not commit; reload the session to recover: {error}"
-                ));
+                if error.effect() == peri_acp_types::session_resources::MutationOutcome::NotApplied
+                {
+                    self.compaction_commit_state.restore(previous_state);
+                }
+                tracing::error!(%error, uncertain = self.compaction_commit_state.is_uncertain(), "compact commit failed");
+                return Err(error.into());
+            }
+        } else if let (Some(archive), Some(id)) = (&self.deployment_archive, &self.thread_id) {
+            self.checkpoint_archive().await?;
+            if let Err(error) = archive.apply_compaction(id, &lifecycle).await {
+                if error.effect() == peri_acp_types::session_resources::MutationOutcome::NotApplied
+                {
+                    self.compaction_commit_state.restore(previous_state);
+                }
+                return Err(error.into());
             }
         }
         self.apply_compaction_lifecycle_memory(&lifecycle);
@@ -813,58 +878,12 @@ impl MessageTranscript {
             compaction_commit_state: self.compaction_commit_state.clone(),
             session_resources: self.session_resources.take(),
             deployment_owned_compaction: self.deployment_owned_compaction,
+            deployment_archive: self.deployment_archive.take(),
             budget: self.budget.take(),
             view_instance: self.view_instance,
             // 重建整体替换内容：修订号必须前进（旧视图一律失效）
             view_revision: self.view_revision.wrapping_add(1),
         }
-    }
-
-    // ── Rewind ─────────────────────────────────────────────────────────────────
-
-    /// 截断 Transcript 至指定消息（含）
-    ///
-    /// 同步收缩索引表、清空 staging。
-    /// 若 id 不存在返回错误。
-    pub fn rewind_to(&mut self, id: MessageId) -> Result<(), anyhow::Error> {
-        let ids: Vec<MessageId> = self.entries.iter().map(TranscriptEntry::id).collect();
-        // transcript rewind 保留目标本身（KeepThrough）；用户 rewind 的 RemoveFrom
-        // 是另一个边界，两者共用 store::history 的边界规则。
-        let keep_len = history::rewind_keep_len(&ids, RewindBoundary::KeepThrough(id))
-            .map_err(|_| anyhow!("rewind target id {id:?} not found in transcript"))?;
-        let target_idx = keep_len - 1;
-
-        // ancestor 边界保护：不能 rewind 到祖先消息内部
-        if target_idx < self.ancestor_len {
-            return Err(anyhow!(
-                "cannot rewind into ancestor region (ancestor_len={}, target_idx={})",
-                self.ancestor_len,
-                target_idx
-            ));
-        }
-
-        // 清空暂存区
-        self.staged = None;
-
-        // 收集要移除的 id（用于清理索引和标记）
-        let remove_ids: Vec<MessageId> = ids[keep_len..].to_vec();
-
-        // 截断 entries
-        self.entries.truncate(keep_len);
-
-        // 收缩索引表
-        for rid in &remove_ids {
-            self.id_index.remove(rid);
-            self.flags.remove(rid);
-        }
-        self.bump_view_revision();
-
-        // 异步持久化 rewind（保留目标本身的 KeepThrough 边界）
-        if let Some(reserved) = self.reserve_persistence(Reservation::marker(1)) {
-            self.send_persist(PersistOp::RewindTo { id, reserved });
-        }
-
-        Ok(())
     }
 }
 

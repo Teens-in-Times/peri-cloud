@@ -72,8 +72,11 @@ struct Request {
 }
 fn digest(value: &impl Serialize) -> Result<String> {
     Ok(format!(
-        "sha256:{:x}",
-        sha2::Sha256::digest(serde_json::to_vec(value)?)
+        "sha256:{}",
+        (sha2::Sha256::digest(serde_json::to_vec(value)?))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     ))
 }
 fn delivery_version(delivery: &Delivery) -> Result<String> {
@@ -271,9 +274,15 @@ impl WorkerService {
                     .map_err(|_| TaskError::Forbidden)?;
                 let binding = state.frozen.binding.ok_or(TaskError::Invalid)?;
                 let content_version = if native == "Write" {
-                    call.input["content"]
-                        .as_str()
-                        .map(|s| format!("sha256:{:x}", sha2::Sha256::digest(s.as_bytes())))
+                    call.input["content"].as_str().map(|s| {
+                        format!(
+                            "sha256:{}",
+                            (sha2::Sha256::digest(s.as_bytes()))
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()
+                        )
+                    })
                 } else {
                     None
                 };

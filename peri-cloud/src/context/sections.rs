@@ -52,7 +52,7 @@ impl ContextSectionInfo {
             origin: origin.into(),
             freshness,
             bytes: part.text.len(),
-            version:format!("sha256:{:x}",Sha256::digest(serde_json::to_vec(&serde_json::json!({"text":part.text,"tools":part.tools.iter().map(|tool|tool.definition()).collect::<Vec<_>>()})).unwrap_or_default())),
+            version:format!("sha256:{}",(Sha256::digest(serde_json::to_vec(&serde_json::json!({"text":part.text,"tools":part.tools.iter().map(|tool|tool.definition()).collect::<Vec<_>>()})).unwrap_or_default())).iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
             tool_count: part.tools.len(),
             role: "selected cloud role".into(),
         }

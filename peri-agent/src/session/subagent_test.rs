@@ -834,12 +834,16 @@ mod bound_and_tail_cases;
 mod resume_cases;
 #[path = "subagent/resume_dispatch_test.rs"]
 mod resume_dispatch_cases;
+#[path = "subagent/resume_owner_reuse_test.rs"]
+mod resume_owner_reuse;
 
 #[path = "subagent/close_lifecycle_test.rs"]
 mod close_lifecycle_cases;
 
 #[path = "subagent/child_wire_capture_test.rs"]
 mod child_wire_capture_test;
+#[path = "subagent/mcp_policy_test.rs"]
+mod mcp_policy_tests;
 #[path = "subagent/provenance_test.rs"]
 mod provenance_tests;
 async fn create_bound_root(

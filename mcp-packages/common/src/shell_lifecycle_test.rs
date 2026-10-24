@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use super::*;
 use peri_acp_types::tasks::{TaskManager as TaskManagerPort, TaskShutdownReport};
 use peri_agent::agent::async_tasks::*;

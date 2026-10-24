@@ -202,6 +202,7 @@ impl Wire {
 
     pub(crate) fn install(&self, pool: &McpClientPool, name: &str, builtin: bool) {
         let handle = Arc::new(McpClientHandle {
+            call_gate: Default::default(),
             name: name.into(),
             version: None,
             connected_at: None,
@@ -301,12 +302,13 @@ async fn child_scope_metadata_ignores_owner_parameters_and_captured_root() {
     {
         let calls = calls.lock();
         assert_eq!(calls.len(), 1);
-        let capability = pool
-            .task_scope_authority
-            .resolve_capability(calls[0].meta.as_ref().expect("wire task scope metadata"))
-            .expect("wire task scope must be issued by the trusted authority");
-        assert_eq!(capability.session_id, "child-thread");
-        assert_ne!(capability.session_id, "root-session");
+        let meta = calls[0].meta.as_ref().expect("wire task owner metadata");
+        assert_eq!(
+            meta.0
+                 .0
+                .get(peri_mcp_core::task_owner::TASK_OWNER_META_KEY),
+            Some(&serde_json::json!("child-thread"))
+        );
     }
     assert!(root.is_execution_idle());
     assert!(child.is_execution_idle());
@@ -522,8 +524,9 @@ async fn child_initiated_task_receipt_delivers_to_the_child_not_root() {
         .with_task_terminal_delivery(delivery.clone());
     let output = bridge.invoke(serde_json::json!({}), context).await.unwrap();
     assert!(
-        output.contains("committed to the initiating session's transcript"),
-        "回执必须只承诺可达的持久投递: {output}"
+        output.contains("delivered to the initiating session when it arrives")
+            && output.contains("recorded at that point"),
+        "回执只能承诺结果到达时的投递与记录: {output}"
     );
     let task_id = manager.snapshot().tasks[0].task_id.clone();
     let mut result = peri_acp_types::event::BackgroundTaskResult {

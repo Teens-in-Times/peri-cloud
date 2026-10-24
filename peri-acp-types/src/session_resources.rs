@@ -224,15 +224,16 @@ pub enum FrozenState {
     LegacyAbsent,
 }
 
-/// 绑定复核的力度：两次复核的差别只在是否重跑一次完整发现。
+/// 绑定复核的力度。
 ///
-/// 与「事务」「CAS」无关，也不表达复核结果的确定性差异：两者都在不一致时失败，
-/// `Recorded` 只是省去外部进程。
+/// 文件对象身份与完整发现快照不再参与准入，因此两种力度现在执行同一套检查
+/// （归属关系与执行目录可用性）；`Full` 保留为一次准入入口的既有标记，避免
+/// 协议与调用方改动。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BindingRecheck {
-    /// 权威复核：SQL 关系、关键文件对象，加一次完整发现快照比对。
+    /// 一次准入入口的权威复核（当前与 `Recorded` 等价）。
     Full,
-    /// 同一次准入内的复核：SQL 关系与关键文件对象，不启动外部进程。
+    /// 同一次准入内的复核（当前与 `Full` 等价）。
     Recorded,
 }
 
@@ -454,6 +455,16 @@ pub trait SessionResources: Send + Sync {
     /// 一次一致读取：metadata、binding 分类、frozen 状态、own payload/flags、inherited。
     async fn load_session_snapshot(&self, id: &ThreadId) -> SessionResourceResult<SessionSnapshot>;
 
+    /// Explicit independent-fork read: flatten the frozen inherited context and own
+    /// history, and materialize only archives authorized by those frozen roots.
+    /// Added archive bodies are recovery_only and stay excluded through rewind/refork.
+    /// Preserve the frozen source tail and verify catalog/member identities before returning.
+    async fn load_fork_snapshot(&self, _id: &ThreadId) -> SessionResourceResult<SessionSnapshot> {
+        Err(SessionResourceError::new(
+            SessionResourceErrorKind::Unsupported,
+        ))
+    }
+
     /// 一次一致读取的执行关键有效视图：同一份 metadata/binding/frozen/inherited，
     /// 但 `payloads` 只含未排除的 own 条目、`flags` 只含活跃 id。
     ///
@@ -493,6 +504,26 @@ pub trait SessionResources: Send + Sync {
             payloads,
             flags,
         })
+    }
+
+    /// 轻量读取恢复所需的 frozen 原字节，不分页、不装入任何正文。
+    ///
+    /// 恢复准入只需要 frozen 这一项不可变事实；默认实现拒绝，生产后端必须覆写为
+    /// 单列读取，**不得**用 [`Self::load_active_snapshot`] 作为捷径（那会把 own 有效
+    /// payload、flags 与 inherited 一并读入内存）。会话不存在是 `NotFound`，行存在但
+    /// 从未保存 frozen 是 [`FrozenState::LegacyAbsent`]。
+    async fn load_frozen_state(&self, _id: &ThreadId) -> SessionResourceResult<FrozenState> {
+        Err(SessionResourceError::new(
+            SessionResourceErrorKind::Unsupported,
+        ))
+    }
+
+    /// 后端是否实现 `peri.historyWindowV1` 的边界/页/正文读取端口。
+    ///
+    /// 协商必须反映**端到端**可用：客户端声明不能把未实现的后端变成可用。默认 false；
+    /// 覆写了窗口读取端口的后端必须同时覆写本方法。
+    fn supports_history_window(&self) -> bool {
+        false
     }
 
     /// 轻量绑定分类：只回答本机能否验证这条会话的绑定，不加载历史、不启动发现。
@@ -724,6 +755,53 @@ pub trait SessionResources: Send + Sync {
         Ok(HashMap::new())
     }
 
+    /// Resolve a frozen inherited archive grant. Source IDs/references are never credentials.
+    async fn inherited_archive_root(
+        &self,
+        _id: &ThreadId,
+        _source: &ThreadId,
+        _anchor: MessageId,
+    ) -> SessionResourceResult<crate::context_archive::ArchiveRoot> {
+        Err(crate::session_resources::SessionResourceError::new(
+            crate::session_resources::SessionResourceErrorKind::Unsupported,
+        ))
+    }
+
+    /// Bounded archive metadata access, including excluded anchors. Unsupported adapters fail closed.
+    async fn read_archive_metadata(
+        &self,
+        _id: &ThreadId,
+        _query: &crate::context_archive::ArchiveMetadataQuery,
+    ) -> SessionResourceResult<crate::context_archive::ArchiveMetadataPage> {
+        Err(crate::session_resources::SessionResourceError::new(
+            crate::session_resources::SessionResourceErrorKind::Unsupported,
+        ))
+    }
+
+    /// Read only the requested canonical byte interval below a stable committed tail.
+    async fn read_archive_chunk(
+        &self,
+        _id: &ThreadId,
+        _query: &crate::context_archive::ArchiveChunkQuery,
+    ) -> SessionResourceResult<crate::context_archive::ArchiveChunk> {
+        Err(crate::session_resources::SessionResourceError::new(
+            crate::session_resources::SessionResourceErrorKind::Unsupported,
+        ))
+    }
+
+    /// Read a bounded batch in request order. Adapters may combine it into one I/O.
+    async fn read_archive_chunks(
+        &self,
+        id: &ThreadId,
+        batch: &crate::context_archive::ArchiveChunkBatch,
+    ) -> SessionResourceResult<Vec<crate::context_archive::ArchiveChunk>> {
+        let mut chunks = Vec::with_capacity(batch.queries().len());
+        for query in batch.queries() {
+            chunks.push(self.read_archive_chunk(id, query).await?);
+        }
+        Ok(chunks)
+    }
+
     /// 按给定 id 集合读取 flags，范围有界：只回答这些 id 的标记，不做全历史扫描。
     ///
     /// 默认实现返回空 map（非生产后端的回退，不满足分页路径的读取范围要求；
@@ -869,9 +947,8 @@ pub trait SessionResources: Send + Sync {
     /// `clear_excluded` 是保留前缀里必须清零 `excluded` 的 id，由调用方从一致读取的完整
     /// own 历史算出（[`crate::store::history::rewind_clear_excluded_ids`] 是唯一规则实现）：
     /// 边界删除与 flags 清零要么都生效、要么都不生效，只生效一半会让热态与随后的冷恢复
-    /// 看到两份不同的历史。清零同时把整条 `projection` 载荷一并清掉（恢复正文的条目不再
-    /// 携带 `superseded_by` 这类只在 `excluded` 为真时才有意义的投影记录），`truncated`
-    /// 保持原样。
+    /// 看到两份不同的历史。清零同时撤销 `superseded_by`；仍有效的 archive catalog
+    /// 保留身份，丢失锚点、成员或替代依据的整组省略动作与入口在同一事务撤销。
     ///
     /// 未知边界保持「无变更」语义，但**必须如实回报** [`RewindOutcome::BoundaryMissing`]：
     /// 调用方（如 ACP rewind handler）不能把「什么都没做」当成「已按边界重建」，
