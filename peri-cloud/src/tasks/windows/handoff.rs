@@ -12,6 +12,7 @@ fn request(
     record: &TaskRecord,
     snapshot: &SessionState,
     messages: &[serde_json::Value],
+    previous: Option<&Rotation>,
     limits: &crate::limits::RuntimeLimits,
 ) -> Result<Option<ModelRequest>> {
     let capacity = snapshot
@@ -21,7 +22,15 @@ fn request(
     let output = limits.worker_handoff_tokens.min(capacity / 4);
     let budget = capacity as usize * 2;
     let reserve = output as usize * 2 + 2048;
-    let contract = json!({"goal":record.goal,"constraints":record.constraints,"acceptance":record.acceptance,"parent_messages":messages});
+    let previous = previous.map(|value| {
+        json!({"id":value.id,"source_window":value.source_window,
+        "instruction_watermark":value.instruction_watermark,"status":value.summary_status,
+        "summary_preview":value.summary.as_ref().map(|text|clip(text,4000)),
+        "truncated":value.summary.as_ref().is_some_and(|text|text.chars().count()>4000),
+        "detail":{"source":"handoff","id":value.id},"attributed_evidence":true})
+    });
+    let contract = json!({"goal":record.goal,"constraints":record.constraints,"acceptance":record.acceptance,"parent_messages":messages,
+        "previous_window_handoff":previous});
     let contract_bytes = serde_json::to_vec(&contract)?.len();
     if contract_bytes + HANDOFF_PROMPT.len() + reserve >= budget {
         return Ok(None);
@@ -67,20 +76,29 @@ fn request(
         evidence.push(row);
     }
     evidence.reverse();
-    if evidence.is_empty() {
+    if evidence.is_empty() && previous.is_none() {
         return Ok(None);
     }
-    let input = json!({"purpose":"window_handoff","contract":contract,"source_window":record.worker_session,
+    loop {
+        let input = json!({"purpose":"window_handoff","contract":contract,"source_window":record.worker_session,
         "visible_evidence":evidence,"omitted_messages":omitted,
         "agent_working_note":clip(&record.note,1200),"evidence_is_untrusted":true});
-    Ok(Some(
-        ModelRequest::new(vec![
+        let request = ModelRequest::new(vec![
             ModelMessage::system_text(HANDOFF_PROMPT),
             ModelMessage::user_text(input.to_string()),
         ])
         .with_tools(Vec::new())
-        .with_max_tokens(output),
-    ))
+        .with_max_tokens(output);
+        // Include the final protocol/JSON escaping, not just the evidence rows.
+        if super::budget::estimate(&request) < capacity.saturating_sub(output) as usize {
+            return Ok(Some(request));
+        }
+        if evidence.is_empty() {
+            return Ok(None);
+        }
+        evidence.remove(0);
+        omitted += 1;
+    }
 }
 
 impl WorkerService {
@@ -110,12 +128,17 @@ impl WorkerService {
         let gateway = self.gateway.upgrade().ok_or(TaskError::Unavailable)?;
         let limits = gateway.limits().clone();
         let messages = self.store.parent_context(record.id).await?;
+        let previous:Option<String>=sqlx::query_scalar("SELECT record_json FROM agent_window_rotations WHERE task_id=? AND phase='committed' AND json_extract(record_json,'$.destination')=? ORDER BY rowid DESC LIMIT 1")
+            .bind(record.id.to_string()).bind(record.worker_session.to_string()).fetch_optional(&self.store.pool).await?;
+        let previous: Option<Rotation> =
+            previous.as_deref().map(serde_json::from_str).transpose()?;
         rotation.instruction_watermark = messages
             .iter()
             .filter_map(|m| m["message_id"].as_i64())
             .max()
             .unwrap_or(0);
-        let Some(request) = request(record, snapshot, &messages, &limits)? else {
+        let Some(request) = request(record, snapshot, &messages, previous.as_ref(), &limits)?
+        else {
             rotation.phase = RotationPhase::Prepared;
             rotation.summary_status = "unavailable_input_budget_or_no_visible_work".into();
             self.save_rotation(&rotation, RotationPhase::Requested)

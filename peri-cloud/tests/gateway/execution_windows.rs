@@ -99,11 +99,17 @@ async fn three_proactive_windows_use_tool_free_handoffs_and_continue_without_use
     {
         let handoffs = f.script.handoff_requests.lock();
         assert_eq!(handoffs.len(), 3);
-        for request in handoffs.iter() {
+        for (index, request) in handoffs.iter().enumerate() {
             assert!(request
                 .get("tools")
                 .is_none_or(|t| t.as_array().is_some_and(Vec::is_empty)));
             assert!(!request.to_string().contains("PRIVATE_REASONING"));
+            if index > 0 {
+                assert!(
+                    request.to_string().contains("Retained finding"),
+                    "the next summary must retain the previous attributed handoff"
+                );
+            }
         }
     }
     let rotations: Vec<String> = sqlx::query_scalar(
