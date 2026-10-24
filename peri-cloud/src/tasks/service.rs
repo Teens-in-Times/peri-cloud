@@ -232,6 +232,14 @@ impl WorkerService {
             .session(scope.principal, scope.session)
             .await
             .map_err(|_| TaskError::Forbidden)?;
+        let parent_goal = if input.link_parent_goal {
+            super::windows::active_parent_goal(&self.store.pool, scope.principal, scope.session)
+                .await?
+                .ok_or(TaskError::Invalid)
+                .map(Some)?
+        } else {
+            None
+        };
         let worker = gateway
             .prepare_worker(scope, &input)
             .await
@@ -264,6 +272,8 @@ impl WorkerService {
             request_fingerprint: fingerprint,
             route: scope.route.clone(),
             goal: input.goal,
+            parent_goal,
+            manual_goal_guard: false,
             reply_to,
             reply_kind,
             constraints: input.constraints,
@@ -434,6 +444,25 @@ impl WorkerService {
             }
             self.flush_worker_messages(&record).await?;
             if record.turn.is_none() && !record.terminal() {
+                if record.manual_goal_guard && record.state == "queued" {
+                    let active = super::windows::active_parent_goal(
+                        &self.store.pool,
+                        record.principal,
+                        record.parent_session,
+                    )
+                    .await?;
+                    if record.parent_goal.is_none() || record.parent_goal != active {
+                        record.state = "window_ready".into();
+                        self.store.save(&mut record).await?;
+                    }
+                }
+                if (record.state == "waiting_parent" && self.parent_replied(&record).await?)
+                    || (record.state == "waiting_external"
+                        && record.wake_at.is_some_and(|at| at <= now()))
+                {
+                    record.state = "queued".into();
+                    self.store.save(&mut record).await?;
+                }
                 if record.state == "pause_requested" {
                     record.state = "paused".into();
                     self.store.save(&mut record).await?;

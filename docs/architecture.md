@@ -166,3 +166,7 @@ schema 23 持久保存原生操作的单次取消请求。执行窗口可在原�
 
 ContextAssembler 保留来源、角色、大小及版本清单，支持每来源累计预算与总预算；base/role 只执行已注册的一层宏替换。SOUL 属于助手层，cwd 优先 AGENTS.md，再回退 CLAUDE.md，local 是独立补充。全局 Skill 按 operator/account 明确安装，项目 Skill 来自认证工作区；只注入目录，正文按需读取。环境快照通过独立认证只读接口取得，并校验原 binding，不创建 job 或执行探测命令。MCP 延续账号明确配置和现有权限链。完整契约、范围与验证见 [上下文装配](context-assembly.md)。
 提示词规则由宿主承接：主会话类型化审批、完整活跃约束快照、原调用回执复用、空工具摘要、QQ Markdown 降级和生效 Skill 目录。实现边界见 [宿主契约](prompt-host-contracts.md)。
+
+## 执行窗口 schema 26
+
+执行会话不绑定物理模型窗口。换窗协调器通过持久意图、单次无工具摘要请求、激活时重建的完整任务锚点及有界历史查询接续；提交前重核授权与版本，原工具独立结算。主会话 goal 可以显式关联任务，不为执行者新增 goal 控制器。手动切窗默认就绪，自动预算/执行者主动换窗继续原任务。具体工具、恢复与容量边界见 [窗口运行契约](worker-window-runtime.md)，[验证记录](worker-window-verification-20261024.md)区分模拟联调与尚未进行的真实模型/生产验收。

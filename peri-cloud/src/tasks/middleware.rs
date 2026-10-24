@@ -60,13 +60,43 @@ impl TaskFrames {
                 .sum::<usize>()
                 / 2
         };
+        let service = self
+            .scope
+            .service
+            .upgrade()
+            .ok_or(AgentError::Interrupted)?;
+        let gateway = service.gateway.upgrade().ok_or(AgentError::Interrupted)?;
+        let limits = gateway.limits();
+        let observation = super::windows::budget::observation(
+            &service.store.pool,
+            self.scope.principal,
+            self.scope.session,
+        )
+        .await
+        .map_err(|_| AgentError::Interrupted)?;
+        let estimated = super::windows::budget::calibrate(
+            estimated.saturating_add(self.overhead_tokens.max(observation.fixed_prefix_estimate)),
+            &observation,
+        );
+        let capacity = limits.worker_window_tokens.min(self.context_window);
+        let threshold = capacity.saturating_sub(limits.worker_reserve_tokens.min(capacity / 2));
+        if estimated >= threshold.saturating_mul(9) as usize / 10 {
+            let mut transcript = self.transcript.write();
+            let exists=transcript.canonical_payloads().iter().any(|p| matches!(p,
+                peri_acp_types::store::PersistedPayload::SystemReminder{reminder,..} if reminder.as_reminder().metadata["window_budget_warning"]==true));
+            if !exists {
+                let frame=reminder("This execution window is approaching its budget. Finish a useful safe step, retain important evidence references, and request_window_rotation when a fresh window would help. The host can also rotate at its boundary.".into(),
+                    json!({"window_budget_warning":true,"estimated_tokens":estimated,"capacity":capacity,"rotation_threshold":threshold,"estimate_is_exact":false})).map_err(|_|AgentError::Interrupted)?;
+                transcript.append_system_reminder(frame);
+            }
+        }
         self.scope
             .service
             .upgrade()
             .ok_or(AgentError::Interrupted)?
             .boundary_stop(
                 &self.scope,
-                estimated.saturating_add(self.overhead_tokens),
+                estimated,
                 progressed,
                 self.context_window,
                 step.unwrap_or(0),
@@ -150,7 +180,7 @@ impl TaskFrames {
                         && active.insert(value.body.clone())
                     {
                         restore.push(reminder.clone());
-                        if restore.len() == 2 {
+                        if restore.len() == 3 {
                             break;
                         }
                     }
@@ -167,7 +197,7 @@ impl TaskFrames {
                 .filter(|m| m["truncated"] == false)
                 .filter_map(|m| m["message_id"].as_i64())
                 .collect();
-            let snapshot = json!({"kind":"active_constraints_snapshot","task":service.summary(&record),"goal":record.goal,"constraints":record.constraints,"acceptance":record.acceptance,"parent_messages":messages,"instruction_version":message_ids.last().copied().unwrap_or(0),"complete":true,"receipt":"presented_in_window; not a claim of understanding or application"});
+            let snapshot = json!({"kind":"active_constraints_snapshot","task":service.summary(&record),"goal":record.goal,"constraints":record.constraints,"acceptance":record.acceptance,"parent_messages":messages,"resume_facts":service.resume_facts(&record).await?,"instruction_version":message_ids.last().copied().unwrap_or(0),"complete":true,"receipt":"presented_in_window; not a claim of understanding or application"});
             // Active requirements are complete or the request fails closed.
             let reserve = (self.context_window as usize / 4).min(2048);
             let budget = (self.context_window as usize)
@@ -333,6 +363,12 @@ impl Middleware for TaskFrames {
         _: &mut dyn capabilities::BeforeToolState,
         calls: &[peri_agent::agent::react::ToolCall],
     ) -> Vec<AgentResult<peri_agent::agent::react::ToolCall>> {
+        if calls.len() > 1 && calls.iter().any(|c| c.name == "request_window_rotation") {
+            return calls.iter().map(|call| Err(AgentError::ToolRejected {
+                tool:call.name.clone(), reason:"Window rotation is a control boundary. Submit request_window_rotation alone; this entire batch was not dispatched.".into(),
+                cause:peri_acp_types::error::ToolRejectionCause::PolicyDenied,
+            })).collect();
+        }
         let valid = match self.scope.service.upgrade() {
             Some(service) => match self.scope.task {
                 Some(task) => service

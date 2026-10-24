@@ -18,6 +18,7 @@ pub(crate) mod sessions;
 mod store;
 mod suspension;
 pub(crate) mod tools;
+pub(crate) mod windows;
 pub(crate) use service::WorkerService;
 
 use crate::context::AgentRole;
@@ -77,6 +78,11 @@ pub(crate) struct TaskRecord {
     pub request_fingerprint: String,
     pub route: ChannelRoute,
     pub goal: String,
+    /// Optional parent-owned goal; workers do not own a goal controller.
+    #[serde(default)]
+    pub parent_goal: Option<String>,
+    #[serde(default)]
+    pub manual_goal_guard: bool,
     pub reply_to: String,
     pub reply_kind: crate::gateway::ReplyKind,
     pub constraints: String,
@@ -125,6 +131,8 @@ impl TaskRecord {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Delegate {
     pub goal: String,
+    #[serde(default)]
+    pub link_parent_goal: bool,
     #[serde(default)]
     pub constraints: String,
     #[serde(default)]

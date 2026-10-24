@@ -12,6 +12,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[path = "runtime_auxiliary.rs"]
+mod auxiliary;
+
 use crate::state::{CloudJournal, StateError, TurnRecord};
 use crate::{CloudAgent, CloudTurnRequest};
 

@@ -164,7 +164,7 @@ async fn read_pool(f: &Fixture) -> sqlx::SqlitePool {
 
 #[tokio::test]
 async fn process_kill_preserves_wait_approval_native_submission_and_window_handoff() {
-    for stage in ["wait", "approval", "submission", "rotation"] {
+    for stage in ["wait", "approval", "submission", "rotation", "handoff"] {
         eprintln!("process kill and recovery stage: {stage}");
         let action = match stage {
             "wait" => call(
@@ -172,17 +172,17 @@ async fn process_kill_preserves_wait_approval_native_submission_and_window_hando
                 json!({"reason":"external event"}),
                 "durable-wait",
             ),
-            "rotation" => call(
+            "rotation" | "handoff" => call(
                 "Read",
                 json!({"file_path":"source.txt"}),
                 "read-before-rotation",
             ),
             _ => tool_write(),
         };
-        let limits = if stage == "rotation" {
+        let limits = if matches!(stage, "rotation" | "handoff") {
             peri_cloud::limits::RuntimeLimits {
-                worker_window_tokens: 512,
-                worker_reserve_tokens: 64,
+                worker_window_tokens: 40000,
+                worker_reserve_tokens: 6000,
                 ..Default::default()
             }
         } else {
@@ -202,6 +202,9 @@ async fn process_kill_preserves_wait_approval_native_submission_and_window_hando
             limits,
         )
         .await;
+        if matches!(stage, "rotation" | "handoff") {
+            f.script.replies.lock().push_back(call("request_window_rotation",json!({"reason":"exercise the process-kill handoff boundary after retaining a read receipt"}),"rotate-before-kill"));
+        }
         std::fs::write(
             f.workspaces[0].path().join("source.txt"),
             "bounded handoff evidence ".repeat(4000),
@@ -233,8 +236,15 @@ async fn process_kill_preserves_wait_approval_native_submission_and_window_hando
         if stage == "submission" {
             f.held_submissions[0].store(true, Ordering::SeqCst);
         }
+        if stage == "handoff" {
+            f.script.hold_handoff.store(true, Ordering::SeqCst);
+        }
         let mut child = launch(&mut f, stage == "rotation").await;
-        if stage == "rotation" {
+        if stage == "handoff" {
+            tokio::time::timeout(Duration::from_secs(15), f.script.handoff_waiting.notified())
+                .await
+                .unwrap();
+        } else if stage == "rotation" {
             wait_file(&mut child, &f.root.path().join("rotation-ready")).await;
         } else if stage == "submission" {
             wait_file(&mut child, &f.workspaces[0].path().join("agent.txt")).await;
@@ -280,6 +290,8 @@ async fn process_kill_preserves_wait_approval_native_submission_and_window_hando
         if stage == "submission" {
             f.hidden_receipts[0].store(true, Ordering::SeqCst);
         }
+        f.script.hold_handoff.store(false, Ordering::SeqCst);
+        f.script.handoff_release.notify_one();
         reopen(&mut f).await;
         if stage == "wait" {
             let pool = read_pool(&f).await;
@@ -334,7 +346,15 @@ async fn process_kill_preserves_wait_approval_native_submission_and_window_hando
                 answer("worker resumed from durable facts"),
                 answer("result received"),
             ]);
-            pump(&f, if stage == "approval" { 6 } else { 5 }).await;
+            pump(
+                &f,
+                if matches!(stage, "approval" | "rotation" | "handoff") {
+                    6
+                } else {
+                    5
+                },
+            )
+            .await;
         }
         assert_eq!(
             f.submissions[0].load(Ordering::SeqCst),
@@ -353,8 +373,17 @@ async fn process_kill_preserves_wait_approval_native_submission_and_window_hando
             record["run_number"].as_u64().unwrap() > 0,
             "recovery has a distinct durable run"
         );
-        if stage == "rotation" {
+        if matches!(stage, "rotation" | "handoff") {
             assert_ne!(record["worker_session"], receipt["worker_session"]);
+        }
+        if stage == "handoff" {
+            assert_eq!(
+                f.script.handoff_requests.lock().len(),
+                1,
+                "unknown summary is not submitted again"
+            );
+            let status:String=sqlx::query_scalar("SELECT json_extract(record_json,'$.summary_status') FROM agent_window_rotations WHERE task_id=? ORDER BY rowid DESC LIMIT 1").bind(&task).fetch_one(&pool).await.unwrap();
+            assert_eq!(status, "unknown_after_restart");
         }
         pool.close().await;
         f.finish().await;

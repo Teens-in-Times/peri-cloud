@@ -82,6 +82,8 @@ fn task(scope: &TaskScope, execution: &ExecutionSession, key: &str) -> TaskRecor
         request_fingerprint: key.into(),
         route: scope.route.clone(),
         goal: key.into(),
+        parent_goal: None,
+        manual_goal_guard: false,
         reply_to: String::new(),
         reply_kind: crate::gateway::ReplyKind::Message,
         constraints: String::new(),
@@ -460,6 +462,8 @@ async fn schema_rebuild_preserves_old_task_and_unknown_operation_identity() {
     original.result = "unknown operation; do not replay".into();
     service.store.insert(&original).await.unwrap();
     for sql in [
+        "DROP TABLE agent_window_budget",
+        "DROP TABLE agent_window_rotations",
         "DROP TABLE cloud_archive_entries",
         "DROP TABLE agent_task_approval_presentations",
         "DROP TABLE cloud_native_cancellations",

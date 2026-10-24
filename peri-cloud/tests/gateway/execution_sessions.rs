@@ -19,6 +19,8 @@ mod history_tests;
 mod observation_tests;
 #[path = "execution_parallel.rs"]
 mod parallel_tests;
+#[path = "execution_windows.rs"]
+mod window_tests;
 
 pub(super) fn call(name: &str, args: Value, id: &str) -> String {
     let delta = json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});
@@ -38,7 +40,7 @@ fn delegate_receipt(request: &Value) -> Value {
 }
 
 async fn pump(f: &Fixture, count: usize) {
-    tokio::time::timeout(Duration::from_secs(20), async {
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             f.c().gateway.dispatch().await.unwrap();
             if f.script.requests.lock().len() >= count
@@ -49,8 +51,22 @@ async fn pump(f: &Fixture, count: usize) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("worker and main result event must settle");
+    .await;
+    if result.is_err() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(f.root.path().join("cloud.sqlite")),
+            )
+            .await
+            .unwrap();
+        let states:Vec<(String,String)>=sqlx::query_as("SELECT json_extract(record_json,'$.state'),json_extract(record_json,'$.note') FROM agent_tasks ORDER BY rowid")
+            .fetch_all(&pool).await.unwrap();
+        let requests = f.script.requests.lock().len();
+        pool.close().await;
+        panic!("worker/main did not settle: expected {count} requests, observed {requests}, task states {states:?}");
+    }
 }
 
 fn tool_value(request: &Value, field: &str) -> Value {
@@ -489,8 +505,8 @@ async fn long_task_continues_after_the_bounded_loop_iteration_limit() {
 #[tokio::test]
 async fn low_budget_rotates_real_windows_retrieves_archived_read_and_hides_them_from_chat() {
     let limits = peri_cloud::limits::RuntimeLimits {
-        worker_window_tokens: 512,
-        worker_reserve_tokens: 64,
+        worker_window_tokens: 34000,
+        worker_reserve_tokens: 5000,
         ..Default::default()
     };
     let f = Fixture::new_for_limits(
@@ -506,6 +522,8 @@ async fn low_budget_rotates_real_windows_retrieves_archived_read_and_hides_them_
                 json!({"file_path":"source.txt"}),
                 "read-original",
             ),
+            call("reading", json!({"file_path":"source.txt"}), "read-second"),
+            call("reading", json!({"file_path":"source.txt"}), "read-third"),
         ],
         true,
         limits,
@@ -513,7 +531,7 @@ async fn low_budget_rotates_real_windows_retrieves_archived_read_and_hides_them_
     .await;
     std::fs::write(
         f.workspaces[0].path().join("source.txt"),
-        format!("WINDOW_SOURCE\n{}", "evidence ".repeat(3000)),
+        format!("WINDOW_SOURCE\n{}", "evidence \n".repeat(3000)),
     )
     .unwrap();
     let parent = f
@@ -550,24 +568,24 @@ async fn low_budget_rotates_real_windows_retrieves_archived_read_and_hides_them_
         ),
         answer("rotation result confirmed"),
     ]);
-    pump(&f, 8).await;
+    pump(&f, 10).await;
     let (status, windows) = {
         let requests = f.script.requests.lock();
-        let context = requests[3]["messages"].to_string();
+        let context = requests[5]["messages"].to_string();
         assert!(context.contains("Most recent bounded tool evidence"));
         assert!(
             context.matches("evidence ").count() < 300,
             "the last result is a bounded preview, never the entire archived read or trace"
         );
         (
-            tool_value(&requests[6], "run_number"),
-            tool_value(&requests[7], "windows"),
+            tool_value(&requests[8], "run_number"),
+            tool_value(&requests[9], "windows"),
         )
     };
     assert_eq!(status["task_id"], receipt["task_id"]);
     assert_eq!(status["execution_session"], receipt["execution_session"]);
     assert_ne!(status["worker_session"], receipt["worker_session"]);
-    assert!(status["run_number"].as_u64().unwrap() >= 2);
+    assert!(status["run_number"].as_u64().unwrap() >= 1);
     let retrieved_window =
         Uuid::parse_str(windows["windows"][1]["window_id"].as_str().unwrap()).unwrap();
     let retrieved = f

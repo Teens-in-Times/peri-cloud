@@ -207,7 +207,7 @@ def guide(entry):
         "05": "这里写记忆的使用方法；实际个人资料通过授权记忆帧及检索结果出现，任务 trace 不整体充当个人记忆。",
         "06": "分别编辑官方 QQ 与个人 QQ 的表达习惯；Web 没有单列默认文案，需要时可提出。消息投递和排版转换属于渠道管道。",
         "07": "主助手读取有界任务摘要与审批事件；执行者获得目标、约束、验收条件及最新补充。双向沟通使用 message_task / message_parent，等待使用 wait_task。下方是观察证据时的固定指引，不是完整动态任务帧。",
-        "08": "末尾 {} 由宿主填入当前续接事实；原工具回执、执行状态与交接笔记分别保留来源。这里适合写如何读交接和选择下一步，具体目标与指令不手填。",
+        "08": "分为无工具接班摘要请求与新窗口续接说明。宿主另行提供当前锚点、摘要覆盖水位、最新补充与证据引用；具体身份和任务事实不手填。手动无关联活跃主 goal 时停在就绪状态，这条策略由代码保证。",
         "09": "与摘要任务模板配合使用；负责总原则，不混入主助手人格、当前任务事实或工具黑名单。",
         "10": "与摘要 system 一起构成独立压缩请求；保留 {summary_target_tokens}，可改信息取舍与组织方式。",
         "11": "三个小节分别用于继续未完成摘要、在剩余预算内收尾、重新生成简洁摘要，并非每次都一起发送。",
@@ -261,6 +261,8 @@ def main():
         entry["export_sha256"] = digest(path)
     archive_tool_source = "peri-cloud/src/archive/tool.rs"
     put("tools/peri-cloud--archive-tool.md", tool_contract(archive_tool_source), [archive_tool_source], "active-tool-contract")
+    task_tool_source="peri-cloud/src/tasks/tools.rs"
+    put("tools/peri-cloud--tasks-tools.md",tool_contract(task_tool_source),[task_tool_source],"active-tool-contract")
     put("01-host-base.md", read("peri-cloud/prompts/base.md"), ["peri-cloud/prompts/base.md"], "active-default")
     for name, source in [("02-main.md", "peri-cloud/prompts/main.md"), ("03-worker.md", "peri-cloud/prompts/worker.md")]:
         put(name, read(source), [source], "active-role")
@@ -285,8 +287,10 @@ def main():
     task_text = next(value for _, _, value in literals(read(task_source)) if value.startswith("Worker notes and results"))
     put("07-task-frames.md", task_text, [task_source])
     recovery_source = "peri-cloud/src/tasks/recovery.rs"
-    handoff = next(value for _, _, value in literals(read(recovery_source)) if value.startswith("Execution window continuation."))
-    put("08-window-handoff.md", handoff, [recovery_source])
+    handoff_source="peri-cloud/prompts/window-handoff.md"
+    resume_source="peri-cloud/prompts/window-resume.md"
+    handoff = "## 接班摘要生成\n\n"+read(handoff_source)+"\n\n## 新窗口接班\n\n"+read(resume_source)
+    put("08-window-handoff.md", handoff, [recovery_source,handoff_source,resume_source])
     schedule_name = "12-goal-and-schedule.md"
     blocks = prompt_blocks(schedule_name)
     if blocks:

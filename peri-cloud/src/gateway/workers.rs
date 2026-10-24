@@ -4,6 +4,21 @@ use crate::tasks::{Delegate, TaskRecord, TaskScope};
 use std::sync::Weak;
 
 impl Gateway {
+    pub(crate) fn try_spawn_worker_auxiliary<F, Fut>(
+        &self,
+        id: Uuid,
+        principal: Uuid,
+        session: Uuid,
+        work: F,
+    ) -> GatewayResult<bool>
+    where
+        F: FnOnce(tokio_util::sync::CancellationToken) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), crate::RuntimeError>> + Send + 'static,
+    {
+        Ok(self
+            .runtime
+            .try_spawn_auxiliary(id, principal, session, work)?)
+    }
     pub(crate) fn park_worker(&self, scope: &TaskScope, turn: Uuid) -> bool {
         self.runtime
             .park_background(scope.principal, scope.session, turn)
@@ -146,6 +161,7 @@ impl Gateway {
             route: record.route.clone(),
         };
         let input = Delegate {
+            link_parent_goal: false,
             goal: record.goal.clone(),
             constraints: record.constraints.clone(),
             acceptance: record.acceptance.clone(),
@@ -436,6 +452,8 @@ impl Gateway {
         record: &TaskRecord,
         turn: Uuid,
     ) -> GatewayResult<crate::state::TurnRecord> {
+        self.runtime
+            .cancel_auxiliary(record.principal, record.worker_session);
         Ok(self
             .runtime
             .cancel(record.principal, record.worker_session, turn)

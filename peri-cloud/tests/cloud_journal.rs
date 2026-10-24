@@ -371,6 +371,7 @@ async fn schema_eight_migrates_to_current_and_preserves_rows() {
         .await
         .unwrap();
     for sql in [
+        "DROP TABLE agent_window_budget", "DROP TABLE agent_window_rotations",
         "DROP TABLE cloud_archive_entries",
         "DROP TABLE agent_task_approval_presentations", "DROP TABLE cloud_native_cancellations", "DROP TABLE cloud_native_operations", "DROP TABLE cloud_device_targets", "DROP TABLE agent_task_instruction_reads", "DROP TABLE agent_task_approvals", "DROP TABLE agent_task_runs", "DROP TABLE agent_task_operations", "DROP TABLE agent_task_checkpoints",
         "DROP TABLE agent_execution_windows", "DROP TABLE agent_execution_sessions",
@@ -480,7 +481,7 @@ async fn schema_eight_migrates_to_current_and_preserves_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 25);
+    assert_eq!(version, 26);
     let (application_id,): (i64,) = sqlx::query_as("PRAGMA application_id")
         .fetch_one(&pool)
         .await
@@ -512,7 +513,7 @@ async fn schema_eight_migrates_to_current_and_preserves_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 25);
+    assert_eq!(version, 26);
     pool.close().await;
     journal.close().await;
 }

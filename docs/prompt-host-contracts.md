@@ -10,7 +10,7 @@
 | 简单操作 | 原生读取及严格字面量输出/位置命令由有界宿主策略处理；审批记录区分 host_read_only 与 main_agent | 对未命中规则的动作权衡必要性、范围与误解 |
 | 删除 | 原生工具语义及保守 Shell 分析；不透明操作按可能删除；原 outbox 通知确认后放行 | 可补充风险，不能降低宿主判定 |
 | 摘要 | 初始与恢复请求共用空工具构造入口；工具形状响应拒绝；预算、有界恢复和原子历史替换 | 提取关键事实与决定压缩取舍 |
-| 换窗 | 完整目标、约束、验收和全部保留补充消息组成活跃快照，逐窗口记录呈现回执；派发事务和调用受理再次核对最新指令 | 使用事实、按需检索证据、记录工作理解 |
+| 换窗 | 完整活跃快照、持久换窗意图、独立无工具接班请求、原子提交及启动前重核；手动无关联活跃主 goal 时就绪，未知摘要不重试 | 解释关键发现与下一步，按需检索证据 |
 | 幂等 | 持久 session/turn/call 身份与独立参数指纹；Dispatch/Existing 类型分支；原回执缓存或原调用查询 | 判断下一步，以及是否确实需要一个新的动作 |
 | 渠道 | CommonMark 解析转 QQ 纯文本，表格/链接/列表/代码专门处理；工具详情与菜单保持独立 | 自然表达、语气与详略 |
 | Skill | Rust 合并优先级；默认生效目录、稳定 Skill ID；可显式查看遮蔽条目，正文按需读取 | 选择适用的专业指导 |
@@ -58,3 +58,5 @@ cargo fmt --all --check 通过；peri-cloud、peri-agent、peri-executor、peri-
 - 云库：cargo-rmcp-patched.sh test --locked -p peri-cloud --lib -- snapshot_tests gateway::plain workspace::skills tasks::deletion
 - 摘要：cargo-rmcp-patched.sh test --locked -p peri-agent --lib continuation_tests
 - 执行链：cargo-rmcp-patched.sh test --locked -p peri-cloud --test gateway -- approval_tests deletion_tests approval_capacity_tests duplicate_native_call low_budget per_call_target process_kill_preserves_wait recovery_queries_original_receipt independent_execution_sessions --test-threads 3
+
+换窗的请求预算、输出上限、摘要失败降级和历史工具契约见 [schema 26 窗口运行契约](worker-window-runtime.md)。提示词合集保留创作指引与装配说明，工程验证记录放在独立文档中。

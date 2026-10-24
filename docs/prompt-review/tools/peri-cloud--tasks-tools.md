@@ -1,16 +1,16 @@
-<!-- PERI-EDIT-GUIDE:BEGIN -->
-> **编辑说明（正式交付时清除）**
-> - 功能：工具使用契约。
-> - 作用位置：工具目录的 description/schema。
-> - 应当写：写何时使用、参数含义、返回值及失败处理；工具名与 schema 字段须和实现一致。
-> - 正文中可用 {{宏名}} 标记需求；未实现宏先作为设计标记。保留本段之外的正文作为创作内容。
-<!-- PERI-EDIT-GUIDE:END -->
-
 # 工具说明与参数契约
 
 正文为原始工具说明，参数部分为 Rust 生成表达式，字段身份与校验仍由代码保证。
 
-## description · peri-cloud/src/tasks/tools.rs:130
+## description · peri-cloud/src/tasks/tools.rs:143
+
+~~~text
+request_window_rotation
+~~~
+
+~~~text
+Request a fresh context window for the current task, then continue authorized work. Supply a short reason and optional handoff notes. Host creates the handoff and preserves operation identity. Call this control tool alone in its batch.
+~~~
 
 ~~~text
 delegate_task
@@ -88,15 +88,19 @@ Update this execution task's work plan, discoveries and blockers, and explicitly
 Send a message or question to the main assistant through its durable conversation queue. For a question requiring a response, set wait_for_reply=true; the host durably suspends this run and resumes on the parent response while the main assistant remains free to chat. Do not send ordinary user messages directly.
 ~~~
 
-## parameters · peri-cloud/src/tasks/tools.rs:144
+## parameters · peri-cloud/src/tasks/tools.rs:158
 
 ~~~rust
 fn parameters(&self) -> Value {
         let id = json!({"type":"string","format":"uuid"});
         let rev = json!({"type":"integer","minimum":0});
         let (properties, required) = match self.name {
+            "request_window_rotation" => (
+                json!({"reason":{"type":"string","minLength":1,"maxLength":1000},"notes":{"type":"string","maxLength":2000}}),
+                vec!["reason"],
+            ),
             "delegate_task" => (
-                json!({"goal":{"type":"string","maxLength":16384},"constraints":{"type":"string","maxLength":16384},"acceptance":{"type":"string","maxLength":8192},"device_id":id,"workspace":{"type":"string"},"execution_session":id}),
+                json!({"goal":{"type":"string","maxLength":16384},"link_parent_goal":{"type":"boolean","description":"Explicitly link this task to the current main-session goal. Host fixes its real ID; workers do not own goals."},"constraints":{"type":"string","maxLength":16384},"acceptance":{"type":"string","maxLength":8192},"device_id":id,"workspace":{"type":"string"},"execution_session":id}),
                 vec!["goal"],
             ),
             "list_execution_sessions" => (json!({}), vec![]),
@@ -105,7 +109,7 @@ fn parameters(&self) -> Value {
                 vec![],
             ),
             "inspect_task" => (
-                json!({"task_id":id,"view":{"type":"string","enum":["status","trace","conversation","messages","operations","windows","contract","approvals","detail","related_tasks"]},"window_id":id,"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32},"kind":{"type":"string","maxLength":80},"query":{"type":"string","maxLength":200},"detail":{"type":"object","properties":{"source":{"type":"string","enum":["operation_input","operation_output","approval_input","conversation"]},"id":{"type":"string","maxLength":256},"offset":{"type":"integer","minimum":0},"chars":{"type":"integer","minimum":1,"maximum":16384},"version":{"type":"string","maxLength":80}},"required":["source","id"],"additionalProperties":false}}),
+                json!({"task_id":id,"view":{"type":"string","enum":["status","overview","search","trace","conversation","messages","operations","windows","contract","approvals","detail","related_tasks"]},"window_id":id,"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32},"kind":{"type":"string","maxLength":80},"query":{"type":"string","maxLength":200},"filter":{"type":"object","properties":{"source":{"type":"string","enum":["operations","messages","conversation"]},"tool":{"type":"string","maxLength":256},"call_id":{"type":"string","maxLength":256},"status":{"type":"string","maxLength":256},"path":{"type":"string","maxLength":256},"direction":{"type":"string","enum":["parent","worker"]}},"additionalProperties":false},"detail":{"type":"object","properties":{"source":{"type":"string","enum":["operation_input","operation_output","approval_input","conversation","handoff","task_message"]},"id":{"type":"string","maxLength":256},"offset":{"type":"integer","minimum":0},"chars":{"type":"integer","minimum":1,"maximum":16384},"version":{"type":"string","maxLength":80}},"required":["source","id"],"additionalProperties":false}}),
                 vec!["task_id"],
             ),
             "message_task" => (
