@@ -47,6 +47,9 @@ jobs:
         if: runner.os == 'Windows'
         run: rustup component add --toolchain 1.99.0 rustfmt clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          # Automatic upstream code can read trusted caches, but cannot publish a poisoned cache.
+          save-if: ${{ !startsWith(github.head_ref || github.ref_name, 'codex/upstream-sync-') }}
       - name: Format
         if: runner.os == 'Windows'
         run: cargo +1.99.0 fmt --all -- --check
@@ -69,6 +72,9 @@ jobs:
       - name: Upstream provenance
         if: runner.os == 'Windows'
         run: python scripts/check-upstream.py
+      - name: Upstream automation boundary tests
+        if: runner.os == 'Windows'
+        run: python -m unittest discover -s scripts/tests -p test_upstream_sync.py
       - name: Cloud and executor regression tests
         if: runner.os == 'Windows'
         run: bash ./scripts/cargo-rmcp-patched.sh test --locked -p peri-scheduler -p peri-cloud -p peri-executor -p peri-remote-tools -p peri-tool-runtime -p peri-process -- --test-threads=1
