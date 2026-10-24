@@ -1,5 +1,5 @@
 {
-  "source_commit": "cd6945d72228672e0ffe495fa54aafc8ede1f055",
+  "source_commit": "955bed9c215e124ee0a41ddb2a10a3f421b78644",
   "files": [
     {
       "file": "02-main.md",
@@ -7,10 +7,10 @@
       "sources": [
         {
           "path": "peri-cloud/prompts/main.md",
-          "sha256": "19b0fc383a4a53a376ddee88d4f6866c8f91656fe41618bca914cb5b35f4983a"
+          "sha256": "2208d130a43fef165ca9c135a78d516f98babb81159374b021464f5dd699b730"
         }
       ],
-      "export_sha256": "a2242f21ca6b0ddffe4f89ca6bf79c9e43b0ceb97e41573650ced6e8231cb6f1"
+      "export_sha256": "7f8cd6f7e3d54e01b449836d9958c5cb45d0fc395b4614ca2d54961d95addbe8"
     },
     {
       "file": "03-worker.md",
@@ -18,10 +18,10 @@
       "sources": [
         {
           "path": "peri-cloud/prompts/worker.md",
-          "sha256": "72c6eb58833f79613b4182fa3fd16fe0ec7f6faafb5cb66e553862a72d6454d6"
+          "sha256": "f7d932c213a1d83007e83f79fc7372530446c7b0f2ef24a872d213b186ca1669"
         }
       ],
-      "export_sha256": "ee76fe82d5c967294689d7457c0aee26d1b74b7f08bc274eb996f5e12a6fa733"
+      "export_sha256": "30af3428d40dd4c256fe71f994208b1949bc922267e346227bc6ab9d6417c358"
     },
     {
       "file": "01-host-base.md",
@@ -118,7 +118,7 @@
       "sources": [
         {
           "path": "peri-cloud/src/tasks/middleware.rs",
-          "sha256": "bc8dc30639fec6fe400fbf71379f0e0b8f6aeed930632a605b72425362bcea81"
+          "sha256": "1d3b57bf562931dcbe4d7593ca8a33a6d426703c0058a88483dddb9ace0f5f1e"
         }
       ],
       "export_sha256": "00faa3fbfc5728fcf429a0d0a21f4040212c5d3ea2f1e1bcaf80b67edf6b4cc8"
@@ -129,10 +129,18 @@
       "sources": [
         {
           "path": "peri-cloud/src/tasks/recovery.rs",
-          "sha256": "b005389d5cd03ad63ef339a6564b496452bb1acb847b88dc9952ddbf734dd32b"
+          "sha256": "b5609fbdaaadc38bb408bf6159cd91da67cad30415a420c80970ded6f0d61699"
+        },
+        {
+          "path": "peri-cloud/prompts/window-handoff.md",
+          "sha256": "16775fdf8470c64736a3ac75f80ef6fd0144dace04e11c0392597f92207ca788"
+        },
+        {
+          "path": "peri-cloud/prompts/window-resume.md",
+          "sha256": "59a26513b0ccb4b7720227cd51787f1b3f7582b6410ad638be4c3570b941ad58"
         }
       ],
-      "export_sha256": "1367c486f2804a692936e19687fc11f369081e4c1a77c02d4873477d58dbda24"
+      "export_sha256": "aae14b1968ea6d974164eccb9e22ef2430b25471e5f7fb6f1c5c70d9ef621864"
     },
     {
       "file": "12-goal-and-schedule.md",
@@ -157,10 +165,10 @@
       "sources": [
         {
           "path": "peri-cloud/src/tasks/tools.rs",
-          "sha256": "d77cde1ec5ceebb2e9fb6dbfc9665c72995beeb04609646853e1b59db43597e9"
+          "sha256": "50f3ab1eef92d8110fe32d7ea2ab9470b6c509a66ae00e979348dd63b55c5c53"
         }
       ],
-      "export_sha256": "3a8030aa3856255a63c9c56d37c7f0f7eafcab1e75fa320990616fc1b7aa88d3"
+      "export_sha256": "228008408ef6b5bb32ddbca505c56f2a43a4ccbb6480e5df8fd86929d6d92f03"
     },
     {
       "file": "tools/peri-cloud--tasks-deliverables.md",
@@ -884,7 +892,7 @@
       "file": "PROMPTS-EDIT.md",
       "kind": "review-combined",
       "sources": [],
-      "export_sha256": "14029b8023b462784d5609e8cb5cb8bd3766690b0d6f007e883c7d786d5ba1e0"
+      "export_sha256": "6b418905b772f3e904ba48134d9c23fe60535f2f9edcc752b9da364c6a5b7697"
     },
     {
       "file": "14-capability-loading.md",

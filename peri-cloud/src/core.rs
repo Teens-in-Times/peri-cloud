@@ -36,6 +36,8 @@ use crate::workspace::WorkspaceCache;
 
 #[path = "compact.rs"]
 mod compact;
+#[path = "handoff_model.rs"]
+mod handoff_model;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -329,6 +331,11 @@ impl CloudAgent {
             journal,
             principal,
             daily_limit: limits.daily_model_requests,
+            worker_budget: self.is_worker().then_some((
+                self.session_id,
+                self.context_window.min(limits.worker_window_tokens),
+                limits.worker_reserve_tokens,
+            )),
         });
         let model: Arc<dyn Model> = if self.private_memory {
             Arc::new(crate::memory::frames::GuardedModel {

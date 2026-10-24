@@ -17,7 +17,13 @@ impl Middleware for TaskTools {
     }
     fn collect_tools(&self, _: &str) -> Vec<Box<dyn BaseTool>> {
         let names: &[&str] = if self.scope.role == AgentRole::Worker {
-            &["inspect_task", "update_task", "message_parent", "wait_task"]
+            &[
+                "inspect_task",
+                "update_task",
+                "message_parent",
+                "wait_task",
+                "request_window_rotation",
+            ]
         } else {
             &[
                 "delegate_task",
@@ -65,6 +71,7 @@ struct Inspect {
     detail: Option<super::evidence::Detail>,
     kind: Option<String>,
     query: Option<String>,
+    filter: Option<super::windows::HistoryFilter>,
 }
 fn status_view() -> String {
     "status".into()
@@ -118,6 +125,12 @@ struct Wait {
     reason: String,
     resume_after_seconds: Option<u64>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Rotate {
+    reason: String,
+    notes: Option<String>,
+}
 
 #[async_trait]
 impl BaseTool for TaskTool {
@@ -129,6 +142,7 @@ impl BaseTool for TaskTool {
     }
     fn description(&self) -> &str {
         match self.name {
+        "request_window_rotation"=>"Request a fresh context window for the current task, then continue authorized work. Supply a short reason and optional handoff notes. Host creates the handoff and preserves operation identity. Call this control tool alone in its batch.",
         "delegate_task"=>"Persist an independent cloud execution task and return immediately. Supply goal, constraints and acceptance; optional device/workspace must belong to this user. Native tools remain available for small operations. Workers use their own context and the original tool approval policy.",
         "list_execution_sessions"=>"List authorized execution conversations for explicit reuse. Reuse preserves work context across independent tasks, within the same device, canonical workspace and privacy scope. Supply the execution_session plus matching device/workspace to delegate_task.",
         "list_tasks"=>"List paginated bounded task history for this logical conversation, newest first; pass next_cursor as after. Runtime state and worker-authored notes are separate. Never poll continuously while the user wants to chat.",
@@ -145,8 +159,12 @@ impl BaseTool for TaskTool {
         let id = json!({"type":"string","format":"uuid"});
         let rev = json!({"type":"integer","minimum":0});
         let (properties, required) = match self.name {
+            "request_window_rotation" => (
+                json!({"reason":{"type":"string","minLength":1,"maxLength":1000},"notes":{"type":"string","maxLength":2000}}),
+                vec!["reason"],
+            ),
             "delegate_task" => (
-                json!({"goal":{"type":"string","maxLength":16384},"constraints":{"type":"string","maxLength":16384},"acceptance":{"type":"string","maxLength":8192},"device_id":id,"workspace":{"type":"string"},"execution_session":id}),
+                json!({"goal":{"type":"string","maxLength":16384},"link_parent_goal":{"type":"boolean","description":"Explicitly link this task to the current main-session goal. Host fixes its real ID; workers do not own goals."},"constraints":{"type":"string","maxLength":16384},"acceptance":{"type":"string","maxLength":8192},"device_id":id,"workspace":{"type":"string"},"execution_session":id}),
                 vec!["goal"],
             ),
             "list_execution_sessions" => (json!({}), vec![]),
@@ -155,7 +173,7 @@ impl BaseTool for TaskTool {
                 vec![],
             ),
             "inspect_task" => (
-                json!({"task_id":id,"view":{"type":"string","enum":["status","trace","conversation","messages","operations","windows","contract","approvals","detail","related_tasks"]},"window_id":id,"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32},"kind":{"type":"string","maxLength":80},"query":{"type":"string","maxLength":200},"detail":{"type":"object","properties":{"source":{"type":"string","enum":["operation_input","operation_output","approval_input","conversation"]},"id":{"type":"string","maxLength":256},"offset":{"type":"integer","minimum":0},"chars":{"type":"integer","minimum":1,"maximum":16384},"version":{"type":"string","maxLength":80}},"required":["source","id"],"additionalProperties":false}}),
+                json!({"task_id":id,"view":{"type":"string","enum":["status","overview","search","trace","conversation","messages","operations","windows","contract","approvals","detail","related_tasks"]},"window_id":id,"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32},"kind":{"type":"string","maxLength":80},"query":{"type":"string","maxLength":200},"filter":{"type":"object","properties":{"source":{"type":"string","enum":["operations","messages","conversation"]},"tool":{"type":"string","maxLength":256},"call_id":{"type":"string","maxLength":256},"status":{"type":"string","maxLength":256},"path":{"type":"string","maxLength":256},"direction":{"type":"string","enum":["parent","worker"]}},"additionalProperties":false},"detail":{"type":"object","properties":{"source":{"type":"string","enum":["operation_input","operation_output","approval_input","conversation","handoff","task_message"]},"id":{"type":"string","maxLength":256},"offset":{"type":"integer","minimum":0},"chars":{"type":"integer","minimum":1,"maximum":16384},"version":{"type":"string","maxLength":80}},"required":["source","id"],"additionalProperties":false}}),
                 vec!["task_id"],
             ),
             "message_task" => (
@@ -197,6 +215,28 @@ impl BaseTool for TaskTool {
         let call = ctx.tool_call_id.as_ref().ok_or(TaskError::Invalid)?;
         let key = format!("{}:{call}", self.turn);
         let result = match self.name {
+            "request_window_rotation" => {
+                let args: Rotate = serde_json::from_value(input)?;
+                if self.scope.role != AgentRole::Worker
+                    || args.reason.trim().is_empty()
+                    || args.reason.len() > 1000
+                    || args.notes.as_ref().is_some_and(|s| s.len() > 2000)
+                {
+                    return Err(TaskError::Invalid.into());
+                }
+                let task = self.scope.task.ok_or(TaskError::Forbidden)?;
+                let mut record = service.authorized(&self.scope, task).await?;
+                if record.state != "running" {
+                    return Err(TaskError::Conflict.into());
+                }
+                if let Some(notes) = args.notes {
+                    record.note = notes;
+                }
+                service
+                    .begin_rotation(&mut record, super::windows::RotationCause::Worker)
+                    .await?;
+                json!({"state":"rotate_requested","reason":args.reason,"resume":"continue_authorized_work"})
+            }
             "decide_approval" => {
                 if ctx.turn_generation.as_deref() != Some(self.turn.to_string().as_str()) {
                     return Err(TaskError::Forbidden.into());
@@ -227,6 +267,19 @@ impl BaseTool for TaskTool {
                 let args: Inspect = serde_json::from_value(input)?;
                 let record = service.readable(&self.scope, args.task_id).await?;
                 match args.view.as_str() {
+                    "overview" => service.window_overview(&record).await?,
+                    "search" => {
+                        service
+                            .search_history(
+                                &record,
+                                args.window_id,
+                                args.after,
+                                args.limit,
+                                args.query.as_deref(),
+                                args.filter.unwrap_or_default(),
+                            )
+                            .await?
+                    }
                     "related_tasks" => {
                         service
                             .task_history_page(

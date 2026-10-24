@@ -57,6 +57,28 @@ impl WorkerService {
             return Err(TaskError::Invalid);
         }
         let text = match detail.source.as_str() {
+            "handoff" => {
+                let id = Uuid::parse_str(&detail.id).map_err(|_| TaskError::Invalid)?;
+                sqlx::query_scalar::<_, String>(
+                    "SELECT record_json FROM agent_window_rotations WHERE id=? AND task_id=?",
+                )
+                .bind(id.to_string())
+                .bind(record.id.to_string())
+                .fetch_optional(&self.store.pool)
+                .await?
+                .ok_or(TaskError::Forbidden)?
+            }
+            "task_message" => {
+                let id = detail.id.parse::<i64>().map_err(|_| TaskError::Invalid)?;
+                sqlx::query_scalar::<_, String>(
+                    "SELECT body FROM agent_task_messages WHERE task_id=? AND seq=?",
+                )
+                .bind(record.id.to_string())
+                .bind(id)
+                .fetch_optional(&self.store.pool)
+                .await?
+                .ok_or(TaskError::Forbidden)?
+            }
             "operation_input" | "operation_output" => {
                 let id = detail.id.parse::<i64>().map_err(|_| TaskError::Invalid)?;
                 let row=sqlx::query("SELECT call_json,receipt_json,reconciled_json FROM agent_task_operations WHERE task_id=? AND seq=?")

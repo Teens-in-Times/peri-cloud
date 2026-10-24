@@ -40,6 +40,18 @@ impl WorkerService {
         if record.revision != revision {
             return Err(TaskError::Conflict);
         }
+        if action == "rotate" && record.state == "window_ready" {
+            return Ok(record);
+        }
+        if action == "resume" && record.state == "rotate_requested" {
+            return Err(TaskError::Conflict);
+        }
+        if action == "resume" {
+            record.manual_goal_guard = false;
+        }
+        if action == "rotate" {
+            record.manual_goal_guard = true;
+        }
         if record.terminal()
             && !(action == "resume" && matches!(record.state.as_str(), "failed" | "completed"))
         {
@@ -67,6 +79,11 @@ impl WorkerService {
         } else {
             false
         };
+        if action == "rotate" {
+            self.begin_rotation(&mut record, super::windows::RotationCause::Manual)
+                .await?;
+            return Ok(record);
+        }
         record.state = match action {
             "pause" => {
                 if running {
@@ -82,7 +99,9 @@ impl WorkerService {
             _ => return Err(TaskError::Invalid),
         }
         .into();
-        record.wake_at = None;
+        if action != "rotate" {
+            record.wake_at = None;
+        }
         record.notified = false;
         self.store.save(&mut record).await?;
         Ok(record)
@@ -140,6 +159,24 @@ impl WorkerService {
                 .await
                 .map_err(|_| AgentError::Interrupted)?;
         }
+        if record.manual_goal_guard && record.state == "running" {
+            let active = super::windows::active_parent_goal(
+                &self.store.pool,
+                record.principal,
+                record.parent_session,
+            )
+            .await
+            .map_err(|_| AgentError::Interrupted)?;
+            if record.parent_goal.is_none() || record.parent_goal != active {
+                record.state = "window_ready".into();
+            } else {
+                record.manual_goal_guard = false;
+            }
+            self.store
+                .save(&mut record)
+                .await
+                .map_err(|_| AgentError::Interrupted)?;
+        }
         if record.state == "waiting_parent" && self.parent_replied(&record).await.unwrap_or(false) {
             record.state = "running".into();
             self.store
@@ -159,9 +196,24 @@ impl WorkerService {
             })
             .unwrap_or(40000);
         if progressed && estimated >= budget && record.state == "running" {
-            record.state = "rotate_requested".into();
-            self.store
-                .save(&mut record)
+            let observed = super::windows::budget::observation(
+                &self.store.pool,
+                scope.principal,
+                scope.session,
+            )
+            .await
+            .map_err(|_| AgentError::Interrupted)?;
+            if observed.requests == 0 && record.run_number > 0 {
+                record.state = "waiting_external".into();
+                record.note="Fresh window exceeds context budget before any model work; waiting for a smaller contract or larger capacity.".into();
+                record.wake_at = None;
+                self.store
+                    .save(&mut record)
+                    .await
+                    .map_err(|_| AgentError::Interrupted)?;
+                return Err(AgentError::Interrupted);
+            }
+            self.begin_rotation(&mut record, super::windows::RotationCause::Budget)
                 .await
                 .map_err(|_| AgentError::Interrupted)?;
         }
@@ -182,6 +234,7 @@ impl WorkerService {
                 | "resume_requested"
                 | "cancel_requested"
                 | "invalidated"
+                | "window_ready"
         ) {
             return Err(AgentError::Interrupted);
         }

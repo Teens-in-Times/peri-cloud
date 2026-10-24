@@ -111,8 +111,8 @@ async fn expired_memory_boundary_invalidates_a_waiting_task_before_any_new_work(
 async fn fresh_window_handoff_does_not_survive_a_real_forget_privacy_boundary() {
     use peri_cloud::memory::{MemoryContent, MemoryKind, MemorySource, MemoryStore};
     let limits = peri_cloud::limits::RuntimeLimits {
-        worker_window_tokens: 512,
-        worker_reserve_tokens: 64,
+        worker_window_tokens: 48000,
+        worker_reserve_tokens: 8000,
         ..Default::default()
     };
     let f = Fixture::new_for_limits(
@@ -124,6 +124,11 @@ async fn fresh_window_handoff_does_not_survive_a_real_forget_privacy_boundary() 
             ),
             answer("delegated"),
             call("Read", json!({"file_path":"source.txt"}), "read-source"),
+            call(
+                "request_window_rotation",
+                json!({"reason":"test a fresh privacy-bound window"}),
+                "rotate-before-forget",
+            ),
         ],
         true,
         limits,
@@ -168,8 +173,8 @@ async fn fresh_window_handoff_does_not_survive_a_real_forget_privacy_boundary() 
         json!({"reason":"external condition"}),
         "wait",
     ));
-    pump(&f, 4).await;
-    let context = f.script.requests.lock()[3]["messages"].to_string();
+    pump(&f, 5).await;
+    let context = f.script.requests.lock()[4]["messages"].to_string();
     assert!(
         context.contains("Most recent bounded tool evidence")
             && context.contains("FORGOTTEN_PRIVATE_FIXTURE")
@@ -229,8 +234,8 @@ async fn fresh_window_handoff_does_not_survive_a_real_forget_privacy_boundary() 
 async fn running_tool_keeps_original_identity_through_rotation_and_can_settle_or_cancel() {
     for cancel in [false, true] {
         let limits = peri_cloud::limits::RuntimeLimits {
-            worker_window_tokens: 512,
-            worker_reserve_tokens: 64,
+            worker_window_tokens: 48000,
+            worker_reserve_tokens: 8000,
             ..Default::default()
         };
         let mut f = Fixture::new_for_limits(vec![], true, limits).await;
@@ -262,11 +267,16 @@ async fn running_tool_keeps_original_identity_through_rotation_and_can_settle_or
                     "original-background",
                 ),
                 3 => call(
+                    "request_window_rotation",
+                    json!({"reason":"continue observing the original background operation in a fresh window"}),
+                    "rotate-live-operation",
+                ),
+                4 => call(
                     "inspect_task",
                     json!({"task_id":task,"view":"operations"}),
                     "observe-original",
                 ),
-                4 => {
+                5 => {
                     let context = request["messages"].to_string();
                     assert!(
                         context.contains("Most recent bounded tool evidence")
@@ -304,7 +314,7 @@ async fn running_tool_keeps_original_identity_through_rotation_and_can_settle_or
             .unwrap();
         f.settled(parent, turn.turn_id).await;
         if cancel {
-            pump(&f, 5).await;
+            pump(&f, 6).await;
         } else {
             let task = facts.lock()["task_id"].as_str().unwrap().to_string();
             let mut child = super::crash_tests::launch(&mut f, false).await;
@@ -319,7 +329,7 @@ async fn running_tool_keeps_original_identity_through_rotation_and_can_settle_or
             tokio::time::timeout(Duration::from_secs(20),async {loop {
                 assert!(child.try_wait().unwrap().is_none(),"the cloud child remains live until the explicit kill point");
                 let settled:i64=sqlx::query_scalar("SELECT COUNT(*) FROM agent_tasks a JOIN cloud_turns t ON t.id=json_extract(a.record_json,'$.turn') WHERE a.id=? AND json_extract(a.record_json,'$.state')='waiting_external' AND t.state NOT IN ('queued','running')").bind(&task).fetch_one(&pool).await.unwrap();
-                if settled==1 && f.script.requests.lock().len()==5 {break;}
+                if settled==1 && f.script.requests.lock().len()==6 {break;}
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }}).await.unwrap();
             pool.close().await;

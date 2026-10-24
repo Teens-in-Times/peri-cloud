@@ -74,6 +74,14 @@ struct Script {
     review_waiting: Notify,
     review_release: Notify,
     dynamic: Mutex<Option<DynamicResponse>>,
+    handoff_requests: Mutex<Vec<Value>>,
+    handoff_replies: Mutex<VecDeque<String>>,
+    hold_handoff: AtomicBool,
+    handoff_waiting: Notify,
+    handoff_release: Notify,
+    hold_worker: AtomicBool,
+    worker_waiting: Notify,
+    worker_release: Notify,
 }
 type DynamicResponse = Box<dyn FnMut(&Value) -> String + Send>;
 
@@ -81,6 +89,22 @@ async fn model_request(
     State(script): State<Arc<Script>>,
     Json(request): Json<Value>,
 ) -> ([(axum::http::HeaderName, &'static str); 1], String) {
+    let handoff = request["messages"].as_array().is_some_and(|messages| {
+        messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+            .any(|v| v["purpose"] == "window_handoff")
+    });
+    if handoff {
+        script.handoff_requests.lock().push(request);
+        if script.hold_handoff.load(Ordering::SeqCst) {
+            script.handoff_waiting.notify_one();
+            script.handoff_release.notified().await;
+        }
+        let text=script.handoff_replies.lock().pop_front().unwrap_or_else(||answer("Retained finding: inspect the original operation before proceeding. Handoff fixture evidence remains queryable."));
+        return ([(CONTENT_TYPE, "text/event-stream")], text);
+    }
     let control = request["tools"].as_array().is_some_and(|tools| {
         !tools.is_empty()
             && tools.iter().all(|tool| {
@@ -144,10 +168,24 @@ async fn model_request(
         );
     }
     script.requests.lock().push(request.clone());
-    if let Some(responder) = script.dynamic.lock().as_mut() {
-        return ([(CONTENT_TYPE, "text/event-stream")], responder(&request));
+    let dynamic = script
+        .dynamic
+        .lock()
+        .as_mut()
+        .map(|responder| responder(&request));
+    let reply =
+        dynamic.unwrap_or_else(|| script.replies.lock().pop_front().expect("模型调用超出脚本"));
+    let worker = request["messages"].as_array().is_some_and(|messages| {
+        messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+            .any(|v| v["role"] == "execution_task")
+    });
+    if worker && script.hold_worker.swap(false, Ordering::SeqCst) {
+        script.worker_waiting.notify_one();
+        script.worker_release.notified().await;
     }
-    let reply = script.replies.lock().pop_front().expect("模型调用超出脚本");
     ([(CONTENT_TYPE, "text/event-stream")], reply)
 }
 
