@@ -59,7 +59,9 @@ class OverlayTests(unittest.TestCase):
         digest = sync.tree(self.up, self.base)[SOURCE][1]
         put(self.root, manifest, f"# upstream {self.base}\n{digest}\t{SOURCE}\n")
         put(self.root, "docs/upstream/production-patches.txt", SOURCE + "\n")
-        put(self.root, "README.md", f"Source `{self.base}` [record]({manifest.removesuffix('.manifest')}.md)\n")
+        record = manifest.removesuffix('.manifest') + ".md"
+        put(self.root, "README.md", f"Source `{self.base}` [上游升级记录]({record})\n"
+                                  f"Historical baseline [record]({record})\n")
         put(self.root, "AGENTS.md", f"Upstream source: {sync.UPSTREAM}, revision {self.base}.\n")
         put(self.root, "NOTICE", f"Base revision: {self.base}\n")
         put(self.root, ".gitignore", "/target/\n*.log\n")
@@ -82,6 +84,9 @@ class OverlayTests(unittest.TestCase):
         text = (self.root / SOURCE).read_text()
         self.assertIn("deployment customization", text)
         self.assertIn("incoming change", text)
+        readme = (self.root / "README.md").read_text("utf-8")
+        self.assertIn(f"[上游升级记录](docs/upstream/peri-{result['upstream_head'][:12]}.md)", readme)
+        self.assertIn(f"Historical baseline [record](docs/upstream/peri-{self.base[:8]}.md)", readme)
         child = self.clone()
         sync.apply(child, self.out)
         self.assertEqual((child / SOURCE).read_text(), text)

@@ -56,3 +56,9 @@ peri-resources/src/sessions/sqlite_store/schema_test.rs
 peri-resources/src/sessions/sqlite_store/database.rs
 peri-workflow/src/tool_test.rs
 mcp-packages/common/src/shell_lifecycle_test.rs
+
+# Manual 199382c5 sync: split records/tests/fork wiring below the 1000-line limit.
+peri-acp-types/src/session_resources.rs
+peri-agent/src/agent/stages/tool_dispatch_test.rs
+peri-resources/src/sessions/sqlite_store/session_data.rs
+peri-resources/src/sessions/sqlite_store/session_data/port.rs

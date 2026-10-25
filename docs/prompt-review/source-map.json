@@ -1,5 +1,5 @@
 {
-  "source_commit": "955bed9c215e124ee0a41ddb2a10a3f421b78644",
+  "source_commit": "3bfbfa82c874d4b1ca7f3990c1ea6d9070290eff",
   "files": [
     {
       "file": "02-main.md",
@@ -92,7 +92,7 @@
       "sources": [
         {
           "path": "peri-agent/src/agent/compact_v2/full.rs",
-          "sha256": "88f11441deb481a5f2748c2516668533365f1177822d1b6f9228425bec549ce0"
+          "sha256": "02f86ad4fca1a50705377c822b1bfda82627cc704bb1bd091bf57ecac8ac8236"
         }
       ],
       "export_sha256": "6b2ace74e9ac72653d28a1ebdcbef4696da0542edfbc891bfa1ae29eb31244ec"
@@ -451,10 +451,10 @@
       "sources": [
         {
           "path": "mcp-packages/workspace/src/filesystem/descriptions/read.md",
-          "sha256": "5f73f146fa090a8817faf5c27d2e390641e18a41c0c8d91d65936d72c0b77c75"
+          "sha256": "11e216a1b7592dee370341141724db6dce1414e240254268da298fd0e2509e64"
         }
       ],
-      "export_sha256": "80137b4261ac76ba4928e70959d4373b012c2a466eb316012a7d3333d4431320"
+      "export_sha256": "5a4f2f39605bfc20e3a204a80bb27fecaa60892dc7a68f6373c2fc8568640080"
     },
     {
       "file": "reference/mcp-packages/workspace/src/filesystem/descriptions/write.md",
@@ -803,10 +803,10 @@
       "sources": [
         {
           "path": "peri-tool-runtime/src/filesystem/descriptions/read.md",
-          "sha256": "6b481d73d788b5348b2b3163a84ef876eccc40e648a3bcfeb69cdbcf447ff417"
+          "sha256": "409b388e73e9079411c7d4ed4a69ad9eb83b99d4d86d32a5c3d3dc5f3a49528f"
         }
       ],
-      "export_sha256": "68208c7c39d97e1f4f460ca17e85f9fa6d5266fd9c5fbac32f98e5ff99f45023"
+      "export_sha256": "a701d78587770e862f9fc1f665c54d06afca232281ed8323dbe31d0a9141c4a5"
     },
     {
       "file": "tool-text/peri-tool-runtime/src/filesystem/descriptions/write.md",
