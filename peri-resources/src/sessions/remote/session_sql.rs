@@ -191,6 +191,21 @@ const SELECT_ACTIVE_ENTRY_POSITIONS_SQL: &str =
     "SELECT m.message_id, m.rowid FROM messages m WHERE m.thread_id = ?1 AND m.excluded = 0
     ORDER BY m.rowid ASC";
 
+// ─── 回退候选（有界读取） ──────────────────────────────────────────────────────
+
+/// 阶段一：user 行身份 + 存储序键，keyset 向更早方向，最多 `limit` 行。
+///
+/// 不取正文；`role = 'user'` 是领域常量（`canonical::role_of` 的稳定取值），不是用户输入。
+/// `excluded` 不是读取条件：归档 user 消息仍是合法回退目标。
+const SELECT_REWIND_CANDIDATE_ROWS_SQL: &str = "SELECT m.message_id, m.rowid
+    FROM messages m
+    WHERE m.thread_id = ?1 AND m.role = 'user' AND (?2 IS NULL OR m.rowid < ?2)
+    ORDER BY m.rowid DESC LIMIT ?3";
+
+/// 阶段二：按本批命中的 id 逐条取正文（主键单行）。
+const SELECT_REWIND_CANDIDATE_BODY_SQL: &str =
+    "SELECT m.content FROM messages m WHERE m.thread_id = ?1 AND m.message_id = ?2 LIMIT 1";
+
 // ─── 向前段读取（canonical 完整回放，REQ §5.3） ──────────────────────────────
 
 /// 段读取的边界事实：会话存在吗 + 本次回放的固定上界（该线程自有行的最大 `rowid`，
@@ -343,6 +358,36 @@ pub(super) fn select_messages_statement(id: &str) -> StatementSpec {
 /// 有效范围的自有 payload 行（同一顺序，读取条件带未排除约束）。
 pub(super) fn select_active_messages_statement(id: &str) -> StatementSpec {
     StatementSpec::new(SELECT_ACTIVE_MESSAGES_SQL, vec![Value::Text(id.to_owned())])
+}
+
+/// 回退候选阶段一：`cursor` 为 `Some(rowid)` 时严格向更早方向继续，`None` 为首批。
+pub(super) fn rewind_candidate_rows_statement(
+    id: &str,
+    cursor: Option<i64>,
+    limit: i64,
+) -> StatementSpec {
+    StatementSpec::new(
+        SELECT_REWIND_CANDIDATE_ROWS_SQL,
+        vec![
+            Value::Text(id.to_owned()),
+            match cursor {
+                Some(rowid) => Value::Integer(rowid),
+                None => Value::Null,
+            },
+            Value::Integer(limit),
+        ],
+    )
+}
+
+/// 回退候选阶段二：一条语句取一个本批条目的正文（调用方按同一批次一起发）。
+pub(super) fn rewind_candidate_body_statement(id: &str, message_id: &str) -> StatementSpec {
+    StatementSpec::new(
+        SELECT_REWIND_CANDIDATE_BODY_SQL,
+        vec![
+            Value::Text(id.to_owned()),
+            Value::Text(message_id.to_owned()),
+        ],
+    )
 }
 
 /// 分页读取的边界事实：`anchor` 为 `None` 时锚点列恒为 NULL（首屏）。

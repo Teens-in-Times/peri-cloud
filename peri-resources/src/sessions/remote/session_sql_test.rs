@@ -76,3 +76,41 @@ fn inherited_index_deletes_precede_thread_row_deletion() {
     );
     assert_eq!(snapshot_only[3].sql, DELETE_SESSION_SQL);
 }
+
+/// 回退候选语句形状：阶段一 user 过滤 + keyset + LIMIT，阶段二按主键单行；
+/// 参数全部走绑定（静态 SQL 不插值）。
+#[test]
+fn rewind_candidate_statements_are_user_filtered_bounded_and_parameterized() {
+    let first = rewind_candidate_rows_statement("s", None, 128);
+    assert!(first.is_read_only(), "阶段一必须是只读语句");
+    assert!(first.sql.contains("m.role = 'user'"));
+    assert!(first.sql.contains("ORDER BY m.rowid DESC LIMIT ?3"));
+    assert!(!first.sql.contains("excluded"), "归档 user 仍是合法目标");
+    assert_eq!(
+        first.params,
+        vec![
+            Value::Text("s".to_owned()),
+            Value::Null,
+            Value::Integer(128)
+        ]
+    );
+
+    let next = rewind_candidate_rows_statement("s", Some(42), 128);
+    assert_eq!(
+        next.params,
+        vec![
+            Value::Text("s".to_owned()),
+            Value::Integer(42),
+            Value::Integer(128)
+        ],
+        "keyset 游标只走绑定参数"
+    );
+
+    let body = rewind_candidate_body_statement("s", "m-1");
+    assert!(body.is_read_only());
+    assert!(body.sql.contains("m.message_id = ?2"));
+    assert_eq!(
+        body.params,
+        vec![Value::Text("s".to_owned()), Value::Text("m-1".to_owned())]
+    );
+}

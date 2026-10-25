@@ -401,10 +401,22 @@ async fn test_resolution_error_emits_tool_started_and_ended() {
         .with_event_bus(Arc::new(bus))
         .build();
 
-    let reasoning = Reasoning::with_tools(
+    let mut reasoning = Reasoning::with_tools(
         "",
         vec![ToolCall::new("missing-1", "NotARealTool", json!({}))],
     );
+    // 真实模型路径总能拿到本条 assistant 消息身份；工具事件必须携带它，
+    // TUI 才能在纯工具轮次建立可淘汰归属。
+    let source_message = crate::messages::BaseMessage::ai_with_tool_calls(
+        "",
+        vec![crate::messages::ToolCallRequest::new(
+            "missing-1",
+            "NotARealTool",
+            json!({}),
+        )],
+    );
+    let ai_msg_id = source_message.id();
+    reasoning.source_message = Some(source_message);
     ctx.compact
         .token_tracker
         .write()
@@ -433,10 +445,24 @@ async fn test_resolution_error_emits_tool_started_and_ended() {
     while let Some(event) = handles.try_render() {
         match event {
             RenderEvent::ToolStarted {
-                tool_call_id, name, ..
+                tool_call_id,
+                name,
+                origin_message_id,
+                origin_readable,
+                ..
             } => {
                 assert_eq!(tool_call_id, "missing-1");
                 assert_eq!(name, "NotARealTool");
+                assert_eq!(
+                    origin_message_id,
+                    Some(ai_msg_id),
+                    "结算路径的 ToolStarted 必须携带真实 assistant 消息身份"
+                );
+                assert_eq!(
+                    origin_readable,
+                    Some(true),
+                    "结算路径归属模型批次，必须显式标记可回读"
+                );
                 started = true;
             }
             RenderEvent::ToolEnded {
@@ -722,6 +748,19 @@ async fn assert_dual_path_schema_survives_dispatch(approved_path: Option<&str>, 
         },
     );
     let reasoning = Reasoning::with_tools("", vec![raw_call.clone()]);
+    // 真实模型路径会带上本条 assistant 消息；审批补发的 ToolStarted 必须携带同一
+    // 身份，TUI 才能在纯工具轮次建立可淘汰归属。
+    let source_message = crate::messages::BaseMessage::ai_with_tool_calls(
+        "",
+        vec![crate::messages::ToolCallRequest::new(
+            raw_call.id.clone(),
+            raw_call.name.clone(),
+            raw_call.input.clone(),
+        )],
+    );
+    let source_message_id = source_message.id();
+    let mut reasoning = reasoning;
+    reasoning.source_message = Some(source_message);
     let catalog = ctx
         .runtime
         .tool_catalog
@@ -759,8 +798,16 @@ async fn assert_dual_path_schema_survives_dispatch(approved_path: Option<&str>, 
                 tool_call_id,
                 name,
                 input,
+                origin_message_id,
+                origin_readable,
                 ..
-            } => Some((tool_call_id, name, input)),
+            } => Some((
+                tool_call_id,
+                name,
+                input,
+                origin_message_id,
+                origin_readable,
+            )),
             _ => None,
         })
         .collect();
@@ -769,9 +816,11 @@ async fn assert_dual_path_schema_survives_dispatch(approved_path: Option<&str>, 
         vec![(
             raw_call.id,
             "DualPath".into(),
-            json!({"path": approved_path.unwrap_or("requested/root")})
+            json!({"path": approved_path.unwrap_or("requested/root")}),
+            Some(source_message_id),
+            Some(true),
         )],
-        "ToolStarted/toolcard must describe the same approved target input that was invoked"
+        "审批通过后补发的 ToolStarted 必须描述同一 approved target input，并携带 assistant 消息身份与可回读标记"
     );
 }
 
@@ -790,132 +839,121 @@ async fn test_approved_wrapper_started_uses_edited_target_input() {
     assert_dual_path_schema_survives_dispatch(Some("approved/root"), true).await;
 }
 
+/// 审批拒绝同样补发 ToolStarted（随后 ToolEnded）：必须携带真实 assistant 消息
+/// 身份，否则 TUI 只能把拒绝卡片记为不可淘汰的未归属正文。
 #[tokio::test]
-async fn test_dispatch_emits_fast_completion_before_atomic_batch_commit() {
-    struct GatedTool {
-        name: &'static str,
-        release: Option<Arc<tokio::sync::Notify>>,
-    }
+async fn test_approval_rejection_started_carries_origin_message_id() {
+    use crate::agent::events_v2::{EventBus, RenderEvent};
+
+    struct EchoTool;
     #[async_trait::async_trait]
-    impl BaseTool for GatedTool {
+    impl BaseTool for EchoTool {
         fn name(&self) -> &str {
-            self.name
+            "Bash"
         }
         fn description(&self) -> &str {
-            "batch ordering fixture"
+            "approval rejection fixture"
         }
         fn parameters(&self) -> serde_json::Value {
-            json!({})
+            json!({"type": "object"})
         }
         async fn invoke(
             &self,
             _input: serde_json::Value,
             _ctx: crate::tools::ToolContext<'_>,
         ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-            if let Some(release) = &self.release {
-                release.notified().await;
-            }
-            Ok(self.name.into())
+            panic!("rejected call must not execute")
         }
     }
-    type HookTrace = Arc<parking_lot::Mutex<Vec<(&'static str, usize)>>>;
-    struct Hooks(HookTrace);
+
+    struct RejectAll;
     #[async_trait::async_trait]
-    impl Middleware for Hooks {
+    impl Middleware for RejectAll {
         fn name(&self) -> &str {
-            "BatchHooks"
+            "RejectAll"
         }
-        async fn after_tool(
+        async fn before_tools_batch(
             &self,
-            state: &mut dyn hook_state::AfterToolState,
-            _call: &ToolCall,
-            _result: &ToolResult,
-        ) -> AgentResult<()> {
-            self.0.lock().push(("after_tool", state.messages().len()));
-            Ok(())
-        }
-        async fn after_tools_batch(
-            &self,
-            state: &mut dyn hook_state::AfterToolsBatchState,
-            _results: &[(ToolCall, ToolResult)],
-        ) -> AgentResult<()> {
-            self.0.lock().push(("after_batch", state.messages().len()));
-            Ok(())
+            _state: &mut dyn hook_state::BeforeToolState,
+            calls: &[ToolCall],
+        ) -> Vec<crate::error::AgentResult<ToolCall>> {
+            calls
+                .iter()
+                .map(|call| {
+                    Err(AgentError::ToolRejected {
+                        tool: call.name.clone(),
+                        reason: "user rejected".to_string(),
+                        cause: peri_acp_types::error::ToolRejectionCause::UserRejected,
+                    })
+                })
+                .collect()
         }
     }
-    let (bus, mut handles) = crate::agent::events_v2::EventBus::new(Default::default());
-    let turn = TurnContext::new(Arc::from("/tmp"), Arc::new(CancellationToken::new()));
-    let transcript = Arc::new(parking_lot::RwLock::new(MessageTranscript::new()));
-    transcript
+
+    let (bus, mut events) = EventBus::new(Default::default());
+    let mut ctx = make_test_ctx();
+    ctx.runtime.event_bus = Arc::new(bus);
+    ctx.runtime
+        .tools
         .write()
-        .append(BaseMessage::human("previous history"));
-    let mut ctx = StageContext::builder(turn, Arc::clone(&transcript), MessageQueue::new())
-        .with_event_bus(Arc::new(bus))
-        .build();
-    let release = Arc::new(tokio::sync::Notify::new());
-    for (name, gate) in [("Slow", Some(Arc::clone(&release))), ("Fast", None)] {
-        ctx.runtime.tools.write().insert(
-            name.into(),
-            Arc::new(GatedTool {
-                name,
-                release: gate,
-            }),
-        );
-    }
-    let trace: HookTrace = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        .insert("Bash".into(), Arc::new(EchoTool));
     let mut chain = MiddlewareChain::new();
-    chain.add(Box::new(Hooks(Arc::clone(&trace))));
+    chain.add(Box::new(RejectAll));
     ctx.runtime.middleware_chain = Arc::new(chain);
-    let reasoning = Reasoning::with_tools(
+
+    let call = ToolCall::new("call-rejected", "Bash", json!({"command": "true"}));
+    let source_message = crate::messages::BaseMessage::ai_with_tool_calls(
         "",
-        vec![
-            ToolCall::new("slow", "Slow", json!({})),
-            ToolCall::new("fast", "Fast", json!({})),
-        ],
+        vec![crate::messages::ToolCallRequest::new(
+            call.id.clone(),
+            call.name.clone(),
+            call.input.clone(),
+        )],
     );
+    let source_message_id = source_message.id();
+    let mut reasoning = Reasoning::with_tools("", vec![call]);
+    reasoning.source_message = Some(source_message);
     let catalog = ctx
         .runtime
         .tool_catalog
         .pin_working_tools(&ctx.runtime.tools.read())
         .unwrap();
-    let cancel = CancellationToken::new();
-    let dispatch = dispatch_tools(&ctx, &reasoning, &catalog, &cancel);
-    tokio::pin!(dispatch);
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            tokio::select! {
-                result = &mut dispatch => panic!("slow tool must still block the batch: {}", result.is_ok()),
-                event = handles.render_rx.recv() => {
-                    if matches!(event, Some(RenderEvent::ToolEnded { tool_call_id, .. }) if tool_call_id == "fast") { break; }
-                }
-            }
-        }
-    }).await.expect("fast completion must be observable while slow invoke waits");
-    assert_eq!(
-        transcript.read().len(),
-        1,
-        "no partial batch may become visible"
-    );
-    assert!(
-        trace.lock().is_empty(),
-        "after_tool waits for all concurrent invocations"
-    );
-    release.notify_one();
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), dispatch)
+    let outcome = dispatch_tools(&ctx, &reasoning, &catalog, &CancellationToken::new())
         .await
-        .unwrap()
-        .unwrap();
+        .expect("rejected call settles as a tool error");
+    assert_eq!(outcome.results.len(), 1);
+    assert!(outcome.results[0].1.is_error);
+
+    let mut started_origin = None;
+    let mut ended = false;
+    while let Some(event) = events.try_render() {
+        match event {
+            RenderEvent::ToolStarted {
+                tool_call_id,
+                origin_message_id,
+                origin_readable,
+                ..
+            } if tool_call_id == "call-rejected" => {
+                started_origin = Some((origin_message_id, origin_readable));
+            }
+            RenderEvent::ToolEnded {
+                tool_call_id,
+                is_error,
+                ..
+            } if tool_call_id == "call-rejected" => {
+                assert!(is_error);
+                ended = true;
+            }
+            _ => {}
+        }
+    }
     assert_eq!(
-        outcome
-            .results
-            .iter()
-            .map(|(call, _)| call.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["slow", "fast"]
+        started_origin,
+        Some((Some(source_message_id), Some(true))),
+        "审批拒绝补发的 ToolStarted 必须携带 assistant 消息身份与可回读标记"
     );
-    assert_eq!(
-        *trace.lock(),
-        vec![("after_tool", 1), ("after_tool", 1), ("after_batch", 4)]
-    );
-    assert_eq!(transcript.read().len(), 4);
+    assert!(ended, "rejection must emit ToolEnded");
 }
+
+#[path = "tool_dispatch_batch_completion_test.rs"]
+mod batch_completion;

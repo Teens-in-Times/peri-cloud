@@ -230,7 +230,9 @@ def prepare(root: Path, repo: Path, head: str, output: Path) -> dict:
     ):
         plan[name] = replace_once(target(root, name).read_bytes(), old_text, new_text)
     old_record = pin["manifest"].removesuffix(".manifest") + ".md"
-    plan["README.md"] = replace_once(plan["README.md"], f"]({old_record})", f"]({record_name})")
+    # Historical notes can link the same record; only advance the current source attribution.
+    plan["README.md"] = replace_once(
+        plan["README.md"], f"[上游升级记录]({old_record})", f"[上游升级记录]({record_name})")
     compare = f"https://github.com/{UPSTREAM}/compare/{base}...{head}"
     plan[record_name] = (f"# Peri 自动同步候选 {prefix}\n\n上游：`{base}` → `{head}`。\n\n"
         f"[上游差异]({compare})；源码范围变化 {len(changed)} 项。\n\n"
