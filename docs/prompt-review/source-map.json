@@ -1,5 +1,5 @@
 {
-  "source_commit": "3bfbfa82c874d4b1ca7f3990c1ea6d9070290eff",
+  "source_commit": "867a4e4b47ac3bf691f677f891fd2c7ef5178d8d",
   "files": [
     {
       "file": "02-main.md",
@@ -7,10 +7,10 @@
       "sources": [
         {
           "path": "peri-cloud/prompts/main.md",
-          "sha256": "2208d130a43fef165ca9c135a78d516f98babb81159374b021464f5dd699b730"
+          "sha256": "0894a0b7f5eed3e4831fba8fb30a19527212c537ad0da4e2ab030ac1c05ca013"
         }
       ],
-      "export_sha256": "7f8cd6f7e3d54e01b449836d9958c5cb45d0fc395b4614ca2d54961d95addbe8"
+      "export_sha256": "ab620983e769147b08ee0dff24f0a64935afef49af1525de3a371d8f2422a1b5"
     },
     {
       "file": "03-worker.md",
@@ -118,7 +118,7 @@
       "sources": [
         {
           "path": "peri-cloud/src/tasks/middleware.rs",
-          "sha256": "1d3b57bf562931dcbe4d7593ca8a33a6d426703c0058a88483dddb9ace0f5f1e"
+          "sha256": "c6e5a6f6eedc7a1221956a96cc981aa43bb43c755563bb72b9d8845f749a0aa3"
         }
       ],
       "export_sha256": "00faa3fbfc5728fcf429a0d0a21f4040212c5d3ea2f1e1bcaf80b67edf6b4cc8"
@@ -165,10 +165,10 @@
       "sources": [
         {
           "path": "peri-cloud/src/tasks/tools.rs",
-          "sha256": "50f3ab1eef92d8110fe32d7ea2ab9470b6c509a66ae00e979348dd63b55c5c53"
+          "sha256": "497981bf17c6f368d06b1f9926b90a85cf4bf15ccbfa46e7f8fc53e260bc69de"
         }
       ],
-      "export_sha256": "228008408ef6b5bb32ddbca505c56f2a43a4ccbb6480e5df8fd86929d6d92f03"
+      "export_sha256": "434cfe97246c04c98803d04c3bb3380e7bc6457d46913502bcee9eda85c3b931"
     },
     {
       "file": "tools/peri-cloud--tasks-deliverables.md",
@@ -880,7 +880,7 @@
           "sha256": "a1e7d9ade95cf9cb224a9e92a5d6538d465a363ebd84a78330094c69f148d77e"
         }
       ],
-      "export_sha256": "4812df42e6706609e1882b1e8ca8a951a4f5e02e8c2105cdeb63b65530a09819"
+      "export_sha256": "b5ad1379aaefabb6ec37701b0e1b17850c8267ea6f0a56eb24a117a4a44fe7d6"
     },
     {
       "file": "README.md",
@@ -892,7 +892,7 @@
       "file": "PROMPTS-EDIT.md",
       "kind": "review-combined",
       "sources": [],
-      "export_sha256": "6b418905b772f3e904ba48134d9c23fe60535f2f9edcc752b9da364c6a5b7697"
+      "export_sha256": "5f7e0fb233f9f4a3515817cbf5368cb24c16a403d626247ad318d22531e6ae8b"
     },
     {
       "file": "14-capability-loading.md",

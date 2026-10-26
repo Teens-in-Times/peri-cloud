@@ -8,6 +8,7 @@ pub(crate) mod detached;
 pub(crate) mod devices;
 mod evidence;
 mod history;
+mod intent;
 pub(crate) mod middleware;
 pub(crate) mod native_operations;
 mod observation;

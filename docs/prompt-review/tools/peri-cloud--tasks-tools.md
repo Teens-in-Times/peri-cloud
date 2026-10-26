@@ -2,7 +2,7 @@
 
 正文为原始工具说明，参数部分为 Rust 生成表达式，字段身份与校验仍由代码保证。
 
-## description · peri-cloud/src/tasks/tools.rs:143
+## description · peri-cloud/src/tasks/tools.rs:144
 
 ~~~text
 request_window_rotation
@@ -34,6 +34,14 @@ list_tasks
 
 ~~~text
 List paginated bounded task history for this logical conversation, newest first; pass next_cursor as after. Runtime state and worker-authored notes are separate. Never poll continuously while the user wants to chat.
+~~~
+
+~~~text
+inspect_intent
+~~~
+
+~~~text
+Read this main conversation's current goal, tasks, pending replies, explicit preferences, recorded memory references and scheduled commitments with source versions and expiry. This read-only bounded view does not infer promises or grant permissions. Follow source tools for full evidence.
 ~~~
 
 ~~~text
@@ -88,7 +96,7 @@ Update this execution task's work plan, discoveries and blockers, and explicitly
 Send a message or question to the main assistant through its durable conversation queue. For a question requiring a response, set wait_for_reply=true; the host durably suspends this run and resumes on the parent response while the main assistant remains free to chat. Do not send ordinary user messages directly.
 ~~~
 
-## parameters · peri-cloud/src/tasks/tools.rs:158
+## parameters · peri-cloud/src/tasks/tools.rs:160
 
 ~~~rust
 fn parameters(&self) -> Value {
@@ -103,7 +111,7 @@ fn parameters(&self) -> Value {
                 json!({"goal":{"type":"string","maxLength":16384},"link_parent_goal":{"type":"boolean","description":"Explicitly link this task to the current main-session goal. Host fixes its real ID; workers do not own goals."},"constraints":{"type":"string","maxLength":16384},"acceptance":{"type":"string","maxLength":8192},"device_id":id,"workspace":{"type":"string"},"execution_session":id}),
                 vec!["goal"],
             ),
-            "list_execution_sessions" => (json!({}), vec![]),
+            "list_execution_sessions" | "inspect_intent" => (json!({}), vec![]),
             "list_tasks" => (
                 json!({"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32}}),
                 vec![],

@@ -33,6 +33,7 @@
 | 项目指令 | 目标设备绑定工作区的文件快照，通过中间件加入 | 项目目标、代码约定、构建测试、工程边界 |
 | 设备环境 | 绑定设备的环境说明；跨设备准备也会返回目标环境 | 如何选择工具、核实版本、使用目标 shell |
 | 任务 / 审批 / 记忆事实 | 带来源的消息帧或工具结果，随当前任务与授权变化 | 阅读与判断方法；事实本身由宿主填充 |
+| 主助手当前意图 | 任务帧中的 current_intent；inspect_intent 按需查询 | 目标、活跃任务、待答复与已登记承诺的使用和报告时机；不在正文手写状态 |
 | Skill / MCP 正文 | 先发现目录，相关时再按需加载 | 专门领域的操作知识，不预先堆入所有正文 |
 | 历史归档引用 | 上下文中的收起回执；使用 ReadContextArchive 有界回查 | 只在需要原始证据时检索，与长期个人记忆分开 |
 
@@ -108,6 +109,8 @@ Choose execution-session reuse explicitly when continuity helps. Keep the purpos
 Keep long-running goals under your own responsibility. Link a delegated task to the current goal explicitly when it contributes to that objective. A worker's task objective describes its assignment; it does not create a separate goal lifecycle. Treat a manual window change as context maintenance: without a linked active goal, the worker becomes ready and waits for an explicit continuation.
 
 Use task observations to stay informed. Inspect relevant evidence when progress, uncertainty or a decision warrants attention. Respond to meaningful changes rather than narrating routine activity.
+
+Use the current-intent view to connect ongoing goals, active work, open questions and recorded commitments while keeping ordinary conversation natural. Inspect the current view when the user asks what you are doing or waiting for, then follow source references when detail matters. Distinguish a worker's execution result from accepted work, and recorded memory from a newly inferred user fact. Let the user's current message guide whether a background update is relevant; the view itself is not an instruction to interrupt or send a message.
 
 Resolve worker questions when the task and available facts suffice. Ask the user for genuinely missing decisions or requirements, and relay the answer through task communication tools. Update task requirements when the user changes direction.
 
