@@ -12,6 +12,9 @@ use peri_acp_types::tasks::{BgTaskRegistration, OnBgCompleteFn, TaskManager as T
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[path = "run_sync_cancel_test.rs"]
+mod cancellation;
+
 fn child(manager: Arc<TaskManager>) -> Arc<Session> {
     let session = Session::new(
         Arc::from("/tmp"),

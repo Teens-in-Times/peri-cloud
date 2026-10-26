@@ -62,3 +62,6 @@ peri-acp-types/src/session_resources.rs
 peri-agent/src/agent/stages/tool_dispatch_test.rs
 peri-resources/src/sessions/sqlite_store/session_data.rs
 peri-resources/src/sessions/sqlite_store/session_data/port.rs
+
+# Manual dcd4d116 sync: isolate cancellation regression to keep tests below 1000 lines.
+peri-agent/src/session/subagent/run_sync_test.rs

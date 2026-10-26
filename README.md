@@ -125,7 +125,7 @@ chcp 65001   # Windows：让 PowerShell 中文输出按 UTF-8 解码
 
 ## 来源与许可
 
-本发行版整体采用 AGPL-3.0-only。来自 Peri 的上游代码保留原 Apache-2.0 声明和[完整许可文本](licenses/Apache-2.0.txt)。源代码基于 Peri 提交 `199382c5d048ae033104ab64a9f63eba13fe6e87`，新增云端、执行器、远程工具协议和共享工具运行库，并修改必要的依赖模块。叠加范围、逐文件清单和生产补丁见 [上游升级记录](docs/upstream/peri-199382c5d048.md)。QQ 官方网关实现参考独立项目 Prism 的适配协议；按钮行为参考 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的网关实现。
+本发行版整体采用 AGPL-3.0-only。来自 Peri 的上游代码保留原 Apache-2.0 声明和[完整许可文本](licenses/Apache-2.0.txt)。源代码基于 Peri 提交 `dcd4d116a12dacdc8db41ec5d1387c6bbe874fdd`，新增云端、执行器、远程工具协议和共享工具运行库，并修改必要的依赖模块。叠加范围、逐文件清单和生产补丁见 [上游升级记录](docs/upstream/peri-dcd4d116a12d.md)。QQ 官方网关实现参考独立项目 Prism 的适配协议；按钮行为参考 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的网关实现。
 
 参见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。第三方依赖保留各自许可证。公开仓库采用新的源码快照，未包含原开发目录的 Git 历史、个人配置、聊天记录、凭据或运行数据库。
 
@@ -149,3 +149,5 @@ QQ 原生命令发现、执行 API、扩展接口和兼容范围：[QQ CLI 命�
 提示词规则由宿主承接：主会话类型化审批、完整活跃约束快照、原调用回执复用、空工具摘要、QQ Markdown 降级和生效 Skill 目录。实现边界见 [宿主契约](docs/prompt-host-contracts.md)。
 
 2026-10-25 人工解决 Issue #16 的同步冲突，源码基线更新至 `199382c5d048`，保留 Cloud schema 26 和云端执行账本。接入上游 Micro 常驻历史预算、有界回退查询、MCP 取消和超长单行读取提示修复；具体适配与验证见 [本轮同步记录](docs/upstream/peri-199382c5d048.md)。未升级生产。
+
+2026-10-26 人工处理 Issue #18，源码基线更新至 `dcd4d116a12d`。接入 SDK 同步子执行取消后的收尾修复，拆分超长测试，保留自动同步的文件长度限制；适配范围和验证见 [同步记录](docs/upstream/peri-dcd4d116a12d.md)。Cloud schema 仍为 26，未升级生产。
