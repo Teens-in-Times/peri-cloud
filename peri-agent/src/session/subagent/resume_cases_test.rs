@@ -583,8 +583,5 @@ async fn test_resume_subagent_concurrent_resume_mutex() {
     );
 }
 
-/// 重建失败回滚（R-M1）：load_messages 失败 → status 回滚至原值
-/// （不被 active 卡死，可再次恢复）
-
 #[path = "resume_background_cases_test.rs"]
 mod tail;

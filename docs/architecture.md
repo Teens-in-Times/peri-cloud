@@ -162,7 +162,7 @@ schema 23 持久保存原生操作的单次取消请求。执行窗口可在原�
 
 ## 上下文装配与设备观察扩展
 
-上游核心基线现为 `e598d178`。Cloud schema 25 增加会话绑定的原文恢复副本，主会话 Micro Compact 可收起已闭合、已被模型读取且可恢复的工具交换，Full 继续生成摘要。`ReadContextArchive` 按预算和游标读取，重新核对用户、会话代次、隐私 epoch 与有效期；隐藏推理不通过工具暴露。云端只接入窄归档端口，原 CloudJournal、持久任务和操作账本继续拥有状态权威。异步任务结果另存模型消费回执，投递、模型处理、任务验收和渠道送达分别结算。远程执行器继续校验冻结目录身份。范围与验证见 [本次上游同步记录](upstream/peri-e598d178.md)。
+上游核心基线现为 `dcd4d116`，最近的 SDK 同步子执行取消收尾修复见 [同步记录](upstream/peri-dcd4d116a12d.md)。Cloud schema 25 增加会话绑定的原文恢复副本，主会话 Micro Compact 可收起已闭合、已被模型读取且可恢复的工具交换，Full 继续生成摘要。`ReadContextArchive` 按预算和游标读取，重新核对用户、会话代次、隐私 epoch 与有效期；隐藏推理不通过工具暴露。云端只接入窄归档端口，原 CloudJournal、持久任务和操作账本继续拥有状态权威。异步任务结果另存模型消费回执，投递、模型处理、任务验收和渠道送达分别结算。远程执行器继续校验冻结目录身份。归档接入范围与验证见 [原同步记录](upstream/peri-e598d178.md)。
 
 ContextAssembler 保留来源、角色、大小及版本清单，支持每来源累计预算与总预算；base/role 只执行已注册的一层宏替换。SOUL 属于助手层，cwd 优先 AGENTS.md，再回退 CLAUDE.md，local 是独立补充。全局 Skill 按 operator/account 明确安装，项目 Skill 来自认证工作区；只注入目录，正文按需读取。环境快照通过独立认证只读接口取得，并校验原 binding，不创建 job 或执行探测命令。MCP 延续账号明确配置和现有权限链。完整契约、范围与验证见 [上下文装配](context-assembly.md)。
 提示词规则由宿主承接：主会话类型化审批、完整活跃约束快照、原调用回执复用、空工具摘要、QQ Markdown 降级和生效 Skill 目录。实现边界见 [宿主契约](prompt-host-contracts.md)。

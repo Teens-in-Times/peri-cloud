@@ -605,10 +605,5 @@ fn assert_single_turn_completed(
     assert_eq!(completed_steps, vec![expected_steps]);
 }
 
-/// [回归测试] 最后一轮语义工作产出 final answer 后，下一次 Receive 必须观察正常完成。
-///
-/// 历史背景：旧循环把整个 Receive→Act 外层 `for` 计入预算，limit=1 时 Act 已提交
-/// final answer，却在下一次 Receive 前直接误报 MaxIterationsExceeded。
-
 #[path = "loop_iteration_tail_test.rs"]
 mod tail;
