@@ -34,6 +34,7 @@ mod onebot_tests;
 
 #[derive(Default)]
 struct Wire {
+    device_id: Mutex<Option<Uuid>>,
     messages: Mutex<Vec<Value>>,
     acknowledgements: Mutex<Vec<(String, Value)>>,
     model_requests: Mutex<Vec<Value>>,
@@ -65,7 +66,7 @@ async fn model(
     };
     let delta = match index {
         0 | 2 | 4 => {
-            let (tool, input) = match index {
+            let (tool, mut input) = match index {
                 0 => (
                     "Write",
                     json!({"file_path":"approved.txt","content":"PRIVATE_TOOL_CONTENT"}),
@@ -77,6 +78,7 @@ async fn model(
                 ),
                 _ => unreachable!(),
             };
+            input["device_id"] = json!(wire.device_id.lock().expect("fixture execution device"));
             json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":format!("host-tool-{index}"),"type":"function","function":{"name":tool,"arguments":input.to_string()}}]},"finish_reason":"tool_calls"}]})
         }
         1 | 3 => {
@@ -419,6 +421,7 @@ async fn actual_host_qq_buttons_execute_then_restart_restores_session_and_shutdo
             .unwrap();
     });
     let wire = Arc::new(Wire::default());
+    *wire.device_id.lock() = Some(device);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let app = Router::new()

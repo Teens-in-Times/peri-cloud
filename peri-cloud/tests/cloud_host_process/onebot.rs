@@ -194,6 +194,9 @@ impl Fixture {
         let process = Process::launch(&path, base.clone(), &client).await;
         client.post(format!("{base}/api/setup")).header("Origin",&base).json(&json!({"bootstrap_token":SETUP,"login":"owner","password":PASSWORD,"display_name":"Owner"})).send().await.unwrap().error_for_status().unwrap();
         let account = local_instance_tests::browser_login(&process, &client).await;
+        let data = process.get(&client, &account, "/api/account").await;
+        *wire.device_id.lock() =
+            Some(Uuid::parse_str(data["devices"][0]["id"].as_str().unwrap()).unwrap());
         Self {
             _root: root,
             path,

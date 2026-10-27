@@ -46,12 +46,12 @@ impl MessageAdapter for Adapter {
 }
 
 async fn model(
-    State(calls): State<Arc<AtomicUsize>>,
+    State((calls, device_id)): State<(Arc<AtomicUsize>, uuid::Uuid)>,
     Json(_body): Json<Value>,
 ) -> ([(axum::http::HeaderName, &'static str); 1], String) {
     let delta = match calls.fetch_add(1, Ordering::SeqCst) {
         0 => {
-            json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"browser-write","type":"function","function":{"name":"Write","arguments":json!({"file_path":"approved.txt","content":"PRIVATE_TOOL_CONTENT"}).to_string()}}]},"finish_reason":"tool_calls"}]})
+            json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"browser-write","type":"function","function":{"name":"Write","arguments":json!({"device_id":device_id,"file_path":"approved.txt","content":"PRIVATE_TOOL_CONTENT"}).to_string()}}]},"finish_reason":"tool_calls"}]})
         }
         1 => {
             json!({"choices":[{"delta":{"role":"assistant","content":"文件已写入。","reasoning_content":"PRIVATE_REASONING"},"finish_reason":"stop"}]})
@@ -164,7 +164,7 @@ async fn browser_cookie_and_csrf_approve_the_existing_channel_request_once() {
     let address = listener.local_addr().unwrap();
     let app = Router::new()
         .route("/v1/chat/completions", post(model))
-        .with_state(calls.clone());
+        .with_state((calls.clone(), executor.info().device_id));
     let signal = stop.clone();
     servers.push(tokio::spawn(async move {
         axum::serve(listener, app)
