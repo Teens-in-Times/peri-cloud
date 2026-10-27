@@ -217,6 +217,28 @@ impl Gateway {
     pub(crate) fn worker_private_route(&self, route: &ChannelRoute) -> bool {
         self.private_memory_route(route)
     }
+    pub(crate) async fn intent_questions(
+        &self,
+        principal: Uuid,
+        sessions: &[Uuid],
+    ) -> GatewayResult<Vec<serde_json::Value>> {
+        let mut result = Vec::new();
+        for card in self.hub.browser_cards(principal).await? {
+            if !sessions.contains(&card.session_id) {
+                continue;
+            }
+            if let peri_acp_types::interaction::InteractionContext::Questions { requests } =
+                card.context
+            {
+                for request in requests {
+                    result.push(serde_json::json!({"source":"interaction_hub","request_id":card.request_id,
+                        "session_id":card.session_id,"question_id":request.id,"question":crate::tasks::clip(&request.question,240),
+                        "preview":true,"expires_at":card.expires_at,"respond":"existing_question_interface"}));
+                }
+            }
+        }
+        Ok(result)
+    }
     pub(crate) async fn prepare_worker(
         &self,
         scope: &TaskScope,

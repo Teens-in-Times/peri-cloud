@@ -27,7 +27,7 @@ pub(super) fn call(name: &str, args: Value, id: &str) -> String {
     format!("data: {delta}\n\ndata: [DONE]\n\n")
 }
 
-fn delegate_receipt(request: &Value) -> Value {
+pub(super) fn delegate_receipt(request: &Value) -> Value {
     request["messages"]
         .as_array()
         .unwrap()
@@ -39,7 +39,7 @@ fn delegate_receipt(request: &Value) -> Value {
         .expect("delegation returns a durable task and execution conversation")
 }
 
-async fn pump(f: &Fixture, count: usize) {
+pub(super) async fn pump(f: &Fixture, count: usize) {
     let result = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             f.c().gateway.dispatch().await.unwrap();
@@ -69,7 +69,7 @@ async fn pump(f: &Fixture, count: usize) {
     }
 }
 
-fn tool_value(request: &Value, field: &str) -> Value {
+pub(super) fn tool_value(request: &Value, field: &str) -> Value {
     request["messages"]
         .as_array()
         .unwrap()

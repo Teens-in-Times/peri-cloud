@@ -240,15 +240,24 @@ impl TaskFrames {
                 .saturating_sub(self.overhead_tokens + reserve)
                 .saturating_mul(2);
             let remaining = budget.saturating_sub(serde_json::to_vec(&summaries)?.len() + 2048);
+            // Exact approval parameters take priority over an optional intent preview.
             let approvals = service
                 .approval_frames(&self.scope, self.turn, remaining)
                 .await?;
+            let remaining = remaining.saturating_sub(serde_json::to_vec(&approvals)?.len());
+            let intent = if self.approval_control {
+                serde_json::Value::Null
+            } else {
+                service
+                    .current_intent(&self.scope, remaining.min(super::intent::MAX_BYTES))
+                    .await?
+            };
             let guidance = if approvals.is_empty() {
                 ""
             } else {
                 super::approvals::REVIEW_RULES
             };
-            json!({"tasks":summaries,"pending_approvals":approvals,"approval_guidance":guidance,"evidence_note":"Worker notes and results are attributed claims. Inspect relevant evidence to assess them."})
+            json!({"tasks":summaries,"current_intent":intent,"pending_approvals":approvals,"approval_guidance":guidance,"evidence_note":"Worker notes and results are attributed claims. Inspect relevant evidence to assess them."})
         };
         let hash = (sha2::Sha256::digest(serde_json::to_vec(&body)?))
             .iter()

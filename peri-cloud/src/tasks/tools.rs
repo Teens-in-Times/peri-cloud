@@ -29,6 +29,7 @@ impl Middleware for TaskTools {
                 "delegate_task",
                 "list_execution_sessions",
                 "list_tasks",
+                "inspect_intent",
                 "inspect_task",
                 "message_task",
                 "control_task",
@@ -146,6 +147,7 @@ impl BaseTool for TaskTool {
         "delegate_task"=>"Persist an independent cloud execution task and return immediately. Supply goal, constraints and acceptance; optional device/workspace must belong to this user. Native tools remain available for small operations. Workers use their own context and the original tool approval policy.",
         "list_execution_sessions"=>"List authorized execution conversations for explicit reuse. Reuse preserves work context across independent tasks, within the same device, canonical workspace and privacy scope. Supply the execution_session plus matching device/workspace to delegate_task.",
         "list_tasks"=>"List paginated bounded task history for this logical conversation, newest first; pass next_cursor as after. Runtime state and worker-authored notes are separate. Never poll continuously while the user wants to chat.",
+        "inspect_intent"=>"Read this main conversation's current goal, tasks, pending replies, explicit preferences, recorded memory references and scheduled commitments with source versions and expiry. This read-only bounded view does not infer promises or grant permissions. Follow source tools for full evidence.",
         "inspect_task"=>"Read status, full task contract, approval/operation receipts, windows, bounded trace, conversation or messages. related_tasks pages prior tasks in the same explicitly reused execution session; these are historical evidence and do not grant control over other tasks. Trace supports kind/query filters. Use detail with source/id/offset/chars/version for complete evidence in bounded versioned chunks; preserve the returned version across pages. For archived context, list windows then select window_id in conversation. Cropped previews and agent claims are not complete evidence; private reasoning is excluded.",
         "message_task"=>"Send a supplement or question to this conversation's task at its current revision. Submitted, consumed and applied are different receipts. A message cannot authorize additional permissions.",
         "control_task"=>"Control a task at its current revision: pause at a safe boundary, resume a durable wait/paused task, rotate its context window, or cancel. Unknown execution is queried before any continuation; cancellation does not prove that an effect stopped.",
@@ -167,7 +169,7 @@ impl BaseTool for TaskTool {
                 json!({"goal":{"type":"string","maxLength":16384},"link_parent_goal":{"type":"boolean","description":"Explicitly link this task to the current main-session goal. Host fixes its real ID; workers do not own goals."},"constraints":{"type":"string","maxLength":16384},"acceptance":{"type":"string","maxLength":8192},"device_id":id,"workspace":{"type":"string"},"execution_session":id}),
                 vec!["goal"],
             ),
-            "list_execution_sessions" => (json!({}), vec![]),
+            "list_execution_sessions" | "inspect_intent" => (json!({}), vec![]),
             "list_tasks" => (
                 json!({"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32}}),
                 vec![],
@@ -215,6 +217,16 @@ impl BaseTool for TaskTool {
         let call = ctx.tool_call_id.as_ref().ok_or(TaskError::Invalid)?;
         let key = format!("{}:{call}", self.turn);
         let result = match self.name {
+            "inspect_intent" => {
+                if input != json!({}) {
+                    return Err(TaskError::Invalid.into());
+                }
+                let mut view = service
+                    .current_intent(&self.scope, super::intent::MAX_BYTES)
+                    .await?;
+                view["observed_at"] = json!(now());
+                view
+            }
             "request_window_rotation" => {
                 let args: Rotate = serde_json::from_value(input)?;
                 if self.scope.role != AgentRole::Worker
