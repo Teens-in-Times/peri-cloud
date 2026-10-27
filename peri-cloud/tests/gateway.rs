@@ -196,6 +196,20 @@ fn tool_write() -> String {
     format!("data: {delta}\n\ndata: [DONE]\n\n")
 }
 
+// Explicit fixture token, resolved once when device zero is registered. Worker fixtures
+// continue using tool_write() without routing arguments.
+fn main_tool_write() -> String {
+    main_tool_write_for(0)
+}
+
+fn main_tool_write_for(index: usize) -> String {
+    execution_session_tests::call(
+        "Write",
+        json!({"device_id":format!("FIXTURE_DEVICE_{index}"),"file_path":"agent.txt","content":"PRIVATE_TOOL_CONTENT"}),
+        "fixture-write-call",
+    )
+}
+
 fn answer(text: &str) -> String {
     let delta = json!({"choices":[{"delta":{"role":"assistant","content":text,"reasoning_content":"PRIVATE_REASONING"},"finish_reason":"stop"}]});
     format!("data: {delta}\n\ndata: [DONE]\n\n")
@@ -352,6 +366,7 @@ struct Fixture {
     limits: peri_cloud::limits::RuntimeLimits,
     web: bool,
     submissions: Vec<Arc<std::sync::atomic::AtomicUsize>>,
+    cancellations: Vec<Arc<std::sync::atomic::AtomicUsize>>,
     hidden_receipts: Vec<Arc<AtomicBool>>,
     crash_config: Value,
     held_submissions: Vec<Arc<AtomicBool>>,
@@ -412,6 +427,7 @@ impl Fixture {
             limits,
             web,
             submissions: Vec::new(),
+            cancellations: Vec::new(),
             hidden_receipts: Vec::new(),
             crash_config: json!({"model_url":format!("http://{model_address}/v1"),"clients":[]}),
             held_submissions: Vec::new(),
@@ -466,6 +482,8 @@ impl Fixture {
         let client_address = listener.local_addr().unwrap();
         let shutdown = self.stop.clone();
         let submissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.cancellations.push(cancellations.clone());
         let hidden = Arc::new(AtomicBool::new(false));
         let held = Arc::new(AtomicBool::new(false));
         let release = Arc::new(Notify::new());
@@ -476,10 +494,16 @@ impl Fixture {
         let app = web::router(executor.clone()).layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
                 let submissions = submissions.clone();
+                let cancellations = cancellations.clone();
                 let hidden = hidden.clone();
                 let held = held.clone();
                 let release = release.clone();
                 async move {
+                    if request.method() == axum::http::Method::POST
+                        && request.uri().path().ends_with("/cancel")
+                    {
+                        cancellations.fetch_add(1, Ordering::SeqCst);
+                    }
                     let submission = request.method() == axum::http::Method::POST
                         && request.uri().path().ends_with("/jobs");
                     if request.method() == axum::http::Method::POST
@@ -567,6 +591,9 @@ impl Fixture {
             .register_device(&actor, device.clone())
             .await
             .unwrap();
+        for reply in self.script.replies.lock().iter_mut() {
+            *reply = reply.replace(&format!("FIXTURE_DEVICE_{index}"), &device.id.to_string());
+        }
         self.devices.push(device);
         self.workspaces.push(workspace);
         self.executors.push(executor);

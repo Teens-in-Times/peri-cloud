@@ -41,8 +41,8 @@ async fn per_call_target_is_fixed_approved_exactly_and_unknown_receipts_are_quer
                 )
             }
             3 => call(
-                "execute_device",
-                json!({"target_id":*capture.lock(),"tool":"Write","input":{"file_path":"direct.txt","content":"FROZEN_TARGET"}}),
+                "Write",
+                json!({"device_id":device1,"file_path":"direct.txt","content":"FROZEN_TARGET"}),
                 "write-other",
             ),
             4 => call("inspect_device_operations", json!({}), "receipts"),
@@ -230,7 +230,7 @@ async fn per_call_target_is_fixed_approved_exactly_and_unknown_receipts_are_quer
         1,
         "querying is not resubmission"
     );
-    f.script.replies.lock().extend([call("execute_device",json!({"target_id":*saved_target.lock(),"tool":"Write","input":{"file_path":"stale.txt","content":"no"}}),"stale-target"),answer("previous-turn handle is invalid")]);
+    f.script.replies.lock().extend([call("Write",json!({"device_id":device1,"_device_target":{"target_id":*saved_target.lock()},"file_path":"stale.txt","content":"no"}),"stale-target"),answer("previous-turn handle is invalid")]);
     let turn = f
         .c()
         .gateway
@@ -248,7 +248,7 @@ async fn per_call_target_is_fixed_approved_exactly_and_unknown_receipts_are_quer
     f.finish().await;
 }
 
-async fn next_card(f: &Fixture) -> InteractionCard {
+pub(super) async fn next_card(f: &Fixture) -> InteractionCard {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             f.c().gateway.dispatch().await.unwrap();
@@ -291,14 +291,11 @@ async fn direct_calls_share_worker_mutation_ownership_but_other_device_and_chat_
                 json!({"device_id":device0}),
                 "same-device",
             ),
-            4 => {
-                let target = tool_value(request, "target")["target"]["target_id"].clone();
-                call(
-                    "execute_device",
-                    json!({"target_id":target,"tool":"Write","input":{"file_path":"conflict.txt","content":"must not write"}}),
-                    "conflict",
-                )
-            }
+            4 => call(
+                "Write",
+                json!({"device_id":device0,"file_path":"conflict.txt","content":"must not write"}),
+                "conflict",
+            ),
             5 => {
                 assert!(request["messages"]
                     .as_array()
@@ -314,14 +311,11 @@ async fn direct_calls_share_worker_mutation_ownership_but_other_device_and_chat_
                 json!({"device_id":device1}),
                 "other-device",
             ),
-            7 => {
-                let target = tool_value(request, "target")["target"]["target_id"].clone();
-                call(
-                    "execute_device",
-                    json!({"target_id":target,"tool":"Write","input":{"file_path":"direct.txt","content":"other device remains available"}}),
-                    "independent",
-                )
-            }
+            7 => call(
+                "Write",
+                json!({"device_id":device1,"file_path":"direct.txt","content":"other device remains available"}),
+                "independent",
+            ),
             8 => answer("small operation completed; still chatting"),
             9 => answer("worker finished original assignment"),
             10 => answer("task result received"),
@@ -429,14 +423,19 @@ async fn direct_calls_share_worker_mutation_ownership_but_other_device_and_chat_
 
 #[tokio::test]
 async fn duplicate_native_call_identity_is_rejected_without_reexecuting_the_tool() {
-    let f = Fixture::new_for(
-        vec![
-            call("Read", json!({"file_path":"source.txt"}), "stable-call"),
-            call("Read", json!({"file_path":"source.txt"}), "stable-call"),
-        ],
-        true,
-    )
-    .await;
+    let f = Fixture::new_for(vec![], true).await;
+    f.script.replies.lock().extend([
+        call(
+            "Read",
+            json!({"device_id":f.devices[0].id,"file_path":"source.txt"}),
+            "stable-call",
+        ),
+        call(
+            "Read",
+            json!({"device_id":f.devices[0].id,"file_path":"source.txt"}),
+            "stable-call",
+        ),
+    ]);
     std::fs::write(
         f.workspaces[0].path().join("source.txt"),
         "original evidence",

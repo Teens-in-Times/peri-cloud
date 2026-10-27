@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn workspace_switch_preserves_permissions_freezes_history_and_survives_restart() {
-    let mut f = Fixture::new(vec![tool_write(), answer("已写入指定目录。")]).await;
+    let mut f = Fixture::new(vec![main_tool_write(), answer("已写入指定目录。")]).await;
     f.pair().await;
     f.select("default-workspace", 0).await;
     f.c()
@@ -75,6 +75,14 @@ async fn workspace_switch_preserves_permissions_freezes_history_and_survives_res
         .remove(0);
     assert_eq!(restored.session_id, selected.session_id);
     assert_eq!(restored.workspace, selected.workspace);
+    f.script.replies.lock()[0] = execution_session_tests::call(
+        "Write",
+        json!({
+            "device_id": f.devices[0].id, "workspace": selected.workspace,
+            "file_path":"agent.txt", "content":"PRIVATE_TOOL_CONTENT"
+        }),
+        "fixture-write-call",
+    );
     let receipt = f
         .c()
         .gateway
@@ -118,7 +126,7 @@ async fn workspace_switch_preserves_permissions_freezes_history_and_survives_res
 
 #[tokio::test]
 async fn workspace_invalid_busy_and_unlinked_requests_cannot_change_selection() {
-    let f = Fixture::new(vec![tool_write(), answer("操作未获批准。")]).await;
+    let f = Fixture::new(vec![main_tool_write(), answer("操作未获批准。")]).await;
     f.pair().await;
     f.select("select", 0).await;
     let selected = f

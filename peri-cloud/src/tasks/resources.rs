@@ -109,6 +109,27 @@ impl WorkerService {
         Ok(())
     }
 }
+pub(crate) fn wrap_worker_tools(
+    scope: &TaskScope,
+    remote: &Arc<peri_remote_tools::RemoteSession>,
+    tools: &mut std::collections::BTreeMap<String, Arc<dyn BaseTool>>,
+) {
+    for name in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
+        if let Some(inner) = tools.remove(name) {
+            tools.insert(
+                name.into(),
+                Arc::new(ResourceTool {
+                    inner,
+                    scope: scope.clone(),
+                    device: remote.device_id(),
+                    remote: remote.clone(),
+                    mutation: matches!(name, "Write" | "Edit" | "Bash"),
+                }),
+            );
+        }
+    }
+}
+
 pub(crate) struct ResourceTool {
     pub inner: Arc<dyn BaseTool>,
     pub scope: TaskScope,
@@ -151,6 +172,26 @@ impl BaseTool for ResourceTool {
     fn parameters(&self) -> serde_json::Value {
         self.inner.parameters()
     }
+    fn bind_invocation(
+        &self,
+        input: serde_json::Value,
+    ) -> std::result::Result<
+        Option<peri_acp_types::tools::BoundToolInvocation>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        if [
+            "device_id",
+            "workspace",
+            "_device_target",
+            "_device_request",
+        ]
+        .iter()
+        .any(|key| input.get(key).is_some())
+        {
+            return Err("execution agent tools use the host-bound device and workspace".into());
+        }
+        Ok(None)
+    }
     fn is_direct(&self) -> bool {
         self.inner.is_direct()
     }
@@ -190,7 +231,7 @@ impl BaseTool for ResourceTool {
         input: serde_json::Value,
         ctx: ToolContext<'_>,
     ) -> std::result::Result<ToolOutput, Box<dyn std::error::Error + Send + Sync>> {
-        // Only the immutable execute_device wrapper may project another target.
+        // Execution agents cannot override their host-bound target.
         if input.get("_device_target").is_some() {
             return Err(TaskError::Forbidden.into());
         }

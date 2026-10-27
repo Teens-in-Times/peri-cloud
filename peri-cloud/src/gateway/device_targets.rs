@@ -13,7 +13,7 @@ impl Gateway {
         }
         let (_, devices) = self.identity.channel_devices(&scope.route.identity).await?;
         Ok(
-            json!({"devices":devices.iter().filter(|d|!d.revoked).take(64).map(|d|json!({"device_id":d.id,"name":d.name,"platform":d.platform,"registration_is_not_online":true})).collect::<Vec<_>>(),"prepare_required":true}),
+            json!({"devices":devices.iter().filter(|d|!d.revoked).take(64).map(|d|json!({"device_id":d.id,"name":d.name,"platform":d.platform,"default_workspace":d.default_workspace,"registration_is_not_online":true})).collect::<Vec<_>>(),"prepare_required":false,"explicit_device_id_required":true}),
         )
     }
     pub(crate) async fn prepare_native_target(

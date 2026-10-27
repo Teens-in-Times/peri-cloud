@@ -10,9 +10,9 @@
 
 正文为原始工具说明，参数部分为 Rust 生成表达式，字段身份与校验仍由代码保证。
 
-## description · peri-middlewares/src/goal/tool.rs:259
+## description · peri-middlewares/src/goal/tool.rs:295
 
-## parameters · peri-middlewares/src/goal/tool.rs:263
+## parameters · peri-middlewares/src/goal/tool.rs:299
 
 ~~~rust
 fn parameters(&self) -> Value {

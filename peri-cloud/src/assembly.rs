@@ -27,6 +27,8 @@ use crate::workspace::{CloudSkillsMiddleware, DeviceWorkspace};
 
 pub(crate) struct CloudAssemblyContext {
     pub remote: Option<Arc<RemoteSession>>,
+    pub device_routing: Option<crate::tasks::device_routing::MainDeviceRouting>,
+    pub explicit_devices: bool,
     pub broker: Arc<dyn UserInteractionBroker>,
     pub permissions: Arc<SharedPermissionMode>,
     pub classifier: Option<Arc<dyn AutoClassifier>>,
@@ -115,14 +117,18 @@ impl MiddlewareChainAssembler for CloudChainAssembler {
         let mut chain = MiddlewareChain::new();
         // v4 removed the Filesystem/Terminal slots. The device tools are
         // installed explicitly before approval, preserving the old chain order.
-        if let Some(remote) = &ctx.remote {
+        if let Some(routing) = &ctx.device_routing {
+            chain.add(Box::new(routing.clone()));
+        } else if let Some(remote) = &ctx.remote {
             chain.add(Box::new(DeviceTools {
                 remote: remote.clone(),
                 shell: false,
+                explicit: ctx.explicit_devices,
             }));
             chain.add(Box::new(DeviceTools {
                 remote: remote.clone(),
                 shell: true,
+                explicit: ctx.explicit_devices,
             }));
         }
         chain.add(Box::new(CloudBuiltinTools {
@@ -241,6 +247,7 @@ fn todo_channel() -> mpsc::Sender<Vec<TodoItem>> {
 struct DeviceTools {
     remote: Arc<RemoteSession>,
     shell: bool,
+    explicit: bool,
 }
 
 #[async_trait]
@@ -253,8 +260,12 @@ impl Middleware for DeviceTools {
         }
     }
     fn collect_tools(&self, _cwd: &str) -> Vec<Box<dyn BaseTool>> {
-        self.remote
-            .tools()
+        let tools = if self.explicit {
+            crate::tasks::device_fixed::tools(&self.remote)
+        } else {
+            self.remote.tools()
+        };
+        tools
             .into_iter()
             .filter(|tool| {
                 let shell = matches!(tool.name(), "Bash" | "GetExecution" | "CancelExecution");

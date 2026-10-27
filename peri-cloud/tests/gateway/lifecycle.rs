@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn gateway_pc_confirm_select_approve_once_real_write_and_only_ai_reply() {
-    let f = Fixture::new(vec![tool_write(), answer("文件已写入。")]).await;
+    let f = Fixture::new(vec![main_tool_write(), answer("文件已写入。")]).await;
     f.pair().await;
     f.select("select-pc", 0).await;
     f.adapter.attempts.lock().clear();
@@ -87,7 +87,7 @@ async fn gateway_pc_confirm_select_approve_once_real_write_and_only_ai_reply() {
 
 #[tokio::test]
 async fn gateway_busy_controls_and_cancel_reject_stale_approval() {
-    let f = Fixture::new(vec![tool_write()]).await;
+    let f = Fixture::new(vec![main_tool_write()]).await;
     f.pair().await;
     f.select("select-pc", 0).await;
     let receipt = f
@@ -135,7 +135,7 @@ async fn gateway_busy_controls_and_cancel_reject_stale_approval() {
 
 #[tokio::test]
 async fn gateway_device_revoke_invalidates_pending_approval() {
-    let f = Fixture::new(vec![tool_write()]).await;
+    let f = Fixture::new(vec![main_tool_write()]).await;
     f.pair().await;
     f.select("select-pc", 0).await;
     f.c()
@@ -171,7 +171,7 @@ async fn gateway_cloud_restart_delivers_saved_ai_reply_and_target_switch_resets_
     let mut f = Fixture::new(vec![
         answer("第一台电脑完成。"),
         answer("继续使用第一台电脑。"),
-        tool_write(),
+        main_tool_write_for(1),
         answer("第二台电脑完成。"),
     ])
     .await;
@@ -345,7 +345,7 @@ async fn gateway_disconnected_dispatch_waiter_does_not_abort_owned_delivery() {
 
 #[tokio::test]
 async fn gateway_expired_card_and_revoked_channel_cannot_approve() {
-    let f = Fixture::new(vec![tool_write()]).await;
+    let f = Fixture::new(vec![main_tool_write()]).await;
     f.pair().await;
     f.select("select-pc", 0).await;
     f.c()

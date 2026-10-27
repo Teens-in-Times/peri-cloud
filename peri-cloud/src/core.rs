@@ -532,8 +532,37 @@ impl CloudAgent {
             index: Arc::new(ToolSearchIndex::new()),
             tools: tools.clone(),
         });
+        let task_scope = self.task_scope.read().clone();
+        let scheduled = personal.as_ref().is_some_and(|p| p.scheduled);
+        let has_devices = match &task_scope {
+            Some(scope)
+                if scope.role == crate::context::AgentRole::Main && self.remote.is_none() =>
+            {
+                crate::tasks::device_routing::MainDeviceRouting::available(scope)
+                    .await
+                    .map_err(|_| Error::Context)?
+            }
+            _ => self.remote.is_some(),
+        };
+        let device_routing = task_scope
+            .as_ref()
+            .filter(|s| {
+                s.role == crate::context::AgentRole::Main
+                    && has_devices
+                    && (!scheduled || self.remote.is_some())
+            })
+            .map(|scope| {
+                crate::tasks::device_routing::MainDeviceRouting::new(
+                    scope.clone(),
+                    request.turn_id,
+                    self.remote.clone(),
+                    scheduled,
+                )
+            });
         let assembly = CloudAssemblyContext {
             remote: self.remote.clone(),
+            device_routing,
+            explicit_devices: !self.is_worker(),
             broker: request.broker,
             permissions: if self.is_worker() {
                 SharedPermissionMode::new(peri_acp_types::permission::PermissionMode::Default)
@@ -571,7 +600,6 @@ impl CloudAgent {
         } else {
             build_middleware_chain(&CloudChainAssembler, &assembly)
         };
-        let task_scope = self.task_scope.read().clone();
         if let (Some(scope), Some(personal)) = (&task_scope, &personal) {
             if !personal.scheduled {
                 chain.add(Box::new(crate::tasks::tools::TaskTools {
@@ -707,23 +735,13 @@ impl CloudAgent {
         }
         let chain = Arc::new(chain);
         let mut tool_map = assembled.tools;
-        if let (Some(scope), Some(device), Some(remote)) =
-            (&task_scope, self.device_id, &self.remote)
-        {
-            for name in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
-                if let Some(inner) = tool_map.remove(name) {
-                    tool_map.insert(
-                        name.into(),
-                        Arc::new(crate::tasks::resources::ResourceTool {
-                            inner,
-                            scope: scope.clone(),
-                            device,
-                            remote: remote.clone(),
-                            mutation: matches!(name, "Write" | "Edit" | "Bash"),
-                        }),
-                    );
-                }
-            }
+        if let (Some(scope), Some(remote)) = (
+            task_scope
+                .as_ref()
+                .filter(|s| s.role == crate::context::AgentRole::Worker),
+            &self.remote,
+        ) {
+            crate::tasks::resources::wrap_worker_tools(scope, remote, &mut tool_map);
         }
         if approval_control {
             tool_map.retain(|name, _| {

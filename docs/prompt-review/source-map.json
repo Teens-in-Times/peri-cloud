@@ -1,5 +1,5 @@
 {
-  "source_commit": "867a4e4b47ac3bf691f677f891fd2c7ef5178d8d",
+  "source_commit": "2eead86f89a75f65b03c6f815b6adeed41367194",
   "files": [
     {
       "file": "02-main.md",
@@ -7,10 +7,10 @@
       "sources": [
         {
           "path": "peri-cloud/prompts/main.md",
-          "sha256": "0894a0b7f5eed3e4831fba8fb30a19527212c537ad0da4e2ab030ac1c05ca013"
+          "sha256": "55ab07f1d197f808bc95ed747e49790acd07b2c8b6edc5871dd400f841057040"
         }
       ],
-      "export_sha256": "ab620983e769147b08ee0dff24f0a64935afef49af1525de3a371d8f2422a1b5"
+      "export_sha256": "33c27ac899dc87b00f75cea1899ffd2546e2da4a9a40391c08558e33456dea97"
     },
     {
       "file": "03-worker.md",
@@ -18,10 +18,10 @@
       "sources": [
         {
           "path": "peri-cloud/prompts/worker.md",
-          "sha256": "f7d932c213a1d83007e83f79fc7372530446c7b0f2ef24a872d213b186ca1669"
+          "sha256": "841ef3d880b0701f65a3e01a93f47a7ad7b86250c651a0e878698577988b8dfe"
         }
       ],
-      "export_sha256": "30af3428d40dd4c256fe71f994208b1949bc922267e346227bc6ab9d6417c358"
+      "export_sha256": "a4357a55209cd566a9557ecaad0b048e2e4e4721654dc79702626408a9bf7005"
     },
     {
       "file": "01-host-base.md",
@@ -168,7 +168,7 @@
           "sha256": "497981bf17c6f368d06b1f9926b90a85cf4bf15ccbfa46e7f8fc53e260bc69de"
         }
       ],
-      "export_sha256": "434cfe97246c04c98803d04c3bb3380e7bc6457d46913502bcee9eda85c3b931"
+      "export_sha256": "6a6216542731319c264342218d25ab3026fd6613def84b2816b5e45ef2fee8d0"
     },
     {
       "file": "tools/peri-cloud--tasks-deliverables.md",
@@ -176,10 +176,10 @@
       "sources": [
         {
           "path": "peri-cloud/src/tasks/deliverables.rs",
-          "sha256": "63f20bdef7800d0040976b6e9f053b9d67fd5bd8b73992ddfcf850278144947e"
+          "sha256": "cadf4f90b2189c5d07ac5fc556cea0a74513a7a659f5909cbeffb60a1ede0234"
         }
       ],
-      "export_sha256": "2a353cb6b87d94785f275580a6d2b6129cbbb8735aecfff34329fb45ebf14784"
+      "export_sha256": "3c966425f5a67dce3c9ebc0a7c9b5abf1ff637efbb663a5a2df319d0aaa38ec2"
     },
     {
       "file": "tools/peri-cloud--tasks-devices.md",
@@ -187,10 +187,10 @@
       "sources": [
         {
           "path": "peri-cloud/src/tasks/devices.rs",
-          "sha256": "71ac76471328a188cbaf41c22903c9ec017c482b2120583f253c12a202ec9018"
+          "sha256": "44a60dbebe96829add17f1b3180be0c2e85cceae1d6fcba171d097cc68949db7"
         }
       ],
-      "export_sha256": "6b427a80e954af596298fe51a56dde3241c5e6b866a27057bbc8ec2009e5c743"
+      "export_sha256": "4a52d07754b4c9b81795b43b5518aed9d69e37e57fcefc449956a370365eaf78"
     },
     {
       "file": "tools/peri-cloud--tasks-resources.md",
@@ -198,10 +198,10 @@
       "sources": [
         {
           "path": "peri-cloud/src/tasks/resources.rs",
-          "sha256": "d353798e45e828d8b172c7800580b72fc458afaa6136c5de4bd96e985de661c8"
+          "sha256": "746005b341b97b87e5587eb2a73a9b36853ac258606e7089c35a9cbaf4f994e3"
         }
       ],
-      "export_sha256": "fcd7b9fdf5480f9e3b672a764e108b546dd5656e0de98bd8be96936d51fde1fa"
+      "export_sha256": "f2b7cebd363857905b01e5af06c77becd38d86ae131b4463b20d537d5e64ce42"
     },
     {
       "file": "tools/peri-cloud--memory-tools.md",
@@ -209,7 +209,7 @@
       "sources": [
         {
           "path": "peri-cloud/src/memory/tools.rs",
-          "sha256": "904fc88390d5cb0565ff6d83977f1ed691c3f5a3850cd0120cce6496b6f0293f"
+          "sha256": "19b820bf11f06662491cd5986ccd9f14597f2586fc6b406c73eeb09ab9804053"
         }
       ],
       "export_sha256": "13ad6cb3dddaafe0e45ecee133a0f5c76337b3ce5e87775f9fe3231b66c482f7"
@@ -231,10 +231,10 @@
       "sources": [
         {
           "path": "peri-cloud/src/workspace/skills.rs",
-          "sha256": "45abfc75d9240d85a2a64baf3128cc5b6b5cd81337ed144f97386cacfa0bfa3e"
+          "sha256": "e8c9851ce56e33b3cb80c2f89eb05c0df9da62d28c47f95e50147ee1edb7f129"
         }
       ],
-      "export_sha256": "b81522b565ed22170bab0f9f9c95b029585c27c64b2f60c892dd8b1538383277"
+      "export_sha256": "135beb8245298b4588ace6698c942ba95cd3993b2a98a004497af7c6c4d3f653"
     },
     {
       "file": "tools/peri-middlewares--tools-ask_user_tool.md",
@@ -242,10 +242,10 @@
       "sources": [
         {
           "path": "peri-middlewares/src/tools/ask_user_tool.rs",
-          "sha256": "e223e5008a5a8172deadb1def28332973eeca64ee4e299971a65e28aada4f287"
+          "sha256": "1662afb7fb133ec881e5c0bcefed4ca6a9c82911ed085a9e783b67a86c388d5f"
         }
       ],
-      "export_sha256": "0fcfc0a2642058f9dbdb337999af1d75048a753c238fcde5abc41fa9433ace5b"
+      "export_sha256": "4ffb93dc798e6057ab0099f0eb46ff12665d547cf8641dd53cf145a503bae14c"
     },
     {
       "file": "tools/peri-middlewares--tools-todo.md",
@@ -253,10 +253,10 @@
       "sources": [
         {
           "path": "peri-middlewares/src/tools/todo.rs",
-          "sha256": "f26b0df499f76272c339ddd5573c1b4cc2cb3c5da3565e43d61dbd1e94cec1c7"
+          "sha256": "9f02c2764e580d1e624555272efc5b6b18888c904e0ddb998c651fa3f691eef3"
         }
       ],
-      "export_sha256": "058a4cb92b6abaf4a8a2e09a047f65b87ae8a5469bc7b4f0d6deae70a6102dc8"
+      "export_sha256": "0bcd59f8d769dc4a998ed0d717970993e7fbfb31a20f6d0848c08302d4828971"
     },
     {
       "file": "tools/peri-middlewares--goal-tool.md",
@@ -264,10 +264,10 @@
       "sources": [
         {
           "path": "peri-middlewares/src/goal/tool.rs",
-          "sha256": "0cc3af02a039f7ebe4dd08bfe5f670ee4e7ead0eb8023d795a5c284ea7875a3b"
+          "sha256": "fc7078145e537b4d417a76f3cbd97e8820ed87da7add6820e05dcc4ab2d2dddc"
         }
       ],
-      "export_sha256": "81ce38f0b5b67493667a3330df701b16c430d6fd1c41aad44fc0b3e65a5d1fc5"
+      "export_sha256": "ad113d2318b9349a8e5d386aa5c8ddbd9903887d73c9f285f90b0620ba3bca7f"
     },
     {
       "file": "tools/peri-middlewares--tool_search-search_tool.md",
@@ -308,7 +308,7 @@
       "sources": [
         {
           "path": "peri-middlewares/src/mcp/resource_tool.rs",
-          "sha256": "5fdc8a2ab98af1999f559e2de6f4055992ffeb78840297af42935ccf6e580103"
+          "sha256": "6512cb52e36feeb54d4555c36714c7ef85f9a949810f313849a0e44c0931dfd4"
         }
       ],
       "export_sha256": "18367dfc96ff6d0364494c05082b0b961dfb2bfa4fc7a27e657d32dc8b42dd69"
@@ -330,10 +330,10 @@
       "sources": [
         {
           "path": "peri-remote-tools/src/tool.rs",
-          "sha256": "f4049c38b7d11869ef7a76de3f8fe89646356bf76119c3b4bc4faae828f25116"
+          "sha256": "500eb2b1eb880287000dca164718731036eb0e89e2016fbe6681f35dbc39729d"
         }
       ],
-      "export_sha256": "58f696b7170c5ff7c7d1a787fc6f39f2dc6acfffa8954fb459b44a3d16442577"
+      "export_sha256": "cb90b943bfb0d786489d005b2f0974fd9082c31ded302ee57837c7bb11c15585"
     },
     {
       "file": "reference/design/frames.md",
@@ -880,7 +880,7 @@
           "sha256": "a1e7d9ade95cf9cb224a9e92a5d6538d465a363ebd84a78330094c69f148d77e"
         }
       ],
-      "export_sha256": "b5ad1379aaefabb6ec37701b0e1b17850c8267ea6f0a56eb24a117a4a44fe7d6"
+      "export_sha256": "7f91a3c70d44355ee2b34be4b297d8d1fdbf3bece1778990b452342ad0c68eca"
     },
     {
       "file": "README.md",
@@ -892,7 +892,7 @@
       "file": "PROMPTS-EDIT.md",
       "kind": "review-combined",
       "sources": [],
-      "export_sha256": "5f7e0fb233f9f4a3515817cbf5368cb24c16a403d626247ad318d22531e6ae8b"
+      "export_sha256": "acf52a1fbd79a3981bfaa1c3a9aa52ed50128ee30036d5d730d8f494377db221"
     },
     {
       "file": "14-capability-loading.md",
@@ -948,7 +948,18 @@
           "sha256": "2e82815188ea05d74450ac772d38c81211043ef9ef726ebb48ad073f19d8c56e"
         }
       ],
-      "export_sha256": "583330079d496f8a1e0abb558cee2f3f12ed41b5011165fb1073d32e6e7459b2"
+      "export_sha256": "43ec65c1d36ccb0e195f65b652ccd0f6dbc0ba27cf3d2eaab6241d3a0ebd44f7"
+    },
+    {
+      "file": "tools/peri-cloud--tasks-device-routing.md",
+      "kind": "active-tool-contract",
+      "sources": [
+        {
+          "path": "peri-cloud/src/tasks/device_routing.rs",
+          "sha256": "5c5dbb0112b248b86e4b54b2b91ff13109b695985235694a2b4b1d6abc139a2a"
+        }
+      ],
+      "export_sha256": "ae584459a624b67c98312e0507064fc4560819307e86ee909f6ee31e08a44724"
     }
   ],
   "source_snapshot": "working tree, source hashes recorded per document"

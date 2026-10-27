@@ -1,15 +1,19 @@
 # 主助手按调用选择设备
 
-主助手保留原生小操作工具，也可以对其他授权设备执行小操作。此路径不创建委派任务、执行 agent 或新的模型会话；主会话的默认设备保持不变。
+主助手的设备执行工具显式选择设备；执行 Agent 使用宿主绑定的设备和工作区。直接小操作不创建委派任务、执行 Agent 或新的模型会话，也不修改主会话默认设备。
 
 ## 契约
 
-- list_devices 只返回当前 OAuth 用户可见的设备 ID、名称和平台。登记不代表在线，不返回地址、令牌或 SSH 信息。
-- prepare_device(device_id, workspace?) 由宿主认证执行器、解析规范工作区、冻结执行器绑定，按需加载工作区指令预览与工具定义。返回 target_id，限当前主会话、运行轮次、隐私与上下文代次，15 分钟有效；新轮次重新准备。准备目标不执行模型任务。
-- execute_device(target_id, tool, input) 可调用 Read、Write、Edit、Glob、Grep、Bash。解析时把目标和参数绑定为不可变执行动作；后续准备其他设备不能改写旧动作。敏感操作以原生工具名进入原 PermissionMiddleware，完整参数附宿主核验的 _device_target。审批卡显示实际设备和工作区；混合批次按完整参数列出各目标。审批修改不能偷偷改变已经绑定的动作。
-- inspect_device_operations(after?, limit?) 分页查看本主会话、当前隐私与上下文代次的原生操作；已撤销设备的记录不可读取。也可指定 operation_id、view=input/output、offset/chars/version 取得完整证据的有界版本化分段。宿主查询原绑定、原 invocation 回执，缺失仍是未知，不重新提交。
+- 主助手的 `Read / Write / Edit / Glob / Grep / Bash` 均要求 `device_id`；原生字段保持展开的类型化 Schema，不再通过 `execute_device(tool, input)` 包装。缺失、非法或未授权设备均拒绝，不回退到当前设备。别名与 ExecuteExtraTool 仍进入同一规范调用路径。
+- `workspace` 可选，指定时由目标执行器规范化；省略时在本轮首次受理该设备时固定设备默认工作区。同轮同一请求目标复用原绑定；设备/工作区变化不修改已绑定动作。定时设备任务仍固定原计划的设备和工作区。
+- `list_devices` 返回当前 OAuth 用户可见的设备 ID、名称、平台及默认工作区。登记不代表在线，不返回地址、令牌或 SSH 信息。
+- `prepare_device(device_id, workspace?)` 是可选的环境与项目资料查询，认证执行器并返回有界环境、项目指令及主助手工具 Schema；直接执行不需要先调用它。工作区资料保留来源、长度、截断和版本。
+- 宿主在 PermissionMiddleware 前解析真实用户、设备、规范工作区和原生参数，生成一次性调用绑定；审批看到原生工具名、完整参数及宿主核验的 `_device_target`。模型不能提供宿主保留字段，审批或后续参数修改也不能改绑调用。
+- `GetExecution / CancelExecution` 在主助手侧同样要求 `device_id`，以 `task_id` 查询原操作账本并恢复原执行器绑定；不能拿设备 B 的身份查询设备 A 的任务。取消意图先持久保存，结果未知时只查询，重复请求不重复提交取消。执行 Agent 的同名工具继续使用原固定环境。
+- `inspect_device_operations(after?, limit?)` 分页查看本主会话、当前隐私与上下文代次的原生操作；已撤销设备的记录不可读取。也可指定 operation_id、view=input/output、offset/chars/version 取得完整证据的有界版本化分段。宿主查询原绑定、原 invocation 回执，缺失仍是未知，不重新提交。此工具读取云端账本，无需设备参数。
+- 执行 Agent 的原生工具 Schema 没有 `device_id / workspace`。宿主在审批前拒绝这些覆盖参数，使用派发和执行会话中固定的真实设备、工作区及权限。
 
-原设备原生工具和显式目标共用 cloud_native_operations。记录发起用户、主会话/物理窗口、轮次、可选任务 ID、模型 call ID、真实 invocation ID、原执行器绑定、精确输入及指纹，区分提交未知、运行或未知和已确认。首次输出与后来查询回执分开保存。数据不自动进入个人记忆。
+所有设备操作共用 cloud_native_operations。记录发起用户、主会话/物理窗口、轮次、可选任务 ID、模型 call ID、真实 invocation ID、原执行器绑定、精确输入及指纹，区分提交未知、运行或未知和已确认。首次输出与后来查询回执分开保存。数据不自动进入个人记忆。
 
 ## 资源与权限
 
@@ -21,4 +25,4 @@ Write、Edit、Bash 共用整台设备修改占用。执行任务预占的设备
 
 ## 验证状态
 
-202 项定向回归通过；跨设备联调覆盖两次准备后的目标固定、实际目标审批、无委派直接写入、原主会话设备不变、缺失原回执跨重启只查询，以及与后台任务共用设备修改占用。最终组合联调与严格检查结果见 [完整验收记录](execution-continuity-verification.md)。
+2026-10-28 定向回归通过：模拟模型与本地执行器覆盖显式设备必填、越权/伪造目标拒绝、未选择默认设备的主会话直接执行、实际目标审批、原操作查询、重复取消只提交一次、执行者固定环境、未知结果重启查询及共用设备修改占用。主会话生命周期、工作区、网页/QQ 审批、原生循环与装配回归通过；cargo fmt 和 peri-cloud / peri-executor / peri-remote-tools 的严格 all-targets Clippy 通过。未运行全量测试，不包含真实模型调用或生产升级。

@@ -231,7 +231,7 @@ impl WorkerService {
         }
         Ok(())
     }
-    async fn query_native(&self, id: Uuid) -> Result<()> {
+    pub(super) async fn query_native(&self, id: Uuid) -> Result<()> {
         let row=sqlx::query("SELECT principal,source_session,turn_id,call_id,task_id,frozen_json,invocation_id,tool FROM cloud_native_operations WHERE id=? AND state!='confirmed'").bind(id.to_string()).fetch_optional(&self.store.pool).await?;
         let Some(row) = row else {
             return Ok(());

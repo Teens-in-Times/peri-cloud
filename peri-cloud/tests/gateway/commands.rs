@@ -106,7 +106,7 @@ async fn failed_compact_preserves_context_and_new_selects_an_independent_session
     let f = Fixture::new(vec![
         answer("previous"),
         answer("   "),
-        tool_write(),
+        main_tool_write(),
         answer("denied"),
     ])
     .await;

@@ -64,9 +64,11 @@ def selected(source):
         result.append(f"### {source}:{line}\n\n~~~text\n{value}\n~~~")
     return "\n\n".join(result)
 
+TOOL_GUIDE = '<!-- PERI-EDIT-GUIDE:BEGIN -->\n> **编辑说明（正式交付时清除）**\n> - 功能：工具使用契约。\n> - 作用位置：工具目录的 description/schema。\n> - 应当写：写何时使用、参数含义、返回值及失败处理；工具名与 schema 字段须和实现一致。\n> - 正文中可用 {{宏名}} 标记需求；未实现宏先作为设计标记。保留本段之外的正文作为创作内容。\n<!-- PERI-EDIT-GUIDE:END -->\n\n'
+
 def tool_contract(source):
     text = read(source).split("#[cfg(test)]")[0]
-    chunks = ["# 工具说明与参数契约\n\n正文为原始工具说明，参数部分为 Rust 生成表达式，字段身份与校验仍由代码保证。\n"]
+    chunks = [TOOL_GUIDE + "# 工具说明与参数契约\n\n正文为原始工具说明，参数部分为 Rust 生成表达式，字段身份与校验仍由代码保证。\n"]
     for method in ("description", "parameters", "prompt_declaration", "prompt_sections", "prompt_contribution"):
         for start, body in functions(text, method):
             line = text.count("\n", 0, start) + 1
@@ -94,7 +96,7 @@ ARCHITECTURE = """# 项目架构参考
 
 用户 ↔ 云端主助手 ↔ 云端执行者 ↔ 设备执行器
 
-主助手负责聊天、理解意图和统筹任务；小操作可直接调用设备执行器，复杂任务交给执行者，派活后仍能继续聊天。执行者可以复用会话、换窗续接，并与主助手双向沟通。设备端只负责执行工具。
+主助手负责聊天、理解意图和统筹任务；小操作通过显式填写 device_id 的原生工具调用设备执行器，prepare_device 用于可选的环境查询；复杂任务交给执行者，派活后仍能继续聊天。执行者的设备与工作区由宿主固定，工具不需要设备参数。执行者可以复用会话、换窗续接，并与主助手双向沟通。设备端只负责执行工具。
 
 宿主提供任务与操作记录、权限审批、个人记忆、调度和消息渠道。个人记忆与任务历史分开；主助手保留摘要式压缩，执行者根据任务事实和交接材料继续工作。
 
@@ -248,7 +250,7 @@ def main():
     def put(name, text, sources=(), kind="active-protocol"):
         entry = by_name.get(name)
         path = OUT / name
-        if path.exists() and entry and (entry.get("user_edited") or digest(path) != entry["export_sha256"]):
+        if path.exists() and entry and (entry.get("user_edited") or (digest(path) != entry["export_sha256"] and path.read_text("utf-8") != text.rstrip() + "\n")):
             print("preserved user edit: " + name)
             entry["user_edited"] = True
             return
@@ -260,10 +262,19 @@ def main():
         path.write_text(text.rstrip() + "\n", encoding="utf-8", newline="\n")
         entry["sources"] = [{"path": s, "sha256": digest(ROOT / s)} for s in sources]
         entry["export_sha256"] = digest(path)
+    for entry in list(entries):
+        sources = entry.get("sources", [])
+        if entry.get("kind") == "active-tool-contract" and len(sources) == 1:
+            source = sources[0]["path"]
+            if source.endswith(".rs") and (ROOT / source).is_file():
+                put(entry["file"], tool_contract(source), [source], "active-tool-contract")
     archive_tool_source = "peri-cloud/src/archive/tool.rs"
     put("tools/peri-cloud--archive-tool.md", tool_contract(archive_tool_source), [archive_tool_source], "active-tool-contract")
     task_tool_source="peri-cloud/src/tasks/tools.rs"
     put("tools/peri-cloud--tasks-tools.md",tool_contract(task_tool_source),[task_tool_source],"active-tool-contract")
+    for source in ("peri-cloud/src/tasks/devices.rs", "peri-cloud/src/tasks/device_routing.rs"):
+        name = "tools/peri-cloud--tasks-" + Path(source).stem.replace("_", "-") + ".md"
+        put(name, tool_contract(source), [source], "active-tool-contract")
     put("01-host-base.md", read("peri-cloud/prompts/base.md"), ["peri-cloud/prompts/base.md"], "active-default")
     for name, source in [("02-main.md", "peri-cloud/prompts/main.md"), ("03-worker.md", "peri-cloud/prompts/worker.md")]:
         put(name, read(source), [source], "active-role")
@@ -332,7 +343,7 @@ def main():
     e["export_sha256"] = digest(p)
     manifest["source_commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     manifest["source_snapshot"] = "working tree, source hashes recorded per document"
-    (OUT / "source-map.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (OUT / "source-map.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
     print(json.dumps({"documents": len(entries), "authoring_collection": "PROMPTS-EDIT.md"}, ensure_ascii=False))
 
 if __name__ == "__main__":

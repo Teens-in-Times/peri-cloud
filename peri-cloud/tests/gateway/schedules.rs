@@ -213,9 +213,9 @@ async fn unknown_schedule_delivery_is_visible_and_never_retried_even_after_resta
 #[tokio::test]
 async fn schedule_task_preserves_exact_approval_cancel_and_device_identity() {
     let f = Fixture::new(vec![
-        tool_write(),
+        main_tool_write(),
         answer("已经写入。"),
-        tool_write(),
+        main_tool_write(),
         answer("停止处理。"),
     ])
     .await;

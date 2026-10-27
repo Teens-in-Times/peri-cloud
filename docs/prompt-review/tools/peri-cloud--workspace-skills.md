@@ -10,19 +10,19 @@
 
 正文为原始工具说明，参数部分为 Rust 生成表达式，字段身份与校验仍由代码保证。
 
-## description · peri-cloud/src/workspace/skills.rs:103
+## description · peri-cloud/src/workspace/skills.rs:106
 
 ~~~text
 Load a project, account or operator skill by catalog name or scoped path. Use DiscoverSkillsTool first if you do not know the name. Global skill paths are cloud guidance references, not target-device filesystem paths.
 ~~~
 
-## description · peri-cloud/src/workspace/skills.rs:172
+## description · peri-cloud/src/workspace/skills.rs:175
 
 ~~~text
 List effective authorized skills with stable IDs and source references. Filter by query; include_shadowed optionally exposes explicitly selectable alternatives.
 ~~~
 
-## parameters · peri-cloud/src/workspace/skills.rs:108
+## parameters · peri-cloud/src/workspace/skills.rs:111
 
 ~~~rust
 fn parameters(&self) -> Value {
@@ -39,7 +39,7 @@ fn parameters(&self) -> Value {
     }
 ~~~
 
-## parameters · peri-cloud/src/workspace/skills.rs:176
+## parameters · peri-cloud/src/workspace/skills.rs:179
 
 ~~~rust
 fn parameters(&self) -> Value {
@@ -56,7 +56,7 @@ fn parameters(&self) -> Value {
     }
 ~~~
 
-## prompt_declaration · peri-cloud/src/workspace/skills.rs:133
+## prompt_declaration · peri-cloud/src/workspace/skills.rs:136
 
 ~~~rust
 fn prompt_declaration(&self) -> Option<String> {
@@ -68,7 +68,7 @@ fn prompt_declaration(&self) -> Option<String> {
     }
 ~~~
 
-## prompt_declaration · peri-cloud/src/workspace/skills.rs:197
+## prompt_declaration · peri-cloud/src/workspace/skills.rs:200
 
 ~~~rust
 fn prompt_declaration(&self) -> Option<String> {
@@ -80,7 +80,7 @@ fn prompt_declaration(&self) -> Option<String> {
     }
 ~~~
 
-## prompt_sections · peri-cloud/src/workspace/skills.rs:48
+## prompt_sections · peri-cloud/src/workspace/skills.rs:51
 
 ~~~rust
 fn prompt_sections(&self) -> Vec<PromptSection> {
@@ -93,7 +93,7 @@ fn prompt_sections(&self) -> Vec<PromptSection> {
     }
 ~~~
 
-## prompt_contribution · peri-cloud/src/workspace/skills.rs:57
+## prompt_contribution · peri-cloud/src/workspace/skills.rs:60
 
 ~~~rust
 fn prompt_contribution(&self) -> Option<String> {

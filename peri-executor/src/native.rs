@@ -20,46 +20,12 @@ impl NativeTools {
         let cwd = binding.workspace.clone();
         Self {
             binding,
-            tools: vec![
-                Arc::new(ReadFileTool::new(cwd.clone())),
-                Arc::new(WriteFileTool::new(cwd.clone())),
-                Arc::new(EditFileTool::new(cwd.clone())),
-                Arc::new(GlobFilesTool::new(cwd.clone())),
-                Arc::new(GrepTool::new(cwd)),
-            ],
+            tools: file_tools(cwd),
         }
     }
 
     pub fn descriptors(&self) -> Vec<NativeToolDescriptor> {
-        let mut tools: Vec<_> = self
-            .tools
-            .iter()
-            .map(|tool| NativeToolDescriptor {
-                definition: tool.definition(),
-                aliases: tool.aliases().iter().map(|s| (*s).into()).collect(),
-                namespace: tool.namespace().map(str::to_owned),
-                is_direct: tool.is_direct(),
-                output_char_limit: tool.output_char_limit(),
-                prefers_persist: tool.prefers_persist(),
-                context_retention: tool.context_retention(),
-                prompt_declaration: tool.prompt_declaration(),
-            })
-            .collect();
-        tools.push(NativeToolDescriptor {
-            definition: ToolDefinition {
-                name: "Bash".into(),
-                description: BASH_DESCRIPTION.into(),
-                parameters: bash_parameters(),
-            },
-            aliases: vec!["Shell".into()],
-            namespace: Some("execution".into()),
-            is_direct: true,
-            output_char_limit: Some(10_000),
-            prefers_persist: false,
-            context_retention: peri_acp_types::tools::ContextRetention::Preserve,
-            prompt_declaration: Some("Run a shell command → `{{name}}` ({{title}}).".into()),
-        });
-        tools
+        descriptors(&self.tools)
     }
 
     pub fn validate(&self, request: &SubmitJob) -> Result<()> {
@@ -132,4 +98,50 @@ impl NativeTools {
 
 pub(crate) fn is_shell(name: &str) -> bool {
     name.eq_ignore_ascii_case("Bash") || name.eq_ignore_ascii_case("Shell")
+}
+
+fn file_tools(cwd: String) -> Vec<Arc<dyn BaseTool>> {
+    vec![
+        Arc::new(ReadFileTool::new(cwd.clone())),
+        Arc::new(WriteFileTool::new(cwd.clone())),
+        Arc::new(EditFileTool::new(cwd.clone())),
+        Arc::new(GlobFilesTool::new(cwd.clone())),
+        Arc::new(GrepTool::new(cwd)),
+    ]
+}
+
+/// Protocol schemas only; constructing the catalog performs no filesystem or shell operations.
+pub fn native_tool_catalog() -> Vec<NativeToolDescriptor> {
+    descriptors(&file_tools(String::new()))
+}
+
+fn descriptors(files: &[Arc<dyn BaseTool>]) -> Vec<NativeToolDescriptor> {
+    let mut tools: Vec<_> = files
+        .iter()
+        .map(|tool| NativeToolDescriptor {
+            definition: tool.definition(),
+            aliases: tool.aliases().iter().map(|s| (*s).into()).collect(),
+            namespace: tool.namespace().map(str::to_owned),
+            is_direct: tool.is_direct(),
+            output_char_limit: tool.output_char_limit(),
+            prefers_persist: tool.prefers_persist(),
+            context_retention: tool.context_retention(),
+            prompt_declaration: tool.prompt_declaration(),
+        })
+        .collect();
+    tools.push(NativeToolDescriptor {
+        definition: ToolDefinition {
+            name: "Bash".into(),
+            description: BASH_DESCRIPTION.into(),
+            parameters: bash_parameters(),
+        },
+        aliases: vec!["Shell".into()],
+        namespace: Some("execution".into()),
+        is_direct: true,
+        output_char_limit: Some(10_000),
+        prefers_persist: false,
+        context_retention: peri_acp_types::tools::ContextRetention::Preserve,
+        prompt_declaration: Some("Run a shell command → `{{name}}` ({{title}}).".into()),
+    });
+    tools
 }
