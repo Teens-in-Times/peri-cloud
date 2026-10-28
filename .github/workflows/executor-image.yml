@@ -23,8 +23,8 @@ jobs:
         shell: bash
         run: |
           [[ "$ARTIFACT_RUN_ID" =~ ^[0-9]+$ ]]
-          gh run view "$ARTIFACT_RUN_ID" --repo "$GITHUB_REPOSITORY" --json event,headBranch,headSha,jobs > run.json
-          source_commit=$(python3 -c 'import json; r=json.load(open("run.json")); assert r["event"]=="push" and r["headBranch"]=="main"; j=next(j for j in r["jobs"] if j["name"]=="cloud-executor (windows-latest)"); required={"Cloud and executor regression tests","Clippy","Format"}; assert j["conclusion"]=="success" and required <= {s["name"] for s in j["steps"] if s["conclusion"]=="success"}; linux=next(j for j in r["jobs"] if j["name"]=="cloud-executor (ubuntu-22.04)"); assert linux["conclusion"]=="success"; print(r["headSha"])')
+          gh run view "$ARTIFACT_RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion,event,headBranch,headSha,jobs > run.json
+          source_commit=$(python3 -c 'import json; r=json.load(open("run.json")); assert r["conclusion"]=="success" and r["event"]=="push" and r["headBranch"]=="main"; j=next(j for j in r["jobs"] if j["name"]=="cloud-executor (windows-latest)"); required={"Cloud and executor regression tests","Clippy","Format"}; assert j["conclusion"]=="success" and required <= {s["name"] for s in j["steps"] if s["conclusion"]=="success"}; linux=next(j for j in r["jobs"] if j["name"] in {"native-build (ubuntu-22.04)","cloud-executor (ubuntu-22.04)"}); assert linux["conclusion"]=="success"; print(r["headSha"])')
           git diff --exit-code "$source_commit" HEAD -- Cargo.toml Cargo.lock 'peri-*/src' npm-packages
       - name: Download verified native binary
         run: gh run download "$ARTIFACT_RUN_ID" --repo "$GITHUB_REPOSITORY" --name native-ubuntu-22.04 --dir native
