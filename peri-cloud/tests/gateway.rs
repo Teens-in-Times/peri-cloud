@@ -71,6 +71,7 @@ struct Script {
     replies: Mutex<VecDeque<String>>,
     requests: Mutex<Vec<Value>>,
     review_requests: Mutex<Vec<Value>>,
+    review_ids: Mutex<Vec<String>>,
     review_replies: Mutex<VecDeque<String>>,
     hold_review: AtomicBool,
     review_waiting: Notify,
@@ -144,10 +145,17 @@ async fn model_request(
                 answer("No pending approval."),
             );
         };
+        let release = script.review_release.notified();
+        tokio::pin!(release);
+        release.as_mut().enable();
+        script
+            .review_ids
+            .lock()
+            .push(pending["request_id"].as_str().unwrap().to_owned());
         script.review_requests.lock().push(request);
         if script.hold_review.load(Ordering::SeqCst) {
             script.review_waiting.notify_one();
-            script.review_release.notified().await;
+            release.await;
         }
         // The mock emits a typed tool call. Legacy scenario fixtures only supply
         // decision values; production never parses free-form assistant approval.
