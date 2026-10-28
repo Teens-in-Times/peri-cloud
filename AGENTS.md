@@ -17,7 +17,7 @@ Run the targeted tests documented in README.md, cargo fmt, and clippy for change
 Add regression tests for changed execution/authentication behavior, rather than tests mirroring CSS.
 Keep source/test files below 1000 lines; generated workflow artifacts are exempt.
 
-Upstream source: KonghaYao/peri, revision dcd4d116a12dacdc8db41ec5d1387c6bbe874fdd.
+Upstream source: KonghaYao/peri, revision de1a93ab538b2a695c548b5460ced7371c8e7cc4.
 This distribution contains modified source; preserve LICENSE, NOTICE and third-party attribution.
 The overlay manifest and allowed production patches live in docs/upstream/.
 Build with scripts/cargo-rmcp-patched.sh so the pinned rmcp patch is applied.

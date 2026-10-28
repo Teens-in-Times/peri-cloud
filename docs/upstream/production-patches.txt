@@ -65,3 +65,6 @@ peri-resources/src/sessions/sqlite_store/session_data/port.rs
 
 # Manual dcd4d116 sync: isolate cancellation regression to keep tests below 1000 lines.
 peri-agent/src/session/subagent/run_sync_test.rs
+
+# Manual de1a93ab sync: compile the Unix-only OAuth fixture helper only on Unix.
+mcp-packages/credentials/src/model_auth/oauth.rs
