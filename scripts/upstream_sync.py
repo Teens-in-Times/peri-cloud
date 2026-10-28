@@ -133,6 +133,38 @@ def write_report(output: Path, report: dict) -> dict:
     return report
 
 
+def attribution_changes(repo: Path, base: str, head: str, names: list[bytes]) -> tuple[list[str], list[str]]:
+    pattern = re.compile(r"(?:licen[cs]e|copying|notice|authors|copyright)(?:[._-].*)?\Z", re.I)
+    changed = [name.decode("utf-8") for name in names if name and any(
+        pattern.fullmatch(part) or part.casefold() == "licenses"
+        for part in name.decode("utf-8").split("/"))]
+    # A newly packaged byte-identical copy outside our source scope changes no
+    # terms. Compare Git blobs against the old trusted pin, never the new license.
+    original = git(repo, "ls-tree", base, "--", "LICENSE").stdout.split(b"\t", 1)[0]
+    copies, review = [], []
+    for name in changed:
+        safe_path(name)
+        before = git(repo, "ls-tree", base, "--", name).stdout
+        after = git(repo, "ls-tree", head, "--", name).stdout.split(b"\t", 1)[0]
+        if ("/" in name and not scoped(name) and PurePosixPath(name).name == "LICENSE"
+                and not before and original.startswith(b"100644 blob ") and after == original):
+            copies.append(name)
+        else:
+            review.append(name)
+    return review, copies
+
+
+def selected_head(repo: Path, requested: str | None) -> str:
+    latest = git(repo, "rev-parse", "refs/remotes/origin/main^{commit}").stdout.decode().strip()
+    if not requested:
+        return latest
+    if not SHA.fullmatch(requested):
+        raise ValueError("manual upstream checkpoint must be a full commit SHA")
+    if git(repo, "merge-base", "--is-ancestor", requested, latest, check=False).returncode:
+        raise ValueError("manual upstream checkpoint must belong to the fixed upstream main history")
+    return requested
+
+
 def prepare(root: Path, repo: Path, head: str, output: Path) -> dict:
     root, repo = root.resolve(), repo.resolve()
     if output.exists() and any(output.iterdir()):
@@ -154,10 +186,12 @@ def prepare(root: Path, repo: Path, head: str, output: Path) -> dict:
         report.update(state="blocked", reason="upstream history is not a descendant of the recorded pin")
         return write_report(output, report)
     changed_names = git(repo, "diff", "--name-only", "-z", base, head).stdout.split(b"\0")
-    attribution = re.compile(r"(?:licen[cs]e|copying|notice|authors|copyright)(?:[._-].*)?\Z", re.I)
-    if any(attribution.fullmatch(part) or part.casefold() == "licenses"
-           for name in changed_names if name for part in name.decode("utf-8").split("/")):
-        report.update(state="blocked", reason="upstream license/attribution changed; manual review required")
+    review, copies = attribution_changes(repo, base, head, changed_names)
+    if copies:
+        report["unchanged_license_copies"] = copies
+    if review:
+        report.update(state="blocked", reason="upstream license/attribution changed; manual review required",
+                      attribution_changes=review)
         return write_report(output, report)
     old, new = tree(repo, base), tree(repo, head)
     manifest = dict((p, digest) for digest, p in overlay.read_manifest(target(root, pin["manifest"])))
@@ -334,7 +368,7 @@ def main() -> None:
         git(args.upstream, "fetch", "--no-tags", "--filter=blob:none", "origin", "main")
         if git(args.upstream, "cat-file", "-e", pin["revision"] + "^{commit}", check=False).returncode:
             git(args.upstream, "fetch", "--no-tags", "--filter=blob:none", "origin", pin["revision"])
-        print(git(args.upstream, "rev-parse", "refs/remotes/origin/main^{commit}").stdout.decode().strip())
+        print(selected_head(args.upstream, args.head))
         return
     if args.command == "prepare":
         if args.upstream is None or args.head is None:

@@ -8,6 +8,7 @@
 
 - 工作流：`.github/workflows/upstream-sync.yml`，每日 UTC 01:17，即北京时间 09:17。GitHub schedule 为尽力调度，不能当作精确计时器。
 - 支持手工运行；`dry_run` 默认 true，仅生成差异报告和 patch artifact，不写分支、Issue 或 PR。
+- 手工运行可指定 `upstream_revision` 完整 SHA，分段审查真实上游更新；该提交必须属于固定 `KonghaYao/peri` 的 main 历史，准备阶段仍核验其为本地 pin 的后代。留空或每日定时运行始终检测最新 main，不接受其他仓库、分支名、标签或缩写 SHA。
 - 固定来源 `KonghaYao/peri` 的 main。完整 revision 与 manifest 路径保存在 `overlay.json`；范围仍由 `check-upstream.py` 的 SCOPE 定义。
 - 上游只改变范围外代码时记录情况，不创建只改 pin 的日常噪声 PR；以后有范围内变化时再从既有基线三方比较。
 
@@ -29,6 +30,7 @@ GitHub 对 `GITHUB_TOKEN` 创建的 PR 可能要求额外批准 workflow；token
 - 保留已登记的本地补丁；不自动扩大补丁白名单，不自动改根依赖约束、锁文件、rmcp 补丁、Cloud / Executor / Scheduler 实现或 CI 脚本。
 - 只额外更新来源元数据：`overlay.json`、新 manifest / 同步说明，以及 README / AGENTS / NOTICE 的来源定位。历史记录保持原样。
 - 文本、二进制、修改/删除或文件模式冲突、上游历史改写、许可证/归属变化、路径越界、symlink/submodule、大小超限或 Rust 文件达到 1000 行时停止自动发布源码。可分类冲突生成报告，无法安全读取或验证的输入使准备任务明确失败；两种情况均不发布部分源码。
+- 仅例外记录范围外新增加的 `LICENSE` 常规文件：其 Git blob 必须与旧受信上游基线的根 `LICENSE` 完全一致，且旧路径不存在。逐字副本不复制到本发行版，报告保留路径；根许可、范围内许可、已有副本修改、不同正文和符号链接仍需人工审查。阻断报告附带具体归属文件路径。
 - 上游新增文件撞上本地未跟踪/忽略文件时停止，不能把本地数据纳入候选。
 - Cargo 依赖改变可能需要人工适配。保持 `--locked`，失败留在草稿，不靠自动改锁“修绿”。
 - 同时只保留一个待审自动候选；不反复改写正在评审的分支。分支包含上游前后 revision 及本仓库基线身份，禁止 force-push。

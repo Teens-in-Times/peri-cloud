@@ -48,6 +48,7 @@ class OverlayTests(unittest.TestCase):
         init(self.up)
         self.lines = [f"// line {i}\n" for i in range(24)]
         put(self.up, SOURCE, "".join(self.lines))
+        put(self.up, "LICENSE", "fixture original license\n")
         self.base = commit(self.up)
         init(self.root)
         ours = self.lines.copy()
@@ -155,6 +156,48 @@ class OverlayTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sync.apply(child, self.out)
         self.assertFalse(sync.git(child, "status", "--porcelain").stdout)
+
+    def test_only_new_out_of_scope_exact_license_copies_skip_manual_review(self):
+        name = "npm-packages/sdk/LICENSE"
+        put(self.up, name, "fixture original license\n")
+        head = self.incoming()
+        result = sync.prepare(self.root, self.up, head, self.out)
+        self.assertEqual(result["state"], "prepared")
+        self.assertEqual(result["unchanged_license_copies"], [name])
+        self.assertNotIn(name, result["files"])
+        # Edits to existing copies still need review. Symlinks cannot qualify.
+        cases = [
+            (self.base, name, "changed terms\n"),
+            (self.base, "LICENSE", "changed terms\n"),
+            (self.base, "peri-acp-types/LICENSE", "fixture original license\n"),
+            (head, name, "changed again\n"),
+        ]
+        for base, path, content in cases:
+            with self.subTest(path=path, base=base):
+                put(self.up, path, content)
+                next_head = commit(self.up)
+                names = sync.git(self.up, "diff", "--name-only", "-z", base, next_head).stdout.split(b"\0")
+                review, _ = sync.attribution_changes(self.up, base, next_head, names)
+                self.assertIn(path, review)
+        digest = sync.git(self.up, "rev-parse", f"{self.base}:LICENSE").stdout.decode().strip()
+        sync.git(self.up, "update-index", "--add", "--cacheinfo", f"120000,{digest},outside/LICENSE")
+        sync.git(self.up, "commit", "-qm", "fixture license symlink")
+        next_head = sync.git(self.up, "rev-parse", "HEAD").stdout.decode().strip()
+        review, _ = sync.attribution_changes(self.up, self.base, next_head, [b"outside/LICENSE"])
+        self.assertEqual(review, ["outside/LICENSE"])
+
+    def test_manual_checkpoint_is_a_full_commit_in_fixed_upstream_main_history(self):
+        head = self.incoming()
+        sync.git(self.up, "update-ref", "refs/remotes/origin/main", head)
+        self.assertEqual(sync.selected_head(self.up, None), head)
+        self.assertEqual(sync.selected_head(self.up, self.base), self.base)
+        for invalid in ("main", head[:8], "x" * 40):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                sync.selected_head(self.up, invalid)
+        put(self.up, SOURCE, "fixture unrelated branch")
+        other = commit(self.up)
+        with self.assertRaises(ValueError):
+            sync.selected_head(self.up, other)
 
     def test_unchanged_or_an_existing_pending_review_has_no_remote_writes(self):
         sync.prepare(self.root, self.up, self.base, self.out)
