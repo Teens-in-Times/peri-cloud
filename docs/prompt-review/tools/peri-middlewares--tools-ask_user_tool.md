@@ -10,9 +10,9 @@
 
 正文为原始工具说明，参数部分为 Rust 生成表达式，字段身份与校验仍由代码保证。
 
-## description · peri-middlewares/src/tools/ask_user_tool.rs:105
+## description · peri-middlewares/src/tools/ask_user_tool.rs:109
 
-## parameters · peri-middlewares/src/tools/ask_user_tool.rs:109
+## parameters · peri-middlewares/src/tools/ask_user_tool.rs:113
 
 ~~~rust
 fn parameters(&self) -> Value {
@@ -20,7 +20,7 @@ fn parameters(&self) -> Value {
     }
 ~~~
 
-## prompt_declaration · peri-middlewares/src/tools/ask_user_tool.rs:98
+## prompt_declaration · peri-middlewares/src/tools/ask_user_tool.rs:102
 
 ~~~rust
 fn prompt_declaration(&self) -> Option<String> {

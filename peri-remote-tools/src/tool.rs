@@ -77,21 +77,13 @@ pub(crate) struct ControlTool {
 #[async_trait]
 impl BaseTool for ControlTool {
     fn name(&self) -> &str {
-        if self.cancel {
-            "CancelExecution"
-        } else {
-            "GetExecution"
-        }
+        control_name(self.cancel)
     }
     fn description(&self) -> &str {
-        if self.cancel {
-            "Request cancellation of a task on this session's device. The request does not prove that the task has stopped; query its actual status."
-        } else {
-            "Query a previously admitted task on this session's device. Use its task_id to recover after a disconnect or wait deadline, without executing the operation again."
-        }
+        control_description(self.cancel)
     }
     fn parameters(&self) -> Value {
-        json!({"type":"object", "properties":{"task_id":{"type":"string","format":"uuid"}},"required":["task_id"],"additionalProperties":false})
+        control_parameters()
     }
     fn namespace(&self) -> Option<&str> {
         Some("execution")
@@ -127,4 +119,43 @@ impl BaseTool for ControlTool {
         let job = self.session.task(id, self.cancel).await?;
         Ok(snapshot_output(job))
     }
+}
+
+fn control_name(cancel: bool) -> &'static str {
+    if cancel {
+        "CancelExecution"
+    } else {
+        "GetExecution"
+    }
+}
+fn control_description(cancel: bool) -> &'static str {
+    if cancel {
+        "Request cancellation of a task on this session's device. The request does not prove that the task has stopped; query its actual status."
+    } else {
+        "Query a previously admitted task on this session's device. Use its task_id to recover after a disconnect or wait deadline, without executing the operation again."
+    }
+}
+fn control_parameters() -> Value {
+    json!({"type":"object", "properties":{"task_id":{"type":"string","format":"uuid"}},"required":["task_id"],"additionalProperties":false})
+}
+
+/// Control schemas without opening a device session or submitting an operation.
+pub fn control_tool_catalog() -> Vec<NativeToolDescriptor> {
+    [false, true]
+        .into_iter()
+        .map(|cancel| NativeToolDescriptor {
+            definition: peri_acp_types::tools::ToolDefinition {
+                name: control_name(cancel).into(),
+                description: control_description(cancel).into(),
+                parameters: control_parameters(),
+            },
+            aliases: vec![],
+            namespace: Some("execution".into()),
+            is_direct: true,
+            output_char_limit: Some(10_000),
+            prefers_persist: false,
+            context_retention: ContextRetention::StateBearing,
+            prompt_declaration: None,
+        })
+        .collect()
 }

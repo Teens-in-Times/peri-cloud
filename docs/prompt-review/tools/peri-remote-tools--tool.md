@@ -12,15 +12,7 @@
 
 ## description · peri-remote-tools/src/tool.rs:25
 
-## description · peri-remote-tools/src/tool.rs:86
-
-~~~text
-Request cancellation of a task on this session's device. The request does not prove that the task has stopped; query its actual status.
-~~~
-
-~~~text
-Query a previously admitted task on this session's device. Use its task_id to recover after a disconnect or wait deadline, without executing the operation again.
-~~~
+## description · peri-remote-tools/src/tool.rs:82
 
 ## parameters · peri-remote-tools/src/tool.rs:28
 
@@ -30,11 +22,11 @@ fn parameters(&self) -> Value {
     }
 ~~~
 
-## parameters · peri-remote-tools/src/tool.rs:93
+## parameters · peri-remote-tools/src/tool.rs:85
 
 ~~~rust
 fn parameters(&self) -> Value {
-        json!({"type":"object", "properties":{"task_id":{"type":"string","format":"uuid"}},"required":["task_id"],"additionalProperties":false})
+        control_parameters()
     }
 ~~~
 

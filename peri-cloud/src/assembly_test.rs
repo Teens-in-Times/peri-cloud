@@ -53,6 +53,8 @@ impl GoalController for NoGoal {
 fn context(web: CloudWebTools) -> CloudAssemblyContext {
     CloudAssemblyContext {
         remote: None,
+        device_routing: None,
+        explicit_devices: false,
         broker: Arc::new(RejectingBroker),
         permissions: SharedPermissionMode::new(PermissionMode::Default),
         classifier: None,

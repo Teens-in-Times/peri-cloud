@@ -96,7 +96,7 @@ impl Gateway {
                     .await?
             )),
             "/pwd" => Some(format!(
-                "当前会话：{session}\n云端对话，无设备工具。需要处理文件时可通过“实例”选择设备。"
+                "当前会话：{session}\n云端对话，无默认设备。主助手可显式指定授权设备处理文件，也可通过“实例”选择默认设备。"
             )),
             "/状态" => Some(
                 match self.journal().active_turn(principal, session).await? {

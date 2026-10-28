@@ -104,6 +104,7 @@ async fn local_instance_works_without_native_oauth_and_uses_same_approval_and_re
     assert_eq!(data["devices"].as_array().unwrap().len(), 1);
     assert_eq!(data["devices"][0]["is_local"], true);
     let device = data["devices"][0]["id"].as_str().unwrap().to_owned();
+    *wire.device_id.lock() = Some(Uuid::parse_str(&device).unwrap());
     // Invited users inherit neither server execution nor service administration.
     let invite = first
         .post(&client, &account, "/api/admin/invites", json!({}))

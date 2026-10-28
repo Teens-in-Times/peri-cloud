@@ -10,9 +10,9 @@
 
 正文为原始工具说明，参数部分为 Rust 生成表达式，字段身份与校验仍由代码保证。
 
-## description · peri-middlewares/src/tools/todo.rs:135
+## description · peri-middlewares/src/tools/todo.rs:139
 
-## parameters · peri-middlewares/src/tools/todo.rs:139
+## parameters · peri-middlewares/src/tools/todo.rs:143
 
 ~~~rust
 fn parameters(&self) -> Value {
@@ -52,7 +52,7 @@ fn parameters(&self) -> Value {
     }
 ~~~
 
-## prompt_declaration · peri-middlewares/src/tools/todo.rs:128
+## prompt_declaration · peri-middlewares/src/tools/todo.rs:132
 
 ~~~rust
 fn prompt_declaration(&self) -> Option<String> {

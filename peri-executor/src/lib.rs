@@ -13,4 +13,5 @@ pub mod web;
 mod workspace;
 
 pub use error::{Error, Result};
+pub use native::native_tool_catalog;
 pub use service::Executor;

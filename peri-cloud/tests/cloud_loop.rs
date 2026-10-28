@@ -50,7 +50,21 @@ async fn model_request(
     ([(CONTENT_TYPE, "text/event-stream")], response)
 }
 
-fn tool_call(id: &str, name: &str, input: Value) -> String {
+fn tool_call(id: &str, name: &str, mut input: Value) -> String {
+    if matches!(
+        name,
+        "Read"
+            | "Write"
+            | "Edit"
+            | "Glob"
+            | "Grep"
+            | "Bash"
+            | "Shell"
+            | "GetExecution"
+            | "CancelExecution"
+    ) {
+        input["device_id"] = json!("FIXTURE_DEVICE");
+    }
     let delta = json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":input.to_string()}}]},"finish_reason":"tool_calls"}]});
     format!("data: {delta}\n\ndata: [DONE]\n\n")
 }
@@ -149,7 +163,12 @@ impl Harness {
         .await
         .unwrap();
         let script = Arc::new(Script {
-            replies: Mutex::new(responses.into()),
+            replies: Mutex::new(
+                responses
+                    .into_iter()
+                    .map(|s| s.replace("FIXTURE_DEVICE", &executor.info().device_id.to_string()))
+                    .collect(),
+            ),
             requests: Mutex::new(Vec::new()),
         });
         let model_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

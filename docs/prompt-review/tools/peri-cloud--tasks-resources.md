@@ -10,9 +10,9 @@
 
 正文为原始工具说明，参数部分为 Rust 生成表达式，字段身份与校验仍由代码保证。
 
-## description · peri-cloud/src/tasks/resources.rs:148
+## description · peri-cloud/src/tasks/resources.rs:169
 
-## parameters · peri-cloud/src/tasks/resources.rs:151
+## parameters · peri-cloud/src/tasks/resources.rs:172
 
 ~~~rust
 fn parameters(&self) -> serde_json::Value {
@@ -20,7 +20,7 @@ fn parameters(&self) -> serde_json::Value {
     }
 ~~~
 
-## prompt_declaration · peri-cloud/src/tasks/resources.rs:175
+## prompt_declaration · peri-cloud/src/tasks/resources.rs:216
 
 ~~~rust
 fn prompt_declaration(&self) -> Option<String> {

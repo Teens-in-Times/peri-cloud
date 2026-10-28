@@ -175,7 +175,8 @@ async fn model(
         _ => panic!("unexpected model request"),
     };
     let delta = match call {
-        Some((id, name, input)) => {
+        Some((id, name, mut input)) => {
+            input["device_id"] = json!(wire.executor.info().device_id);
             json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":input.to_string()}}]},"finish_reason":"tool_calls"}]})
         }
         None => {

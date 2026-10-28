@@ -37,7 +37,7 @@ async fn approval_wait_releases_capacity_for_another_execution_session_of_the_sa
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             f.c().gateway.dispatch().await.unwrap();
-            if f.script.review_requests.lock().len() == 1 {
+            if !f.script.review_requests.lock().is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -82,9 +82,21 @@ async fn approval_wait_releases_capacity_for_another_execution_session_of_the_sa
         1,
         "another logical execution session used the released slot"
     );
-    assert_eq!(f.script.review_requests.lock().len(), 1);
-    f.script.hold_review.store(false, Ordering::SeqCst);
-    f.script.review_release.notify_one();
+    // A bounded control turn may expire and reread the same pending approval.
+    // Exercise that path while the independent task still holds execution capacity.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            f.c().gateway.dispatch().await.unwrap();
+            if f.script.review_ids.lock().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the unresolved approval gets a bounded review retry");
+    let review_ids = f.script.review_ids.lock().clone();
+    assert!(review_ids.iter().all(|id| id == &review_ids[0]));
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
@@ -92,6 +104,19 @@ async fn approval_wait_releases_capacity_for_another_execution_session_of_the_sa
         )
         .await
         .unwrap();
+    let pending: Vec<(String, String)> =
+        sqlx::query_as("SELECT id,task_id FROM agent_task_approvals WHERE state='reviewing'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let first_task = delegate_receipt(&f.script.requests.lock()[1])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(pending, vec![(review_ids[0].clone(), first_task)]);
+    f.script.hold_review.store(false, Ordering::SeqCst);
+    // Expired HTTP requests can leave mock handlers waiting on the server.
+    f.script.review_release.notify_waiters();
     tokio::time::timeout(Duration::from_secs(15),async {loop {
         f.c().gateway.dispatch().await.unwrap();
         let waiting:i64=sqlx::query_scalar("SELECT COUNT(*) FROM agent_tasks WHERE json_extract(record_json,'$.state')='waiting_capacity'").fetch_one(&pool).await.unwrap();

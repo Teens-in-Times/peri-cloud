@@ -13,6 +13,8 @@ mod delivery_tests;
 mod detached_tests;
 #[path = "execution_devices.rs"]
 mod device_tests;
+#[path = "explicit_devices.rs"]
+mod explicit_device_tests;
 #[path = "execution_history.rs"]
 mod history_tests;
 #[path = "execution_observation.rs"]

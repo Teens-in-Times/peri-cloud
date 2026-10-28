@@ -525,7 +525,7 @@ async fn qq_text_fallback_submits_multiple_options_without_native_buttons() {
 
 #[tokio::test]
 async fn qq_approval_detail_is_read_only_and_text_allow_is_exactly_once() {
-    let f = Fixture::new(vec![tool_write(), answer("创建完成")]).await;
+    let f = Fixture::new(vec![main_tool_write(), answer("创建完成")]).await;
     f.pair().await;
     f.select("approval-select", 0).await;
     f.adapter.attempts.lock().clear();

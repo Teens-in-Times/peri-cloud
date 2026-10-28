@@ -4,9 +4,9 @@ use super::*;
 async fn browser_and_chat_share_task_admission_approval_results_and_idempotence() {
     let f = Fixture::new_for(
         vec![
-            tool_write(),
+            main_tool_write(),
             answer("写入成功。"),
-            tool_write(),
+            main_tool_write_for(1),
             answer("已取消。"),
         ],
         true,

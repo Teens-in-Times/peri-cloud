@@ -10,7 +10,7 @@
 
 正文为原始工具说明，参数部分为 Rust 生成表达式，字段身份与校验仍由代码保证。
 
-## description · peri-cloud/src/tasks/deliverables.rs:395
+## description · peri-cloud/src/tasks/deliverables.rs:404
 
 ~~~text
 record_artifact
@@ -40,7 +40,7 @@ Main assistant reviews a completed execution against latest requirements. Accept
 Inspect bounded task artifacts, validation evidence and acceptance history. accepted is computed against current instructions and receipt versions, separately from loop completion. Evidence is point-in-time, not continuous filesystem monitoring.
 ~~~
 
-## parameters · peri-cloud/src/tasks/deliverables.rs:403
+## parameters · peri-cloud/src/tasks/deliverables.rs:412
 
 ~~~rust
 fn parameters(&self) -> Value {
