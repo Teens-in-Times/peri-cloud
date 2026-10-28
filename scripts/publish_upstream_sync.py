@@ -87,6 +87,7 @@ def publish(root: Path, folder: Path, github: GitHub) -> str:
         body = (marker + "\n\n自动同步需要人工处理；未创建源码分支或 PR。\n\n"
                 f"上游：`{base}` → `{head}`。\n\n```json\n" + display({
                     "state": state, "reason": report.get("reason"), "conflicts": report.get("conflicts", []),
+                    "attribution_changes": report.get("attribution_changes", []),
                     "conflict_count": report.get("conflict_count", 0)}) + "\n```\n\n"
                 "请保留本地权限、身份、任务恢复与工作区语义；不要将无冲突当作验收。")
         issue = github.api("issues", {"title": f"上游同步需人工处理：{base[:8]} → {head[:8]}", "body": body})

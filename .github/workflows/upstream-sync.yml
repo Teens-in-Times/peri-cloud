@@ -9,6 +9,10 @@ on:
         description: Only prepare a report and patch; do not write branches, issues or PRs
         type: boolean
         default: true
+      upstream_revision:
+        description: Optional full SHA checkpoint in upstream main history; empty means latest main
+        type: string
+        default: ''
 permissions:
   contents: read
 concurrency:
@@ -28,8 +32,10 @@ jobs:
       - name: Prepare bounded three-way source candidate
         id: candidate
         shell: bash
+        env:
+          UPSTREAM_REVISION: ${{ inputs.upstream_revision }}
         run: |
-          head=$(python3 scripts/upstream_sync.py fetch --upstream "$RUNNER_TEMP/peri-upstream" --output "$RUNNER_TEMP/peri-candidate")
+          head=$(python3 scripts/upstream_sync.py fetch --upstream "$RUNNER_TEMP/peri-upstream" --output "$RUNNER_TEMP/peri-candidate" --head "$UPSTREAM_REVISION")
           python3 scripts/upstream_sync.py prepare --upstream "$RUNNER_TEMP/peri-upstream" --head "$head" --output "$RUNNER_TEMP/peri-candidate"
           python3 - <<'PY'
           import json, os
