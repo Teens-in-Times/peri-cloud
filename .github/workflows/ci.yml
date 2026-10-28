@@ -1,6 +1,7 @@
 name: CI
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -8,19 +9,69 @@ permissions:
 concurrency:
   group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  # Keep compiled artifacts separate from the wrapper's extracted patch sources.
+  CARGO_TARGET_DIR: target/ci
+  NO_PROXY: 127.0.0.1,localhost
+  RUSTUP_TOOLCHAIN: 1.99.0
 jobs:
   cloud-executor:
+    name: cloud-executor (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install tested Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Install Windows check components
+        run: rustup component add --toolchain 1.99.0 rustfmt clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          prefix-key: v1-ci-target
+          workspaces: . -> target/ci
+          key: ${{ hashFiles('patches/*.patch', 'scripts/cargo-rmcp-patched.sh') }}
+          # Automatic upstream code can read trusted caches, but cannot publish a poisoned cache.
+          save-if: ${{ !startsWith(github.head_ref || github.ref_name, 'codex/upstream-sync-') }}
+      - name: Format
+        run: cargo +1.99.0 fmt --all -- --check
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: scripts/portal-ui/package-lock.json
+      - name: Portal DOM regression tests
+        shell: pwsh
+        run: |
+          npm ci --prefix scripts/portal-ui --ignore-scripts --no-audit --no-fund
+          $env:NODE_PATH = Join-Path $pwd 'scripts/portal-ui/node_modules'
+          node scripts/check-portal-ui.cjs
+          node scripts/check-scheduler-ui.cjs
+          node scripts/check-memory-ui.cjs
+          node scripts/check-model-ui.cjs
+      - name: Upstream provenance
+        run: python scripts/check-upstream.py
+      - name: Upstream automation boundary tests
+        run: python -m unittest discover -s scripts/tests -p test_upstream_sync.py
+      - name: Cloud and executor regression tests
+        run: bash ./scripts/cargo-rmcp-patched.sh test --locked -p peri-scheduler -p peri-cloud -p peri-executor -p peri-remote-tools -p peri-tool-runtime -p peri-process -- --test-threads=1
+      - name: Peri v4 core regression tests
+        run: bash ./scripts/cargo-rmcp-patched.sh test --locked -p peri-acp-types -p peri-agent -p peri-middlewares -p peri-config -p peri-mcp-core -p peri-resources -p peri-workflow -p peri-js-runtime -- --test-threads=1
+      - name: Clippy
+        run: bash ./scripts/cargo-rmcp-patched.sh clippy --locked -p peri-scheduler -p peri-cloud -p peri-executor --all-targets --no-deps -- -D warnings
+  # Release builds run beside checks. Consumers require the entire CI run to succeed.
+  native-build:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, windows-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      CARGO_INCREMENTAL: 0
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-      NO_PROXY: 127.0.0.1,localhost
-      RUSTUP_TOOLCHAIN: 1.99.0
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -43,57 +94,22 @@ jobs:
         run: python scripts/prepare-upgrade-baseline.py --output "${{ env.PERI_UPGRADE_BASELINE }}"
       - name: Install tested Rust toolchain
         run: rustup toolchain install 1.99.0 --profile minimal
-      - name: Install Windows check components
-        if: runner.os == 'Windows'
-        run: rustup component add --toolchain 1.99.0 rustfmt clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
-          # Automatic upstream code can read trusted caches, but cannot publish a poisoned cache.
+          prefix-key: v1-ci-target
+          workspaces: . -> target/ci
+          key: ${{ hashFiles('patches/*.patch', 'scripts/cargo-rmcp-patched.sh') }}
           save-if: ${{ !startsWith(github.head_ref || github.ref_name, 'codex/upstream-sync-') }}
-      - name: Format
-        if: runner.os == 'Windows'
-        run: cargo +1.99.0 fmt --all -- --check
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        if: runner.os == 'Windows'
-        with:
-          node-version: '26'
-          cache: npm
-          cache-dependency-path: scripts/portal-ui/package-lock.json
-      - name: Portal DOM regression tests
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          npm ci --prefix scripts/portal-ui --ignore-scripts --no-audit --no-fund
-          $env:NODE_PATH = Join-Path $pwd 'scripts/portal-ui/node_modules'
-          node scripts/check-portal-ui.cjs
-          node scripts/check-scheduler-ui.cjs
-          node scripts/check-memory-ui.cjs
-          node scripts/check-model-ui.cjs
-      - name: Upstream provenance
-        if: runner.os == 'Windows'
-        run: python scripts/check-upstream.py
-      - name: Upstream automation boundary tests
-        if: runner.os == 'Windows'
-        run: python -m unittest discover -s scripts/tests -p test_upstream_sync.py
-      - name: Cloud and executor regression tests
-        if: runner.os == 'Windows'
-        run: bash ./scripts/cargo-rmcp-patched.sh test --locked -p peri-scheduler -p peri-cloud -p peri-executor -p peri-remote-tools -p peri-tool-runtime -p peri-process -- --test-threads=1
-      - name: Peri v4 core regression tests
-        if: runner.os == 'Windows'
-        run: bash ./scripts/cargo-rmcp-patched.sh test --locked -p peri-acp-types -p peri-agent -p peri-middlewares -p peri-config -p peri-mcp-core -p peri-resources -p peri-workflow -p peri-js-runtime -- --test-threads=1
-      - name: Clippy
-        if: runner.os == 'Windows'
-        run: bash ./scripts/cargo-rmcp-patched.sh clippy --locked -p peri-scheduler -p peri-cloud -p peri-executor --all-targets --no-deps -- -D warnings
       - name: Build optimized binaries
         run: bash ./scripts/cargo-rmcp-patched.sh build --release --locked -p peri-cloud --bin peri-cloud-host -p peri-executor --bin peri-executor
       - name: Record exact native source and binary digests
-        run: python scripts/record-native-build.py target/release
+        run: python scripts/record-native-build.py target/ci/release
       - name: Rehearse isolated upgrade and backup restore
         shell: bash
         run: |
           suffix=""
           if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
-          python scripts/smoke-upgrade.py --baseline "$PERI_UPGRADE_BASELINE/peri-cloud-host$suffix" --candidate "target/release/peri-cloud-host$suffix" --output "$PERI_UPGRADE_REHEARSAL"
+          python scripts/smoke-upgrade.py --baseline "$PERI_UPGRADE_BASELINE/peri-cloud-host$suffix" --candidate "target/ci/release/peri-cloud-host$suffix" --output "$PERI_UPGRADE_REHEARSAL"
       - name: Preserve non-private upgrade report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -108,16 +124,16 @@ jobs:
         with:
           name: native-${{ matrix.os }}
           path: |
-            target/release/peri-cloud-host
-            target/release/peri-cloud-host.exe
-            target/release/peri-executor
-            target/release/peri-executor.exe
-            target/release/SOURCE.json
+            target/ci/release/peri-cloud-host
+            target/ci/release/peri-cloud-host.exe
+            target/ci/release/peri-executor
+            target/ci/release/peri-executor.exe
+            target/ci/release/SOURCE.json
           if-no-files-found: error
           retention-days: 7
       - name: Linux release process smoke
         if: runner.os == 'Linux'
-        run: python3 scripts/smoke-release.py target/release peri-cloud/src/portal/assets
+        run: python3 scripts/smoke-release.py target/ci/release peri-cloud/src/portal/assets
       - name: Linux isolated executor smoke
         if: runner.os == 'Linux'
-        run: sudo env GITHUB_ACTIONS=true RUNNER_OS=Linux python3 scripts/smoke-isolated-executor.py target/release/peri-executor
+        run: sudo env GITHUB_ACTIONS=true RUNNER_OS=Linux python3 scripts/smoke-isolated-executor.py target/ci/release/peri-executor
