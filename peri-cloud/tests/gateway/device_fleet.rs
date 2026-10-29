@@ -189,6 +189,7 @@ async fn fleet_observes_actual_device_ownership_and_never_recommends_pending_mut
     let f = Fixture::new_for(vec![], true).await;
     let device = f.devices[0].id;
     f.held_submissions[0].store(true, Ordering::SeqCst);
+    f.hidden_receipts[0].store(true, Ordering::SeqCst);
     f.script.replies.lock().extend([
         execution_session_tests::call(
             "delegate_task",
@@ -251,6 +252,7 @@ async fn fleet_observes_actual_device_ownership_and_never_recommends_pending_mut
         .recommendation
         .is_none());
     f.held_submissions[0].store(false, Ordering::SeqCst);
+    f.hidden_receipts[0].store(false, Ordering::SeqCst);
     f.submission_release[0].notify_one();
     execution_session_tests::pump(&f, 5).await;
     assert_eq!(f.submissions[0].load(Ordering::SeqCst), 1);
