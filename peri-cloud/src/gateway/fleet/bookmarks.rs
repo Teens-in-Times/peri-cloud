@@ -154,7 +154,7 @@ pub(crate) async fn migrate(pool: &sqlx::SqlitePool) -> crate::state::StateResul
         return Err(crate::state::StateError::Version);
     }
     let mut tx = pool.begin().await?;
-    sqlx::query("CREATE TABLE device_workspace_bookmarks(id TEXT PRIMARY KEY,principal TEXT NOT NULL REFERENCES principals(id),device_id TEXT NOT NULL REFERENCES identity_devices(id),workspace TEXT NOT NULL,label TEXT NOT NULL,revision INTEGER NOT NULL,UNIQUE(principal,device_id,workspace))").execute(&mut *tx).await?;
+    sqlx::query("CREATE TABLE device_workspace_bookmarks(id TEXT PRIMARY KEY,principal TEXT NOT NULL REFERENCES principals(id),device_id TEXT NOT NULL REFERENCES identity_devices(id) ON DELETE CASCADE,workspace TEXT NOT NULL,label TEXT NOT NULL,revision INTEGER NOT NULL,UNIQUE(principal,device_id,workspace))").execute(&mut *tx).await?;
     sqlx::query("PRAGMA user_version=27")
         .execute(&mut *tx)
         .await?;

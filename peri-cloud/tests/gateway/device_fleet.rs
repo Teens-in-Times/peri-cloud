@@ -179,6 +179,28 @@ async fn fleet_bookmarks_are_device_scoped_versioned_and_persist_without_executi
         )
         .await
         .is_err());
+    f.c()
+        .identity
+        .delete_device(&f.c().browser, device)
+        .await
+        .unwrap();
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(f.root.path().join("cloud.sqlite")),
+    )
+    .await
+    .unwrap();
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM device_workspace_bookmarks WHERE device_id=?")
+            .bind(device.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "deleting a revoked device clears only its bookmark metadata"
+    );
+    assert!(f.workspaces[0].path().is_dir());
+    pool.close().await;
     assert!(f.script.requests.lock().is_empty());
     assert!(f.submissions.iter().all(|c| c.load(Ordering::SeqCst) == 0));
     f.finish().await;
