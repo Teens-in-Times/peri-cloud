@@ -22,6 +22,12 @@ const owner = {
   service:{name:'Tokyo control',origin:'https://control.example',version:'fixture',agent_enabled:true},
   gateways:[{adapter:'qq-fixture',label:'官方 QQBot',linked_identities:1}],
   devices:[{id:'device-1',name:'Server B',platform:'linux',default_workspace:'/srv/project',is_local:true,revoked:false}],
+  device_management:{'device-1':{
+    lease:{source:'expired',reported_at:1700000000,expires_at:1700000060},
+    check:{observed_at:1700000000,fresh:false,authenticated:true,details:{version:'fixture',protocol_version:1,tools:['Read','Write'],features:[]}},
+    work:{mutation_lease:'reserved',unconfirmed_operations:1,task_states:{waiting_capacity:1}},
+    bookmarks:[{id:'bookmark-1',workspace:'/srv/saved',label:malicious,revision:1}],known_workspaces:['/srv/recent'],recommendation:null
+  }},
   channels:[{adapter_instance_id:'qq-fixture',external_user_id:'full-identity-'+malicious}],pending_pair_claims:[]
 };
 const sessions = [1,2].map(i=>({session_id:'session-'+i,device_id:'device-1',device_name:'Server B',platform:'linux',adapter:'qq-fixture',conversation_id:'group-'+i,workspace:'/srv/project-'+i,default_workspace:'/srv',known_workspaces:[],busy:false}));
@@ -39,7 +45,7 @@ w.fetch = async (url, options) => {
   if(url==='/api/schedules') return ok([]);
   if(url==='/api/interactions') return ok(interactions);
   if(url==='/api/logout') return ok({});
-  if(url.endsWith('/connection-check')) return delayedProbe ? delayedProbe : ok({device_id:'device-1',transport:'wireguard'});
+  if(url.endsWith('/inspect')) return delayedProbe ? delayedProbe : ok({device_id:'device-1',check:{authenticated:true,observed_at:1700000000,fresh:true,details:{transport:'wireguard'}}});
   throw new Error('Unexpected API: '+url);
 };
 w.document.cookie = 'peri_csrf=fixture';
@@ -66,7 +72,14 @@ w.eval(fs.readFileSync(path.join(assets,'portal.js'),'utf8')+'\nwindow.fixture={
   assert.equal(modelForm.elements.api_key.value,'');
   assert(byId('channels').textContent.includes('full-identity-'+malicious));
   assert.equal(byId('channels').querySelectorAll('img').length,0);
-  assert.equal(requests.filter(r=>r.url.endsWith('/connection-check')).length,0,'enrollment is not a connection probe');
+  assert.equal(requests.filter(r=>r.url.endsWith('/inspect')).length,0,'enrollment is not a connection probe');
+  assert(byId('devices').textContent.includes('租约已过期'));
+  assert(byId('devices').textContent.includes('历史观测，请重新检查'));
+  assert(byId('devices').textContent.includes('等待执行额度或设备资源'));
+  assert(byId('devices').textContent.includes('原操作结果待确认'));
+  assert(!byId('devices').textContent.includes('新任务候选：'));
+  assert(byId('devices').textContent.includes(malicious));
+  assert.equal(byId('devices').querySelectorAll('img').length,0,'bookmark names are literal text');
   const details = byId('devices').querySelector('details'); details.open = true;
   w.fixture.renderAccount(owner);
   assert.equal(byId('devices').querySelector('details'),details,'polling must retain device details');
@@ -83,12 +96,17 @@ w.eval(fs.readFileSync(path.join(assets,'portal.js'),'utf8')+'\nwindow.fixture={
   assert(byId('devices').textContent.includes('已验证连接'));
   assert(byId('devices').textContent.includes('WireGuard'));
   assert.equal(byId('devices').querySelector('.connection-status').dataset.verified,'true');
+  let opened;
+  view.render(owner,{openBrowserWorkspace:(device,workspace)=>{opened={device,workspace};}});
+  [...byId('devices').querySelectorAll('button')].find(b=>b.textContent==='打开独立工作区').click();
+  assert.equal(opened.device.id,'device-1');assert.equal(opened.workspace,'/srv/saved');
+  w.fixture.renderAccount(owner);
   let complete;
   delayedProbe = new Promise(resolve => { complete = resolve; });
   [...byId('devices').querySelectorAll('button')].find(b=>b.textContent==='检查连接').click();
   await settle();
   byId('logout').click(); await settle();
-  complete(ok({device_id:'device-1',transport:'wireguard'})); await settle();
+  complete(ok({device_id:'device-1',check:{authenticated:true,observed_at:1700000000,details:{transport:'wireguard'}}})); await settle();
   assert.equal(byId('devices').children.length,0,'late probe must not restore logged-out data');
   assert.equal(byId('conversation-activity').children.length,0);
   assert.equal(byId('topology-entries').children.length,0);
@@ -98,5 +116,5 @@ w.eval(fs.readFileSync(path.join(assets,'portal.js'),'utf8')+'\nwindow.fixture={
   assert.equal(byId('admin-panel').hidden,true);
   assert.equal(byId('admin-nav').hidden,true);
   assert.equal(byId('service-controls').hidden,true);
-  console.log('PASS: topology, session ownership, partial failures, literal identities, explicit authenticated probes, logout races, member visibility');
+  console.log('PASS: topology, fleet freshness and occupancy, literal bookmarks, independent workspace targets, authenticated probes, logout races, member visibility');
 })().catch(error=>{ console.error(error); process.exitCode=1; }).finally(()=>w.close());

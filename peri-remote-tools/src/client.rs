@@ -72,6 +72,37 @@ impl DeviceClient {
         &self.device
     }
 
+    pub async fn capabilities(&self) -> Result<Option<ExecutorCapabilities>> {
+        if !self
+            .device
+            .features
+            .iter()
+            .any(|f| f == DEVICE_CAPABILITIES_FEATURE)
+        {
+            return Ok(None);
+        }
+        let result: ExecutorCapabilities =
+            self.request(Method::GET, "/v1/capabilities", None).await?;
+        if result.info.device_id != self.device.device_id
+            || result.info.protocol_version != PROTOCOL_VERSION
+            || result.info.platform != self.device.platform
+        {
+            return Err(Error::DeviceMismatch);
+        }
+        if result.tools.len() > 128
+            || result.info.features.len() > 64
+            || result.info.version.len() > 128
+            || result.info.features.iter().any(|f| f.len() > 128)
+            || result
+                .tools
+                .iter()
+                .any(|t| t.definition.name.is_empty() || t.definition.name.len() > 128)
+        {
+            return Err(Error::Protocol);
+        }
+        Ok(Some(result))
+    }
+
     /// Operator diagnostics only; never included in a model tool schema.
     pub async fn active_transport(&self) -> &'static str {
         self.connection.read().await.kind()

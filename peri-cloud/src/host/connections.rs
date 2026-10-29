@@ -174,6 +174,38 @@ impl Connections {
 
 #[async_trait]
 impl SessionConnector for Connections {
+    async fn inspect_device(
+        &self,
+        device: &DeviceRecord,
+    ) -> GatewayResult<crate::gateway::DeviceInspection> {
+        self.check_connection(device).await?;
+        let client = self.client(device.id).await?;
+        crate::gateway::inspect_client(client.as_ref()).await
+    }
+    async fn connection_lease(
+        &self,
+        principal: Uuid,
+        device: &DeviceRecord,
+    ) -> GatewayResult<crate::gateway::ConnectionLease> {
+        let lease = match &self.connections {
+            Some(store) => store.lease(principal, device.id).await?,
+            None => None,
+        };
+        Ok(crate::gateway::ConnectionLease {
+            source: if lease.is_some_and(|(_, expires)| expires > unix_now()) {
+                "reported"
+            } else if self.configured.contains_key(&device.id) {
+                "configured"
+            } else if lease.is_some() {
+                "expired"
+            } else {
+                "none"
+            }
+            .into(),
+            reported_at: lease.map(|l| l.0),
+            expires_at: lease.map(|l| l.1),
+        })
+    }
     fn context_assembler(&self) -> Option<Arc<crate::context::ContextAssembler>> {
         self.native.context_assembler()
     }

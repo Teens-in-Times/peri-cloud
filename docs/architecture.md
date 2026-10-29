@@ -1,5 +1,7 @@
 # 架构与权限
 
+设备管理页按账号投影登记、连接租约、认证与能力检查、修改占用和等待原因；工作区书签独立保存，建议仅用于新任务。该视图不改变原操作目标、权限和资源协调，契约与后续重绑定设计见 [多设备管理](device-management.md)。
+
 ```mermaid
 flowchart LR
   QQ[官方 QQBot] --> QqAdapter[原有 QqAdapter]

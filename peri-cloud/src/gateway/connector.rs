@@ -7,7 +7,7 @@ use peri_model::Model;
 use peri_remote_tools::{DeviceClient, RemoteSession};
 use uuid::Uuid;
 
-use super::{GatewayError, GatewayResult};
+use super::{ConnectionLease, DeviceInspection, GatewayError, GatewayResult};
 use crate::identity::DeviceRecord;
 use crate::state::FrozenSession;
 use crate::CloudAgent;
@@ -68,6 +68,19 @@ pub trait SessionConnector: Send + Sync {
     /// Read-only identity authentication, without opening a session or a job.
     async fn check_connection(&self, _device: &DeviceRecord) -> GatewayResult<&'static str> {
         Err(GatewayError::Connection)
+    }
+    async fn inspect_device(&self, device: &DeviceRecord) -> GatewayResult<DeviceInspection> {
+        Ok(DeviceInspection {
+            transport: self.check_connection(device).await?.to_owned(),
+            ..Default::default()
+        })
+    }
+    async fn connection_lease(
+        &self,
+        _principal: Uuid,
+        _device: &DeviceRecord,
+    ) -> GatewayResult<ConnectionLease> {
+        Ok(ConnectionLease::default())
     }
     /// Bounded transport observation; never authorizes a tool or claims work.
     async fn reachability(&self, _device: &DeviceRecord) -> DeviceReachability {
@@ -157,6 +170,31 @@ impl NativeSessionConnector {
 
 #[async_trait]
 impl SessionConnector for NativeSessionConnector {
+    async fn inspect_device(&self, device: &DeviceRecord) -> GatewayResult<DeviceInspection> {
+        self.check_connection(device).await?;
+        let client = self
+            .clients
+            .read()
+            .get(&device.id)
+            .cloned()
+            .ok_or(GatewayError::Connection)?;
+        inspect_client(&client).await
+    }
+    async fn connection_lease(
+        &self,
+        _principal: Uuid,
+        device: &DeviceRecord,
+    ) -> GatewayResult<ConnectionLease> {
+        Ok(ConnectionLease {
+            source: if self.clients.read().contains_key(&device.id) {
+                "configured"
+            } else {
+                "none"
+            }
+            .into(),
+            ..Default::default()
+        })
+    }
     fn context_assembler(&self) -> Option<Arc<crate::context::ContextAssembler>> {
         Some(self.context_assembler.read().clone())
     }
@@ -291,4 +329,21 @@ impl SessionConnector for NativeSessionConnector {
         }
         Ok(Arc::new(agent))
     }
+}
+
+pub(crate) async fn inspect_client(client: &DeviceClient) -> GatewayResult<DeviceInspection> {
+    let capabilities = client
+        .capabilities()
+        .await
+        .map_err(|_| GatewayError::Connection)?;
+    Ok(DeviceInspection {
+        transport: client.active_transport().await.to_owned(),
+        protocol_version: capabilities.as_ref().map(|c| c.info.protocol_version),
+        version: capabilities.as_ref().map(|c| c.info.version.clone()),
+        features: capabilities
+            .as_ref()
+            .map(|c| c.info.features.clone())
+            .unwrap_or_default(),
+        tools: capabilities.map(|c| c.tools.into_iter().map(|t| t.definition.name).collect()),
+    })
 }

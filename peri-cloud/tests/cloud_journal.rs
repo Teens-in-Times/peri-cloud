@@ -29,6 +29,65 @@ fn binding(principal: Uuid) -> FrozenSession {
 }
 
 #[tokio::test]
+async fn device_metadata_schema_preserves_existing_26_sessions_and_request_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let principal = Uuid::new_v4();
+    let frozen = binding(principal);
+    let journal = CloudJournal::open(root.path()).await.unwrap();
+    journal
+        .bind(frozen.clone(), PermissionMode::Default)
+        .await
+        .unwrap();
+    let admitted = journal
+        .admit(
+            principal,
+            frozen.session_id,
+            "before-migration".into(),
+            MessageContent::text("keep original request"),
+        )
+        .await
+        .unwrap();
+    journal.close().await;
+    drop(journal);
+    let pool = SqlitePool::connect_with(
+        SqliteConnectOptions::new().filename(root.path().join("cloud.sqlite")),
+    )
+    .await
+    .unwrap();
+    sqlx::query("DROP TABLE device_workspace_bookmarks")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA user_version=26")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let journal = CloudJournal::open(root.path()).await.unwrap();
+    assert_eq!(
+        journal
+            .session(principal, frozen.session_id)
+            .await
+            .unwrap()
+            .frozen
+            .binding,
+        frozen.binding
+    );
+    let replay = journal
+        .admit(
+            principal,
+            frozen.session_id,
+            "before-migration".into(),
+            MessageContent::text("keep original request"),
+        )
+        .await
+        .unwrap();
+    assert!(!replay.created);
+    assert_eq!(replay.turn.turn_id, admitted.turn.turn_id);
+    journal.close().await;
+}
+
+#[tokio::test]
 async fn principal_binding_request_identity_and_exclusive_owner_are_preserved() {
     let root = tempfile::tempdir().unwrap();
     let principal = Uuid::new_v4();
@@ -481,7 +540,7 @@ async fn schema_eight_migrates_to_current_and_preserves_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 26);
+    assert_eq!(version, 27);
     let (application_id,): (i64,) = sqlx::query_as("PRAGMA application_id")
         .fetch_one(&pool)
         .await
@@ -513,7 +572,7 @@ async fn schema_eight_migrates_to_current_and_preserves_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 26);
+    assert_eq!(version, 27);
     pool.close().await;
     journal.close().await;
 }

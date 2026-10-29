@@ -40,6 +40,8 @@ mod access_tests;
 mod command_tests;
 #[path = "gateway/current_intent.rs"]
 mod current_intent_tests;
+#[path = "gateway/device_fleet.rs"]
+mod device_fleet_tests;
 #[path = "gateway/execution_sessions.rs"]
 mod execution_session_tests;
 #[path = "gateway/experience.rs"]

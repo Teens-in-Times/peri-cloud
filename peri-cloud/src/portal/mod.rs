@@ -248,6 +248,11 @@ fn build_router(portal: Portal) -> Router {
             post(topology::check_connection),
         )
         .route("/api/workspaces", get(workspaces::list))
+        .route(
+            "/api/instances/{id}/inspect",
+            post(topology::inspect_device),
+        )
+        .route("/api/instances/{id}/bookmarks", post(topology::bookmark))
         .route("/api/workspaces/open", post(tasks::open))
         .route(
             "/api/conversations/{id}/tasks",

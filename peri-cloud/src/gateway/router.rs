@@ -74,6 +74,7 @@ pub struct Gateway {
     pub(super) connector: Arc<dyn SessionConnector>,
     pub(super) adapters: HashMap<String, Arc<dyn MessageAdapter>>,
     pub(super) store: GatewayStore,
+    pub(super) device_observations: RwLock<HashMap<Uuid, super::fleet::Observation>>,
     hub: Arc<InteractionHub>,
     origins: RwLock<Origins>,
     owner: Mutex<Ownership>,
@@ -166,6 +167,7 @@ impl Gateway {
             connector,
             adapters: mapped,
             store,
+            device_observations: RwLock::new(HashMap::new()),
             hub,
             origins: RwLock::new(HashMap::new()),
             owner: Mutex::new(Ownership {
@@ -695,7 +697,7 @@ impl Gateway {
             let state = self.connector.reachability(&device).await;
             states.insert(
                 device.id.to_string(),
-                serde_json::json!({"state": state.key(), "label": state.label()}),
+                serde_json::json!({"state": state.key(), "label": state.label(), "observed_at":self.identity.now()}),
             );
         }
         Ok(states)

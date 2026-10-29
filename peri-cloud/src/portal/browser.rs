@@ -111,6 +111,10 @@ pub(super) async fn account(
         Some(gateway) => gateway.browser_gateways(&actor).await?,
         None => Vec::new(),
     };
+    let device_management = match &portal.gateway {
+        Some(gateway) => gateway.browser_device_management(&actor).await?,
+        None => std::collections::HashMap::new(),
+    };
     Ok(Json(json!({
         "service": {"name":portal.config.service_name,"origin":portal.config.origin,"version":env!("CARGO_PKG_VERSION"),"agent_enabled":portal.gateway.is_some(),"model_gateway":portal.models.as_ref().and_then(|m|m.aggregation()).is_some()},
         "gateways": gateways,
@@ -119,6 +123,7 @@ pub(super) async fn account(
         "personal_data": portal.gateway.is_some(),
         "devices": devices,
         "device_connections": device_connections,
+        "device_management": device_management,
         "channels": portal.identity.channels(&actor).await?.into_iter().filter(|c|c.adapter_instance_id!=crate::gateway::WEB_ADAPTER).collect::<Vec<_>>(),
         "pending_pair_claims": portal.identity.pending_pair_claims(&actor).await?,
     })))

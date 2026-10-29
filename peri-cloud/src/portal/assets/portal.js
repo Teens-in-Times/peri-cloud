@@ -15,6 +15,8 @@ let modelOwner = null;
 let personalRevision = 0;
 let inviteId = null;
 const errors = {
+  bookmark_conflict: '书签已更改或移除，请刷新后核对最新版本。',
+  bookmark_limit: '每台设备最多 32 个工作区书签，请先移除不再使用的快捷入口。',
   private_history: '该会话含私人资料或来源尚未分类。群聊请使用 /new 开始空白会话。',
   invalid_memory: '请检查正文和有效期。单条最多 8192 字节，搜索最多 512 字节。',
   memory_conflict: '记忆已更改，请刷新后核对最新版本；你的草稿仍保留。',
@@ -192,7 +194,7 @@ function renderAccount(data) {
   byId('pair-title').textContent = data.channels.length ? '让对话继续。' : '把聊天，接到工作台。';
   byId('pair-description').textContent = data.channels.length ? '聊天已经连接。你也可以关联其他账号，共用这个工作台。' : '关联你的 QQ 账号。之后，把想做的事直接告诉 Agent。';
   byId('pair-create').textContent = data.channels.length ? '关联其他账号' : '生成关联口令';
-  WorkspaceView.render(data, {api, action, confirm, openWorkspace, openInstanceWorkspace, openSavedResult, openInteraction, openModelSelection:session=>ModelView.sessionModel(session), openTaskForm, cancelTask, openBrowserWorkspace});
+  WorkspaceView.render(data, {api, action, confirm, directoryPicker, openWorkspace, openInstanceWorkspace, openSavedResult, openInteraction, openModelSelection:session=>ModelView.sessionModel(session), openTaskForm, cancelTask, openBrowserWorkspace});
   list('channels', data.channels, '还没有关联的聊天账号。', channel => item(
     (data.gateways || []).find(g => g.adapter === channel.adapter_instance_id)?.label || '聊天入口', channel.adapter_instance_id + '\n' + channel.external_user_id, '移除',
     () => confirm('移除聊天账号？', '这个聊天账号将无法再使用你的 Agent。电脑登录仍然保留。', channel.adapter_instance_id + '\n' + channel.external_user_id, () => api('/api/channels/revoke', channel)), true
@@ -324,8 +326,8 @@ function openInstanceWorkspace(instance) {
   picker.load();
 }
 
-function openBrowserWorkspace(device) {
-  const picker=directoryPicker(device,null);const request_id=crypto.randomUUID();
+function openBrowserWorkspace(device, initial = null) {
+  const picker=directoryPicker(device,initial);const request_id=crypto.randomUUID();
   confirm('打开网页工作区',device.name+'。创建独立工作区与会话，使用默认工具权限；不会更改 QQ 会话的设备。',picker.root,async()=>{
     const result=await api('/api/workspaces/open',{request_id,device_id:device.id,workspace:picker.value()});
     window.history.replaceState(null,'','/?session='+encodeURIComponent(result.session_id)+'#activity-panel');

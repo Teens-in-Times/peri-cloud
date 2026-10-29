@@ -7,6 +7,12 @@ mod plain;
 pub(crate) use plain::plain_chat;
 mod connector;
 mod context_files;
+pub(crate) mod fleet;
+pub(crate) use connector::inspect_client;
+pub use fleet::{
+    Bookmark, BookmarkCommand, CheckView, ConnectionLease, DeviceInspection, DeviceManagement,
+    DeviceWork,
+};
 mod logical_conversations;
 mod normalize;
 pub use normalize::{MessageNormalizer, NormalizedMessage};
@@ -56,6 +62,10 @@ pub enum GatewayError {
     Invalid,
     #[error("gateway message identity was reused with different content")]
     MessageConflict,
+    #[error("workspace bookmark was changed, removed or belongs to another device")]
+    BookmarkConflict,
+    #[error("device workspace bookmark limit reached")]
+    BookmarkLimit,
     #[error("gateway has active or unconfirmed work")]
     Busy,
     #[error("gateway is closing")]

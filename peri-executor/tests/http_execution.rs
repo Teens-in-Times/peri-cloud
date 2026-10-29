@@ -22,6 +22,38 @@ struct Harness {
 #[tokio::test]
 async fn environment_is_authenticated_binding_scoped_and_does_not_launch_jobs() {
     let h = Harness::new().await;
+    let capabilities_url = format!("{}/v1/capabilities", h.base);
+    assert_eq!(
+        h.client
+            .get(&capabilities_url)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let capabilities: ExecutorCapabilities = h
+        .client
+        .get(&capabilities_url)
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(capabilities.info.device_id, h.executor.info().device_id);
+    assert!(capabilities
+        .info
+        .features
+        .iter()
+        .any(|f| f == DEVICE_CAPABILITIES_FEATURE));
+    assert!(capabilities
+        .tools
+        .iter()
+        .any(|t| t.definition.name == "Write"));
     let url = format!("{}/v1/sessions/{}/environment", h.base, h.session);
     assert_eq!(
         h.client.get(&url).send().await.unwrap().status(),
