@@ -144,6 +144,15 @@ impl ConnectionStore {
         Ok(count != 0)
     }
 
+    pub(crate) async fn lease(
+        &self,
+        principal: Uuid,
+        device_id: Uuid,
+    ) -> IdentityResult<Option<(i64, i64)>> {
+        Ok(sqlx::query_as("SELECT updated_at,lease_expires_at FROM device_connections WHERE principal=? AND device_id=?")
+            .bind(principal.to_string()).bind(device_id.to_string()).fetch_optional(&self.pool).await?)
+    }
+
     /// Remove the registry row in the caller's revocation transaction. The
     /// returned token path is deleted after commit.
     pub(crate) async fn take_for_delete(

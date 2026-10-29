@@ -145,7 +145,7 @@ parser.add_argument("--baseline", type=Path, required=True, help="Verified old h
 parser.add_argument("--candidate", type=Path, required=True, help="Candidate host binary")
 parser.add_argument("--output", type=Path, required=True, help="New disposable fixture directory")
 parser.add_argument("--baseline-schema", type=int, default=9)
-parser.add_argument("--candidate-schema", type=int, default=26)
+parser.add_argument("--candidate-schema", type=int, default=27)
 args = parser.parse_args()
 baseline, candidate, output = args.baseline.resolve(), args.candidate.resolve(), args.output.resolve()
 require(baseline.is_file() and candidate.is_file(), "Host binary missing")

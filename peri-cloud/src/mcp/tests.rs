@@ -33,7 +33,7 @@ async fn servers_are_added_replaced_disabled_and_removed_with_revisions() {
         .fetch_one(&journal.identity_pool())
         .await
         .unwrap();
-    assert_eq!(version, 26);
+    assert_eq!(version, 27);
     assert_eq!(store.revision().await.unwrap(), 0);
     assert!(store.list().await.unwrap().is_empty());
 

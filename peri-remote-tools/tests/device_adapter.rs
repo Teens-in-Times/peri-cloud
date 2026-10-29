@@ -117,11 +117,14 @@ fn context<'a>(session: &str, turn: &str, call: &str) -> ToolContext<'a> {
 #[tokio::test]
 async fn native_parameters_and_metadata_survive_adaptation_and_write_retry_does_not_append_twice() {
     let h = Harness::new().await;
+    let capabilities = h.client.capabilities().await.unwrap().unwrap();
+    assert_eq!(capabilities.info.device_id, h.executor.info().device_id);
     let descriptors = h
         .client
         .catalog(h.session.binding().session_id)
         .await
         .unwrap();
+    assert_eq!(capabilities.tools.len(), descriptors.len());
     let tools = h.session.tools();
     for descriptor in descriptors {
         let tool = tools

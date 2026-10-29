@@ -6,6 +6,14 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const DEVICE_CAPABILITIES_FEATURE: &str = "device_capabilities_v1";
+
+/// Authenticated capability declarations; no workspace, session or execution is created.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutorCapabilities {
+    pub info: ExecutorInfo,
+    pub tools: Vec<NativeToolDescriptor>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutorInfo {

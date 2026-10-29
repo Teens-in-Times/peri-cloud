@@ -11,11 +11,13 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 use peri_acp_types::device_executor::{
-    ExecutorInfo, ENVIRONMENT_READ_FEATURE, PROTOCOL_VERSION, WORKSPACE_READ_FEATURE,
+    ExecutorInfo, DEVICE_CAPABILITIES_FEATURE, ENVIRONMENT_READ_FEATURE, PROTOCOL_VERSION,
+    WORKSPACE_READ_FEATURE,
 };
 
 fn features() -> Vec<String> {
     vec![
+        DEVICE_CAPABILITIES_FEATURE.to_owned(),
         WORKSPACE_READ_FEATURE.to_owned(),
         ENVIRONMENT_READ_FEATURE.to_owned(),
     ]

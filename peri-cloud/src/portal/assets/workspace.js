@@ -29,7 +29,7 @@ window.WorkspaceView = (() => {
   }
   function render(data, handlers) {
     if (account && account.principal.id !== data.principal.id) clear();
-    const devicesChanged = !account || JSON.stringify(account.devices) !== JSON.stringify(data.devices);
+    const devicesChanged = !account || JSON.stringify([account.devices,account.device_management,account.device_connections]) !== JSON.stringify([data.devices,data.device_management,data.device_connections]);
     account = data; hooks = handlers;
     get('service-name').textContent = data.service?.name || '云端主控';
     get('service-origin').textContent = data.service?.origin || window.location.origin;
@@ -88,7 +88,7 @@ window.WorkspaceView = (() => {
         status.dataset.verified = String(checked.ok);
         const routes = {wireguard:'WireGuard',loopback:'回环 / SSH'};
         card.append(node('p','subtle',checked.ok ? '本次通路：' + (routes[checked.transport] || '已认证通路') : checked.error));
-      } else if (reach?.state === 'online') status.textContent = '在线 · 设备已上报连接';
+      } else if (reach?.state === 'online') status.textContent = '最近通路探测通过 · ' + (reach.observed_at ? new Date(reach.observed_at*1000).toLocaleTimeString() : '时间未提供');
       else if (reach?.state === 'offline') status.textContent = '暂时无法连接';
       else if (reach?.state === 'not_configured') status.textContent = '未接入云端连接';
       else status.textContent = '连接待检查';
@@ -99,12 +99,16 @@ window.WorkspaceView = (() => {
           const started = generation;
           deviceChecks.set(device.id, {pending:true});
           try {
-            const result = await hooks.api('/api/instances/' + device.id + '/connection-check', {});
+            const result = await hooks.api('/api/instances/' + device.id + '/inspect', {});
             if (!account || generation !== started || account.principal.id !== owner) return;
             if (result.device_id !== device.id) throw new Error('设备身份不一致，请重新检查。');
-            deviceChecks.set(device.id,{ok:true,time:Date.now(),transport:result.transport});
+            const management=account.device_management?.[device.id];
+            if(management){management.check=result.check;management.recommendation=null;}
+            deviceChecks.set(device.id,{ok:result.check.authenticated,time:result.check.observed_at*1000,transport:result.check.details?.transport,error:'认证或工具目录检查未通过，请检查执行器连接。'});
           } catch (error) {
             if (!account || generation !== started || account.principal.id !== owner) return;
+            const management=account.device_management?.[device.id];
+            if(management){management.recommendation=null;if(management.check)management.check.fresh=false;}
             deviceChecks.set(device.id,{ok:false,time:Date.now(),error:error.message});
           }
           renderDevices();
@@ -122,7 +126,69 @@ window.WorkspaceView = (() => {
       const identity = node('details','device-identity'); identity.append(node('summary','','设备标识'),node('div','workspace-path',device.id));
       for (const detail of [defaults,identity]) detail.open = expanded.has(device.id + ':' + detail.className);
       card.append(status,actions,defaults,identity); root.append(card);
+      if (!device.revoked) renderManagement(card,device,account.device_management?.[device.id],expanded);
     }
+  }
+  function bookmarkForm(device, initial = null) {
+    const data=account.device_management?.[device.id];
+    const picker=hooks.directoryPicker(device,initial,data?.known_workspaces || []);
+    const root=node('div',''); const label=node('label','','书签名称');
+    const input=document.createElement('input');input.maxLength=32;input.required=true;
+    input.value=(initial || device.default_workspace).split(/[\\/]/).filter(Boolean).pop()?.slice(0,32) || '常用工作区';
+    label.append(input);root.append(label,picker.root);
+    hooks.confirm('保存工作区书签','保存前由这台设备确认目录。书签是快捷入口，使用时仍会重新验证。',root,()=>hooks.api('/api/instances/'+device.id+'/bookmarks',{
+      action:'save',workspace:picker.value() || device.default_workspace,label:input.value.trim()
+    }),undefined,'保存书签');picker.load();
+  }
+  function renameBookmark(device, bookmark) {
+    const root=node('label','','书签名称');const input=document.createElement('input');input.maxLength=32;input.required=true;input.value=bookmark.label;root.append(input);
+    hooks.confirm('重命名书签',device.name,root,()=>hooks.api('/api/instances/'+device.id+'/bookmarks',{
+      action:'rename',id:bookmark.id,revision:bookmark.revision,label:input.value.trim()
+    }),undefined,'保存名称');
+  }
+  function renderManagement(card,device,data,expanded) {
+    const root=node('section','device-management');root.dataset.device=device.id;root.setAttribute('aria-label','设备状态与工作区');
+    if (!data) {root.append(node('p','subtle','设备能力与占用状态未载入。'));card.append(root);return;}
+    const lease=data.lease || {};
+    const sources={reported:'设备上报的连接租约有效',expired:'设备上报的连接租约已过期',configured:'已配置连接',none:'尚未配置连接'};
+    root.append(node('p','subtle',sources[lease.source] || '连接租约尚无观测'));
+    if(lease.reported_at)root.append(node('p','subtle','最近上报：'+new Date(lease.reported_at*1000).toLocaleString()+' · 租约截止：'+new Date(lease.expires_at*1000).toLocaleString()));
+    const check=data.check;
+    if(check) {
+      const detail=check.details;
+      root.append(node('p','connection-status',(check.authenticated ? '身份检查通过' : '身份或能力检查失败')+' · '+new Date(check.observed_at*1000).toLocaleString()+(check.fresh ? '' : ' · 历史观测，请重新检查')));
+      if(detail) {
+        if(detail.version)root.append(node('p','subtle','执行器 '+detail.version+' · 协议 '+detail.protocol_version));
+        root.append(node('p','subtle',detail.tools ? '工具目录：'+detail.tools.join('、') : '执行器未提供设备工具目录，工作区绑定时再核验。'));
+        if(detail.features?.length){const declared=node('details','device-capabilities');declared.append(node('summary','','协议能力标识'),node('p','workspace-path',detail.features.join('、')));root.append(declared);}
+      }
+    } else root.append(node('p','subtle','尚无能力检查。点击「检查连接」读取身份与工具目录，不创建任务。'));
+    root.append(node('p','subtle','目录声明不等于工作区可执行；工具权限、目录和资源占用在提交时重新核验。'));
+    const work=data.work || {};const states=work.task_states || {};
+    const labels={queued:'等待调度',running:'执行中',waiting_capacity:'等待执行额度或设备资源',waiting_parent:'等待主助手答复',waiting_approval:'等待审批',waiting_device:'等待设备',waiting_external:'等待外部条件',waiting_operations:'等待原操作结算',recovery_required:'需要核对原执行结果',paused:'已暂停',pause_requested:'正在暂停',cancel_requested:'正在取消',rotate_requested:'正在交接窗口',resume_requested:'等待恢复',window_ready:'新窗口就绪，等待继续'};
+    if(work.mutation_lease)root.append(node('p','subtle',work.mutation_lease==='reserved' ? '设备修改资源已由执行任务预占。' : '设备修改资源正在使用。'));
+    if(work.mutation_owner_session){const owner=node('details','device-resource-owner');owner.append(node('summary','','占用会话'),node('div','workspace-path',work.mutation_owner_session));root.append(owner);}
+    if(work.unconfirmed_operations)root.append(node('p','load-error',work.unconfirmed_operations+' 项原操作结果待确认。先回原会话核对，不迁移或重复提交。'));
+    for(const [state,count] of Object.entries(states))root.append(node('p','subtle',(labels[state] || '任务状态：'+state)+' · '+count+' 项'));
+    if(!work.mutation_lease && !work.unconfirmed_operations)root.append(node('p','subtle','当前未观察到设备修改占用。'));
+    if(data.observed_at)root.append(node('p','subtle','占用观测：'+new Date(data.observed_at*1000).toLocaleString()));
+    if(data.recommendation)root.append(node('p','pill','新任务候选：近期认证与目录检查通过，当前未占用修改资源。'));
+    root.append(node('p','subtle','建议仅用于新任务；已提交操作仍由原设备核对和结算。'));
+    const bookmarks=node('details','device-bookmarks');bookmarks.open=expanded.has(device.id+':device-bookmarks');bookmarks.append(node('summary','','工作区书签'));
+    bookmarks.append(command('添加书签',()=>bookmarkForm(device)));
+    for(const bookmark of data.bookmarks || []) {
+      const row=node('div','workspace-bookmark');row.append(node('strong','',bookmark.label),node('div','workspace-path',bookmark.workspace));
+      const actions=node('div','device-actions');actions.append(
+        command('打开独立工作区',()=>hooks.openBrowserWorkspace(device,bookmark.workspace)),
+        command('改名',()=>renameBookmark(device,bookmark)),
+        command('移除',()=>hooks.confirm('移除工作区书签','只移除快捷入口，目录、会话与任务保留。',bookmark.label,()=>hooks.api('/api/instances/'+device.id+'/bookmarks',{action:'remove',id:bookmark.id,revision:bookmark.revision})), 'quiet danger small')
+      );row.append(actions);bookmarks.append(row);
+    }
+    if(!data.bookmarks?.length)bookmarks.append(node('p','subtle','暂无工作区书签。'));
+    const recent=node('details','device-recents');recent.open=expanded.has(device.id+':device-recents');recent.append(node('summary','','最近使用的目录'));
+    for(const path of data.known_workspaces || []) {const row=node('div','');row.append(node('div','workspace-path',path),command('存为书签',()=>bookmarkForm(device,path)));recent.append(row);}
+    if(!data.known_workspaces?.length)recent.append(node('p','subtle','暂无已确认绑定的历史目录。'));
+    root.append(bookmarks,recent);card.append(root);
   }
   function failure(root, title, response) {
     if (response.status === 'rejected') root.append(node('p','load-error',title + '未载入：' + response.reason.message));

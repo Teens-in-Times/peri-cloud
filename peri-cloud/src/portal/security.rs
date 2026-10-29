@@ -104,6 +104,12 @@ impl IntoResponse for PortalError {
             Self::Interaction(crate::gateway::GatewayError::Invalid) => {
                 (StatusCode::BAD_REQUEST, "invalid_workspace")
             }
+            Self::Interaction(crate::gateway::GatewayError::BookmarkConflict) => {
+                (StatusCode::CONFLICT, "bookmark_conflict")
+            }
+            Self::Interaction(crate::gateway::GatewayError::BookmarkLimit) => {
+                (StatusCode::TOO_MANY_REQUESTS, "bookmark_limit")
+            }
             Self::Interaction(
                 crate::gateway::GatewayError::RecoveryRequired
                 | crate::gateway::GatewayError::Runtime(crate::RuntimeError::ExecutionUnconfirmed),

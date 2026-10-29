@@ -17,6 +17,7 @@ use peri_acp_types::device_executor::*;
 pub fn router(executor: Arc<Executor>) -> Router {
     Router::new()
         .route("/v1/info", get(info))
+        .route("/v1/capabilities", get(capabilities))
         .route("/v1/directories", post(directories))
         .route("/v1/sessions/{id}", put(bind_session))
         .route("/v1/sessions/{id}/tools", get(tools))
@@ -62,6 +63,13 @@ async fn authenticate(
 
 async fn info(State(executor): State<Arc<Executor>>) -> Json<ExecutorInfo> {
     Json(executor.info())
+}
+
+async fn capabilities(State(executor): State<Arc<Executor>>) -> Json<ExecutorCapabilities> {
+    Json(ExecutorCapabilities {
+        info: executor.info(),
+        tools: crate::native_tool_catalog(),
+    })
 }
 
 async fn directories(

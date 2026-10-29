@@ -7,6 +7,82 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[tokio::test]
+async fn capability_inspection_rejects_changed_identity_and_skips_legacy_endpoints() {
+    use peri_acp_types::device_executor::{
+        ExecutorCapabilities, ExecutorInfo, DEVICE_CAPABILITIES_FEATURE, PROTOCOL_VERSION,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for advertised in [false, true] {
+        let device = Uuid::new_v4();
+        let info = ExecutorInfo {
+            protocol_version: PROTOCOL_VERSION,
+            device_id: device,
+            device_name: "fixture".into(),
+            platform: "linux".into(),
+            version: "fixture".into(),
+            features: if advertised {
+                vec![DEVICE_CAPABILITIES_FEATURE.into()]
+            } else {
+                vec![]
+            },
+        };
+        let changed = ExecutorCapabilities {
+            info: ExecutorInfo {
+                device_id: Uuid::new_v4(),
+                ..info.clone()
+            },
+            tools: vec![],
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/info",
+                axum::routing::get(move || {
+                    let info = info.clone();
+                    async move { axum::Json(info) }
+                }),
+            )
+            .route(
+                "/v1/capabilities",
+                axum::routing::get(move || {
+                    let changed = changed.clone();
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(changed)
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = CancellationToken::new();
+        let shutdown = stop.clone();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+                .unwrap();
+        });
+        let client = DeviceClient::connect(address, "fixture-token".into(), device)
+            .await
+            .unwrap();
+        if advertised {
+            assert!(matches!(
+                client.capabilities().await,
+                Err(Error::DeviceMismatch)
+            ));
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(client.capabilities().await.unwrap().is_none());
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+        }
+        stop.cancel();
+        task.await.unwrap();
+    }
+}
+
 async fn server(
     executor: Arc<Executor>,
 ) -> (SocketAddr, CancellationToken, tokio::task::JoinHandle<()>) {
