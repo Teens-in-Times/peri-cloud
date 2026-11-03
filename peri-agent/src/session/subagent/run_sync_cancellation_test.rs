@@ -1,49 +1,4 @@
-//! Cancellation settlement regression from upstream issue #291 / PR #292.
-
 use super::*;
-
-/// 阻塞在模型调用中、直到测试放行（或任务被丢弃）的假模型。
-struct BlockingLlm {
-    entered: Arc<tokio::sync::Notify>,
-    gate: Arc<tokio::sync::Notify>,
-}
-
-#[async_trait::async_trait]
-impl ReactLLM for BlockingLlm {
-    async fn generate_reasoning(
-        &self,
-        _messages: &[crate::messages::BaseMessage],
-        _tools: &[&dyn BaseTool],
-        _streaming: Option<StreamingContext>,
-    ) -> crate::error::AgentResult<Reasoning> {
-        self.entered.notify_one();
-        self.gate.notified().await;
-        Ok(Reasoning::with_answer("", "released"))
-    }
-}
-
-fn blocking_context(
-    session: &Arc<Session>,
-    entered: Arc<tokio::sync::Notify>,
-    gate: Arc<tokio::sync::Notify>,
-) -> V2SubagentContext {
-    let id = session.store().thread_id.clone().unwrap();
-    build_v2_subagent_context(
-        Some(session.clone()),
-        Box::new(BlockingLlm { entered, gate }),
-        Arc::new(MiddlewareChain::new()),
-        Vec::new(),
-        Arc::new(|_| true),
-        None,
-        "/tmp",
-        session.config().cancel_token.as_ref().clone(),
-        None,
-        None,
-        None,
-        None,
-        Some(agent_id_from_child_thread(&id)),
-    )
-}
 
 /// 阻塞在模型调用中的同步子任务：父调用 future 被 drop（生产侧 cancel 分支）
 /// 后，子执行仍须走完既有收尾并恰好发射一次 SubagentStopped。
@@ -121,7 +76,7 @@ async fn cancelled_sync_child_emits_stopped_after_caller_future_dropped() {
         while !events
             .lock()
             .iter()
-            .any(|event| matches!(event, ExecutorEvent::SubagentStarted { .. }))
+            .any(|event| matches!(event.payload(), ExecutorEvent::SubagentStarted { .. }))
         {
             peri_time::sleep(Duration::from_millis(5)).await;
         }
@@ -139,7 +94,7 @@ async fn cancelled_sync_child_emits_stopped_after_caller_future_dropped() {
             let observed = events
                 .lock()
                 .iter()
-                .find(|event| matches!(event, ExecutorEvent::SubagentStopped { .. }))
+                .find(|event| matches!(event.payload(), ExecutorEvent::SubagentStopped { .. }))
                 .cloned();
             if let Some(event) = observed {
                 break event;
@@ -154,7 +109,7 @@ async fn cancelled_sync_child_emits_stopped_after_caller_future_dropped() {
         is_error,
         instance_id,
         ..
-    } = stopped
+    } = stopped.payload().clone()
     else {
         unreachable!("filtered to SubagentStopped above");
     };
@@ -174,7 +129,7 @@ async fn cancelled_sync_child_emits_stopped_after_caller_future_dropped() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, ExecutorEvent::SubagentStarted { .. }))
+            .filter(|event| matches!(event.payload(), ExecutorEvent::SubagentStarted { .. }))
             .count(),
         1,
         "Started 恰好一次"
@@ -182,9 +137,25 @@ async fn cancelled_sync_child_emits_stopped_after_caller_future_dropped() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, ExecutorEvent::SubagentStopped { .. }))
+            .filter(|event| matches!(event.payload(), ExecutorEvent::SubagentStopped { .. }))
             .count(),
         1,
         "取消收尾只发一次 Stopped"
     );
+}
+
+/// 关闭失败必须保留诊断，不因同步 worker 结束而宣称成功。
+#[tokio::test]
+async fn explicit_close_reports_failed_sync_delivery() {
+    let manager = Arc::new(TaskManager::new());
+    let session = child(manager.clone());
+    session
+        .subagent_host()
+        .unwrap()
+        .close_state
+        .record_sync_delivery_failure("sync-broken", "callback rejected");
+    let error = super::super::super::close::close_subagent_session_scope(session)
+        .await
+        .unwrap_err();
+    assert!(error.contains("callback rejected"), "{error}");
 }

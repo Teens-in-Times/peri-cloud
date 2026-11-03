@@ -44,6 +44,7 @@ SCOPE = [
     "mcp-packages/web",
     "mcp-packages/artifact",
     "mcp-packages/cron",
+    "mcp-packages/monitor",
     "mcp-packages/workspace",
     "mcp-packages/workflow",
 ]

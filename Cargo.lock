@@ -2711,6 +2711,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "peri-mcp-monitor"
+version = "0.8.0-rc.1"
+dependencies = [
+ "async-trait",
+ "parking_lot",
+ "peri-acp-types",
+ "peri-agent",
+ "peri-mcp-common",
+ "peri-process",
+ "peri-time",
+ "regex",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "peri-mcp-web"
 version = "0.8.0-rc.1"
 dependencies = [
@@ -2816,6 +2838,7 @@ dependencies = [
  "peri-mcp-core",
  "peri-mcp-credentials",
  "peri-mcp-cron",
+ "peri-mcp-monitor",
  "peri-mcp-web",
  "peri-mcp-workflow",
  "peri-mcp-workspace",

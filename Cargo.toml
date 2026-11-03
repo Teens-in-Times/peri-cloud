@@ -11,6 +11,7 @@ members = [
     "mcp-packages/web",
     "mcp-packages/artifact",
     "mcp-packages/cron",
+    "mcp-packages/monitor",
     "mcp-packages/workspace",
     "mcp-packages/workflow",
     "peri-model",
@@ -54,6 +55,7 @@ debug = false
 # ============================================================================
 
 [workspace.dependencies]
+peri-mcp-monitor = { path = "mcp-packages/monitor" }
 peri-config = { path = "peri-config" }
 peri-time = { path = "peri-time" }
 # --- Async runtime ---

@@ -523,7 +523,7 @@ async fn test_integration_background_independent_survives_parent_cancel() {
             break;
         }
         match tokio::time::timeout(remaining, bg_rx.recv()).await {
-            Ok(Some(ev)) => match ev {
+            Ok(Some(ev)) => match ev.payload().clone() {
                 ExecutorEvent::SubagentStarted { is_background, .. } => {
                     got_started = true;
                     assert!(

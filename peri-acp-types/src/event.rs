@@ -5,6 +5,10 @@
 //! [`crate::event_v2`]，随 ExecutorEvent 全量退役（`2026-07-18-executor-event-retirement.md`）
 //! 一起删除。
 
+#[path = "event_origin.rs"]
+mod origin;
+pub use origin::{ChildEventOrigin, ChildEventStream, OriginatedExecutorEvent};
+
 /// 事件 sink 的发送结果。只有 transport 确认写出后才允许调用方确认交付。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventSinkError {
@@ -378,7 +382,7 @@ pub struct CompactFileInfo {
 }
 
 #[cfg(test)]
-#[path = "event_notification_test.rs"]
+#[path = "event_background_result_test.rs"]
 mod tests;
 
 /// Todo 列表条目（用于 ExecutorEvent::TodoUpdate）
@@ -546,6 +550,8 @@ pub enum MiddlewareHook {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ExecutorEvent {
+    /// Runtime provenance around a child display event; never stored in transcript.
+    Originated(Box<OriginatedExecutorEvent>),
     /// Mailbox 执行身份已建立，用于客户端交互生命周期准入。
     UserInputRunStarted {
         generation: String,
