@@ -57,7 +57,7 @@ jobs:
       - name: Upstream provenance
         run: python scripts/check-upstream.py
       - name: Upstream automation boundary tests
-        run: python -m unittest discover -s scripts/tests -p test_upstream_sync.py
+        run: python -m unittest discover -s scripts/tests -p "test_upstream*.py"
       - name: Cloud and executor regression tests
         run: bash ./scripts/cargo-rmcp-patched.sh test --locked -p peri-scheduler -p peri-cloud -p peri-executor -p peri-remote-tools -p peri-tool-runtime -p peri-process -- --test-threads=1
       - name: Peri v4 core regression tests
