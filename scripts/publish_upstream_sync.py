@@ -13,6 +13,7 @@ import urllib.parse
 import urllib.request
 
 from upstream_sync import apply, git, load_report
+from upstream_tracking import update_tracker
 
 PREFIX = "codex/upstream-sync-"
 MARKER = "<!-- peri-upstream-sync:"
@@ -24,11 +25,13 @@ class GitHub:
             raise ValueError("invalid destination repository")
         self.repository, self.token = repository, token
 
-    def api(self, path: str, data: dict | None = None, missing: bool = False):
+    def api(self, path: str, data: dict | None = None, missing: bool = False, method: str | None = None):
         request = urllib.request.Request(
             f"https://api.github.com/repos/{self.repository}/{path}",
             data=json.dumps(data).encode() if data is not None else None,
+            method=method,
             headers={"Authorization": "Bearer " + self.token, "Accept": "application/vnd.github+json",
+                     "Content-Type": "application/json",
                      "User-Agent": "peri-upstream-sync", "X-GitHub-Api-Version": "2022-11-28"},
         )
         try:
@@ -78,20 +81,7 @@ def publish(root: Path, folder: Path, github: GitHub) -> str:
     base, head = report["upstream_base"], report["upstream_head"]
     marker = f"{MARKER}{base}:{head} -->"
     if state in ("conflict", "blocked"):
-        # Report once per source pair; never push conflict markers or delete customized source.
-        issues = pages(github, "issues?state=all&sort=created&direction=desc")
-        existing = next((i for i in issues if marker in (i.get("body") or "")), None)
-        if existing:
-            print("Already reported", existing["html_url"])
-            return "reported"
-        body = (marker + "\n\n自动同步需要人工处理；未创建源码分支或 PR。\n\n"
-                f"上游：`{base}` → `{head}`。\n\n```json\n" + display({
-                    "state": state, "reason": report.get("reason"), "conflicts": report.get("conflicts", []),
-                    "attribution_changes": report.get("attribution_changes", []),
-                    "conflict_count": report.get("conflict_count", 0)}) + "\n```\n\n"
-                "请保留本地权限、身份、任务恢复与工作区语义；不要将无冲突当作验收。")
-        issue = github.api("issues", {"title": f"上游同步需人工处理：{base[:8]} → {head[:8]}", "body": body})
-        print("Reported", issue["html_url"])
+        print("Source publication blocked; the persistent tracker will record the details")
         return "reported"
     expected = f"{PREFIX}{base[:12]}-{head[:12]}-{report['base_commit'][:8]}"
     if report.get("branch") != expected:
@@ -161,10 +151,11 @@ def main() -> None:
         raise SystemExit("publisher runs only from main schedule/manual events")
     github = GitHub(os.environ["GITHUB_REPOSITORY"], os.environ["GH_TOKEN"])
     result = publish(args.root.resolve(), args.artifact.resolve(), github)
+    tracker = update_tracker(github, load_report(args.artifact.resolve()), result)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as output:
-            output.write(f"\nPublication: `{result}`. Human merge only; no deployment.\n")
+            output.write(f"\nPublication: `{result}`. Tracker: {tracker}. Human merge only; no deployment.\n")
 
 
 if __name__ == "__main__":

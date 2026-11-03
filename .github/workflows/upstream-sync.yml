@@ -43,7 +43,11 @@ jobs:
           data = json.loads((Path(os.environ["RUNNER_TEMP"]) / "peri-candidate/report.json").read_text())
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write("state=" + data["state"] + "\nbase_commit=" + data["base_commit"] + "\n")
+          labels = {"conflict": "Blocked: manual source adaptation required", "blocked": "Blocked: manual review required", "unchanged": "No scoped changes", "prepared": "Candidate prepared: review CI before manual merge"}
+          if data["state"] in ("conflict", "blocked"):
+              print("::warning::" + labels[data["state"]])
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write("## " + labels[data["state"]] + "\n\nWorkflow success means detection completed, not source synchronization or deployment.\n\n")
               output.write("# Upstream candidate\n\n```json\n" + json.dumps(data, ensure_ascii=True, indent=2).replace("`", "\\u0060").replace("<", "\\u003c") + "\n```\n")
           PY
       - name: Report publication gate
@@ -61,7 +65,7 @@ jobs:
           retention-days: 7
   publish:
     needs: prepare
-    if: github.ref == 'refs/heads/main' && vars.PERI_UPSTREAM_PUBLISH == 'true' && !inputs.dry_run && needs.prepare.outputs.state != 'unchanged'
+    if: github.ref == 'refs/heads/main' && vars.PERI_UPSTREAM_PUBLISH == 'true' && !inputs.dry_run
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
@@ -79,7 +83,7 @@ jobs:
         with:
           name: upstream-candidate
           path: ${{ runner.temp }}/peri-candidate
-      - name: Publish immutable draft or conflict report
+      - name: Publish immutable draft and refresh persistent status
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/publish_upstream_sync.py --root . --artifact "${{ runner.temp }}/peri-candidate"

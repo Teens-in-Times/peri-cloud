@@ -2,7 +2,7 @@
 
 用户选择：每天检测、尝试同步并开 PR，人工决定合并。本流程不自动批准、合并 main、升级生产或调用模型。
 
-路线图索引：[Issue #13](https://github.com/Teens-in-Times/peri-cloud/issues/13)；实施待办：[Issue #12](https://github.com/Teens-in-Times/peri-cloud/issues/12)。
+路线图索引：[Issue #13](https://github.com/Teens-in-Times/peri-cloud/issues/13)；实施待办：[Issue #12](https://github.com/Teens-in-Times/peri-cloud/issues/12)；持续状态与阻塞跟踪：[Issue #32](https://github.com/Teens-in-Times/peri-cloud/issues/32)。
 
 ## 运行方式
 
@@ -35,8 +35,19 @@ GitHub 对 `GITHUB_TOKEN` 创建的 PR 可能要求额外批准 workflow；token
 - Cargo 依赖改变可能需要人工适配。保持 `--locked`，失败留在草稿，不靠自动改锁“修绿”。
 - 同时只保留一个待审自动候选；不反复改写正在评审的分支。分支包含上游前后 revision 及本仓库基线身份，禁止 force-push。
 - 同一候选被关闭后不重开。旧分支内容被修改或删除时不覆盖/复活；失败的原 CI 通过 CI 的显式 rerun 处理，不每日重复派发。
-- 冲突 Issue 按上游前后完整 SHA 去重。历史分页最多 1000 项；超过预算明确失败，不能以截断列表证明不存在旧记录。
+- 冲突报告合并到一个 bot 所属的持续跟踪 Issue（固定 `peri-upstream-tracker:v1` 标记），不再随上游 SHA 新建 Issue。最近检测只替换明确标记的状态区域，保留人工备注；初次归并保留原始报告及历史链接，再关闭重复的旧报告。历史分页最多 1000 项，超过预算明确失败。
+- 无变化时也刷新已有跟踪 Issue，避免旧冲突一直显示为当前阻塞。跟踪 Issue 持续开放；若被手动关闭，仅遇到新阻塞才重开。首次健康检测不新建噪声 Issue。只操作 GitHub Actions bot 创建的报告，不覆盖人工 Issue。
 - main 在准备期间前进时跳过这份候选，下次重新计算。
+
+## 持续跟踪的状态含义
+
+跟踪 Issue 显示本仓库基线、上游前后 SHA、最近运行链接、冲突路径和发布结果；每次成功检测都更新同一个状态区域。历史报告保留正文与讨论，归并后可沿链接查阅。
+
+- `conflict` / `blocked`：同步需要人工适配或审查，没有发布部分源码。工作流会标出 warning；整轮成功只证明检测与报告完成。
+- `prepared`：候选已准备，是否已经创建草稿、存在待审候选或候选已被关闭，由 publication 字段区分；CI 与人工审查仍以 PR 记录为准。
+- `unchanged`：该次检测在记录的叠加范围内无变化，不证明生产升级或所有未纳入范围的上游功能均已接入。
+
+main 在准备后前进时，既不发布旧候选，也不回写过时跟踪状态。无法获取或验证来源时准备任务直接失败，检查该轮 Actions；失败不会伪造新的健康状态。dry-run、发布开关关闭及非 main 运行均不修改跟踪 Issue。
 
 所有检查都在仓库临时检出上运行。`prepare` 会修改并暂存候选源码，不应在有开发改动或生产文件的目录手工运行；脚本会拒绝脏工作区。
 
@@ -52,7 +63,9 @@ GitHub 的 **Allow GitHub Actions to create and approve pull requests** 是同�
 
 ## 验证
 
-本地使用临时 Git 仓库与 API mock，验证本地补丁保留、冲突不部分落盘、忽略文件/符号链接/非法路径保护、大小与 manifest 校验、patch 摘要与保护路径校验、原候选不覆盖，以及只推候选分支、只开草稿 PR 和触发 CI。工作流另经 actionlint 检查。
+本地使用临时 Git 仓库与 API mock，验证本地补丁保留、冲突不部分落盘、忽略文件/符号链接/非法路径保护、大小与 manifest 校验、patch 摘要与保护路径校验、原候选不覆盖，以及只推候选分支、只开草稿 PR 和触发 CI。工作流另经 actionlint 检查。持续跟踪测试覆盖跨 SHA 更新、重复调用幂等、人工备注保留、关闭后遇阻重开、恢复健康状态、旧报告归并、非 bot 归属、过时基线与损坏标记保护。
+
+本轮 Python / 工作流修改使用 `python -m unittest discover -s scripts/tests -p "test_upstream*.py"` 及 actionlint 1.7.12 验证；源码同步的 Rust 验证独立归属于上游适配 PR。实际写入与每日运行结果见 #32 的运行链接。
 
 2026-10-24：8 项本地隔离测试通过，actionlint 1.7.12 检查两个工作流通过；来源校验为 1345 个文件、1300 个完全一致、45 个已登记补丁。实际 fetch/prepare 拉取固定上游，返回 `unchanged`，head 与 pin 均为 `e598d17872bce487355e1bfa70f077743984760f`。没有为本次 Python / 工作流改动重复运行整套 Rust 测试。
 
