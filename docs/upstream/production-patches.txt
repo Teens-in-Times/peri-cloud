@@ -68,3 +68,9 @@ peri-agent/src/session/subagent/run_sync_test.rs
 
 # Manual de1a93ab sync: compile the Unix-only OAuth fixture helper only on Unix.
 mcp-packages/credentials/src/model_auth/oauth.rs
+
+# Manual b6e32afd sync: retain all upstream tests in lexical chunks below 1000 lines.
+peri-middlewares/src/mcp/client/subscription_tasks_test.rs
+peri-middlewares/src/mcp/client_test.rs
+peri-middlewares/src/permission/mod_test.rs
+peri-middlewares/src/subagent/tool/tool_test/resume_test.rs

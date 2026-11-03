@@ -3,11 +3,33 @@ use peri_acp_types::{
     event::{BackgroundTaskResult, ShellOutput},
     mcp::McpSubscriptionPort,
     messages::MessageId,
-    session::{MessageQueue, MessageSource, QueuedPayload, SessionInbox},
+    monitor::{monitor_alert_delivery_id, MONITOR_META_KEY},
+    plugin::ConfigSource,
+    session::{
+        MessageKind, MessageQueue, MessageSource, QueuedMessage, QueuedPayload, SessionInbox,
+    },
     system_reminder::TrustedSystemReminder,
-    tasks::{BgTaskKind, ExternalTaskRegistration, TaskManager, TaskTerminalDelivery},
+    tasks::{
+        BgRegistryEvent, BgShellHandle, BgTaskKind, BgTaskRegistration, ExternalTaskRegistration,
+        OnBgCompleteFn, TaskManager, TaskRegistrationTicket, TaskSnapshot, TaskTerminalDelivery,
+    },
 };
-use std::sync::Arc;
+use rmcp::{
+    model::{
+        DetailedTask, GetTaskParams, GetTaskResult, JsonObject, MetaObject, ServerCapabilities,
+        ServerConfig, Task, TaskPayload, TaskStatus,
+    },
+    service::{RequestContext, RoleServer},
+    ServerHandler,
+};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::Duration;
+
+use crate::mcp::client::output_store::tests::Wire;
+use crate::mcp::McpTaskOwner;
 
 #[test]
 fn unobservable_owner_reaches_retry_limit_and_resets_after_recovery() {
@@ -35,6 +57,16 @@ async fn test_unavailable_terminal_settlement_is_retryable() {
     use peri_acp_types::tasks::NoopTaskManager;
     use rmcp::model::{DetailedTask, Task, TaskPayload, TaskStatus};
     let pool = McpClientPool::new_pending();
+    let owner = peri_agent::agent::async_tasks::TaskManager::new();
+    let ticket = owner
+        .register(peri_acp_types::tasks::BgTaskRegistration {
+            task_id: "task".into(),
+            kind: BgTaskKind::Agent,
+            summary: "fixture".into(),
+            pid: None,
+            kill: None,
+        })
+        .unwrap();
     let task = DetailedTask::new(
         Task::new(
             "owner-task",
@@ -50,7 +82,7 @@ async fn test_unavailable_terminal_settlement_is_retryable() {
         let error = pool
             .deliver_managed_task_status(
                 "server",
-                "task",
+                &ticket,
                 transition_id,
                 &task,
                 false,
@@ -303,7 +335,8 @@ async fn terminal_reminder_keeps_the_public_task_id_instead_of_the_remote_shell_
         )
         .unwrap();
     let on_terminal = Arc::clone(&request.on_terminal);
-    let public_id = manager.register_external(request).unwrap();
+    let ticket = manager.register_external(request).unwrap();
+    let public_id = ticket.task_id().to_owned();
     assert!(public_id.starts_with("mcp-"), "{public_id}");
 
     // `settle_external` 的契约：回调收到的 result 已带会话侧公共 id。
@@ -483,3 +516,187 @@ async fn cancel_session_external_tasks_uses_one_total_deadline() {
         "both tasks stay running after bounded cancellation failure"
     );
 }
+
+/// [回归测试] 订阅重试用原票据确认已接纳终态，不查询已淘汰的 UI 快照行。
+#[tokio::test]
+async fn task_subscription_confirms_terminal_after_snapshot_eviction() {
+    use rmcp::model::{DetailedTask, Task, TaskPayload, TaskStatus};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let pool = McpClientPool::new_pending();
+    let manager = peri_agent::agent::async_tasks::TaskManager::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let delivered = calls.clone();
+    let ticket = manager
+        .register_external(ExternalTaskRegistration {
+            session_id: "session".into(),
+            initiator_session_id: Some("session".into()),
+            owner_identity: "server".into(),
+            owner_task_id: "remote".into(),
+            kind: BgTaskKind::Mcp,
+            summary: "remote".into(),
+            started_at: Some("2026-01-01T00:00:00Z".into()),
+            cancel: Arc::new(|| Box::pin(async { Ok(()) })),
+            on_terminal: Arc::new(move |_, _| {
+                delivered.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }),
+        })
+        .unwrap();
+    let task = DetailedTask::new(
+        Task::new(
+            "remote",
+            TaskStatus::Completed,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ),
+        TaskPayload::Completed {
+            result: serde_json::Map::new(),
+        },
+    );
+    pool.deliver_managed_task_status("server", &ticket, "terminal", &task, false, &manager)
+        .await
+        .unwrap();
+    for index in 0..600 {
+        let later = manager
+            .register(peri_acp_types::tasks::BgTaskRegistration {
+                task_id: format!("later-{index}"),
+                kind: BgTaskKind::Agent,
+                summary: "later".into(),
+                pid: None,
+                kill: None,
+            })
+            .unwrap();
+        manager.confirm_external_execution_stopped(&later);
+        let mut result = shell_result();
+        result.task_id = later.task_id().to_owned();
+        assert!(manager.complete(&later, result));
+    }
+    assert!(!manager
+        .snapshot()
+        .tasks
+        .iter()
+        .any(|record| record.task_id == ticket.task_id()));
+    pool.deliver_managed_task_status("server", &ticket, "terminal", &task, false, &manager)
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+fn handle_with_source(
+    name: &str,
+    source: Option<ConfigSource>,
+) -> Arc<crate::mcp::client::McpClientHandle> {
+    Arc::new(crate::mcp::client::McpClientHandle {
+        call_gate: Default::default(),
+        name: name.into(),
+        version: None,
+        connected_at: None,
+        protocol_version: None,
+        cache_version: None,
+        peer: None,
+        tools: vec![],
+        resources: vec![],
+        status: crate::mcp::client::ClientStatus::Connected,
+        oauth_status: Default::default(),
+        source,
+        url: None,
+        skills_capable: false,
+    })
+}
+
+/// Register one external task through the production registration path, settle
+/// it, and return the owner's queued messages plus the published task status.
+async fn settle_registered_task(
+    server: &str,
+    source: Option<ConfigSource>,
+    owner_scoped: bool,
+    success: bool,
+) -> (Vec<QueuedMessage>, String) {
+    let pool = Arc::new(McpClientPool::new_pending());
+    let inbox = SessionInbox::new(Arc::new(MessageQueue::new()));
+    pool.register_inbox("session", inbox.handle());
+    pool.clients
+        .write()
+        .insert(server.into(), handle_with_source(server, source));
+    let manager: Arc<dyn TaskManager> =
+        Arc::new(peri_agent::agent::async_tasks::TaskManager::new());
+    pool.bind_session_task_manager("session", &manager);
+
+    let (manager, request) = pool
+        .external_task_registration(
+            "session",
+            Some("session"),
+            None,
+            server,
+            "remote-1",
+            BgTaskKind::Mcp,
+            "fixture task",
+            owner_scoped,
+            "2026-11-01T00:00:00Z",
+        )
+        .expect("registration");
+    let ticket = manager.register_external(request).expect("register");
+    let mut result = shell_result();
+    result.success = success;
+    result.output = if success {
+        "Command exited successfully.".into()
+    } else {
+        "Command exited with status 3.".into()
+    };
+    assert!(
+        manager
+            .settle_external(&ticket, "remote-1:terminal", result)
+            .await
+            .expect("settle"),
+        "terminal projection must be committed"
+    );
+    let status = manager
+        .snapshot()
+        .tasks
+        .into_iter()
+        .find(|record| record.task_id == ticket.task_id())
+        .map(|record| record.status)
+        .expect("terminal task record");
+    (inbox.queue().drain_all(), status)
+}
+
+/// B9: monitor 的终态（成功/失败）只更新任务投影，不向 owner 投递任何 reminder。
+#[tokio::test]
+async fn monitor_terminal_settlement_never_wakes_the_owner() {
+    for success in [true, false] {
+        let (messages, status) = settle_registered_task(
+            "monitor",
+            Some(ConfigSource::Builtin {
+                instance: "monitor".into(),
+            }),
+            true,
+            success,
+        )
+        .await;
+        assert!(
+            messages.is_empty(),
+            "monitor terminal settlement must not queue a reminder (success={success}): {messages:?}"
+        );
+        assert_eq!(
+            status,
+            if success { "completed" } else { "failed" },
+            "terminal projection must still be observable through the task manager"
+        );
+    }
+}
+
+/// B9 回归：非 monitor 实例的终态投递保持不变。
+#[tokio::test]
+async fn non_monitor_terminal_settlement_still_wakes_the_owner() {
+    let (messages, status) = settle_registered_task("workflow", None, false, true).await;
+    assert_eq!(status, "completed");
+    assert_eq!(
+        messages.len(),
+        1,
+        "non-monitor terminal delivery must be unchanged"
+    );
+    assert_eq!(messages[0].kind, MessageKind::Defer);
+    assert_eq!(messages[0].source, MessageSource::McpNotification);
+}
+
+include!("subscription_tasks_test_part1.rs");

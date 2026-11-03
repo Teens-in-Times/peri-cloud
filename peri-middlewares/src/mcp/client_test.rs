@@ -41,7 +41,7 @@ fn connected_test_handle(name: &str) -> Arc<McpClientHandle> {
 }
 
 #[test]
-fn task_owner_metadata_is_scoped_to_workspace_sources() {
+fn task_owner_metadata_is_scoped_to_session_capable_builtin_sources() {
     let pool = McpClientPool::new_pending();
     assert!(
         pool.task_owner_meta_for("workspace", "session-a").is_none(),
@@ -61,6 +61,54 @@ fn task_owner_metadata_is_scoped_to_workspace_sources() {
             .get(peri_mcp_core::task_owner::TASK_OWNER_META_KEY),
         Some(&serde_json::json!("session-a"))
     );
+
+    let mut monitor = connected_test_handle("monitor");
+    Arc::get_mut(&mut monitor).unwrap().source = Some(crate::mcp::config::ConfigSource::Builtin {
+        instance: "monitor".into(),
+    });
+    pool.clients.write().insert("monitor".into(), monitor);
+    let meta = pool
+        .task_owner_meta_for("monitor", "session-b")
+        .expect("builtin monitor owner");
+    assert_eq!(
+        meta.0
+             .0
+            .get(peri_mcp_core::task_owner::TASK_OWNER_META_KEY),
+        Some(&serde_json::json!("session-b"))
+    );
+}
+
+#[test]
+fn task_owner_scoping_follows_the_builtin_registry() {
+    for (instance, expected) in [
+        ("workspace", true),
+        ("monitor", true),
+        ("web", false),
+        ("artifact", false),
+        ("cron", false),
+        ("workflow", false),
+    ] {
+        let declared = peri_acp_types::builtin_mcp::find(instance)
+            .unwrap_or_else(|| panic!("{instance} must be declared"));
+        assert_eq!(
+            declared.task_owner_scoped, expected,
+            "{instance} task_owner_scoped must match the host owner contract"
+        );
+        let source = Some(crate::mcp::config::ConfigSource::Builtin {
+            instance: instance.into(),
+        });
+        assert_eq!(
+            crate::mcp::client::task_owner_metadata::source_uses_task_owner(source.as_ref()),
+            expected,
+            "{instance} owner metadata must be derived from the registry field"
+        );
+    }
+    assert!(
+        crate::mcp::client::task_owner_metadata::source_uses_task_owner(Some(
+            &crate::mcp::config::ConfigSource::WorkspaceRemote
+        ))
+    );
+    assert!(!crate::mcp::client::task_owner_metadata::source_uses_task_owner(None));
 }
 
 #[test]
@@ -87,7 +135,7 @@ fn task_owner_metadata_covers_remote_workspace_and_skips_other_sources() {
     pool.clients.write().insert("web".into(), web);
     assert!(
         pool.task_owner_meta_for("web", "session-a").is_none(),
-        "non-workspace servers stay generic"
+        "non-session-scoped servers stay generic"
     );
 }
 
@@ -730,49 +778,4 @@ async fn single_recollect_retries_once_and_returns_the_second_result() {
     );
 }
 
-/// [M9] 持续抖动（两次都失败）：返回显式、可重试的内容准入错误，
-/// 不提交半套采集结果。
-#[tokio::test]
-async fn single_recollect_fails_closed_with_retryable_admission_error() {
-    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let result: Result<&str, String> =
-        super::collect_with_single_recollect("workspace instruction face", || {
-            let calls = std::sync::Arc::clone(&calls);
-            async move {
-                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Err("resources/read failed".to_string())
-            }
-        })
-        .await;
-    let error = result.expect_err("持续不一致必须失败");
-    assert!(
-        error.contains("retry the session admission"),
-        "错误必须明说可重试：{error}"
-    );
-    assert!(
-        error.contains("inconsistent"),
-        "错误必须是内容准入错误：{error}"
-    );
-    assert_eq!(
-        calls.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "不稳定时不无限重试"
-    );
-}
-
-/// [M9] 首次即成功：不触发任何重采集。
-#[tokio::test]
-async fn single_recollect_never_retries_a_consistent_first_pass() {
-    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let result: Result<&str, String> =
-        super::collect_with_single_recollect("workspace instruction face", || {
-            let calls = std::sync::Arc::clone(&calls);
-            async move {
-                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok("collected")
-            }
-        })
-        .await;
-    assert_eq!(result, Ok("collected"));
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-}
+include!("client_test_part1.rs");
