@@ -31,6 +31,7 @@ class GitHub:
             data=json.dumps(data).encode() if data is not None else None,
             method=method,
             headers={"Authorization": "Bearer " + self.token, "Accept": "application/vnd.github+json",
+                     "Content-Type": "application/json",
                      "User-Agent": "peri-upstream-sync", "X-GitHub-Api-Version": "2022-11-28"},
         )
         try:
