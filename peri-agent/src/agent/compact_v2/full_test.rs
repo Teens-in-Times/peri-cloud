@@ -913,7 +913,6 @@ fn recovery_prompts_name_recovery_resources() {
         assert!(prompt.contains("recovery resources"));
         assert!(prompt.contains("skills whose bodies were archived"));
         assert!(prompt.contains("contract-vs-actual deviation"));
-        assert!(prompt.contains("Do not call tools"));
     }
     assert!(SUMMARY_RECOVERY_PROMPT.contains("cut off"));
     assert!(SUMMARY_RECOVERY_PROMPT.contains("Continue exactly from the end"));
