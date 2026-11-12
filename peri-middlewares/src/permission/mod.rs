@@ -48,6 +48,12 @@ const CRON_REGISTER_TOOL_NAME: &str = "cron_register";
 /// effective name 只从声明表解析。
 const MONITOR_START_TOOL_NAME: &str = "monitor_start";
 
+/// `Workflow` 的**原始**工具名（不是 effective name）。
+///
+/// 与 [`CRON_REGISTER_TOOL_NAME`] 同形：判定分支与敏感清单条目共用同一字面量，
+/// effective name 只从声明表解析。
+const WORKFLOW_TOOL_NAME: &str = "Workflow";
+
 /// 默认敏感工具判断规则
 ///
 /// builtin direct 工具使用原名，deferred 工具仍可能使用前缀名。命中声明表
@@ -60,6 +66,7 @@ const MONITOR_START_TOOL_NAME: &str = "monitor_start";
 /// - `Edit`：文件编辑
 /// - `folder_operations`：目录操作
 /// - `Agent`：子 Agent 委派（子 Agent 不含 HITL，可传递绕过审批）
+/// - `Workflow`：工作流启动（后台子链不含 HITL，等价于委派执行权）
 /// - `cron_register`：定时任务注册（可定时触发任意 prompt，等价于代理执行权）
 /// - `monitor_start`：启动监控命令（可执行任意 shell，等价于命令执行权）
 pub fn default_requires_approval(tool_name: &str) -> bool {
@@ -74,6 +81,7 @@ fn default_requires_approval_without_builtin(tool_name: &str) -> bool {
     tool_name == TOOL_BASH
         || tool_name == TOOL_FOLDER_OPS
         || tool_name == TOOL_AGENT
+        || tool_name == WORKFLOW_TOOL_NAME
         || tool_name == TOOL_WRITE
         || tool_name == TOOL_EDIT
         || tool_name.starts_with("delete_")
@@ -160,13 +168,13 @@ fn builtin_tool_effective_name(instance: &str, original_name: &str) -> &'static 
 /// 与 [`default_requires_approval`] 的判定分支一一对应——段落不再硬编码
 /// 列表（设计 §3.1.2 重复段处理：修改代码无需同步段落，防失同步）。
 /// 清单包括精确工具条目和前缀规则；已迁移为 builtin 一等工具的条目
-/// （web×2 + cron×1 + monitor×1 + workspace×4）名为**模型面名字**，经
+/// （web×2 + cron×1 + monitor×1 + workflow×1 + workspace×4）名为**模型面名字**，经
 /// [`builtin_tool_effective_name`] 从 `peri_acp_types::builtin_mcp` 声明表解析
 /// （A19/IF-G3：模型看到的名字就是 effective name，条目名若留裸名会点名一个
 /// 已不存在的工具）。只列需审批的 workspace 条目：`Read` / `Glob` / `Grep`
 /// 归一后走免审批分支（[`default_requires_approval`] 为假），进清单即与
 /// 「每条目必须判定为敏感」的一致性断言冲突。
-pub fn sensitive_tool_entries() -> [SensitiveToolEntry; 12] {
+pub fn sensitive_tool_entries() -> [SensitiveToolEntry; 13] {
     [
         SensitiveToolEntry {
             name: builtin_tool_effective_name("workspace", TOOL_BASH),
@@ -226,6 +234,11 @@ pub fn sensitive_tool_entries() -> [SensitiveToolEntry; 12] {
         SensitiveToolEntry {
             name: builtin_tool_effective_name("monitor", MONITOR_START_TOOL_NAME),
             description: "monitor command execution (starts a shell command and watches its output)",
+            prefix_match: false,
+        },
+        SensitiveToolEntry {
+            name: builtin_tool_effective_name("workflow", WORKFLOW_TOOL_NAME),
+            description: "workflow delegation (launches a multi-agent workflow that bypasses HITL, equivalent to delegated execution rights)",
             prefix_match: false,
         },
     ]
@@ -477,6 +490,19 @@ fn unanswered_rejection(call: &ToolCall, cause: UnansweredCause) -> AgentError {
     }
 }
 
+fn classifier_context(
+    state: &dyn hook_state::StateView,
+    call: &ToolCall,
+) -> Option<peri_model::ModelCallContext> {
+    Some(peri_model::ModelCallContext {
+        owner: state.session_id()?.to_owned(),
+        execution: state.execution_binding()?.attempt_id.to_string(),
+        call: format!("auto-classify:{}:{}", state.current_step()?, call.id),
+        purpose: "auto-classify".into(),
+        parent: None,
+    })
+}
+
 impl PermissionMiddleware {
     /// 批量处理一批工具调用：收集所有需要审批的项，一次性弹窗，返回每个 call 的处理结果。
     ///
@@ -488,6 +514,7 @@ impl PermissionMiddleware {
         calls: &[ToolCall],
         origins: &[Option<hook_state::BoundToolOrigin>],
         owner: Option<&TrustedInteractionOwner>,
+        state: Option<&dyn hook_state::StateView>,
     ) -> Vec<AgentResult<ToolCall>> {
         let mut results: Vec<AgentResult<ToolCall>> = Vec::with_capacity(calls.len());
 
@@ -506,8 +533,14 @@ impl PermissionMiddleware {
             // 有 mode → 使用快照模式决策
             if let Some(mode) = &mode_snapshot {
                 results.push(
-                    self.decide_by_mode(mode, call, origins[i].as_ref(), owner)
-                        .await,
+                    self.decide_by_mode(
+                        mode,
+                        call,
+                        origins[i].as_ref(),
+                        owner,
+                        state.and_then(|state| classifier_context(state, call)),
+                    )
+                    .await,
                 );
                 continue;
             }
@@ -587,6 +620,7 @@ impl PermissionMiddleware {
         tool_call: &ToolCall,
         origin: Option<&hook_state::BoundToolOrigin>,
         owner: Option<&TrustedInteractionOwner>,
+        model_context: Option<peri_model::ModelCallContext>,
     ) -> AgentResult<ToolCall> {
         match mode.load() {
             PermissionMode::Bypass => Ok(tool_call.clone()),
@@ -604,7 +638,11 @@ impl PermissionMiddleware {
                 Some(classifier) => {
                     let classification_name = classifier_tool_name(tool_call, origin);
                     let result = classifier
-                        .classify(&classification_name, &tool_call.input)
+                        .classify_with_context(
+                            &classification_name,
+                            &tool_call.input,
+                            model_context,
+                        )
                         .await;
                     match result {
                         Classification::Allow => Ok(tool_call.clone()),
@@ -792,7 +830,7 @@ impl Middleware for PermissionMiddleware {
             .collect();
         // 归属在弹窗前一次性铸造（同一批次 = 同一 turn owner）；缺失即拒绝。
         let owner = crate::interaction_owner::owner_from_hook_state(state);
-        self.process_batch_with_origins(calls, &origins, owner.as_ref())
+        self.process_batch_with_origins(calls, &origins, owner.as_ref(), Some(state))
             .await
     }
 
@@ -813,7 +851,13 @@ impl Middleware for PermissionMiddleware {
             // 不受缺失归属影响（显式 Bypass 仍由原 Permission 权威裁决）。
             let owner = crate::interaction_owner::owner_from_hook_state(state);
             return self
-                .decide_by_mode(mode, tool_call, origin.as_ref(), owner.as_ref())
+                .decide_by_mode(
+                    mode,
+                    tool_call,
+                    origin.as_ref(),
+                    owner.as_ref(),
+                    classifier_context(state, tool_call),
+                )
                 .await;
         }
 

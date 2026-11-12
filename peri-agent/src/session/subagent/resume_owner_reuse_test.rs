@@ -64,7 +64,7 @@ async fn test_resume_suppresses_stop_intent_from_previous_execution() {
         None,
         serde_json::json!({}),
     );
-    owner.queue.push(
+    owner.queue.push_sync(
         QueuedMessage::system_reminder(
             crate::session::MessageKind::Info,
             MessageSource::HookStopIntent,
@@ -74,7 +74,7 @@ async fn test_resume_suppresses_stop_intent_from_previous_execution() {
             previous_execution,
         )),
     );
-    owner.queue.push(QueuedMessage::prompt(
+    owner.queue.push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         BaseMessage::human("resume without old stop"),
     ));
@@ -107,7 +107,7 @@ async fn test_resume_suppresses_stop_intent_from_previous_execution() {
         1,
         "旧 Stop 不得阻止 resume 新执行推理"
     );
-    assert_eq!(owner.queue.len(), 0);
+    assert_eq!(owner.queue.len_sync(), 0);
     assert_eq!(
         owner.queue.suppressed_messages().len(),
         1,
@@ -150,7 +150,7 @@ async fn test_resume_factory_reuses_handoff_owner_queue_and_manager() {
         Some(store.clone()),
         None,
     );
-    owner.queue.push(QueuedMessage::prompt(
+    owner.queue.push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         BaseMessage::human("late handoff context"),
     ));
@@ -168,7 +168,7 @@ async fn test_resume_factory_reuses_handoff_owner_queue_and_manager() {
     .await
     .expect("factory resume must accept the handed-off owner");
     assert_eq!(spawned.child_thread_id, thread_id);
-    assert_eq!(owner.queue.len(), 0, "恢复必须复用并消费原 owner 队列");
+    assert_eq!(owner.queue.len_sync(), 0, "恢复必须复用并消费原 owner 队列");
     assert!(
         owner.check_resume().is_ok(),
         "恢复完成后 owner 必须释放执行准入"
@@ -186,7 +186,7 @@ impl FailWithQueuedInput {
         _request: peri_model::ModelRequest,
         _cancellation: CancellationToken,
     ) -> Vec<peri_model::ModelResult<peri_model::ModelStreamEvent>> {
-        self.queue.push(crate::session::QueuedMessage::prompt(
+        self.queue.push_sync(crate::session::QueuedMessage::prompt(
             crate::session::MessageSource::UserInput,
             BaseMessage::human("未消费的失败后输入"),
         ));
@@ -331,7 +331,10 @@ async fn test_failed_model_handoff_then_resume(background: bool, fail_drain: boo
         .iter()
         .any(|task| task.task_id == "retained-shell"));
     assert!(owner.pending_receipt().is_none());
-    assert!(owner.queue.has_required(), "失败期间到达的输入必须保留");
+    assert!(
+        owner.queue.has_required_sync(),
+        "失败期间到达的输入必须保留"
+    );
     assert_eq!(child_manager.active_count(), 1);
     if fail_drain {
         assert!(owner.failure().unwrap().contains("event drain failed"));
@@ -528,10 +531,12 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
         child_owner: Some(owner.clone()),
         ..Default::default()
     });
-    child.queue().push(crate::session::QueuedMessage::prompt(
-        crate::session::MessageSource::UserInput,
-        BaseMessage::human("开始执行"),
-    ));
+    child
+        .queue()
+        .push_sync(crate::session::QueuedMessage::prompt(
+            crate::session::MessageSource::UserInput,
+            BaseMessage::human("开始执行"),
+        ));
     let built = build_v2_subagent_context(
         Some(child.clone()),
         Box::new(FailingReactLlm),
@@ -547,7 +552,19 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
         None,
         Some(agent_id_from_child_thread(&child_id)),
     );
-    let (entered, release) = store.gate_next_reminder_append();
+    // 交接提醒的持久化门：flush 已成功、提醒尚未写入时暂停，
+    // 让用例在「canonical 提交」与「后续 flush 失败」之间插入观察。
+    let (entered, release) = {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *store.reminder_append_gate.lock().unwrap() =
+            Some(crate::session::test_resources::mock::ResumeLoadGate {
+                entered: entered_tx,
+                release: release_rx,
+                dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+        (entered_rx, release_tx)
+    };
     let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
     let finished_tx = parking_lot::Mutex::new(Some(finished_tx));
     let deregister: crate::session::factory::DeregisterRuntimeFn = Arc::new(move |_| {
@@ -568,6 +585,7 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
             None,
             None,
             Some(store.clone()),
+            None,
             Some(deregister),
             None,
             None,
@@ -628,7 +646,7 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
             shell_output: None,
         }
     ));
-    child.queue().drain_all();
+    child.queue().drain_all_sync();
     let writer = child.transcript().read().persist_tx_handle().unwrap();
     child.transcript().read().shutdown_persistence();
     tokio::time::timeout(Duration::from_secs(10), writer.closed())
@@ -647,7 +665,7 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
     assert!(owner.receipt().is_some(), "交接必须先于后续 flush 失败提交");
     assert!(owner.pending_receipt().is_none());
     assert_eq!(child_manager.active_count(), 0);
-    assert!(!owner.queue.has_required());
+    assert!(!owner.queue.has_required_sync());
     assert_eq!(
         owner.failure().as_deref(),
         Some("child history flush is unconfirmed")
@@ -669,317 +687,4 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
     assert!(error.contains("settlement is unconfirmed"), "{error}");
 }
 
-/// [回归测试] 交接确认后 history flush 失败，不能放行同步执行。
-#[tokio::test(start_paused = true)]
-async fn test_sync_post_handoff_history_flush_failure_blocks_resume() {
-    test_post_handoff_history_flush_failure(false).await;
-}
-
-/// [回归测试] 交接确认后 history flush 失败，不能放行后台执行。
-#[tokio::test(start_paused = true)]
-async fn test_background_post_handoff_history_flush_failure_blocks_resume() {
-    test_post_handoff_history_flush_failure(true).await;
-}
-
-#[derive(Clone)]
-struct FailWithoutResidual;
-
-impl FailWithoutResidual {
-    async fn respond(
-        &self,
-        _request: peri_model::ModelRequest,
-        _cancellation: CancellationToken,
-    ) -> Vec<peri_model::ModelResult<peri_model::ModelStreamEvent>> {
-        vec![Err(peri_model::ModelError::http_status(
-            400,
-            "fixture",
-            None::<&str>,
-        ))]
-    }
-}
-crate::fixture_model_impl!(FailWithoutResidual);
-
-async fn test_failed_without_receipt_resume(background: bool, late_obligations: bool) {
-    use crate::session::subagent::{ParkedChildOwner, SubagentFailure};
-    use crate::session::{FrozenContext, MessageQueue, Session};
-    use peri_acp_types::tasks::{BgTaskKind, BgTaskRegistration, TaskManager as _};
-    use std::time::Duration;
-
-    let store = MockSessionResources::new();
-    let child_id = uuid::Uuid::now_v7().to_string();
-    let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
-    meta.id = child_id.clone();
-    meta.parent_thread_id = Some("parent-thread".into());
-    store.create_resumable_thread(meta).await.unwrap();
-    store
-        .update_thread_status(&child_id, "error")
-        .await
-        .unwrap();
-    let parent_manager = Arc::new(TaskManager::new());
-    let child_manager = Arc::new(TaskManager::new());
-    let owner = ParkedChildOwner::new(
-        child_id.clone(),
-        "parent-thread".into(),
-        child_manager.clone(),
-        MessageQueue::new(),
-        Some(store.clone()),
-        None,
-    );
-    parent_manager.register_child_owner(owner.clone()).unwrap();
-    let parent = Session::new(
-        Arc::from("/tmp"),
-        FrozenContext::builder().build(),
-        Some("parent-thread".into()),
-    );
-    parent.set_subagent_host(SubagentHost {
-        task_manager: Some(parent_manager.clone()),
-        ..Default::default()
-    });
-    let mut config = resume_config_with(
-        store.clone(),
-        child_id.clone(),
-        crate::session::test_resources::mock::model::fixture_source(
-            Arc::new(FailWithoutResidual),
-            "fixture-scripted",
-        ),
-        if background {
-            SubagentRunMode::Background
-        } else {
-            SubagentRunMode::Sync
-        },
-        Some(parent_manager),
-        None,
-    );
-    if late_obligations {
-        let late_manager = child_manager.clone();
-        let late_queue = owner.queue.clone();
-        config.on_subagent_stop = Some(Arc::new(move |_, _, _, _, _| {
-            late_manager
-                .register(BgTaskRegistration {
-                    task_id: "late-shell".into(),
-                    kind: BgTaskKind::Shell,
-                    summary: "结算期间新到达的任务".into(),
-                    pid: None,
-                    kill: Some(Box::new(|| {})),
-                })
-                .unwrap();
-            late_queue.push(crate::session::QueuedMessage::prompt(
-                crate::session::MessageSource::UserInput,
-                BaseMessage::human("结算期间到达的输入"),
-            ));
-        }));
-    }
-    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
-    let finished_tx = parking_lot::Mutex::new(Some(finished_tx));
-    config.deregister_runtime = Some(Arc::new(move |_| {
-        if let Some(sender) = finished_tx.lock().take() {
-            let _ = sender.send(());
-        }
-    }));
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    let result_tx = parking_lot::Mutex::new(Some(result_tx));
-    config.on_bg_complete = Some(Arc::new(move |result, _| {
-        if let Some(sender) = result_tx.lock().take() {
-            let _ = sender.send(result.clone());
-        }
-        Ok(())
-    }));
-    let first = SessionFactory::resume_subagent(Some(&parent), config).await;
-    if background {
-        first.expect("后台执行须成功启动");
-        let result = tokio::time::timeout(Duration::from_secs(10), result_rx)
-            .await
-            .expect("后台失败必须完成")
-            .unwrap();
-        assert!(!result.success);
-    } else {
-        let error = first.err().expect("模型失败必须返回错误");
-        let failure = error.downcast_ref::<SubagentFailure>().unwrap();
-        assert!(
-            failure.handoff().is_none(),
-            "模型失败时尚无义务，不能伪造交接"
-        );
-    }
-    tokio::time::timeout(Duration::from_secs(10), finished_rx)
-        .await
-        .expect("旧执行必须完成")
-        .unwrap();
-    assert!(owner.receipt().is_none());
-    if !late_obligations {
-        assert!(owner.failure().is_none());
-        assert_eq!(child_manager.active_count(), 0);
-        let resumed =
-            SessionFactory::resume_subagent(Some(&parent), resume_config(store, child_id.clone()))
-                .await
-                .expect("没有残余义务的失败应允许新执行");
-        assert_eq!(resumed.child_thread_id, child_id);
-        return;
-    }
-    assert_eq!(child_manager.active_count(), 1);
-    assert!(owner.queue.has_required());
-    assert_eq!(
-        owner.failure().as_deref(),
-        Some("child settlement is unconfirmed after execution failure")
-    );
-    let error = SessionFactory::resume_subagent(Some(&parent), resume_config(store, child_id))
-        .await
-        .err()
-        .expect("无交接回执的未确认义务必须阻止 resume")
-        .to_string();
-    assert!(error.contains("settlement is unconfirmed"), "{error}");
-}
-
-/// [回归测试] 无 receipt 的同步失败在结算期间出现新义务时必须阻断。
-#[tokio::test(start_paused = true)]
-async fn test_sync_failed_without_receipt_late_obligations_block_resume() {
-    test_failed_without_receipt_resume(false, true).await;
-}
-
-/// [回归测试] 无 receipt 的后台失败在结算期间出现新义务时必须阻断。
-#[tokio::test(start_paused = true)]
-async fn test_background_failed_without_receipt_late_obligations_block_resume() {
-    test_failed_without_receipt_resume(true, true).await;
-}
-
-/// [回归测试] 无 receipt 且无遗留义务的同步失败可以恢复。
-#[tokio::test(start_paused = true)]
-async fn test_sync_failed_without_receipt_or_obligations_can_resume() {
-    test_failed_without_receipt_resume(false, false).await;
-}
-
-/// [回归测试] 无 receipt 且无遗留义务的后台失败可以恢复。
-#[tokio::test(start_paused = true)]
-async fn test_background_failed_without_receipt_or_obligations_can_resume() {
-    test_failed_without_receipt_resume(true, false).await;
-}
-
-#[derive(Clone)]
-struct FailWithUnwritableStore(Arc<MockSessionResources>);
-
-impl FailWithUnwritableStore {
-    async fn respond(
-        &self,
-        _request: peri_model::ModelRequest,
-        _cancellation: CancellationToken,
-    ) -> Vec<peri_model::ModelResult<peri_model::ModelStreamEvent>> {
-        self.0.restrict_to_history_read_only();
-        vec![Err(peri_model::ModelError::http_status(
-            400,
-            "fixture",
-            None::<&str>,
-        ))]
-    }
-}
-crate::fixture_model_impl!(FailWithUnwritableStore);
-
-async fn test_unconfirmed_handoff_blocks_factory_resume(background: bool) {
-    use crate::session::subagent::ParkedChildOwner;
-    use crate::session::{FrozenContext, MessageQueue, Session};
-    use peri_acp_types::tasks::{BgTaskKind, BgTaskRegistration, TaskManager as _};
-    use std::time::Duration;
-
-    let store = MockSessionResources::new();
-    let child_id = uuid::Uuid::now_v7().to_string();
-    let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
-    meta.id = child_id.clone();
-    meta.parent_thread_id = Some("parent-thread".into());
-    store.create_resumable_thread(meta).await.unwrap();
-    store
-        .update_thread_status(&child_id, "error")
-        .await
-        .unwrap();
-    let parent_manager = Arc::new(TaskManager::new());
-    let child_manager = Arc::new(TaskManager::new());
-    child_manager
-        .register(BgTaskRegistration {
-            task_id: "unconfirmed-shell".into(),
-            kind: BgTaskKind::Shell,
-            summary: "测试中的后台任务".into(),
-            pid: None,
-            kill: Some(Box::new(|| {})),
-        })
-        .unwrap();
-    let owner = ParkedChildOwner::new(
-        child_id.clone(),
-        "parent-thread".into(),
-        child_manager,
-        MessageQueue::new(),
-        Some(store.clone()),
-        None,
-    );
-    parent_manager.register_child_owner(owner.clone()).unwrap();
-    let parent = Session::new(
-        Arc::from("/tmp"),
-        FrozenContext::builder().build(),
-        Some("parent-thread".into()),
-    );
-    parent.set_subagent_host(SubagentHost {
-        task_manager: Some(parent_manager.clone()),
-        ..Default::default()
-    });
-    let mut config = resume_config_with(
-        store.clone(),
-        child_id.clone(),
-        crate::session::test_resources::mock::model::fixture_source(
-            Arc::new(FailWithUnwritableStore(store.clone())),
-            "fixture-scripted",
-        ),
-        if background {
-            SubagentRunMode::Background
-        } else {
-            SubagentRunMode::Sync
-        },
-        Some(parent_manager),
-        None,
-    );
-    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
-    let finished_tx = parking_lot::Mutex::new(Some(finished_tx));
-    config.deregister_runtime = Some(Arc::new(move |_| {
-        if let Some(sender) = finished_tx.lock().take() {
-            let _ = sender.send(());
-        }
-    }));
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    let result_tx = parking_lot::Mutex::new(Some(result_tx));
-    config.on_bg_complete = Some(Arc::new(move |result, _| {
-        if let Some(sender) = result_tx.lock().take() {
-            let _ = sender.send(result.clone());
-        }
-        Ok(())
-    }));
-    let first = SessionFactory::resume_subagent(Some(&parent), config).await;
-    if background {
-        first.expect("后台执行须成功启动");
-        let result = tokio::time::timeout(Duration::from_secs(10), result_rx)
-            .await
-            .expect("后台失败必须完成")
-            .unwrap();
-        assert!(!result.success);
-    } else {
-        assert!(first.is_err(), "持久化失败必须返回错误");
-    }
-    tokio::time::timeout(Duration::from_secs(10), finished_rx)
-        .await
-        .expect("旧执行必须完成")
-        .unwrap();
-    assert!(owner.pending_receipt().is_some(), "未确认交接身份必须保留");
-    assert!(owner.receipt().is_none());
-    let error = SessionFactory::resume_subagent(Some(&parent), resume_config(store, child_id))
-        .await
-        .err()
-        .expect("未确认交接必须阻止 resume")
-        .to_string();
-    assert!(error.contains("handoff is unconfirmed"), "{error}");
-}
-
-/// [回归测试] 同步交接真实写入失败时，factory 明确拒绝恢复。
-#[tokio::test(start_paused = true)]
-async fn test_sync_unconfirmed_handoff_blocks_factory_resume() {
-    test_unconfirmed_handoff_blocks_factory_resume(false).await;
-}
-
-/// [回归测试] 后台交接真实写入失败时，factory 明确拒绝恢复。
-#[tokio::test(start_paused = true)]
-async fn test_background_unconfirmed_handoff_blocks_factory_resume() {
-    test_unconfirmed_handoff_blocks_factory_resume(true).await;
-}
+include!("resume_owner_settlement_test.rs");

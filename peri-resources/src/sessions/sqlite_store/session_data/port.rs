@@ -1,6 +1,7 @@
 //! `SessionDataPort` 的 SQLite 接线；数据面主体文件只保留类型、模块装配与测试挂载。
 
 use super::*;
+use crate::sessions::sqlite_store::row_mapping::THREAD_META_COLUMNS;
 
 #[async_trait]
 impl SessionDataPort for SqliteSessionData {
@@ -269,99 +270,14 @@ impl SessionDataPort for SqliteSessionData {
     }
 
     async fn load_snapshot(&self, id: &ThreadId) -> SessionResourceResult<SessionSnapshot> {
-        // 一次读取视图：同一连接上的延迟事务让 meta/binding/frozen/历史/继承区来自
-        // 同一个数据库状态，不让调用方拼多次跨时刻查询。meta 走轻量投影（不含
-        // 正文）：历史事实由 payloads 给出。
-        let mut connection = self
-            .database
-            .pool
-            .acquire()
-            .await
-            .map_err(|error| map_sqlx(&error))?;
-        let mut tx = sqlx::Connection::begin(&mut *connection)
-            .await
-            .map_err(|error| map_sqlx(&error))?;
-        let meta = context::load_meta_on(&mut tx, id)
-            .await
-            .map_err(read_failure)?;
-        let parent = meta.parent_thread_id.clone();
-        let binding = match binding_row_state_on(&mut tx, id).await? {
-            BindingRowState::Bound(binding) => BindingState::Bound(binding),
-            BindingRowState::Absent if parent.is_some() => BindingState::ExternalOrUnregistered,
-            BindingRowState::Absent => BindingState::Missing,
-        };
-        let frozen = match frozen_bytes_on(&mut tx, id).await.map_err(read_failure)? {
-            Some(bytes) => FrozenState::Present(FrozenSnapshotBytes::new(bytes)),
-            None => FrozenState::LegacyAbsent,
-        };
-        let payloads = context::load_payloads_on(&mut tx, id)
-            .await
-            .map_err(read_failure)?;
-        let flags = compaction::load_flags_on(&mut tx, id)
-            .await
-            .map_err(read_failure)?;
-        let inherited = context::load_inherited_context_on(&mut tx, id)
-            .await
-            .map_err(read_failure)?;
-        // 只读事务：没有写入效果可以证明，提交失败仍按原因分类，不判 `Unknown`。
-        tx.commit().await.map_err(|error| map_sqlx(&error))?;
-        Ok(SessionSnapshot {
-            meta,
-            binding,
-            frozen,
-            payloads,
-            flags,
-            inherited,
-        })
+        self.load_snapshot_impl(id).await
     }
 
     async fn load_active_snapshot(
         &self,
         id: &ThreadId,
     ) -> SessionResourceResult<ActiveSessionSnapshot> {
-        // 与 `load_snapshot` 同一次读取视图、同一套分类规则，差别只有范围：
-        // payload 与 flags 的读取条件都带 `excluded = 0`，已排除正文与已排除条目的
-        // 标记都不进入内存（不先全量再过滤）。
-        let mut connection = self
-            .database
-            .pool
-            .acquire()
-            .await
-            .map_err(|error| map_sqlx(&error))?;
-        let mut tx = sqlx::Connection::begin(&mut *connection)
-            .await
-            .map_err(|error| map_sqlx(&error))?;
-        let meta = context::load_meta_on(&mut tx, id)
-            .await
-            .map_err(read_failure)?;
-        let parent = meta.parent_thread_id.clone();
-        let binding = match binding_row_state_on(&mut tx, id).await? {
-            BindingRowState::Bound(binding) => BindingState::Bound(binding),
-            BindingRowState::Absent if parent.is_some() => BindingState::ExternalOrUnregistered,
-            BindingRowState::Absent => BindingState::Missing,
-        };
-        let frozen = match frozen_bytes_on(&mut tx, id).await.map_err(read_failure)? {
-            Some(bytes) => FrozenState::Present(FrozenSnapshotBytes::new(bytes)),
-            None => FrozenState::LegacyAbsent,
-        };
-        let payloads = context::load_active_payloads_on(&mut tx, id)
-            .await
-            .map_err(read_failure)?;
-        let flags = compaction::load_active_flags_on(&mut tx, id)
-            .await
-            .map_err(read_failure)?;
-        let inherited = context::load_inherited_context_on(&mut tx, id)
-            .await
-            .map_err(read_failure)?;
-        tx.commit().await.map_err(|error| map_sqlx(&error))?;
-        Ok(ActiveSessionSnapshot {
-            meta,
-            binding,
-            frozen,
-            inherited,
-            payloads,
-            flags,
-        })
+        self.load_active_snapshot_impl(id).await
     }
 
     async fn load_frozen_state(&self, id: &ThreadId) -> SessionResourceResult<FrozenState> {
@@ -391,7 +307,7 @@ impl SessionDataPort for SqliteSessionData {
         let mut tx = sqlx::Connection::begin(&mut *connection)
             .await
             .map_err(|error| map_sqlx(&error))?;
-        let meta = context::load_meta_on(&mut tx, id)
+        let meta = context::load_meta_on(&mut tx, id, THREAD_META_COLUMNS)
             .await
             .map_err(read_failure)?;
         let state = match binding_row_state_on(&mut tx, id).await? {
@@ -418,7 +334,7 @@ impl SessionDataPort for SqliteSessionData {
         let mut tx = sqlx::Connection::begin(&mut *connection)
             .await
             .map_err(|error| map_sqlx(&error))?;
-        let payloads = context::load_context_payloads_on(&mut tx, id)
+        let payloads = context::load_context_payloads_on(&mut tx, id, THREAD_META_COLUMNS)
             .await
             .map_err(read_failure)?;
         tx.commit().await.map_err(|error| map_sqlx(&error))?;
@@ -603,6 +519,66 @@ impl SessionDataPort for SqliteSessionData {
             .unwrap_or_else(|_| id.clone()))
     }
 
+    async fn recovery_scope(
+        &self,
+        id: &ThreadId,
+    ) -> SessionResourceResult<peri_acp_types::recovery::RecoveryScope> {
+        let mut connection = self
+            .database
+            .pool
+            .acquire()
+            .await
+            .map_err(|error| map_sqlx(&error))?;
+        // 根必须严格解析：缺失或成环时范围不可解释，退回自身会把未知当已知。
+        let root = match strict_thread_root_on(&mut connection, id).await {
+            Ok(root) => root,
+            Err(ThreadRootFailure::Missing) => return Err(corrupt("thread ancestry is missing")),
+            Err(ThreadRootFailure::Cyclic) => return Err(corrupt("cyclic thread ancestry")),
+            Err(ThreadRootFailure::Store(error)) => return Err(read_failure(error)),
+        };
+        let (projection, filter) = self.database.recovery_scope_sql_parts();
+        let rows: Vec<(String, Option<String>, Option<i64>, String)> = sqlx::query_as(
+            sqlx::AssertSqlSafe(recovery_scope_statement_with(projection, filter)),
+        )
+        .bind(root.as_str())
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx(&error))?;
+        let mut candidates = Vec::with_capacity(rows.len());
+        for (thread_id, parent_thread_id, usage, state) in rows {
+            let state = state
+                .parse::<peri_acp_types::thread::WorkState>()
+                .map_err(|_| corrupt("stored work state is not a known value"))?;
+            // SQL 已按 working 过滤；这里只防御未来投影漂移，不静默改成候选。
+            if state != peri_acp_types::thread::WorkState::Working {
+                continue;
+            }
+            let context_usage_tokens = match usage {
+                None => None,
+                Some(usage) => Some(
+                    u64::try_from(usage)
+                        .map_err(|_| corrupt("stored context usage is negative"))?,
+                ),
+            };
+            candidates.push(peri_acp_types::recovery::RecoveryCandidate {
+                thread_id,
+                parent_thread_id,
+                context_usage_tokens,
+            });
+        }
+        Ok(peri_acp_types::recovery::RecoveryScope {
+            root_thread_id: root,
+            candidates,
+        })
+    }
+
+    async fn interrupted_threads(
+        &self,
+        id: &ThreadId,
+    ) -> SessionResourceResult<Vec<peri_acp_types::recovery::InterruptedThread>> {
+        self.interrupted_threads_impl(id).await
+    }
+
     async fn list_sessions(
         &self,
         query: &ScopedThreadQuery,
@@ -676,95 +652,7 @@ impl SessionDataPort for SqliteSessionData {
     }
 
     async fn save_child(&self, child: &ChildSnapshot) -> SessionResourceResult<()> {
-        self.writable()?;
-        // 防御校验复用门面同一条规则：落库写的是 `target.meta` 里的父关系，声明与它不一致
-        // 时必须在这里就停下，不能靠「父链核对」兜底——那条链查的是声明里的 parent。
-        ensure_child_relation(child)?;
-        let snapshot_at = child
-            .target
-            .meta
-            .snapshot_at_message_id
-            .map(|id| id.as_uuid().to_string());
-        let inherited = child
-            .inherited
-            .to_json_with_spans()
-            .map_err(|_| corrupt("inherited context is not serializable"))?;
-        // 发布前校验引用边界，损坏的继承区不能落库。
-        InheritedContext::from_json(&inherited.json)
-            .map_err(|_| corrupt("inherited context has invalid message references"))?;
-        let mut tx = self
-            .database
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|error| map_sqlx(&error))?;
-        self.require_session(&mut tx, &child.parent_id).await?;
-        if !thread_exists_on(&mut tx, &child.parent_id)
-            .await
-            .map_err(read_failure)?
-        {
-            return Err(not_found());
-        }
-        // 父子关系与根归属必须与库内事实一致：child 的 root 必须真是 parent 链的根。
-        let parent_root = thread_root_on(&mut tx, &child.parent_id)
-            .await
-            .map_err(read_failure)?;
-        if parent_root != child.root_id {
-            return Err(invalid_input("child root does not match its parent chain"));
-        }
-        // frozen 必须逐字节来自 root 的已保存快照：不重新扫描目录，也不重新冻结。
-        let root_frozen = frozen_bytes_on(&mut tx, &child.root_id)
-            .await
-            .map_err(read_failure)?;
-        if root_frozen.as_deref() != Some(child.target.frozen.as_str()) {
-            return Err(invalid_input(
-                "child frozen snapshot must be the root's saved snapshot",
-            ));
-        }
-        // 子会话继承父会话的执行绑定身份，不另立 workspace 归属。
-        match binding_row_state_on(&mut tx, &child.parent_id).await? {
-            BindingRowState::Bound(parent_binding) if parent_binding != child.target.binding => {
-                return Err(SessionResourceError::new(
-                    SessionResourceErrorKind::Workspace(WorkspaceError::ExecutionBindingMismatch),
-                ));
-            }
-            _ => {}
-        }
-        insert_thread_row(
-            &mut tx,
-            &new_session_row(
-                &child.target,
-                snapshot_at.as_deref(),
-                Some(child.target.frozen.as_str()),
-                0,
-            ),
-        )
-        .await
-        .map_err(write_failure)?;
-        insert_binding_row(&mut tx, &child.target.thread_id, &child.target.binding)
-            .await
-            .map_err(write_failure)?;
-        sqlx::query("UPDATE threads SET inherited_context = ?1 WHERE id = ?2")
-            .bind(&inherited.json)
-            .bind(child.target.thread_id.as_str())
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| map_sqlx(&error))?;
-        // 列文本与派生索引同事务：命中路径从创建时就可用，不必等第一次布局扫描回填。
-        if let Some(write) = super::inherited_index::SnapshotWrite::from_serialization(
-            &child.target.thread_id,
-            Some(child.parent_id.as_str()),
-            &inherited,
-        ) {
-            write
-                .replace(&mut tx)
-                .await
-                .map_err(|error| map_sqlx(&error))?;
-        }
-        tx.commit()
-            .await
-            .map_err(|_| commit_failure(Some(child.target.thread_id.clone())))?;
-        Ok(())
+        self.save_child_impl(child).await
     }
 
     async fn load_child_resume_record(
@@ -917,6 +805,27 @@ impl SessionDataPort for SqliteSessionData {
         self.update_stored_meta(id, patch).await
     }
 
+    async fn set_work_state(&self, id: &ThreadId, state: WorkState) -> SessionResourceResult<()> {
+        // 单列写入与迁移桥共用同一份 SQL：不碰 `updated_at`，不改运行态。
+        session_rows::write_work_state(&self.database.pool, id, state)
+            .await
+            .map_err(write_failure)
+    }
+
+    async fn settle_work_state_after_turn(&self, id: &ThreadId) -> SessionResourceResult<bool> {
+        self.settle_work_state_after_turn_mq(id).await
+    }
+
+    async fn set_context_usage(
+        &self,
+        id: &ThreadId,
+        tokens: Option<u64>,
+    ) -> SessionResourceResult<()> {
+        session_rows::write_context_usage(&self.database.pool, id, tokens)
+            .await
+            .map_err(write_failure)
+    }
+
     async fn delete_tree(&self, id: &ThreadId) -> SessionResourceResult<()> {
         self.delete_stored_tree(id).await
     }
@@ -933,9 +842,120 @@ impl SessionDataPort for SqliteSessionData {
         Ok(())
     }
 
+    async fn mq_enqueue(
+        &self,
+        thread_id: &ThreadId,
+        input: MqInput,
+    ) -> SessionResourceResult<MqEnqueueOutcome> {
+        self.enqueue_mq(thread_id, input).await
+    }
+
+    async fn mq_query(
+        &self,
+        thread_id: &ThreadId,
+        filter: MqFilter,
+    ) -> SessionResourceResult<Vec<MqEntry>> {
+        self.query_mq(thread_id, filter).await
+    }
+
+    async fn mq_headers(
+        &self,
+        thread_id: &ThreadId,
+        filter: MqFilter,
+    ) -> SessionResourceResult<Vec<peri_acp_types::session::MqHeader>> {
+        self.query_mq_headers(thread_id, filter).await
+    }
+
+    async fn mq_count(&self, thread_id: &ThreadId) -> SessionResourceResult<usize> {
+        self.count_mq(thread_id).await
+    }
+
+    async fn mq_exists(&self, thread_id: &ThreadId) -> SessionResourceResult<bool> {
+        self.exists_mq(thread_id).await
+    }
+
+    async fn mq_watermark(
+        &self,
+        thread_id: &ThreadId,
+    ) -> SessionResourceResult<Option<peri_acp_types::session::MqWatermark>> {
+        self.watermark_mq(thread_id).await
+    }
+
+    async fn mq_cancel(
+        &self,
+        thread_id: &ThreadId,
+        id: MessageId,
+    ) -> SessionResourceResult<MqCancelOutcome> {
+        self.cancel_mq(thread_id, id).await
+    }
+
+    async fn mq_receive(
+        &self,
+        thread_id: &ThreadId,
+        selection: MqReceiveSelection,
+    ) -> SessionResourceResult<MqReceiveOutcome> {
+        self.receive_mq(thread_id, selection).await
+    }
+
+    async fn mq_clear(&self, thread_id: &ThreadId) -> SessionResourceResult<()> {
+        self.clear_mq(thread_id).await
+    }
+
+    async fn mq_history_contains(
+        &self,
+        thread_id: &ThreadId,
+        id: MessageId,
+    ) -> SessionResourceResult<bool> {
+        let mut connection = self
+            .database
+            .pool
+            .acquire()
+            .await
+            .map_err(|error| map_sqlx(&error))?;
+        Ok(
+            super::mq::message_fact(&mut connection, &id.as_uuid().to_string())
+                .await?
+                .is_some_and(|(owner, _)| owner == thread_id.as_str()),
+        )
+    }
+
+    async fn finalize_child_terminal(
+        &self,
+        child: &ThreadId,
+        status: AgentStatus,
+        work_state: WorkState,
+        target: &ThreadId,
+        message: MqInput,
+    ) -> SessionResourceResult<MqEnqueueOutcome> {
+        self.finalize_child_terminal_mq(child, status, work_state, target, message)
+            .await
+    }
+
+    async fn settle_terminal_without_result(
+        &self,
+        child: &ThreadId,
+        status: AgentStatus,
+        work_state: WorkState,
+    ) -> SessionResourceResult<TerminalSettlementOutcome> {
+        self.settle_terminal_without_result_rows(child, status, work_state)
+            .await
+    }
+
+    async fn settle_retained_mq(
+        &self,
+        thread_id: &ThreadId,
+        reminders: &[peri_acp_types::session::RetainedReminder],
+        rows: &[MqEntry],
+    ) -> SessionResourceResult<()> {
+        self.settle_retained_mq_rows(thread_id, reminders, rows)
+            .await
+    }
+
     async fn close(&self) -> SessionResourceResult<()> {
         // 连接池由共享库句柄所有（执行面也可能在用），这里只关闭数据侧的写入入口。
         self.closed.store(true, Ordering::Release);
         Ok(())
     }
 }
+
+include!("port_snapshots.rs");

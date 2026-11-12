@@ -73,7 +73,7 @@ impl McpMiddleware {
     ///
     /// 取投影而非把 admission 存成字段：middleware 每 turn 新建，准入输入的权威
     /// 来源仍是 middleware 自身字段，存第二份可写副本会引入漂移面（业务规则单一
-    /// 权威）。将来由 session 级持有者长期持有的实例走
+    /// 权威）。session invocation 复用
     /// [`McpAdmissionPreparation::new`] 同一条构造路径。
     fn admission(&self) -> McpAdmissionPreparation {
         McpAdmissionPreparation::new(
@@ -487,12 +487,14 @@ impl McpMiddleware {
     ///
     /// 无任何已配置服务器时返回 `None`（零噪音，不注入）。
     fn overview_text(&self) -> Option<String> {
-        let infos = self
+        let mut infos = self
             .pool
             .all_server_infos_visible_to(self.session_id.as_deref());
         if infos.is_empty() {
             return None;
         }
+        // This is a set snapshot, not the ordered lifecycle event stream.
+        infos.sort_by(|left, right| left.name.cmp(&right.name));
         let (mut connected, mut failed, mut disabled, mut other) = (0usize, 0usize, 0usize, 0usize);
         let mut lines = Vec::new();
         for info in &infos {
@@ -537,12 +539,12 @@ impl McpMiddleware {
     /// 状态变化以 canonical Info reminder 注入模型上下文。
     ///
     /// 首条推送附 tool search 提示（每个会话恰好一次），后续只推送变化行。
-    fn push_status_changes(&self, state: &mut dyn hook_state::QueueState) {
+    async fn push_status_changes(&self, state: &mut dyn hook_state::QueueState) {
         let changes = self.pool.drain_pending_changes();
         if changes.is_empty() {
             return;
         }
-        let queue = state.v2_queue();
+        let producer = state.v2_producer();
         let mut texts = Vec::with_capacity(changes.len() + 1);
         if !self.hint_sent.swap(true, Ordering::SeqCst) {
             texts.push(format!("MCP 连接状态变化：{MCP_TOOL_USAGE_HINT}"));
@@ -571,11 +573,16 @@ impl McpMiddleware {
                     metadata: json!({}),
                 })
                 .expect("MCP status reminder mapping must be valid");
-            queue.push(QueuedMessage::system_reminder(
-                MessageKind::Info,
-                QueueMessageSource::SystemInjected,
-                reminder,
-            ));
+            if let Err(error) = producer
+                .enqueue(QueuedMessage::system_reminder(
+                    MessageKind::Info,
+                    QueueMessageSource::SystemInjected,
+                    reminder,
+                ))
+                .await
+            {
+                tracing::warn!(%error, "MCP status change enqueue failed");
+            }
         }
     }
 }
@@ -708,8 +715,8 @@ impl Middleware for McpMiddleware {
         state: &mut dyn hook_state::StartupState,
     ) -> peri_agent::error::AgentResult<()> {
         // 顺序不变：await_system_ready → startup_tool_update → stage_startup_tools。
-        // 准入逻辑本体在 session-owned 的 `McpAdmissionPreparation`（同一份实现
-        // 将来也服务 idle invocation），本钩子只保留触发时机与提交出口。
+        // 准入逻辑复用 session invocation 的 `McpAdmissionPreparation`，
+        // 本钩子只保留触发时机与提交出口。
         let admission = self.admission();
         let snapshot = admission
             .await_system_ready()
@@ -730,7 +737,7 @@ impl Middleware for McpMiddleware {
         &self,
         state: &mut dyn hook_state::BeforeModelState,
     ) -> peri_agent::error::AgentResult<()> {
-        self.push_status_changes(state);
+        self.push_status_changes(state).await;
         Ok(())
     }
 }

@@ -23,7 +23,7 @@ use rmcp::{
     ServerHandler,
 };
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -86,6 +86,7 @@ async fn test_unavailable_terminal_settlement_is_retryable() {
                 transition_id,
                 &task,
                 false,
+                None,
                 &NoopTaskManager,
             )
             .await
@@ -159,7 +160,7 @@ async fn workspace_shell_reminder_uses_file_references() {
     )
     .await
     .unwrap();
-    let messages = inbox.queue().drain_all();
+    let messages = inbox.queue_for_test().drain_all_sync();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].source, MessageSource::ShellComplete);
     let QueuedPayload::SystemReminder(reminder) = &messages[0].payload else {
@@ -198,7 +199,7 @@ async fn async_result_shell_reminder_body_keeps_full_identity_and_evidence() {
     )
     .await
     .unwrap();
-    let messages = inbox.queue().drain_all();
+    let messages = inbox.queue_for_test().drain_all_sync();
     let QueuedPayload::SystemReminder(reminder) = &messages[0].payload else {
         panic!("reminder")
     };
@@ -247,7 +248,7 @@ async fn async_result_unresolved_reminder_reports_unknown_side_effects() {
     )
     .await
     .unwrap();
-    let messages = inbox.queue().drain_all();
+    let messages = inbox.queue_for_test().drain_all_sync();
     let QueuedPayload::SystemReminder(reminder) = &messages[0].payload else {
         panic!("reminder")
     };
@@ -283,7 +284,7 @@ async fn async_result_failed_mcp_reminder_is_not_projected_as_completed() {
     )
     .await
     .unwrap();
-    let messages = inbox.queue().drain_all();
+    let messages = inbox.queue_for_test().drain_all_sync();
     let QueuedPayload::SystemReminder(reminder) = &messages[0].payload else {
         panic!("reminder")
     };
@@ -377,7 +378,7 @@ async fn terminal_reminder_is_delivered_to_the_initiator_not_the_task_owner() {
     assert_eq!(metadata["initiator"], "child");
     assert_eq!(metadata["task_owner"], "root");
     assert_eq!(metadata["delivery"], "initiator");
-    assert!(owner_inbox.queue().drain_all().is_empty());
+    assert!(owner_inbox.queue_for_test().drain_all_sync().is_empty());
 }
 
 #[tokio::test]
@@ -399,7 +400,7 @@ async fn unknown_initiator_cannot_register_or_deliver_to_root() {
         )
         .unwrap_err();
     assert!(error.contains("Unroutable"), "{error}");
-    assert!(owner_inbox.queue().is_empty());
+    assert!(owner_inbox.queue_for_test().is_empty_sync());
 }
 
 // 回归：投递失败必须报错（任务保持未结清），不能静默当成功。
@@ -456,7 +457,7 @@ async fn failed_canonical_commit_does_not_enqueue_the_reminder() {
         .await
         .unwrap_err();
     assert_eq!(error, "canonical reminder commit failed");
-    assert!(owner_inbox.queue().drain_all().is_empty());
+    assert!(owner_inbox.queue_for_test().drain_all_sync().is_empty());
 }
 
 /// Close settlement has one shared deadline: a pending external cancel on the
@@ -553,7 +554,7 @@ async fn task_subscription_confirms_terminal_after_snapshot_eviction() {
             result: serde_json::Map::new(),
         },
     );
-    pool.deliver_managed_task_status("server", &ticket, "terminal", &task, false, &manager)
+    pool.deliver_managed_task_status("server", &ticket, "terminal", &task, false, None, &manager)
         .await
         .unwrap();
     for index in 0..600 {
@@ -576,7 +577,7 @@ async fn task_subscription_confirms_terminal_after_snapshot_eviction() {
         .tasks
         .iter()
         .any(|record| record.task_id == ticket.task_id()));
-    pool.deliver_managed_task_status("server", &ticket, "terminal", &task, false, &manager)
+    pool.deliver_managed_task_status("server", &ticket, "terminal", &task, false, None, &manager)
         .await
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -657,46 +658,7 @@ async fn settle_registered_task(
         .find(|record| record.task_id == ticket.task_id())
         .map(|record| record.status)
         .expect("terminal task record");
-    (inbox.queue().drain_all(), status)
+    (inbox.queue_for_test().drain_all_sync(), status)
 }
 
-/// B9: monitor 的终态（成功/失败）只更新任务投影，不向 owner 投递任何 reminder。
-#[tokio::test]
-async fn monitor_terminal_settlement_never_wakes_the_owner() {
-    for success in [true, false] {
-        let (messages, status) = settle_registered_task(
-            "monitor",
-            Some(ConfigSource::Builtin {
-                instance: "monitor".into(),
-            }),
-            true,
-            success,
-        )
-        .await;
-        assert!(
-            messages.is_empty(),
-            "monitor terminal settlement must not queue a reminder (success={success}): {messages:?}"
-        );
-        assert_eq!(
-            status,
-            if success { "completed" } else { "failed" },
-            "terminal projection must still be observable through the task manager"
-        );
-    }
-}
-
-/// B9 回归：非 monitor 实例的终态投递保持不变。
-#[tokio::test]
-async fn non_monitor_terminal_settlement_still_wakes_the_owner() {
-    let (messages, status) = settle_registered_task("workflow", None, false, true).await;
-    assert_eq!(status, "completed");
-    assert_eq!(
-        messages.len(),
-        1,
-        "non-monitor terminal delivery must be unchanged"
-    );
-    assert_eq!(messages[0].kind, MessageKind::Defer);
-    assert_eq!(messages[0].source, MessageSource::McpNotification);
-}
-
-include!("subscription_tasks_test_part1.rs");
+include!("subscription_monitor_tasks_test.rs");

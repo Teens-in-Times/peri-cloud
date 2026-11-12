@@ -56,14 +56,14 @@ impl ReactLLM for StopDuringReasonLlm {
     ) -> crate::error::AgentResult<crate::agent::react::Reasoning> {
         let stop = QueuedMessage::info(MessageSource::HookStopIntent, BaseMessage::human("stop"));
         if self.stop_first {
-            self.completion.queue.push(stop.clone());
+            self.completion.queue.push_sync(stop.clone());
         }
         let answer = self
             .completion
             .generate_reasoning(messages, tools, streaming)
             .await?;
         if !self.stop_first {
-            self.completion.queue.push(stop);
+            self.completion.queue.push_sync(stop);
         }
         Ok(answer)
     }
@@ -78,7 +78,7 @@ async fn hook_stop_in_budget_boundary_batch_wins_without_followup_activation() {
             None,
         );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        session.queue().push(QueuedMessage::prompt(
+        session.queue().push_sync(QueuedMessage::prompt(
             MessageSource::UserInput,
             BaseMessage::human("initial work"),
         ));
@@ -101,7 +101,7 @@ async fn hook_stop_in_budget_boundary_batch_wins_without_followup_activation() {
             LoopResult::HookStopped { unprocessed_tool_calls } if unprocessed_tool_calls.is_empty()
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(session.queue().is_empty());
+        assert!(session.queue().is_empty_sync());
         let delivery_id = crate::agent::async_tasks::delivery::terminal_delivery_id(
             "bg-budget-boundary",
             "terminal",
@@ -120,7 +120,7 @@ impl ReactLLM for CompletionDuringReasonLlm {
     ) -> crate::error::AgentResult<crate::agent::react::Reasoning> {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             for _ in 0..self.passive_prefix {
-                self.queue.push(QueuedMessage::info(
+                self.queue.push_sync(QueuedMessage::info(
                     MessageSource::SystemInjected,
                     BaseMessage::human("passive batch filler"),
                 ));
@@ -145,7 +145,7 @@ impl ReactLLM for CompletionDuringReasonLlm {
                 peri_acp_types::tasks::BgTaskKind::Agent,
             )
             .expect("production completion callback must accept the result");
-            assert!(self.queue.has_ensure_processing());
+            assert!(self.queue.has_ensure_processing_sync());
         } else {
             assert_eq!(
                 messages
@@ -186,7 +186,7 @@ async fn completion_during_reason_with_prefix(
         None,
     );
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    session.queue().push(QueuedMessage::prompt(
+    session.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         BaseMessage::human("start parent reasoning"),
     ));
@@ -216,15 +216,16 @@ async fn background_completion_at_budget_boundary_retains_followup_eligibility()
     let delivery_id =
         crate::agent::async_tasks::delivery::terminal_delivery_id("bg-budget-boundary", "terminal");
     assert!(session.transcript().read().get(delivery_id).is_none());
-    assert!(session.queue().has_ensure_processing_after(1));
+    assert!(session.queue().has_ensure_processing_after_sync(&None));
     assert!(session
         .queue()
-        .has_pending_defer(&MessageSource::SubAgentComplete));
-    let pending = session.queue().drain_all();
+        .has_pending_defer_sync(&MessageSource::SubAgentComplete));
+    let pending = session.queue().snapshot_sync();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].delivery_id, Some(delivery_id));
-    assert_eq!(pending[0].admission_sequence, Some(2));
-    session.queue().push_batch(pending);
+    // MQ 以 (enqueued_at, id) 排序，admission_sequence 不再是队列事实。
+    assert!(pending[0].enqueued_at.is_some());
+    session.queue().push_batch_sync(pending);
     let context = StageContext::builder(
         session.start_turn(),
         session.transcript(),
@@ -242,7 +243,7 @@ async fn background_completion_at_budget_boundary_retains_followup_eligibility()
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(session.transcript().read().get(delivery_id).is_some());
-    assert!(session.queue().is_empty());
+    assert!(session.queue().is_empty_sync());
 }
 
 #[tokio::test]
@@ -255,7 +256,7 @@ async fn background_completion_during_reason_runs_followup_with_remaining_budget
 #[tokio::test]
 async fn deferred_result_that_reaches_failed_reason_is_not_requeued() {
     let (session, calls, _) = completion_during_reason_fixture(1).await;
-    let watermark = session.queue().admission_watermark();
+    let watermark = session.queue().admission_watermark_sync();
     let context = StageContext::builder(
         session.start_turn(),
         session.transcript(),
@@ -268,9 +269,10 @@ async fn deferred_result_that_reaches_failed_reason_is_not_requeued() {
         LoopResult::Error(crate::error::AgentError::Other(_))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert!(session.queue().is_empty());
-    assert_eq!(session.queue().admission_watermark(), watermark);
-    assert!(!session.queue().has_ensure_processing_after(watermark));
+    assert!(session.queue().is_empty_sync());
+    // 队列已排空，水位随行消失；「没有新准入」由 after 判定保证。
+    assert!(session.queue().admission_watermark_sync().is_none());
+    assert!(!session.queue().has_ensure_processing_after_sync(&watermark));
     let context = StageContext::builder(
         session.start_turn(),
         session.transcript(),
@@ -293,9 +295,8 @@ async fn background_completion_after_receive_batch_boundary_retains_original_adm
         LoopResult::Error(crate::error::AgentError::MaxIterationsExceeded(1))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    let pending = session.queue().drain_all();
+    let pending = session.queue().drain_all_sync();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].admission_sequence, Some(66));
     assert_eq!(
         pending[0].delivery_id,
         Some(crate::agent::async_tasks::delivery::terminal_delivery_id(
@@ -308,8 +309,8 @@ async fn background_completion_after_receive_batch_boundary_retains_original_adm
 #[tokio::test]
 async fn deferred_result_in_zero_budget_followup_does_not_reactivate_itself() {
     let (session, calls, _) = completion_during_reason_fixture(1).await;
-    let watermark = session.queue().admission_watermark();
-    assert!(session.queue().has_ensure_processing_after(1));
+    let watermark = session.queue().admission_watermark_sync();
+    assert!(session.queue().has_ensure_processing_after_sync(&None));
     let context = StageContext::builder(
         session.start_turn(),
         session.transcript(),
@@ -326,9 +327,10 @@ async fn deferred_result_in_zero_budget_followup_does_not_reactivate_itself() {
         LoopResult::Error(crate::error::AgentError::MaxIterationsExceeded(0))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(session.queue().admission_watermark(), watermark);
-    assert!(!session.queue().has_ensure_processing_after(watermark));
-    assert!(session.queue().is_empty());
+    // 队列已排空，水位随行消失；「没有新准入」由 after 判定保证。
+    assert!(session.queue().admission_watermark_sync().is_none());
+    assert!(!session.queue().has_ensure_processing_after_sync(&watermark));
+    assert!(session.queue().is_empty_sync());
     let context = StageContext::builder(
         session.start_turn(),
         session.transcript(),
@@ -356,7 +358,7 @@ async fn exhausted_budget_idle_wake_retains_new_required_message() {
     );
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let suspended = Arc::new(AtomicBool::new(false));
-    session.queue().push(QueuedMessage::prompt(
+    session.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         BaseMessage::human("initial work"),
     ));
@@ -383,7 +385,7 @@ async fn exhausted_budget_idle_wake_retains_new_required_message() {
     .expect("the first answer must enter idle before result arrival");
     let message = BaseMessage::human("late idle result");
     let message_id = message.id();
-    session.queue().push(QueuedMessage::defer(
+    session.queue().push_sync(QueuedMessage::defer(
         MessageSource::SubAgentComplete,
         message,
     ));
@@ -396,9 +398,8 @@ async fn exhausted_budget_idle_wake_retains_new_required_message() {
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(session.transcript().read().get(message_id).is_none());
-    let pending = session.queue().drain_all();
+    let pending = session.queue().drain_all_sync();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].admission_sequence, Some(2));
     assert_eq!(pending[0].message().unwrap().id(), message_id);
 }
 
@@ -432,7 +433,7 @@ async fn loaded_history_never_replays_old_tools_and_new_input_starts_a_fresh_run
         LoopResult::Completed
     ));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    session.queue().push(QueuedMessage::prompt(
+    session.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         BaseMessage::human("new input"),
     ));
@@ -605,5 +606,4 @@ fn assert_single_turn_completed(
     assert_eq!(completed_steps, vec![expected_steps]);
 }
 
-#[path = "loop_iteration_tail_test.rs"]
-mod tail;
+include!("loop_iteration_budget_test.rs");

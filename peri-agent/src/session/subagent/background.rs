@@ -8,6 +8,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::lifecycle::drain_subagent_events;
+use super::terminal_settlement::{settle_terminal_without_result, TerminalMqRoute};
 use super::types::{
     ChildRunOutcome, SubagentFailure, SubagentLifecycleStart, SubagentLifecycleStop,
 };
@@ -25,8 +26,8 @@ use crate::agent::events::{AgentEventHandler, ExecutorEvent};
 use crate::agent::subagent_event_forwarder::spawn_subagent_event_forwarder_for_completion;
 use crate::agent::LangfuseBridgeLike;
 use crate::session::factory::{DeregisterRuntimeFn, RegisterRuntimeFn};
-use peri_acp_types::session_resources::{SessionMetaPatch, SessionResources};
-use peri_acp_types::thread::{AgentStatus, ThreadId};
+use peri_acp_types::session_resources::SessionResources;
+use peri_acp_types::thread::{AgentStatus, ThreadId, WorkState};
 
 pub(super) struct BackgroundStartGate {
     pub(super) alive: Arc<parking_lot::Mutex<bool>>,
@@ -97,6 +98,7 @@ pub(super) async fn spawn_background_subagent(
     on_bg_complete: Option<peri_acp_types::tasks::OnBgCompleteFn>,
     langfuse_bridge: Option<Arc<dyn LangfuseBridgeLike>>,
     session_resources: Option<Arc<dyn SessionResources>>,
+    terminal_route: Option<TerminalMqRoute>,
     deregister_runtime: Option<DeregisterRuntimeFn>,
     on_subagent_start: Option<SubagentLifecycleStart>,
     on_subagent_stop: Option<SubagentLifecycleStop>,
@@ -153,6 +155,7 @@ pub(super) async fn spawn_background_subagent(
     let panic_on_complete = on_bg_complete.clone();
     let panic_manager = Arc::clone(&task_manager);
     let panic_resources = session_resources.clone();
+    let panic_terminal_route = terminal_route.clone();
     let runtime_started = Arc::new(AtomicBool::new(false));
     let cleanup_runtime: Option<DeregisterRuntimeFn> = deregister_runtime.map(|deregister| {
         let runtime_started = runtime_started.clone();
@@ -175,6 +178,9 @@ pub(super) async fn spawn_background_subagent(
         ticket: Arc::clone(&registration_slot),
         armed: true,
     };
+    // 后台任务 future 持有 `session_resources`；放行前的 Working 写入与失败恢复
+    // 需要同一句柄，先克隆一份留在本函数。
+    let work_state_resources = session_resources.clone();
     let execution = async move {
         let mut unstarted_registration = unstarted_registration;
         let mut cleanup_guard = cleanup_guard;
@@ -211,6 +217,26 @@ pub(super) async fn spawn_background_subagent(
             return;
         }
         unstarted_registration.armed = false;
+        // 执行已获准开跑：先提交续跑意图再进入 loop，进程若在此刻退出，下次进入仍
+        // 能看出这个 child 需要继续。resume 已在放行前写过 Working（失败即拒绝启动），
+        // 这里只给其余后台启动补写；辅助写失败不阻断执行。
+        if !resuming {
+            if let Some(resources) = session_resources.as_deref() {
+                if let Err(error) = resources
+                    .set_work_state(
+                        &ThreadId::from(child_thread_id_for_task.clone()),
+                        WorkState::Working,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        thread_id = %child_thread_id_for_task,
+                        %error,
+                        "subagent work state write failed"
+                    );
+                }
+            }
+        }
         let started_at = peri_time::monotonic_now();
         // context 将被 move 进 run_react_loop，turn_id 提前提取（Start/Stop emit 用）
         let execution_turn = v2_ctx.context.session.turn.clone();
@@ -536,6 +562,7 @@ pub(super) async fn spawn_background_subagent(
             &child_thread_id_for_task,
             status,
             &mut result,
+            terminal_route.as_ref(),
         )
         .await;
         if !terminal_persisted {
@@ -568,11 +595,17 @@ pub(super) async fn spawn_background_subagent(
                 );
             }
         }
+        // 终态提交失败时仍按既有协议交付失败结果：父会话需要知道结算没完成，
+        // 而这次提交没有留下任何事实（终态、意图与 MQ 行都没写）。
         settle_background_terminal(&task_manager_spawn, &registration, result, on_bg_complete);
         let owner = session
             .subagent_host()
             .and_then(|host| host.child_owner.clone());
         // residual 是已确认的交接；无 receipt 时仍须检查动态到达的义务。
+        let unsettled_obligations = match owner.as_ref() {
+            Some(owner) => owner.has_unsettled_obligations().await,
+            None => false,
+        };
         let permit_result = if !terminal_persisted {
             Err("terminal_status_persist_failed".to_string())
         } else if let Some(error) = drain_failure.as_ref() {
@@ -582,18 +615,21 @@ pub(super) async fn spawn_background_subagent(
         } else if matches!(outcome, ChildRunOutcome::HandoffFailed { .. }) {
             Err("child handoff persistence is unconfirmed".to_string())
         } else if matches!(outcome, ChildRunOutcome::Failed { residual: None, .. })
-            && owner
-                .as_ref()
-                .is_some_and(|owner| owner.has_unsettled_obligations())
+            && unsettled_obligations
         {
             Err("child settlement is unconfirmed after execution failure".to_string())
         } else {
             Ok(())
         };
+        let parked_inbox = permit_result.is_ok() && !explicit_close;
         if permit_result.is_ok() {
             if let Some(guard) = &mut resumed_mailbox {
                 guard.0 = None;
             }
+        }
+        // 先注销再释放执行准入，避免 resume 重新注册后被本次停驻覆盖。
+        if parked_inbox {
+            super::lifecycle::park_child_inbox(&session, &child_thread_id_for_task, &outcome);
         }
         if let Some(permit) = permit {
             permit.finish(permit_result);
@@ -634,6 +670,7 @@ pub(super) async fn spawn_background_subagent(
                     &panic_thread_id,
                     AgentStatus::Error,
                     &mut result,
+                    panic_terminal_route.as_ref(),
                 )
                 .await;
                 if let Some(registration) = panic_registration.lock().clone() {
@@ -697,16 +734,42 @@ pub(super) async fn spawn_background_subagent(
         Some(claim) => Some(claim.release().await?),
         None => None,
     };
+    // 显式 resume 的认领只写 Active，不会解除之前的 Stopped。Working 必须在本函数
+    // 报告成功前落库：否则进程在 worker 补写前退出会留下 Active + Stopped，冷恢复
+    // 按设计跳过它，已接纳的 prompt 不再推进。写失败时 drop handoff 让认领 worker
+    // 按未接收补偿回原状态，后台任务也不放行。
+    if resuming {
+        let resources = work_state_resources
+            .as_deref()
+            .ok_or("resume background start requires session resources")?;
+        if let Err(error) = resources
+            .set_work_state(&ThreadId::from(child_thread_id.clone()), WorkState::Working)
+            .await
+        {
+            tracing::error!(
+                thread_id = %child_thread_id,
+                %error,
+                "resume work state write failed; background start rejected"
+            );
+            return Err(format!("resume work state write failed: {error}").into());
+        }
+    }
     // 注册成功：先注册运行时（active_agents，与任务内 guard 的 deregister 配对），
     // 再放行包装任务继续执行。
     runtime_started.store(true, Ordering::Release);
     if let Some(register) = &register_runtime {
         register(child_thread_id.clone(), cancel_token, "independent".into());
     }
-    confirm_background_start(&startup_alive, reg_tx, confirmed_tx, || match handoff {
-        Some(handoff) => handoff.accept(),
-        None => Ok(()),
-    })?;
+    let confirmation =
+        confirm_background_start(&startup_alive, reg_tx, confirmed_tx, || match handoff {
+            Some(handoff) => handoff.accept(),
+            None => Ok(()),
+        });
+    if let Err(error) = confirmation {
+        // 补偿只有认领 handle 一个所有者：drop handoff 后 worker 在同一门禁内
+        // 恢复状态与工作意图；这里再写一次会与新任务竞争并可能覆盖其 Working。
+        return Err(error.into());
+    }
     registration.ticket = None;
     registration.runtime_cleanup = None;
 
@@ -718,19 +781,38 @@ async fn persist_background_terminal(
     thread_id: &str,
     status: AgentStatus,
     result: &mut crate::agent::events::BackgroundTaskResult,
+    terminal_route: Option<&TerminalMqRoute>,
 ) -> bool {
-    let Some(store) = store else {
+    // 有投递路由时，终态、续跑意图与结果消息由存储一次提交：三条事实不能分两次写，
+    // 否则中断会留下「子任务已结束、父会话没收到结果」。
+    if let Some(route) = terminal_route {
+        if let Err(error) = route.settle(thread_id, status, result).await {
+            tracing::error!(%thread_id, %error, "subagent terminal status write failed");
+            result.success = false;
+            result.output = format!(
+                "{}; subagent terminal status write failed: {error}",
+                result.output
+            );
+            return false;
+        }
         return true;
+    }
+    let Some(store) = store else {
+        // 没有存储就无法把终态与工作意图一次提交；不写半状态，按未结算失败返回，
+        // 让父会话看到「结算未完成」而不是伪装成功。
+        tracing::error!(
+            %thread_id,
+            "subagent terminal status write failed: session resources unavailable"
+        );
+        result.success = false;
+        result.output = format!(
+            "{}; subagent terminal status write failed: session resources unavailable",
+            result.output
+        );
+        return false;
     };
-    if let Err(error) = store
-        .update_session_meta(
-            &ThreadId::from(thread_id),
-            &SessionMetaPatch {
-                status: Some(status),
-                ..Default::default()
-            },
-        )
-        .await
+    if let Err(error) =
+        settle_terminal_without_result(store, &ThreadId::from(thread_id), status).await
     {
         tracing::error!(%thread_id, %error, "subagent terminal status write failed");
         result.success = false;
@@ -807,3 +889,7 @@ impl Drop for PendingBackgroundRegistration {
 #[cfg(test)]
 #[path = "background_registration_test.rs"]
 mod registration_tests;
+
+#[cfg(test)]
+#[path = "background_terminal_test.rs"]
+mod terminal_tests;

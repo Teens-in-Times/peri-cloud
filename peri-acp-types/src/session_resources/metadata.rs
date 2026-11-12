@@ -1,5 +1,10 @@
-//! 会话能力、快照与效果确定性的领域记录。
-use super::*;
+//! 会话资源的能力、创建输入与元数据契约；公共路径由父模块重导出。
+
+use crate::messages::MessageId;
+use crate::store::{InheritedContext, MessageFlags, PersistedPayload};
+use crate::thread::{AgentStatus, CancelPolicy, ThreadId, ThreadMeta};
+use crate::workspace::SessionBinding;
+use std::collections::HashMap;
 
 // ─── 能力与准入 ────────────────────────────────────────────────────────────────
 
@@ -110,7 +115,7 @@ pub struct NewSession {
 /// 与 [`NewSession`] 的唯一区别是**没有 frozen**：内容准入（资源读取后定稿）发生在取得
 /// 执行所有权之后，因此第一阶段只能写「除 frozen 以外」的全部事实。草稿不对外可见
 /// （列表按 `message_count > 0` 过滤），cold load 命中半写草稿按 typed 错误 fail-closed，
-/// 清理判据见 [`SessionResources::discard_incomplete_initialization`]。
+/// 清理判据见 [`super::SessionResources::discard_incomplete_initialization`]。
 #[derive(Clone, Debug)]
 pub struct NewSessionDraft {
     pub thread_id: ThreadId,
@@ -208,6 +213,10 @@ pub struct SessionSnapshot {
 // ─── 定向更新 ──────────────────────────────────────────────────────────────────
 
 // rewind 与有界读取视图的类型本体（本交付新增）在同名子模块 `history`。
+pub use super::history::{
+    collect_rewind_candidates, rewind_candidate, rewind_candidate_text, ActiveSessionSnapshot,
+    RewindBoundary, RewindCandidate, RewindOutcome,
+};
 
 /// 定向 metadata 更新：`None` 表示不更新，`Some(None)` 表示清除。
 ///
@@ -230,7 +239,7 @@ pub struct SessionMetaPatch {
 /// 「写进去了没有」，只能由 adapter 在能证明时给出 `NotApplied`。
 ///
 /// 与 A §5.4 的三态一致；那里的 `NotAppliedReason` / `UnknownReason` 由
-/// [`SessionResourceErrorKind`] 承载（原因是原因，效果是效果）。
+/// [`super::SessionResourceErrorKind`] 承载（原因是原因，效果是效果）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationOutcome {
     /// 已确认未生效。

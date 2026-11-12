@@ -133,6 +133,82 @@ fn test_overview_mixed_statuses() {
     assert!(text.contains("- legacy (disabled)"), "disabled 行: {text}");
     assert!(text.contains("tool search"), "应提示 tool search 用法");
     assert!(!text.contains("resources"), "概览不含资源信息: {text}");
+    assert_eq!(
+        text.lines().skip(1).take(3).collect::<Vec<_>>(),
+        [
+            "- chrome (failed: transport closed)",
+            "- github (connected, 1 tools)",
+            "- legacy (disabled)",
+        ],
+    );
+}
+
+#[test]
+fn prompt_server_sets_have_stable_order_without_reordering_server_resources() {
+    let canonical_names = [
+        "artifact",
+        "cron",
+        "monitor",
+        "web",
+        "workflow",
+        "workspace",
+    ];
+    let expected_resources = canonical_names
+        .iter()
+        .map(|name| {
+            format!("- server \"{name}\": fixture://{name}/z, fixture://{name}/a (2 resources)")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let expected_overview = format!(
+        "MCP: 6 connected, 0 failed, 0 disabled\n{}\n\n{MCP_TOOL_USAGE_HINT}",
+        canonical_names
+            .iter()
+            .map(|name| format!("- {name} (connected, 1 tools)"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    for insertion_order in [
+        [
+            "workflow",
+            "workspace",
+            "web",
+            "monitor",
+            "artifact",
+            "cron",
+        ],
+        [
+            "cron",
+            "artifact",
+            "monitor",
+            "web",
+            "workspace",
+            "workflow",
+        ],
+    ] {
+        let (_mcp_owner, pool) = owned_discovery_pool();
+        for name in insertion_order {
+            let mut handle = make_connected_handle(name, 1);
+            Arc::get_mut(&mut handle).unwrap().resources = ["z", "a"]
+                .iter()
+                .map(|suffix| {
+                    rmcp::model::Resource::new(format!("fixture://{name}/{suffix}"), *suffix)
+                })
+                .collect();
+            pool.clients.write().insert(name.into(), handle);
+        }
+        let tool = McpResourceTool::new(Arc::clone(&pool), Arc::new(McpSkillRegistry::new()));
+        assert_eq!(
+            tool.description(),
+            format!(
+                "Read a resource from an MCP server. Available resources:\n{expected_resources}"
+            ),
+        );
+        assert_eq!(
+            McpMiddleware::new(pool).overview_text().unwrap(),
+            expected_overview
+        );
+    }
 }
 
 // ─── record_status_change：状态变化统一出口 ──────────────────────────────────
@@ -255,8 +331,8 @@ fn test_before_model_pushes_info_messages() {
     let mut state = TestMiddlewareState::new();
 
     // 空缓冲：无消息
-    mw.push_status_changes(&mut state);
-    assert!(state.queue.drain_all().is_empty(), "空缓冲不应推送");
+    futures::executor::block_on(mw.push_status_changes(&mut state));
+    assert!(state.queue.drain_all_sync().is_empty(), "空缓冲不应推送");
 
     // 两条变化 + 首条附 tool search 提示
     pool.clients
@@ -268,8 +344,8 @@ fn test_before_model_pushes_info_messages() {
     }
     pool.record_status_change("github", Some(&ClientStatus::Connected));
 
-    mw.push_status_changes(&mut state);
-    let drained = state.queue.drain_all();
+    futures::executor::block_on(mw.push_status_changes(&mut state));
+    let drained = state.queue.drain_all_sync();
     let texts: Vec<String> = drained
         .iter()
         .map(|m| match &m.payload {
@@ -297,8 +373,8 @@ fn test_before_model_pushes_info_messages() {
     );
 
     // 缓冲已 drain：再次调用无操作
-    mw.push_status_changes(&mut state);
-    assert!(state.queue.drain_all().is_empty(), "缓冲恰好一次");
+    futures::executor::block_on(mw.push_status_changes(&mut state));
+    assert!(state.queue.drain_all_sync().is_empty(), "缓冲恰好一次");
 
     // 队列内消息均为 canonical Info + Lifecycle/MCP mapping
     for msg in &drained {
@@ -335,10 +411,10 @@ fn test_tool_search_hint_once_per_instance() {
             .write()
             .insert("github".to_string(), make_connected_handle("github", 1));
         pool.record_status_change("github", Some(&ClientStatus::Disconnected));
-        mw.push_status_changes(&mut state);
+        futures::executor::block_on(mw.push_status_changes(&mut state));
         let texts: Vec<String> = state
             .queue
-            .drain_all()
+            .drain_all_sync()
             .iter()
             .map(|m| match &m.payload {
                 peri_agent::session::QueuedPayload::SystemReminder(reminder) => {

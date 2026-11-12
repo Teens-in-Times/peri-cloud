@@ -20,7 +20,7 @@ use super::effective_dispatcher::StageEffectiveToolDispatcher;
 use crate::agent::events_v2::RenderEvent;
 use crate::agent::react::{ToolCall, ToolResult};
 use crate::error::{AgentError, AgentResult};
-use crate::messages::{BaseMessage, MessageId};
+use crate::messages::{BaseMessage, ContentBlock, MessageContent, MessageId};
 use crate::session::subagent::SubagentFailure;
 use crate::session::tool_catalog::SessionToolCatalogSnapshot;
 use crate::tools::{
@@ -151,6 +151,78 @@ impl SettledInvocation {
             outcome: ToolOutcome::Unreported,
         }
     }
+}
+
+/// 单条工具消息 base64 图片上限（字符）。transcript 单次持久化预留上限为
+/// 16 MiB；15 MiB 为 JSON 元数据与文本投影留出余量。
+const MAX_MODEL_IMAGE_DATA_CHARS: usize = 15 * 1024 * 1024;
+/// 模型/transcript 接受的内联图片类型；其余类型只保留 `[image: mime]` 文本占位。
+const MODEL_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// 把 `ToolOutcome.raw` 中 MCP 形状的图片块转成模型消息内容块。
+///
+/// 只提升图片；文本仍使用 `ToolOutput.text` 的既有投影，保证截断/摘要语义不变。
+/// 畸形、未知 mime 或超预算的图片只记录警告并丢弃块，不阻塞工具结果。
+fn model_media_blocks(outcome: &ToolOutcome) -> Vec<ContentBlock> {
+    let Some(raw) = outcome.raw() else {
+        return Vec::new();
+    };
+    let mut accepted_chars = 0usize;
+    raw.content()
+        .iter()
+        .filter_map(|block| {
+            if block.get("type").and_then(serde_json::Value::as_str) != Some("image") {
+                return None;
+            }
+            let media_type = block.get("mimeType").and_then(serde_json::Value::as_str)?;
+            if !MODEL_IMAGE_MIME_TYPES.contains(&media_type) {
+                tracing::warn!(
+                    mime_type = media_type,
+                    "dropping unsupported tool image type"
+                );
+                return None;
+            }
+            let data = block.get("data").and_then(serde_json::Value::as_str)?;
+            if data.is_empty() {
+                tracing::warn!(mime_type = media_type, "dropping empty tool image payload");
+                return None;
+            }
+            if data.len() > MAX_MODEL_IMAGE_DATA_CHARS - accepted_chars {
+                tracing::warn!(
+                    mime_type = media_type,
+                    data_chars = data.len(),
+                    accepted_chars,
+                    "dropping tool image payload beyond the message budget"
+                );
+                return None;
+            }
+            accepted_chars += data.len();
+            Some(ContentBlock::image_base64(media_type, data))
+        })
+        .collect()
+}
+
+/// 工具结果的 canonical 消息保留图片；具体 wire 位置由 provider adapter 决定。
+pub(super) fn settled_tool_message(settled: &SettledInvocation) -> BaseMessage {
+    let result = &settled.result;
+    let media = model_media_blocks(&settled.outcome);
+    let content = if media.is_empty() {
+        MessageContent::text(result.output.clone())
+    } else {
+        let mut blocks = Vec::with_capacity(media.len() + 1);
+        if !result.output.is_empty() {
+            blocks.push(ContentBlock::text(result.output.clone()));
+        }
+        blocks.extend(media);
+        MessageContent::Blocks(blocks)
+    };
+    BaseMessage::tool_result_with_execution_and_failure(
+        &result.tool_call_id,
+        content,
+        result.is_error,
+        result.execution.clone(),
+        result.subagent_failure.clone(),
+    )
 }
 
 /// 分配一次 canonical 执行的执行身份。
@@ -452,6 +524,17 @@ async fn dispatch_concurrent(
             let output_limit = tool.as_ref().and_then(|tool| tool.output_char_limit());
             let origin = ctx.origin_for(&ToolCallId::new(model_tool_call_id.clone()));
             let session_id = session_id.clone();
+            let model_parent =
+                session_id
+                    .as_ref()
+                    .zip(turn)
+                    .map(|(owner, turn)| peri_model::ModelCallParent {
+                        owner: owner.clone(),
+                        execution: turn.execution_binding().attempt_id.to_string(),
+                        call: format!("reason:{}", turn.step()),
+                        tool_call: model_tool_call_id.clone(),
+                        slot: None,
+                    });
             // turn_generation 只有真实 turn 才有：无 turn 的执行不写（不伪造）。
             let turn_generation = turn_id.map(|turn_id| turn_id.to_string());
             // 归属事实按**单条执行的来源**投影：App / Host 来源由来源自身派生，
@@ -460,7 +543,7 @@ async fn dispatch_concurrent(
             let session_resources = session_resources.clone();
             async move {
                 let timeout_opt = tool.as_ref().and_then(|t| t.timeout());
-                let invoke_fut = async {
+                let invoke_fut = crate::agent::model_call::scope_tool_parent(model_parent, async {
                     let mut ctx_param = crate::tools::ToolContext::new(&messages, &cwd)
                         .with_invocation(
                             Arc::new(
@@ -510,7 +593,7 @@ async fn dispatch_concurrent(
                             tool_name.clone(),
                         ))),
                     }
-                };
+                });
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {

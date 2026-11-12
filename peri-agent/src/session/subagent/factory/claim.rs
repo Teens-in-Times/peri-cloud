@@ -14,9 +14,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::tools::{EffectiveToolError, EffectiveToolErrorCode};
-use peri_acp_types::session_resources::{
-    SessionMetaPatch, SessionResourceErrorKind, SessionResources,
-};
+use peri_acp_types::session_resources::{SessionResourceErrorKind, SessionResources};
 use peri_acp_types::thread::{AgentStatus, ThreadId, ThreadMeta};
 
 /// 调用方提交给认领 worker 的领域结果。
@@ -27,7 +25,11 @@ enum ClaimDecision {
         accepted: oneshot::Receiver<()>,
     },
     /// 同步收尾：先结清认领，再写领域终态。
-    Finish(AgentStatus),
+    Finish {
+        status: AgentStatus,
+    },
+    /// 终态由 handoff worker 的 finalize 提交：只结束认领，不写任何状态。
+    Release,
     CancelRunning(Arc<crate::session::Session>),
 }
 
@@ -51,7 +53,7 @@ impl BackgroundHandoff {
 
 impl ResumeClaim {
     /// 校验（只读）后由资源侧串行认领 child；认领在写侧门禁内完成「读状态 + 写 active」。
-    pub(super) async fn acquire(
+    pub(in crate::session::subagent) async fn acquire(
         store: Arc<dyn SessionResources>,
         thread_id: String,
         root_id: String,
@@ -107,10 +109,23 @@ impl ResumeClaim {
         mut self,
         status: AgentStatus,
     ) -> Result<(), String> {
-        self.decide(ClaimDecision::Finish(status));
+        self.decide(ClaimDecision::Finish { status });
         (&mut self.worker)
             .await
             .map_err(|error| format!("resume status completion worker failed: {error}"))?
+    }
+
+    /// handoff worker 持有终态：只结束认领 worker，不写任何状态。
+    ///
+    /// 认领事实就是记录仍为 `active`；这里保留 active 直到 finalize 提交终态，
+    /// 远端存储的 `active` 守卫因此仍能命中唯一一次终态写入。
+    pub(in crate::session::subagent) async fn release_without_terminal(
+        mut self,
+    ) -> Result<(), String> {
+        self.decide(ClaimDecision::Release);
+        (&mut self.worker)
+            .await
+            .map_err(|error| format!("resume status release worker failed: {error}"))?
     }
 
     /// 准备失败：关闭决定通道，worker 恢复到认领前的记录并报告其失败。
@@ -202,28 +217,34 @@ async fn own_claim(
                 }
             };
             if !accepted {
+                // 调用方消失后仍由本 worker 收尾：后台未放行，Working 写可能已提交，
+                // 只回滚 agent_status 会留下「终态 + working」，下一次进入会误判待继续。
+                // 状态与工作意图的恢复统一由认领 handle 在同一门禁内提交：记录已被
+                // 新任务改写时 handle 放弃补偿，调用方不再独立写工作意图。
                 handle
                     .mark_failed()
                     .await
                     .map_err(|error| format!("resume hand-off rollback failed: {error}"))?;
             }
         }
-        Ok(ClaimDecision::Finish(status)) => {
-            // 顺序不可反——结清会把记录写回认领前的值，先写终态会被它覆盖。
-            handle
-                .mark_terminated()
-                .await
-                .map_err(|error| format!("resume claim settle failed: {error}"))?;
-            store
-                .update_session_meta(
-                    &thread_id,
-                    &SessionMetaPatch {
-                        status: Some(status),
-                        ..Default::default()
-                    },
-                )
+        Ok(ClaimDecision::Finish { status }) => {
+            // 终态与「恢复到认领前」必须由同一个归属校验提交：分开写时，新认领
+            // 可以插在结清与终态之间，旧终态会覆盖新认领的 Active。
+            let applied = handle
+                .finish_with_status(status)
                 .await
                 .map_err(|error| format!("resume terminal status write failed: {error}"))?;
+            if !applied {
+                tracing::warn!(
+                    %thread_id,
+                    ?status,
+                    "resume terminal status write skipped: claim no longer owns this child"
+                );
+            }
+        }
+        Ok(ClaimDecision::Release) => {
+            // 不写记录：认领事实由 finalize 写入的终态解除；提前写回 previous
+            // 会让远端 `active` 守卫拒绝随后唯一的 finalize。
         }
         Ok(ClaimDecision::CancelRunning(session)) => {
             // 资源关闭可能因未确认交接返回 Incomplete；此时仍须先结清认领并
@@ -237,20 +258,16 @@ async fn own_claim(
                 }
             };
             if finalize {
-                handle
-                    .mark_terminated()
+                let applied = handle
+                    .finish_with_status(AgentStatus::Cancelled)
                     .await
                     .map_err(|error| error.to_string())?;
-                store
-                    .update_session_meta(
-                        &thread_id,
-                        &SessionMetaPatch {
-                            status: Some(AgentStatus::Cancelled),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
+                if !applied {
+                    tracing::warn!(
+                        %thread_id,
+                        "resume cancellation status write skipped: claim no longer owns this child"
+                    );
+                }
             }
             close_result?;
         }

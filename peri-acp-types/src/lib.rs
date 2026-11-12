@@ -84,6 +84,7 @@ pub mod plugin;
 pub mod plugin_scope;
 pub mod ports;
 pub mod projection;
+pub mod recovery;
 pub mod runtime;
 pub mod sentinel;
 pub mod session;

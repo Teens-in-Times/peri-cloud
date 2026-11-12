@@ -196,11 +196,12 @@ async fn test_active_message_reaches_next_model_request_without_resume() {
         .await;
     // 即使 agent 定义已消失，active 发送也不能重新加载定义或创建模型。
     std::fs::remove_file(fixture.dir.path().join(".claude/agents/test-agent.md")).unwrap();
-    for text in ["supplement-one", "supplement-two"] {
+    for (text, send_only) in [("supplement-one", true), ("supplement-two", false)] {
         let receipt = fixture
             .invoke(serde_json::json!({
-                "resume_thread_id": id,
+                "resume_thread_id": id.clone(),
                 "prompt": text,
+                "send_only": send_only,
                 "run_in_background": false,
                 "subagent_type": "missing-definition",
                 "fork": true,
@@ -260,6 +261,152 @@ async fn test_active_message_reaches_next_model_request_without_resume() {
     );
 }
 
+#[tokio::test]
+async fn test_send_only_rejects_invalid_inputs_without_side_effects() {
+    let fixture = MessageFixture::new(Reasoning::with_answer("", "finished")).await;
+    let id = uuid::Uuid::now_v7().to_string();
+    let legacy = super::super::invocation::InvocationArgs::parse(&serde_json::json!({
+        "resume_thread_id": id.clone(),
+        "prompt": "legacy resume",
+    }))
+    .unwrap();
+    assert!(!legacy.send_only, "省略 send_only 必须保留普通 resume 语义");
+    let explicit_false = super::super::invocation::InvocationArgs::parse(&serde_json::json!({
+        "send_only": false,
+        "resume_thread_id": id.clone(),
+        "prompt": "legacy resume",
+    }))
+    .unwrap();
+    assert!(
+        !explicit_false.send_only,
+        "显式 false 必须保留普通 resume 语义"
+    );
+    for (input, expected) in [
+        (
+            serde_json::json!({"send_only": true, "prompt": "hello"}),
+            "resume_thread_id",
+        ),
+        (
+            serde_json::json!({
+                "send_only": true,
+                "resume_thread_id": id.clone(),
+                "prompt": "  "
+            }),
+            "non-empty prompt",
+        ),
+        (
+            serde_json::json!({
+                "send_only": true,
+                "resume_thread_id": "not-a-uuid",
+                "prompt": "hello"
+            }),
+            "invalid resume_thread_id",
+        ),
+        (
+            serde_json::json!({
+                "send_only": "true",
+                "resume_thread_id": id.clone(),
+                "prompt": "hello"
+            }),
+            "send_only must be a boolean",
+        ),
+        (
+            serde_json::json!({
+                "send_only": 1,
+                "resume_thread_id": id.clone(),
+                "prompt": "hello"
+            }),
+            "send_only must be a boolean",
+        ),
+        (
+            serde_json::json!({
+                "send_only": null,
+                "resume_thread_id": id.clone(),
+                "prompt": "hello"
+            }),
+            "send_only must be a boolean",
+        ),
+    ] {
+        let error = fixture.invoke(input).await.unwrap_err().to_string();
+        assert!(error.contains(expected), "unexpected error: {error}");
+    }
+    assert_eq!(fixture.factories.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.manager.active_count(), 0);
+}
+
+#[tokio::test]
+async fn test_send_only_to_stopped_thread_fails_without_resuming() {
+    let mut fixture = MessageFixture::new(Reasoning::with_answer("", "finished")).await;
+    let id = fixture.start(serde_json::json!({"fork": true})).await;
+    fixture.finish().await;
+    let before = fixture
+        .host
+        .fixture
+        .list_session_threads(&id)
+        .await
+        .unwrap()
+        .len();
+    let error = fixture
+        .invoke(serde_json::json!({
+            "send_only": true,
+            "resume_thread_id": id.clone(),
+            "prompt": "must not resume",
+            "run_in_background": true,
+        }))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("no live background receiver"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(fixture.factories.load(Ordering::SeqCst), 1, "不能重建模型");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1, "不能恢复执行");
+    assert_eq!(fixture.manager.active_count(), 0);
+    assert_eq!(
+        fixture
+            .host
+            .fixture
+            .list_session_threads(&id)
+            .await
+            .unwrap()
+            .len(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn test_send_only_still_rejects_foreign_cwd_before_delivery() {
+    let mut fixture = MessageFixture::new(Reasoning::with_tools(
+        "",
+        vec![ToolCall::new("probe", "Probe", serde_json::json!({}))],
+    ))
+    .await;
+    let id = fixture
+        .start(serde_json::json!({"subagent_type": "test-agent"}))
+        .await;
+    let foreign = tempdir().unwrap();
+    let error = fixture
+        .invoke(serde_json::json!({
+            "send_only": true,
+            "resume_thread_id": id.clone(),
+            "prompt": "must not be queued",
+            "cwd": foreign.path().to_str().unwrap(),
+        }))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Agent.cwd must resolve to the parent cwd"));
+    assert_eq!(fixture.manager.active_count(), 1);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    fixture.finish().await;
+    let next = fixture.snapshots.recv().await.unwrap();
+    assert!(!next
+        .iter()
+        .any(|message| message.content().contains("must not be queued")));
+}
+
 /// [回归测试] 父代理在末轮推理期间发送的补充任务不能因 Info 调度被静默跳过。
 #[tokio::test]
 async fn test_active_message_background_fork_defer_extends_final_answer() {
@@ -294,6 +441,7 @@ async fn test_active_message_background_fork_defer_extends_final_answer() {
     assert!(fixture
         .manager
         .send_subagent_message(&id, Some("late"))
+        .await
         .unwrap()
         .is_none());
 }
@@ -435,8 +583,12 @@ async fn test_active_message_panic_revokes_before_runtime_deregistration() {
         let tx = tx.clone();
         let cleanup_manager = host_callback_manager.clone();
         Arc::new(move |thread_id| {
-            tx.send(matches!(
+            // DeregisterRuntimeFn 是同步回调：block_on 只观察收件箱关闭态。
+            let outcome = futures::executor::block_on(
                 cleanup_manager.send_subagent_message(thread_id, Some("cleanup message")),
+            );
+            tx.send(matches!(
+                outcome,
                 Err(peri_agent::agent::async_tasks::SubagentMessageError::Closed)
             ))
             .unwrap();
@@ -470,8 +622,12 @@ async fn test_active_message_panic_revokes_before_runtime_deregistration() {
             let tx = tx.clone();
             let cleanup_manager = cleanup_manager.clone();
             Arc::new(move |thread_id| {
-                tx.send(matches!(
+                // DeregisterRuntimeFn 是同步回调：block_on 只观察收件箱关闭态。
+                let outcome = futures::executor::block_on(
                     cleanup_manager.send_subagent_message(thread_id, Some("cleanup message")),
+                );
+                tx.send(matches!(
+                    outcome,
                     Err(peri_agent::agent::async_tasks::SubagentMessageError::Closed)
                 ))
                 .unwrap();

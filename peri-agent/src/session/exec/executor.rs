@@ -46,7 +46,8 @@
 //!   （`cmd.execute` 与 `cancel.cancelled()` 仍按原 biased 顺序，二者均触发 push_done）
 //! - `build_and_execute_agent_v2` 末尾的 cancel cascade 仍在循环失败后触发，
 //!   `LoopResult::Error` 分支先发 `AgentExecutionFailed` 事件再判断 stop_reason
-//! - `collect_result` 严格 "close → wait_for_pump(10s timeout) → drain recall"
+//! - `collect_result` 严格 "close → wait_for_pump(10s timeout) → drain recall"；
+//!   泵未送达终态时本轮按失败结算（done 缺失不能报告完成）
 
 use std::sync::Arc;
 
@@ -54,12 +55,11 @@ use tokio::sync::oneshot as exec_oneshot;
 
 use peri_acp_types::{
     event::ExecutorEvent,
-    interaction::UserInteractionBroker,
     messages::{ContentBlock, MessageContent},
 };
-use tokio_util::sync::CancellationToken as AgentCancellationToken;
 
 use peri_acp_types::tasks::BgTaskKind;
+use peri_acp_types::{event::BackgroundTaskResult, session::ExecutionFailure};
 
 use crate::agent::react::AgentInput;
 use crate::session::async_router::AsyncRouter;
@@ -112,6 +112,8 @@ pub struct ContinuationRequest {
     pub mq_steering: bool,
     /// 已规范提交但尚未被主模型响应覆盖的后台结果构成的工作来源。
     pub pending_result: bool,
+    /// 由恢复启动门发出的 continuation：只有这类请求的早失败会反馈给恢复协调器。
+    pub recovery: bool,
 }
 
 /// Result of prompt execution.
@@ -136,22 +138,34 @@ pub fn is_keepgoing(content: &peri_acp_types::messages::MessageContent) -> bool 
     content.is_empty()
 }
 
+/// 把本轮 `bg_results` 注入 MQ；任一失败都必须回到调用方（一次性投递）。
+async fn inject_bg_results(
+    router: &AsyncRouter,
+    results: &[BackgroundTaskResult],
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for result in results {
+        if let Err(error) = router.route_bg_result(result, BgTaskKind::Agent).await {
+            failures.push(format!("task {}: {error}", result.task_id));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
 /// Per-turn computed configuration derived from [`SessionContext`].
 ///
 /// Built once at the top of [`run_session_loop`], passed by reference to
 /// [`build_and_execute_agent`] to avoid recomputing and to keep the agent
 /// builder function signature manageable.
-#[allow(dead_code)]
 struct TurnConfig<'a> {
     cwd: &'a str,
     frozen: Option<&'a FrozenSessionData>,
     language: Option<String>,
-    cancel: &'a AgentCancellationToken,
-    permission_mode: &'a Arc<peri_acp_types::permission::SharedPermissionMode>,
-    broker: &'a Arc<dyn UserInteractionBroker>,
-    session_start_source: Option<String>,
     auxiliary_model: Option<Arc<dyn peri_model::Model>>,
-    effective_context_window: u32,
 }
 
 /// Shared agent execution pipeline with auto-compact support.
@@ -238,6 +252,7 @@ pub async fn run_session_loop(ctx: SessionContext, turn: TurnInput) -> PromptRes
             .filter_map(|payload| payload.as_message().cloned())
             .collect();
         return PromptResult {
+            execution_binding: None,
             persisted_payloads: history_payloads,
             messages,
             ok: true,
@@ -247,6 +262,7 @@ pub async fn run_session_loop(ctx: SessionContext, turn: TurnInput) -> PromptRes
             recall_items: Vec::new(),
             pending_tasks: 0,
             failure: None,
+            context_usage_tokens: None,
         };
     }
 
@@ -265,7 +281,7 @@ pub async fn run_session_loop(ctx: SessionContext, turn: TurnInput) -> PromptRes
         .and_then(|sa| sa.v2_message_queue(&ctx.session_id))
         .unwrap_or_default();
     if mailbox_input && !incoming_recalls.is_empty() {
-        input_recalls::push_input_recalls(&v2_message_queue, &incoming_recalls);
+        input_recalls::push_input_recalls(&v2_message_queue, &incoming_recalls).await;
         incoming_recalls.clear();
     }
 
@@ -275,8 +291,31 @@ pub async fn run_session_loop(ctx: SessionContext, turn: TurnInput) -> PromptRes
             count = bg_results.len(),
             "[bg-diag] ctx.bg_results is non-empty, will inject each via AsyncRouter"
         );
-        for result in &bg_results {
-            async_router.route_bg_result(result, BgTaskKind::Agent);
+        // bg_results 来自一次性 ACP prompt 参数，没有第二次投递机会：失败必须
+        // 以本轮失败暴露，不能只留日志。
+        if let Err(error) = inject_bg_results(&async_router, &bg_results).await {
+            event_sink
+                .push_done(&ctx.session_id, "error", ctx.request_id.as_deref())
+                .await;
+            let messages = history_payloads
+                .iter()
+                .filter_map(|payload| payload.as_message().cloned())
+                .collect();
+            return PromptResult {
+                execution_binding: None,
+                persisted_payloads: history_payloads,
+                messages,
+                ok: false,
+                stop_reason: PromptStopReason::EndTurn,
+                history_replaced_by_compaction: false,
+                persistence_inconsistent: false,
+                recall_items: Vec::new(),
+                pending_tasks: 0,
+                failure: Some(ExecutionFailure::internal(format!(
+                    "background result injection failed: {error}"
+                ))),
+                context_usage_tokens: None,
+            };
         }
     }
 
@@ -371,14 +410,10 @@ pub async fn run_session_loop(ctx: SessionContext, turn: TurnInput) -> PromptRes
         AgentInput::blocks(MessageContent::blocks(blocks))
     };
 
-    // [v2] Context budget 由 AgentComponents 传给 StageContext，此处不再需要本地变量。
-
     // Event channel (lives for entire run_session_loop lifetime)
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutorEvent>();
     let event_tx = Arc::new(parking_lot::Mutex::new(Some(event_tx)));
 
-    // 将会 move 的 middleware resources（无法借用，必须 move）。
-    // turn 仍以引用形式借用 cwd/cancel/permission_mode/broker。
     let turn = TurnConfig {
         cwd: &ctx.cwd,
         frozen: frozen.as_ref(),
@@ -386,12 +421,7 @@ pub async fn run_session_loop(ctx: SessionContext, turn: TurnInput) -> PromptRes
             .as_ref()
             .and_then(|f| f.language().map(|s| s.to_string()))
             .or_else(|| ctx.language.clone()),
-        cancel: &ctx.cancel,
-        permission_mode: &ctx.permission_mode,
-        broker: &ctx.broker,
-        session_start_source: ctx.session_start_source.clone(),
         auxiliary_model: auxiliary_model.clone(),
-        effective_context_window,
     };
 
     // Langfuse 遥测经注入闭包（宿主构造的 LangfuseHooks）接入。

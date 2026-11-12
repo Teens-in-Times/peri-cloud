@@ -19,7 +19,7 @@ use peri_acp_types::session_resources::{
     SessionMetaPatch, SessionResourceError, SessionResourceErrorKind, SessionResourceResult,
 };
 use peri_acp_types::store::MessageFlags;
-use peri_acp_types::thread::ThreadId;
+use peri_acp_types::thread::{ThreadId, WorkState};
 use peri_acp_types::workspace::{ResolvedWorkspace, SessionBinding, WorkspaceError};
 
 use crate::sessions::data::ensure_child_relation;
@@ -28,8 +28,24 @@ use super::ledger::{OperationId, OperationIdentity};
 use super::mutation::QualifiedMutation;
 use super::session_codec::{self as codec, corrupt};
 use super::session_data::{invalid_input, not_found, RemoteSessionData};
+use super::session_lifecycle::guard_session_statement;
 use super::session_sql::{self, SessionInsert};
 use super::sql::StatementSpec;
+
+/// 归属行上的完整发现快照 → 绑定行入库的最小执行根。
+///
+/// `path_source` 的判断在投影之前、对完整快照执行（见 `workspace_registration_statements`）：
+/// 它需要 `common_dir`/`private_dir`，而投影只作用于入库值。
+fn projected_evidence(workspace: &ResolvedWorkspace) -> SessionResourceResult<Option<String>> {
+    workspace
+        .discovery_snapshot
+        .as_deref()
+        .map(|raw| {
+            crate::sessions::binding_evidence::project(raw)
+                .map_err(|_| invalid_input("workspace creation evidence is invalid"))
+        })
+        .transpose()
+}
 
 impl RemoteSessionData {
     fn workspace_registration_statements(
@@ -82,7 +98,7 @@ impl RemoteSessionData {
         }
         let mut row = session_sql::session_insert(input, 0, None);
         row.owner_workspace_id = Some(workspace.workspace_id);
-        row.discovery_snapshot = workspace.discovery_snapshot.as_deref();
+        row.discovery_snapshot = projected_evidence(workspace)?;
         let mut statements = self.workspace_registration_statements(workspace)?;
         statements.extend(session_sql::insert_session_statements(&row)?);
         let inputs = session_inputs(input);
@@ -240,7 +256,7 @@ impl RemoteSessionData {
             session_sql::session_insert(&fork.target, fork.payloads.len() as i64, None);
         if let Some(workspace) = workspace {
             insert.owner_workspace_id = Some(workspace.workspace_id);
-            insert.discovery_snapshot = workspace.discovery_snapshot.as_deref();
+            insert.discovery_snapshot = projected_evidence(workspace)?;
         }
         let mut statements = workspace
             .map(|workspace| self.workspace_registration_statements(workspace))
@@ -303,20 +319,35 @@ impl RemoteSessionData {
         let inherited = codec::inherited_json(&child.inherited)?;
         let insert: SessionInsert<'_> =
             session_sql::session_insert(&child.target, 0, Some(inherited.as_str()));
-        let statements = session_sql::insert_session_statements(&insert)?;
+        // 父存在性的预检在批外，删除树可能在这两步之间提交；守卫把同一判据放进批内，
+        // 父行消失时整批回滚，不会留下指向空父节点的 child。
+        let mut statements = vec![guard_session_statement(&child.parent_id)];
+        statements.extend(session_sql::insert_session_statements(&insert)?);
         let mut inputs = session_inputs(&child.target);
         inputs.push(format!("parent:{}", child.parent_id.as_str()));
         inputs.push(format!("root:{}", child.root_id.as_str()));
         inputs.push(inherited);
         // 子会话的根是显式给定的（已与父链核对一致），不需要再解析一次。
-        self.commit_effects(
-            "child_session",
-            &inputs,
-            statements,
-            &child.target.thread_id,
-        )
-        .await
-        .map(|_| ())
+        match self
+            .commit_effects(
+                "child_session",
+                &inputs,
+                statements,
+                &child.target.thread_id,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // 守卫把并发删除折成批内约束拒绝；对外仍按父会话缺失归类。
+                if matches!(error.kind(), SessionResourceErrorKind::InvalidInput { .. })
+                    && !self.exists(&child.parent_id).await.unwrap_or(true)
+                {
+                    return Err(not_found());
+                }
+                Err(error)
+            }
+        }
     }
 
     /// 定向 metadata 更新：没有字段要改时不写、也不假装更新了时间戳。
@@ -361,6 +392,69 @@ impl RemoteSessionData {
             Some(0) => Err(not_found()),
             Some(_) => Err(corrupt(
                 "session metadata update did not apply to exactly one row",
+            )),
+        }
+    }
+
+    /// 写入 durable 工作意图：单列更新，不碰 `updated_at`。
+    pub(super) async fn write_work_state(
+        &self,
+        id: &ThreadId,
+        state: WorkState,
+    ) -> SessionResourceResult<()> {
+        let inputs = vec![
+            format!("id:{}", id.as_str()),
+            format!("work_state:{}", state.as_str()),
+        ];
+        self.commit_single_row_effect(
+            "set_work_state",
+            &inputs,
+            vec![session_sql::work_state_statement(id, state)],
+            id,
+        )
+        .await
+    }
+
+    /// 写入上下文占用快照：单列更新，`None` 写 NULL，不碰 `updated_at`。
+    pub(super) async fn write_context_usage(
+        &self,
+        id: &ThreadId,
+        tokens: Option<u64>,
+    ) -> SessionResourceResult<()> {
+        let inputs = vec![
+            format!("id:{}", id.as_str()),
+            format!(
+                "context_usage_tokens:{}",
+                tokens.map_or(String::from("null"), |tokens| tokens.to_string())
+            ),
+        ];
+        self.commit_single_row_effect(
+            "set_context_usage",
+            &inputs,
+            vec![session_sql::context_usage_statement(id, tokens)?],
+            id,
+        )
+        .await
+    }
+
+    /// 一次「资格先于效果」的单行写入，效果必须恰好命中一行。
+    async fn commit_single_row_effect(
+        &self,
+        behavior: &str,
+        inputs: &[String],
+        statements: Vec<StatementSpec>,
+        id: &ThreadId,
+    ) -> SessionResourceResult<()> {
+        let counts = self
+            .commit_effects(behavior, inputs, statements, id)
+            .await?;
+        match counts.first() {
+            // 重放：原操作已生效，效果落在第一次提交里。
+            None => Ok(()),
+            Some(1) => Ok(()),
+            Some(0) => Err(not_found()),
+            Some(_) => Err(corrupt(
+                "single-row session write matched more than one row",
             )),
         }
     }

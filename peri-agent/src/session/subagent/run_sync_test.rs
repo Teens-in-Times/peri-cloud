@@ -30,7 +30,7 @@ fn bound_child(manager: Arc<TaskManager>) -> (Arc<Session>, Arc<ParkedChildOwner
     (session, owner)
 }
 
-fn bound_child_with_store(
+pub(super) fn bound_child_with_store(
     manager: Arc<TaskManager>,
 ) -> (
     Arc<Session>,
@@ -126,7 +126,7 @@ impl ReactLLM for AnswerLlm {
     }
 }
 
-fn context(session: &Arc<Session>, answer: &'static str) -> V2SubagentContext {
+pub(super) fn context(session: &Arc<Session>, answer: &'static str) -> V2SubagentContext {
     let id = session.store().thread_id.clone().unwrap();
     build_v2_subagent_context(
         Some(session.clone()),
@@ -188,7 +188,10 @@ fn blocking_context(
     )
 }
 
-fn shell_task(manager: &TaskManager, id: &str) -> peri_acp_types::tasks::TaskRegistrationTicket {
+pub(super) fn shell_task(
+    manager: &TaskManager,
+    id: &str,
+) -> peri_acp_types::tasks::TaskRegistrationTicket {
     TaskManagerPort::register(
         manager,
         BgTaskRegistration {
@@ -223,23 +226,26 @@ fn shell_result(id: &str) -> crate::agent::events::BackgroundTaskResult {
 async fn settled_sync_child_returns_finished_without_parent_task() {
     let manager = Arc::new(TaskManager::new());
     let parent_manager = Arc::new(TaskManager::new());
-    let (session, _owner) = bound_child(manager.clone());
+    let (session, _owner, store) = bound_child_with_store(manager.clone());
+    let child_id = session.store().thread_id.clone().unwrap();
+    store.register_bound_session(&child_id, "/tmp");
     let ticket = shell_task(&manager, "shell-task");
-    session.queue().push(QueuedMessage::prompt(
+    session.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         crate::messages::BaseMessage::human("run shell"),
     ));
     let built = context(&session, "child answer");
-    let child_id = session.store().thread_id.clone().unwrap();
     let task_id = new_sync_task_id();
     let run_id = child_id.clone();
+    let run_store = Arc::clone(&store) as Arc<dyn SessionResources>;
     let call = tokio::spawn(run_sync_with_registered_handoff(
         session.clone(),
-        child_id,
+        child_id.clone(),
         "fixture".into(),
         Some(parent_manager.clone()),
         Some(task_id),
         Some(Arc::new(|_, _| Ok(()))),
+        None,
         move |handoff, _| async move {
             run_sync_subagent(
                 &run_id,
@@ -249,7 +255,7 @@ async fn settled_sync_child_returns_finished_without_parent_task() {
                 None,
                 None,
                 None,
-                None,
+                Some(run_store),
                 None,
                 None,
                 None,
@@ -273,6 +279,9 @@ async fn settled_sync_child_returns_finished_without_parent_task() {
         panic!("settled run must not detach");
     };
     assert!(matches!(outcome, ChildRunOutcome::Settled), "{outcome:?}");
+    let meta = store.load_session_meta(&child_id).await.unwrap();
+    assert_eq!(meta.agent_status, peri_acp_types::thread::AgentStatus::Done);
+    assert_eq!(meta.work_state, peri_acp_types::thread::WorkState::Idle);
     assert_eq!(manager.active_count(), 0);
     assert!(manager
         .snapshot()
@@ -312,8 +321,9 @@ async fn failed_receipt_before_cleanup_preserves_typed_failure_without_detaching
             observed_deliveries.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })),
+        None,
         move |handoff, _| async move {
-            handoff.send(receipt.clone()).unwrap();
+            handoff.sender.send(receipt.clone()).unwrap();
             cleanup_ready.await.unwrap();
             Err(Box::new(SubagentFailure::failed_with_handoff(
                 run_child_id,
@@ -351,14 +361,20 @@ async fn failed_receipt_before_cleanup_preserves_typed_failure_without_detaching
 async fn handoff_sync_child_returns_pending_and_registry_retries_delivery() {
     let manager = Arc::new(TaskManager::new());
     let parent_manager = Arc::new(TaskManager::new());
-    let (session, _owner) = bound_child(manager.clone());
+    let (session, _owner, store) = bound_child_with_store(manager.clone());
     let ticket = shell_task(&manager, "shell-task");
-    session.queue().push(QueuedMessage::prompt(
+    session.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         crate::messages::BaseMessage::human("run shell"),
     ));
     let built = context(&session, "child answer");
     let child_id = session.store().thread_id.clone().unwrap();
+    store.register_bound_session(&child_id, "/tmp");
+    let terminal_route = TerminalMqRoute {
+        store: Arc::clone(&store) as Arc<dyn SessionResources>,
+        target: child_id.clone(),
+        mailbox: None,
+    };
     let sync_state = session.subagent_host().unwrap().close_state.clone();
     let close_session = session.clone();
     let task_id = new_sync_task_id();
@@ -383,6 +399,7 @@ async fn handoff_sync_child_returns_pending_and_registry_retries_delivery() {
         Some(parent_manager.clone()),
         Some(task_id.clone()),
         Some(delivery),
+        Some(terminal_route),
         move |handoff, _| async move {
             run_sync_subagent(
                 &run_id,
@@ -453,7 +470,7 @@ async fn handoff_without_parent_owner_finishes_incomplete_without_task() {
     let manager = Arc::new(TaskManager::new());
     let (session, _owner) = bound_child(manager.clone());
     shell_task(&manager, "shell-task");
-    session.queue().push(QueuedMessage::prompt(
+    session.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         crate::messages::BaseMessage::human("run shell"),
     ));
@@ -467,6 +484,7 @@ async fn handoff_without_parent_owner_finishes_incomplete_without_task() {
         None,
         Some(new_sync_task_id()),
         Some(Arc::new(|_, _| Ok(()))),
+        None,
         move |handoff, _| async move {
             run_sync_subagent(
                 &run_id,
@@ -504,14 +522,20 @@ async fn handoff_without_parent_owner_finishes_incomplete_without_task() {
 async fn parent_close_retains_unconfirmed_delivery_and_reports_incomplete() {
     let manager = Arc::new(TaskManager::new());
     let parent_manager = Arc::new(TaskManager::new());
-    let (session, _owner) = bound_child(manager.clone());
+    let (session, _owner, store) = bound_child_with_store(manager.clone());
     shell_task(&manager, "shell-task");
-    session.queue().push(QueuedMessage::prompt(
+    session.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         crate::messages::BaseMessage::human("run shell"),
     ));
     let built = context(&session, "child answer");
     let child_id = session.store().thread_id.clone().unwrap();
+    store.register_bound_session(&child_id, "/tmp");
+    let terminal_route = TerminalMqRoute {
+        store: Arc::clone(&store) as Arc<dyn SessionResources>,
+        target: child_id.clone(),
+        mailbox: None,
+    };
     let sync_state = session.subagent_host().unwrap().close_state.clone();
     let task_id = new_sync_task_id();
     let run_id = child_id.clone();
@@ -522,6 +546,7 @@ async fn parent_close_retains_unconfirmed_delivery_and_reports_incomplete() {
         Some(parent_manager.clone()),
         Some(task_id.clone()),
         Some(Arc::new(|_, _| Err("parent delivery unavailable".into()))),
+        Some(terminal_route),
         move |handoff, _| async move {
             run_sync_subagent(
                 &run_id,
@@ -574,14 +599,20 @@ async fn handoff_with_closing_parent_finishes_incomplete_without_registration() 
     let manager = Arc::new(TaskManager::new());
     let parent_manager = Arc::new(TaskManager::new());
     parent_manager.begin_session_close();
-    let (session, _owner) = bound_child(manager.clone());
+    let (session, _owner, store) = bound_child_with_store(manager.clone());
     shell_task(&manager, "shell-task");
-    session.queue().push(QueuedMessage::prompt(
+    session.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         crate::messages::BaseMessage::human("run shell"),
     ));
     let built = context(&session, "child answer");
     let child_id = session.store().thread_id.clone().unwrap();
+    store.register_bound_session(&child_id, "/tmp");
+    let terminal_route = TerminalMqRoute {
+        store: Arc::clone(&store) as Arc<dyn SessionResources>,
+        target: child_id.clone(),
+        mailbox: None,
+    };
     let run_id = child_id.clone();
     let completion = run_sync_with_registered_handoff(
         session.clone(),
@@ -590,6 +621,7 @@ async fn handoff_with_closing_parent_finishes_incomplete_without_registration() 
         Some(parent_manager.clone()),
         Some(new_sync_task_id()),
         Some(Arc::new(|_, _| Ok(()))),
+        Some(terminal_route),
         move |handoff, _| async move {
             run_sync_subagent(
                 &run_id,
@@ -631,18 +663,24 @@ async fn handoff_with_closing_parent_finishes_incomplete_without_registration() 
 async fn handoff_with_empty_task_list_keeps_retained_messages() {
     let manager = Arc::new(TaskManager::new());
     let parent_manager = Arc::new(TaskManager::new());
-    let (session, _owner) = bound_child(manager.clone());
+    let (session, _owner, store) = bound_child_with_store(manager.clone());
     let ticket = shell_task(&manager, "shell-task");
-    session.queue().push(QueuedMessage::info(
+    session.queue().push_sync(QueuedMessage::info(
         MessageSource::HookStopIntent,
         crate::messages::BaseMessage::human("stop"),
     ));
-    session.queue().push(QueuedMessage::prompt(
+    session.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         crate::messages::BaseMessage::human("run shell"),
     ));
     let built = context(&session, "child answer");
     let child_id = session.store().thread_id.clone().unwrap();
+    store.register_bound_session(&child_id, "/tmp");
+    let terminal_route = TerminalMqRoute {
+        store: Arc::clone(&store) as Arc<dyn SessionResources>,
+        target: child_id.clone(),
+        mailbox: None,
+    };
     let task_id = new_sync_task_id();
     let run_id = child_id.clone();
     let run_session = session.clone();
@@ -662,6 +700,7 @@ async fn handoff_with_empty_task_list_keeps_retained_messages() {
                 Ok(())
             },
         )),
+        Some(terminal_route),
         move |handoff, _| async move {
             run_sync_subagent(
                 &run_id,
@@ -715,9 +754,9 @@ async fn handoff_with_empty_task_list_keeps_retained_messages() {
 async fn sync_worker_releases_session_llm_and_context_after_takeover() {
     let manager = Arc::new(TaskManager::new());
     let parent_manager = Arc::new(TaskManager::new());
-    let (session, _owner) = bound_child(manager.clone());
+    let (session, _owner, store) = bound_child_with_store(manager.clone());
     shell_task(&manager, "shell-task");
-    session.queue().push(QueuedMessage::prompt(
+    session.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         crate::messages::BaseMessage::human("run shell"),
     ));
@@ -725,6 +764,12 @@ async fn sync_worker_releases_session_llm_and_context_after_takeover() {
     let weak = Arc::downgrade(&marker);
     let built = probe_context(&session, marker);
     let child_id = session.store().thread_id.clone().unwrap();
+    store.register_bound_session(&child_id, "/tmp");
+    let terminal_route = TerminalMqRoute {
+        store: Arc::clone(&store) as Arc<dyn SessionResources>,
+        target: child_id.clone(),
+        mailbox: None,
+    };
     let sync_state = session.subagent_host().unwrap().close_state.clone();
     let task_id = new_sync_task_id();
     let (delivered_tx, delivered_rx) = tokio::sync::oneshot::channel();
@@ -744,6 +789,7 @@ async fn sync_worker_releases_session_llm_and_context_after_takeover() {
                 Ok(())
             },
         )),
+        Some(terminal_route),
         move |handoff, _| async move {
             run_sync_subagent(
                 &run_id,
@@ -800,7 +846,7 @@ async fn run_sync_handoff_failure_preserves_error_and_receipt() {
     let manager = Arc::new(TaskManager::new());
     let (session, owner, store) = bound_child_with_store(manager.clone());
     shell_task(&manager, "shell-task");
-    session.queue().push(QueuedMessage::prompt(
+    session.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         crate::messages::BaseMessage::human("run shell"),
     ));
@@ -821,6 +867,12 @@ async fn run_sync_handoff_failure_preserves_error_and_receipt() {
         Some(agent_id_from_child_thread(&child_id)),
     );
     store.restrict_to_history_read_only();
+    // MQ 原子移交不再排队异步持久化，handoff 前的 flush 只能因 writer 关闭而失败。
+    let writer = session.transcript().read().persist_tx_handle().unwrap();
+    session.transcript().read().shutdown_persistence();
+    tokio::time::timeout(std::time::Duration::from_secs(10), writer.closed())
+        .await
+        .expect("测试 writer 必须在 handoff 前关闭");
     let error = run_sync_subagent(
         &child_id, "fixture", "/tmp", 10, None, None, None, None, None, None, None, None, None,
         built, session, None, None,

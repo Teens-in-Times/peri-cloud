@@ -1,5 +1,3 @@
-use super::*;
-
 /// [回归测试] 最后一轮语义工作产出 final answer 后，下一次 Receive 必须观察正常完成。
 ///
 /// 历史背景：旧循环把整个 Receive→Act 外层 `for` 计入预算，limit=1 时 Act 已提交
@@ -21,7 +19,7 @@ async fn test_run_react_loop_final_answer_at_iteration_limit_completes() {
         }))
         .with_event_bus(Arc::new(bus))
         .build();
-    context.session.queue.push(QueuedMessage::prompt(
+    context.session.queue.push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         BaseMessage::human("final prompt"),
     ));
@@ -62,7 +60,7 @@ async fn test_run_react_loop_info_only_does_not_wake_model() {
             answer: "must not run",
         }))
         .build();
-    context.session.queue.push(QueuedMessage::info(
+    context.session.queue.push_sync(QueuedMessage::info(
         MessageSource::SystemInjected,
         BaseMessage::human("micro compact state update"),
     ));
@@ -93,7 +91,7 @@ async fn test_run_react_loop_defer_still_continues_to_model() {
             answer: "continued",
         }))
         .build();
-    context.session.queue.push(QueuedMessage::defer(
+    context.session.queue.push_sync(QueuedMessage::defer(
         MessageSource::SubAgentComplete,
         BaseMessage::human("real deferred result"),
     ));
@@ -178,7 +176,7 @@ async fn test_run_react_loop_prompt_with_zero_budget_returns_max_iterations() {
         .with_middleware_chain(Arc::new(chain))
         .with_event_bus(Arc::new(bus))
         .build();
-    context.session.queue.push(QueuedMessage::prompt(
+    context.session.queue.push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         BaseMessage::human("zero budget prompt"),
     ));
@@ -229,7 +227,7 @@ async fn test_run_react_loop_required_reason_beyond_limit_returns_max_iterations
         .with_tools(tools)
         .with_event_bus(Arc::new(bus))
         .build();
-    context.session.queue.push(QueuedMessage::prompt(
+    context.session.queue.push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         BaseMessage::human("use one tool"),
     ));
@@ -313,7 +311,7 @@ async fn test_run_react_loop_idle_wake_does_not_consume_iteration_budget() {
     .expect("循环必须进入可观测的 idle suspended 状态");
     assert_eq!(before_agent_calls.load(Ordering::SeqCst), 0);
     should_wait.store(false, Ordering::Release);
-    handle.push_prompt(
+    handle.push_prompt_sync(
         MessageSource::UserInput,
         BaseMessage::human("idle wake prompt"),
     );
@@ -417,7 +415,7 @@ async fn async_result_ready_without_queue_work_runs_followup() {
 
     let _id = ready_result(&context, "shell-no-queue");
     assert!(context.session.async_result_mailbox.has_ready());
-    assert!(session.queue().is_empty());
+    assert!(session.queue().is_empty_sync());
 
     let result = run_react_loop(context.clone(), 5).await;
     assert!(matches!(result, LoopResult::Completed));
@@ -456,7 +454,7 @@ async fn async_result_hook_stop_suspends_ready_result() {
     .build();
 
     let id = ready_result(&context, "shell-stop");
-    session.queue().push(QueuedMessage::info(
+    session.queue().push_sync(QueuedMessage::info(
         MessageSource::HookStopIntent,
         BaseMessage::human("stop"),
     ));

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use peri_acp_types::mcp::McpSubscriptionPort;
+use peri_acp_types::monitor::monitor_alert_delivery_id;
 use peri_acp_types::plugin::ConfigSource;
 use peri_acp_types::ports::McpPoolPort;
 use peri_acp_types::session::{
@@ -228,10 +229,22 @@ async fn wait_settled_external(manager: &Arc<dyn TaskManager>) {
     }
 }
 
+/// Wait until the owner no longer registers the finished subscription.
+async fn wait_host_registration_release(owner: &McpTaskOwner) {
+    let deadline = tokio::time::Instant::now() + OBSERVE_TIMEOUT;
+    while owner.active_count() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the finished task subscription must release its owner registration"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn wait_for_reminder(queue: &MessageQueue) -> Vec<QueuedMessage> {
     let deadline = tokio::time::Instant::now() + OBSERVE_TIMEOUT;
     loop {
-        let messages = queue.drain_all();
+        let messages = queue.drain_all_sync();
         if !messages.is_empty() {
             return messages;
         }
@@ -244,7 +257,7 @@ async fn wait_for_reminder(queue: &MessageQueue) -> Vec<QueuedMessage> {
 }
 
 fn drain(queue: &MessageQueue) -> Vec<QueuedMessage> {
-    queue.drain_all()
+    queue.drain_all_sync()
 }
 
 fn reminder_body(message: &QueuedMessage) -> String {
@@ -259,7 +272,7 @@ async fn receipt_ids_drive_monitor_tools_and_host_id_is_unknown() {
     let link = connect_monitor().await;
     let (owner, spawner) = McpTaskOwner::new();
     let pool = pool_with_monitor(&link, spawner);
-    let (queue, _manager) = register_bridge_session(&pool, "session-a");
+    let (queue, manager) = register_bridge_session(&pool, "session-a");
 
     let receipt = start_monitor_via_bridge(
         &pool,
@@ -349,7 +362,17 @@ async fn receipt_ids_drive_monitor_tools_and_host_id_is_unknown() {
         "monitor_stop with the receipt monitor_id must succeed: {stopped}"
     );
     assert!(stopped["cleanup"].is_object(), "{stopped}");
-    assert!(drain(&queue).is_empty(), "no alert is configured");
+    wait_settled_external(&manager).await;
+    let messages = drain(&queue);
+    assert_eq!(
+        messages.len(),
+        1,
+        "a stopped monitor task wakes its initiator once: {messages:?}"
+    );
+    assert!(
+        reminder_body(&messages[0]).contains(&monitor_id),
+        "the terminal reminder identifies the monitor id"
+    );
 
     shutdown_link(link, pool, owner).await;
 }
@@ -379,7 +402,8 @@ async fn running_monitor_delivers_the_first_hit_without_waiting_for_terminal() {
     let message = &messages[0];
     assert_eq!(message.kind, MessageKind::Defer);
     assert_eq!(message.source, MessageSource::McpNotification);
-    assert!(message.delivery_id.is_some(), "canonical delivery id");
+    let alert_delivery_id = message.delivery_id;
+    assert!(alert_delivery_id.is_some(), "canonical delivery id");
     let body = reminder_body(message);
     assert!(body.contains(&monitor_id), "{body}");
     assert!(body.contains("\"build\""), "{body}");
@@ -397,27 +421,43 @@ async fn running_monitor_delivers_the_first_hit_without_waiting_for_terminal() {
         TaskStatus::Cancelled
     );
     wait_settled_external(&manager).await;
+    let terminal = drain(&queue);
+    assert_eq!(
+        terminal.len(),
+        1,
+        "the cancellation wakes the initiator exactly once: {terminal:?}"
+    );
+    let body = reminder_body(&terminal[0]);
+    assert!(body.contains(&monitor_id), "{body}");
+    assert!(body.contains("Cancelled"), "{body}");
     assert!(
-        drain(&queue).is_empty(),
-        "an unchanged alert count must not add a terminal reminder"
+        !body.contains("time(s)"),
+        "the reported hit must not repeat in the terminal reminder: {body}"
+    );
+    assert_ne!(
+        terminal[0].delivery_id, alert_delivery_id,
+        "the terminal reminder must not reuse the alert delivery id"
     );
 
     shutdown_link(link, pool, owner).await;
 }
 
 #[tokio::test]
-async fn completed_monitor_flushes_its_alert_before_settlement() {
+async fn completed_monitor_merges_its_alert_into_the_terminal_reminder() {
     let link = connect_monitor().await;
     let (owner, spawner) = McpTaskOwner::new();
     let pool = pool_with_monitor(&link, spawner);
     let (queue, manager) = register_bridge_session(&pool, "session-a");
 
+    // The hit lands after the first poll (which runs immediately) and the
+    // terminal state is observed on the next poll, so the round has no
+    // separate running alert to deliver.
     let receipt = start_monitor_via_bridge(
         &pool,
         &link,
         "session-a",
         json!({
-            "command": "echo ERROR boom",
+            "command": "sleep 1; echo ERROR boom",
             "alert": "ERROR",
             "label": "build"
         }),
@@ -425,16 +465,28 @@ async fn completed_monitor_flushes_its_alert_before_settlement() {
     .await;
     let monitor_id = receipt_field(&receipt, "monitor_id");
 
-    let messages = wait_for_reminder(&queue).await;
-    assert_eq!(messages.len(), 1, "one final alert reminder: {messages:?}");
+    wait_settled_external(&manager).await;
+    let messages = drain(&queue);
+    assert_eq!(
+        messages.len(),
+        1,
+        "a terminal round delivers exactly one reminder: {messages:?}"
+    );
+    assert_eq!(messages[0].kind, MessageKind::Defer);
+    assert_eq!(messages[0].source, MessageSource::McpNotification);
+    assert!(messages[0].delivery_id.is_some());
+    assert_ne!(
+        messages[0].delivery_id,
+        Some(monitor_alert_delivery_id(&monitor_id, 1)),
+        "the merged reminder keeps the terminal delivery id, not the alert id"
+    );
     let body = reminder_body(&messages[0]);
     assert!(body.contains(&monitor_id), "{body}");
-    assert!(body.contains("1 time(s)"));
-    wait_settled_external(&manager).await;
-    assert!(
-        drain(&queue).is_empty(),
-        "settlement must not deliver the same alert again"
-    );
+    assert!(body.contains("\"build\""), "{body}");
+    assert!(body.contains("1 time(s)"), "{body}");
+    assert!(body.contains("1 hit(s) were not reported"), "{body}");
+    assert!(body.contains("finished with status Completed"), "{body}");
+    assert!(!body.contains("ERROR boom"), "no event text: {body}");
     assert_eq!(
         manager
             .snapshot()
@@ -445,6 +497,37 @@ async fn completed_monitor_flushes_its_alert_before_settlement() {
         vec!["completed"],
         "the terminal task must remain observable through the task manager"
     );
+
+    shutdown_link(link, pool, owner).await;
+}
+
+#[tokio::test]
+async fn completed_monitor_without_alert_wakes_the_owner() {
+    let link = connect_monitor().await;
+    let (owner, spawner) = McpTaskOwner::new();
+    let pool = pool_with_monitor(&link, spawner);
+    let (queue, manager) = register_bridge_session(&pool, "session-a");
+
+    let receipt = start_monitor_via_bridge(
+        &pool,
+        &link,
+        "session-a",
+        json!({ "command": "echo done", "label": "plain" }),
+    )
+    .await;
+    let monitor_id = receipt_field(&receipt, "monitor_id");
+
+    wait_settled_external(&manager).await;
+    let messages = drain(&queue);
+    assert_eq!(
+        messages.len(),
+        1,
+        "a completed task without alerts still wakes the initiator: {messages:?}"
+    );
+    let body = reminder_body(&messages[0]);
+    assert!(body.contains(&monitor_id), "{body}");
+    assert!(body.contains("finished with status Completed"), "{body}");
+    assert!(!body.contains("time(s)"), "{body}");
 
     shutdown_link(link, pool, owner).await;
 }
@@ -461,24 +544,30 @@ async fn alert_goes_only_to_the_initiating_session() {
         &pool,
         &link,
         "session-a",
-        json!({ "command": "echo ERROR boom", "alert": "ERROR" }),
+        json!({ "command": "sleep 1; echo ERROR boom", "alert": "ERROR" }),
     )
     .await;
     let monitor_id = receipt_field(&receipt, "monitor_id");
 
-    let messages = wait_for_reminder(&queue_a).await;
-    assert_eq!(messages.len(), 1);
-    assert!(reminder_body(&messages[0]).contains(&monitor_id));
     wait_settled_external(&manager_a).await;
+    let messages = drain(&queue_a);
+    assert_eq!(
+        messages.len(),
+        1,
+        "the initiator receives exactly one merged terminal reminder: {messages:?}"
+    );
+    let body = reminder_body(&messages[0]);
+    assert!(body.contains(&monitor_id), "{body}");
+    assert!(body.contains("1 time(s)"), "{body}");
     assert!(
         drain(&queue_b).is_empty(),
-        "an alert must never be broadcast to another session"
+        "a reminder must never be broadcast to another session"
     );
 
     shutdown_link(link, pool, owner).await;
 }
 
-/// 离线发起会话：告警丢弃并推进，任务仍能结算。
+/// 离线发起会话：运行中告警与终态提醒都丢弃，任务仍能结算。
 #[tokio::test]
 async fn offline_initiating_session_drops_the_alert_and_still_settles() {
     let link = connect_monitor().await;
@@ -488,7 +577,7 @@ async fn offline_initiating_session_drops_the_alert_and_still_settles() {
     let inbox = SessionInbox::new(Arc::clone(&queue)).handle();
     let manager: Arc<dyn TaskManager> =
         Arc::new(peri_agent::agent::async_tasks::TaskManager::new());
-    pool.bind_agent_session("child", inbox, Arc::clone(&manager));
+    pool.bind_agent_session("child", inbox, queue.as_ref().clone(), Arc::clone(&manager));
     assert_eq!(
         pool.session_bindings.read().kind("child"),
         Some(crate::mcp::client::session_bindings::BindingKind::Agent)
@@ -526,10 +615,10 @@ async fn offline_initiating_session_drops_the_alert_and_still_settles() {
     shutdown_link(link, pool, owner).await;
 }
 
-/// 取消终态只更新任务投影，不产生 Defer/reminder。
+/// 取消终态向发起会话投递一条 cancelled 终态提醒。
 #[cfg(unix)]
 #[tokio::test]
-async fn cancelled_monitor_terminal_state_never_wakes_the_owner() {
+async fn cancelled_monitor_terminal_state_wakes_the_owner() {
     let link = connect_monitor().await;
     let (owner, spawner) = McpTaskOwner::new();
     let pool = pool_with_monitor(&link, spawner);
@@ -556,18 +645,24 @@ async fn cancelled_monitor_terminal_state_never_wakes_the_owner() {
         "tasks/cancel must end in the cancelled terminal state"
     );
     wait_settled_external(&manager).await;
-    assert!(
-        drain(&queue).is_empty(),
-        "cancelled monitor terminal must not deliver a Defer reminder"
+    let messages = drain(&queue);
+    assert_eq!(
+        messages.len(),
+        1,
+        "cancelled monitor terminal must deliver exactly one reminder: {messages:?}"
     );
+    let body = reminder_body(&messages[0]);
+    assert!(body.contains(&monitor_id), "{body}");
+    assert!(body.contains("Cancelled"), "{body}");
+    assert!(!body.contains("time(s)"), "no alert was configured: {body}");
 
     shutdown_link(link, pool, owner).await;
 }
 
-/// deadline 终态（failed）只更新任务投影，不产生 Defer/reminder。
+/// deadline 终态（failed）向发起会话投递一条 failed 提醒。
 #[cfg(unix)]
 #[tokio::test]
-async fn deadline_monitor_terminal_state_never_wakes_the_owner() {
+async fn deadline_monitor_terminal_state_wakes_the_owner() {
     let link = connect_monitor().await;
     let (owner, spawner) = McpTaskOwner::new();
     let pool = pool_with_monitor(&link, spawner);
@@ -588,10 +683,73 @@ async fn deadline_monitor_terminal_state_never_wakes_the_owner() {
         "deadline expiry must end in the failed terminal state"
     );
     wait_settled_external(&manager).await;
-    assert!(
-        drain(&queue).is_empty(),
-        "deadline monitor terminal must not deliver a Defer reminder"
+    let messages = drain(&queue);
+    assert_eq!(
+        messages.len(),
+        1,
+        "deadline expiry must deliver exactly one reminder: {messages:?}"
     );
+    let body = reminder_body(&messages[0]);
+    assert!(body.contains(&monitor_id), "{body}");
+    assert!(body.contains("finished with status Failed"), "{body}");
+    assert!(!body.contains("time(s)"), "no alert was configured: {body}");
+
+    shutdown_link(link, pool, owner).await;
+}
+
+/// 重复完成 / 取消 monitor 任务后，宿主登记必须回到基线，终态提醒不重复。
+#[tokio::test]
+async fn completed_and_cancelled_monitor_rounds_release_host_registrations() {
+    let link = connect_monitor().await;
+    let (owner, spawner) = McpTaskOwner::new();
+    let pool = pool_with_monitor(&link, spawner);
+    let (queue, manager) = register_bridge_session(&pool, "session-a");
+
+    for round in 0..4 {
+        let completed = round % 2 == 0;
+        let command = if completed { "echo done" } else { "sleep 30" };
+        let receipt = start_monitor_via_bridge(
+            &pool,
+            &link,
+            "session-a",
+            json!({ "command": command, "label": format!("retention-{round}") }),
+        )
+        .await;
+        let monitor_id = receipt_field(&receipt, "monitor_id");
+
+        if !completed {
+            let stopped: serde_json::Value = serde_json::from_str(
+                &invoke_monitor_via_bridge(
+                    &pool,
+                    &link,
+                    "session-a",
+                    "monitor_stop",
+                    json!({ "task_id": monitor_id, "reason": "retention probe" }),
+                )
+                .await,
+            )
+            .expect("stop JSON");
+            assert!(stopped["cleanup"].is_object(), "{stopped}");
+        }
+
+        wait_monitor_terminal(&link.peer(), "session-a", &monitor_id).await;
+        wait_settled_external(&manager).await;
+        wait_host_registration_release(&owner).await;
+        assert_eq!(
+            owner.active_count(),
+            0,
+            "round {round} must return to the host baseline"
+        );
+
+        let messages = drain(&queue);
+        assert_eq!(
+            messages.len(),
+            1,
+            "round {round} must deliver exactly one terminal reminder: {messages:?}"
+        );
+        let body = reminder_body(&messages[0]);
+        assert!(body.contains(&monitor_id), "{body}");
+    }
 
     shutdown_link(link, pool, owner).await;
 }

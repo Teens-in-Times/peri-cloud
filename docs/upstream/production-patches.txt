@@ -75,3 +75,18 @@ peri-middlewares/src/mcp/client/subscription_tasks_test.rs
 peri-middlewares/src/mcp/client_test.rs
 peri-middlewares/src/permission/mod_test.rs
 peri-middlewares/src/subagent/tool/tool_test/resume_test.rs
+
+# Manual 40d1a65f sync: split the queue, migration and regression sources.
+peri-acp-types/src/session/queue.rs
+peri-acp-types/src/session/queue_mq_test.rs
+peri-agent/src/session/subagent/child_runner_test.rs
+peri-agent/src/session/subagent/resume_owner_reuse_test.rs
+peri-config/src/system_test.rs
+peri-resources/src/sessions/remote/schema_upgrade.rs
+peri-resources/src/sessions/remote/schema_upgrade_test.rs
+peri-resources/src/sessions/sqlite_store/session_mq_test.rs
+
+# Preserve the Cloud compatible-provider client settings with the upstream transport route.
+peri-model/src/anthropic/mod.rs
+peri-model/src/openai_responses/mod.rs
+peri-model/src/transport/http.rs

@@ -16,7 +16,7 @@ use super::*;
 use crate::mcp::resource_tool::{ResourceError, RESOURCE_READ_TIMEOUT};
 use crate::mcp::tool_bridge::{format_contents, TOOL_CALL_TIMEOUT};
 use crate::mcp::ToolCallError;
-use peri_acp_types::ports::McpResourceSubscription;
+use peri_acp_types::ports::{LiveTask, McpResourceSubscription, PeripheralTasks};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, ReadResourceRequestParams, RequestMetaObject,
     ResourceContents, ServerNotification, SubscriptionFilter,
@@ -26,6 +26,46 @@ use tokio::sync::mpsc;
 
 /// 宿主面订阅的通知缓冲；满即丢弃（唤醒信号，消费方按快照补读）。
 const INSTANCE_SUBSCRIPTION_BUFFER: usize = 64;
+
+/// 恢复期的外围任务查询期限：进入会话不能被未响应的 workspace 拖住。
+const PERIPHERAL_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `shell_task_list` 的 wire 形状（Workspace 以 JSON 文本返回）。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShellTaskListWire {
+    unknown: bool,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    tasks: Vec<ShellTaskWire>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShellTaskWire {
+    task_id: String,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    started_at: Option<String>,
+}
+
+/// One live Shell task as reported by `shell_task_list`, keeping the owner
+/// creation timestamp for recovery admission.
+///
+/// The timestamp is not part of the public [`LiveTask`] port: recovery uses it
+/// to distinguish tasks that pre-date this process (adoptable) from tasks this
+/// process started normally (already registered by the tool bridge).
+#[derive(Debug, Clone)]
+pub(super) struct WorkspaceLiveTask {
+    pub task_id: String,
+    pub owner: Option<String>,
+    pub state: String,
+    pub started_at: Option<String>,
+}
 
 impl McpClientPool {
     /// 解析池内实例的可消费句柄（按实例消费的统一入口）。
@@ -115,6 +155,69 @@ impl McpClientPool {
             .to_string()),
             Err(error) => Err(instance_tool_error(instance, tool, error)),
         }
+    }
+
+    /// 按直接 owner（thread id）查询 workspace 实例持有的存活 Shell 任务。
+    ///
+    /// 传输失败、非 JSON 响应或服务端明确报告 `unknown` 都归入
+    /// [`PeripheralTasks::Unknown`]：调用方不得把它当成「没有存活任务」。
+    pub(crate) async fn workspace_live_tasks(&self, owner: &str) -> PeripheralTasks {
+        match self.workspace_shell_tasks(owner).await {
+            Ok(tasks) => PeripheralTasks::Known(
+                tasks
+                    .into_iter()
+                    .map(|task| LiveTask {
+                        task_id: task.task_id,
+                        owner: task.owner,
+                        state: task.state,
+                    })
+                    .collect(),
+            ),
+            Err(detail) => PeripheralTasks::unknown(detail),
+        }
+    }
+
+    /// 查询内核：`Ok` 是服务端确认的存活任务（可为空），`Err` 是未能确认。
+    ///
+    /// 恢复监听需要 owner 创建时间来判断任务是否先于本进程；端口只暴露
+    /// [`LiveTask`]，因此保留这份更完整的内部事实，避免公开契约漂移。
+    pub(super) async fn workspace_shell_tasks(
+        &self,
+        owner: &str,
+    ) -> Result<Vec<WorkspaceLiveTask>, String> {
+        let call = self.call_instance_tool(
+            "workspace",
+            "shell_task_list",
+            serde_json::json!({ "owner": owner }),
+            None,
+        );
+        let text = match peri_time::timeout(PERIPHERAL_QUERY_TIMEOUT, call).await {
+            Ok(Ok(text)) => text,
+            Ok(Err(detail)) => return Err(detail),
+            Err(_) => {
+                return Err(format!(
+                    "shell task list query timed out after {}s",
+                    PERIPHERAL_QUERY_TIMEOUT.as_secs()
+                ));
+            }
+        };
+        let parsed: ShellTaskListWire = serde_json::from_str(&text)
+            .map_err(|error| format!("shell task list response was not JSON: {error}"))?;
+        if parsed.unknown {
+            return Err(parsed
+                .detail
+                .unwrap_or_else(|| "workspace reported an unknown shell task state".into()));
+        }
+        Ok(parsed
+            .tasks
+            .into_iter()
+            .map(|task| WorkspaceLiveTask {
+                task_id: task.task_id,
+                owner: task.owner,
+                state: task.state,
+                started_at: task.started_at,
+            })
+            .collect())
     }
 
     /// 读取池内某实例的资源 URI 正文（首个非空文本内容的按序拼接）。

@@ -32,28 +32,18 @@ fn revocation_statements_split_by_entry_point() {
     }
 }
 
-/// inherited 派生索引删除必须排在会话行删除之前；缺表时跳过，不改变原有撤销语句。
+/// inherited 派生索引随 v15 退役：撤销批次只剩 canonical 删除，线程删除仍在末尾。
 #[test]
-fn inherited_index_deletes_precede_thread_row_deletion() {
-    let effects =
-        with_inherited_index_deletes(revoke_session_statements("s"), "s", true, true, false);
-    let sqls: Vec<&str> = effects.iter().map(|statement| statement.sql).collect();
-    assert_eq!(effects.len(), 5);
-    assert_eq!(
-        sqls[2],
-        crate::sessions::canonical::DELETE_INHERITED_PAYLOADS_BY_THREAD_SQL
-    );
-    assert_eq!(
-        sqls[3],
-        crate::sessions::canonical::DELETE_INHERITED_SNAPSHOT_BY_THREAD_SQL
-    );
-    assert_eq!(sqls[4], DELETE_SESSION_SQL);
+fn revoke_batches_end_with_the_thread_row_deletion() {
+    let effects = revoke_session_statements("s");
+    assert_eq!(effects.len(), 3);
+    assert_eq!(effects.last().unwrap().sql, DELETE_SESSION_SQL);
 
-    let draft = with_inherited_index_deletes(revoke_draft_statements("s"), "s", true, true, true);
-    for statement in &draft[2..4] {
+    let draft = revoke_draft_statements("s");
+    for statement in &draft[..2] {
         assert!(
             statement.sql.contains("frozen_context IS NULL"),
-            "草稿撤销的派生索引删除必须与线程删除共用未提交判据: {}",
+            "草稿撤销必须与线程删除共用未提交判据: {}",
             statement.sql
         );
     }
@@ -61,20 +51,13 @@ fn inherited_index_deletes_precede_thread_row_deletion() {
         draft.last().unwrap().sql.starts_with("DELETE FROM threads"),
         "线程删除必须留在批次末尾（撤销流程按 counts.last() 判定）"
     );
-
-    assert_eq!(
-        with_inherited_index_deletes(revoke_session_statements("s"), "s", false, true, false).len(),
-        3,
-        "缺 snapshot 表时不能插入任何派生删除"
-    );
-    let snapshot_only =
-        with_inherited_index_deletes(revoke_session_statements("s"), "s", true, false, false);
-    assert_eq!(snapshot_only.len(), 4);
-    assert_eq!(
-        snapshot_only[2].sql,
-        crate::sessions::canonical::DELETE_INHERITED_SNAPSHOT_BY_THREAD_SQL
-    );
-    assert_eq!(snapshot_only[3].sql, DELETE_SESSION_SQL);
+    for statement in effects.iter().chain(draft.iter()) {
+        assert!(
+            !statement.sql.contains("inherited_"),
+            "v15 起撤销批次不得引用已退役的派生索引: {}",
+            statement.sql
+        );
+    }
 }
 
 /// 回退候选语句形状：阶段一 user 过滤 + keyset + LIMIT，阶段二按主键单行；

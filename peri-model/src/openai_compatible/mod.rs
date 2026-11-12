@@ -117,24 +117,20 @@ impl OpenAiModel {
     /// transport 与 native request path 共享同一个 `reqwest::Client`（clone 仅
     /// 增加引用计数，连接池 / TLS session cache 复用），不再创建双 client。
     pub fn new(config: OpenAiConfig) -> Self {
-        // Some compatible gateways reject or stall anonymous HTTP clients.
-        // Identify Peri without including model, device or account metadata.
+        let loopback = config.endpoint.host().is_some_and(|host| match host {
+            url::Host::Ipv4(ip) => ip.is_loopback(),
+            url::Host::Ipv6(ip) => ip.is_loopback(),
+            url::Host::Domain(_) => false,
+        });
+        // Identify Peri to compatible gateways and keep loopback credentials off system proxies.
         let builder =
             reqwest::Client::builder().user_agent(concat!("Peri/", env!("CARGO_PKG_VERSION")));
-        // A loopback provider is local to this process's host. Never route its
-        // credentials through an environment or system proxy.
-        let loopback = match config.endpoint.host() {
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            _ => false,
-        };
-        let client = if loopback {
+        let builder = if loopback {
             builder.no_proxy()
         } else {
             builder
-        }
-        .build()
-        .expect("model HTTP client initialization failed");
+        };
+        let client = crate::transport::http::client_for_runtime(&config.runtime, true, builder);
         Self {
             config,
             transport: Arc::new(ReqwestTransport::new(client.clone())),
@@ -176,13 +172,16 @@ impl OpenAiModel {
 #[async_trait]
 impl crate::Model for OpenAiModel {
     fn prepare_stream(&self, request: ModelRequest) -> ModelResult<crate::PreparedModelCall> {
+        let call_context = request.call_context.clone();
         let built = Arc::new(self.build_request(&request)?);
         let checkpoint =
             crate::protocol::prepared::checkpoint(PROVIDER_NAME, &built.endpoint, &built.body)?;
         let client = self.client.clone();
         let api_key = self.config.api_key.clone();
-        let request_factory =
-            Arc::new(move || Self::native_http_request(&client, &api_key, &built));
+        let request_factory = Arc::new(move || {
+            Self::native_http_request(&client, &api_key, &built)
+                .map(|wire| wire.with_call_context(call_context.clone()))
+        });
         let runtime = self.config.runtime.clone();
         let transport = Arc::clone(&self.transport);
         Ok(crate::PreparedModelCall::new(
@@ -231,12 +230,16 @@ impl crate::Model for OpenAiModel {
         if cancellation.is_cancelled() {
             return Err(ModelError::cancelled());
         }
+        let call_context = request.call_context.clone();
         let built = Arc::new(self.build_request(&request)?);
         let client = self.client.clone();
         let api_key = self.config.api_key.clone();
         let request_factory = {
             let built = Arc::clone(&built);
-            Arc::new(move || Self::native_http_request(&client, &api_key, &built))
+            Arc::new(move || {
+                Self::native_http_request(&client, &api_key, &built)
+                    .map(|wire| wire.with_call_context(call_context.clone()))
+            })
         };
 
         Ok(runtime_http_sse_stream(

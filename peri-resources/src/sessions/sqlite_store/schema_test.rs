@@ -33,7 +33,7 @@ async fn assert_no_recovery_tables(pool: &sqlx::SqlitePool) {
 }
 
 #[tokio::test]
-async fn current_store_has_ten_business_tables_and_normal_history() {
+async fn current_store_has_nine_business_tables_and_normal_history() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("threads.db");
     let store = SqliteThreadStore::new(&path).await.unwrap();
@@ -44,8 +44,9 @@ async fn current_store_has_ten_business_tables_and_normal_history() {
     .fetch_one(&store.database.pool)
     .await
     .unwrap();
-    // 执行登记并入 `workspaces`：新建库只有八张业务表 + 两张 inherited 派生索引表，没有登记表，也没有运行时状态表。
-    assert_eq!(count, 10);
+    // v15 起九张 canonical 表：两张 inherited 派生索引表退役，执行登记并入 `workspaces`。
+    // 没有登记表，也没有运行时状态表。
+    assert_eq!(count, 9);
     let registrations: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'legacy_execution_registrations'",
     )
@@ -80,10 +81,11 @@ async fn current_store_has_ten_business_tables_and_normal_history() {
     reopened.close().await;
 }
 
-/// 压缩掉的开发期代数（13..19）一律拒绝：不迁移、不改写，库留在原位由上一版二进制打开。
+/// 压缩掉的开发期代数（16..19）一律拒绝：不迁移、不改写，库留在原位由上一版二进制打开。
+/// 15 是当前代数，不在拒绝面里。
 #[tokio::test]
 async fn compressed_dev_generations_are_refused_without_touching_the_database() {
-    for version in 13..=19_i64 {
+    for version in 16..=19_i64 {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("threads.db");
         let store = SqliteThreadStore::new(&path).await.unwrap();
@@ -699,16 +701,26 @@ async fn version3_database(path: &Path, root: &Path) -> SqliteConnection {
         value["birth_nanos"] = serde_json::json!(456);
         value
     };
-    let project_identity =
-        identity_with_legacy_fields(serde_json::to_value(discovery.project_identity()).unwrap());
     let mut discovery_json = serde_json::to_value(&discovery).unwrap();
-    for key in ["root_identity", "common_identity", "private_identity"] {
-        assert!(
-            discovery_json[key].is_object(),
-            "Git fixture must include {key}"
-        );
-        discovery_json[key] = identity_with_legacy_fields(discovery_json[key].clone());
+    // 旧行（schema ≤14）的文件对象身份：`Discovery` 已不再有这些字段，因此夹具按旧形状
+    // 手工补上——它测的正是「v14 及更早写下的字节仍能被识别并升级」。
+    let legacy_identity = |device: u64| {
+        identity_with_legacy_fields(serde_json::json!({ "device": device, "inode": device }))
+    };
+    discovery_json["root_identity"] = legacy_identity(1);
+    if discovery.common_dir.is_some() {
+        // `project_identity()` 取 common 优先、root 兜底：旧行里三者同源。
+        discovery_json["common_identity"] = legacy_identity(2);
+        discovery_json["private_identity"] = legacy_identity(2);
+    } else {
+        discovery_json["common_identity"] = serde_json::Value::Null;
+        discovery_json["private_identity"] = serde_json::Value::Null;
     }
+    let project_identity = if discovery_json["common_identity"].is_null() {
+        discovery_json["root_identity"].clone()
+    } else {
+        discovery_json["common_identity"].clone()
+    };
     let root_identity = discovery_json["root_identity"].clone();
     let root = discovery.root.to_str().unwrap();
     let locator = discovery.project_locator().to_str().unwrap();
@@ -743,5 +755,4 @@ async fn version3_database(path: &Path, root: &Path) -> SqliteConnection {
     connection
 }
 
-#[path = "schema_identity_test.rs"]
-mod tail;
+include!("schema_identity_test.rs");

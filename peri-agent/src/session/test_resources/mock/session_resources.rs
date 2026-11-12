@@ -1,6 +1,7 @@
 //! `SessionResources` 门面替身：实现契约语义，未覆盖的行为按 `Unsupported` 拒绝而不是静默 no-op。
 
 use super::*;
+use peri_acp_types::session::{MqEnqueueOutcome, MqInput, ThreadMqStore as _};
 
 /// 替身的工作区投影：按保存路径造一个自洽的 `ResolvedWorkspace`。
 ///
@@ -244,11 +245,141 @@ impl SessionResources for MockSessionResources {
                 SessionResourceErrorKind::ReadOnlyStore,
             ));
         }
+        let gate = self.append_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.wait().await;
+        }
         self.injection.lock().unwrap().append_calls += 1;
         for payload in payloads {
             self.with_region(id, |region| region.payloads.push(payload.clone()));
         }
         Ok(())
+    }
+
+    async fn mq_enqueue(
+        &self,
+        thread_id: &ThreadId,
+        input: peri_acp_types::session::MqInput,
+    ) -> SessionResourceResult<peri_acp_types::session::MqEnqueueOutcome> {
+        self.ensure_writable()?;
+        if self.mq_enqueue_failure.load(Ordering::SeqCst) {
+            return Err(SessionResourceError::new(
+                SessionResourceErrorKind::Internal {
+                    detail: "injected MQ enqueue failure".to_owned(),
+                },
+            ));
+        }
+        // 历史优先：已移交的 ID 不再回到 MQ（与真实 adapter 的判定顺序一致）。
+        let handed_off = self.region(thread_id).is_some_and(|region| {
+            region
+                .payloads
+                .iter()
+                .any(|payload| payload.id() == input.id)
+        });
+        if handed_off {
+            let mut clock = self.mq_clock.lock().unwrap();
+            *clock += 1;
+            let enqueued_at = format!("1970-01-01T00:00:00.{:06}Z", *clock);
+            return Ok(peri_acp_types::session::MqEnqueueOutcome {
+                disposition: peri_acp_types::session::MqEnqueueDisposition::AlreadyHandedOff,
+                entry: peri_acp_types::session::MqEntry {
+                    id: input.id,
+                    enqueued_at,
+                    kind: input.kind,
+                    source: input.source,
+                    payload: input.payload,
+                    policy: input.policy,
+                    original_draft: input.original_draft,
+                },
+            });
+        }
+        self.mq.mq_enqueue(thread_id, input).await
+    }
+
+    async fn mq_query(
+        &self,
+        thread_id: &ThreadId,
+        filter: peri_acp_types::session::MqFilter,
+    ) -> SessionResourceResult<Vec<peri_acp_types::session::MqEntry>> {
+        if self
+            .mq_query_failures
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(SessionResourceError::new(
+                SessionResourceErrorKind::Internal {
+                    detail: "injected MQ query failure".to_owned(),
+                },
+            ));
+        }
+        self.mq.mq_query(thread_id, filter).await
+    }
+
+    async fn mq_cancel(
+        &self,
+        thread_id: &ThreadId,
+        id: peri_acp_types::messages::MessageId,
+    ) -> SessionResourceResult<peri_acp_types::session::MqCancelOutcome> {
+        self.ensure_writable()?;
+        self.mq.mq_cancel(thread_id, id).await
+    }
+
+    async fn mq_receive(
+        &self,
+        thread_id: &ThreadId,
+        selection: peri_acp_types::session::MqReceiveSelection,
+    ) -> SessionResourceResult<peri_acp_types::session::MqReceiveOutcome> {
+        self.ensure_writable()?;
+        let outcome = self.mq.mq_receive(thread_id, selection).await?;
+        for item in &outcome.items {
+            if item.status != peri_acp_types::session::MqReceiveStatus::Committed {
+                continue;
+            }
+            let Some(entry) = item.entry.as_ref() else {
+                continue;
+            };
+            let payload = entry.payload.clone();
+            self.with_region(thread_id, |region| {
+                if !region
+                    .payloads
+                    .iter()
+                    .any(|known| known.id() == payload.id())
+                {
+                    region.payloads.push(payload);
+                }
+            });
+        }
+        Ok(outcome)
+    }
+
+    async fn mq_clear(&self, thread_id: &ThreadId) -> SessionResourceResult<()> {
+        self.ensure_writable()?;
+        self.mq.mq_clear(thread_id).await
+    }
+
+    async fn mq_history_contains(
+        &self,
+        thread_id: &ThreadId,
+        id: peri_acp_types::messages::MessageId,
+    ) -> SessionResourceResult<bool> {
+        if self.mq_history_failure.load(Ordering::SeqCst) {
+            return Err(SessionResourceError::new(
+                SessionResourceErrorKind::Internal {
+                    detail: "injected MQ history lookup failure".to_owned(),
+                },
+            ));
+        }
+        self.mq.mq_history_contains(thread_id, id).await
+    }
+
+    fn install_receive_gate(&self, gate: peri_acp_types::session::ReceiveGate) {
+        self.mq.install_receive_gate(gate);
+    }
+
+    fn install_query_gate(&self, gate: peri_acp_types::session::ReceiveGate) {
+        self.mq.install_query_gate(gate);
     }
 
     async fn append_reminder_if_absent(
@@ -258,11 +389,7 @@ impl SessionResources for MockSessionResources {
         reminder: &peri_acp_types::system_reminder::TrustedSystemReminder,
     ) -> SessionResourceResult<bool> {
         self.ensure_writable()?;
-        let gate = self.reminder_append_gate.lock().unwrap().take();
-        if let Some((entered, release)) = gate {
-            let _ = entered.send(());
-            let _ = release.await;
-        }
+        Self::wait_gate(&self.reminder_append_gate).await;
         self.with_region(id, |region| {
             if let Some(existing) = region
                 .payloads
@@ -330,12 +457,12 @@ impl SessionResources for MockSessionResources {
         _root: &ThreadId,
     ) -> SessionResourceResult<Box<dyn ChildResumeClaim>> {
         self.ensure_writable()?;
-        // 与资源实现同构：门禁内「读状态 + 写 active」，已有 active 时拒绝并发认领。
-        let previous = self
+        // 与资源实现同构：门禁内「读状态 + 读工作意图 + 写 active」，已有 active 时拒绝并发认领。
+        let (previous, previous_work_state) = self
             .region(child)
             .and_then(|region| region.meta)
-            .ok_or_else(|| SessionResourceError::new(SessionResourceErrorKind::NotFound))?
-            .agent_status;
+            .map(|meta| (meta.agent_status, meta.work_state))
+            .ok_or_else(|| SessionResourceError::new(SessionResourceErrorKind::NotFound))?;
         if previous.is_active() {
             return Err(SessionResourceError::new(
                 SessionResourceErrorKind::InvalidInput {
@@ -344,6 +471,13 @@ impl SessionResources for MockSessionResources {
             ));
         }
         self.write_status(child, AgentStatus::Active);
+        let claim_nonce = {
+            let mut ledger = self.claim_ledger.lock().unwrap();
+            ledger.next += 1;
+            let nonce = ledger.next;
+            ledger.current.insert(child.clone(), nonce);
+            nonce
+        };
         // 阶段门在写入之后：用例据此断言「已提交的写入不会被调用方 drop 撤销」。
         Self::wait_gate(&self.active_write_gate).await;
         self.claimed.store(true, Ordering::SeqCst);
@@ -352,8 +486,12 @@ impl SessionResources for MockSessionResources {
             regions: Arc::clone(&self.regions),
             statuses: Arc::clone(&self.statuses),
             status_changed: Arc::clone(&self.status_changed),
+            claim_ledger: Arc::clone(&self.claim_ledger),
+            claim_nonce,
             child: child.clone(),
             previous,
+            previous_work_state,
+            settled: AtomicBool::new(false),
         }))
     }
 
@@ -493,6 +631,125 @@ impl SessionResources for MockSessionResources {
         if let Some(status) = patch.status {
             self.write_status(id, status);
         }
+        if let Some(config) = &patch.config {
+            self.with_region(id, |region| {
+                if let Some(meta) = region.meta.as_mut() {
+                    meta.config = config.clone();
+                }
+            });
+        }
+        Ok(())
+    }
+
+    async fn set_work_state(
+        &self,
+        id: &ThreadId,
+        state: peri_acp_types::thread::WorkState,
+    ) -> SessionResourceResult<()> {
+        self.ensure_writable()?;
+        if state == WorkState::Working {
+            Self::wait_gate(&self.working_write_gate).await;
+            if self.fail_working_write.load(Ordering::SeqCst) {
+                return Err(SessionResourceError::new(
+                    SessionResourceErrorKind::Unavailable {
+                        detail: "injected working write failure".into(),
+                    },
+                ));
+            }
+        }
+        self.write_work_state(id, state);
+        Ok(())
+    }
+
+    /// 测试替身的 finalize 故障注入；事务原子性由真实 SQLite／远端用例验证。
+    async fn finalize_child_terminal(
+        &self,
+        child: &ThreadId,
+        status: AgentStatus,
+        work_state: WorkState,
+        target: &ThreadId,
+        message: MqInput,
+    ) -> SessionResourceResult<MqEnqueueOutcome> {
+        self.finalize_attempts.fetch_add(1, Ordering::SeqCst);
+        self.finalize_message_ids
+            .lock()
+            .unwrap()
+            .push(message.payload.id());
+        if self
+            .finalize_failures
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(SessionResourceError::new(
+                SessionResourceErrorKind::Internal {
+                    detail: "injected finalize failure".into(),
+                },
+            ));
+        }
+        if self.finalize_requires_active.load(Ordering::SeqCst) {
+            let current = self.load_session_meta(child).await?.agent_status;
+            if !current.is_active() {
+                return Err(SessionResourceError::new(
+                    SessionResourceErrorKind::Conflict {
+                        detail: "child terminal settlement requires active child".into(),
+                    },
+                ));
+            }
+        }
+        self.update_session_meta(
+            child,
+            &SessionMetaPatch {
+                status: Some(status),
+                ..Default::default()
+            },
+        )
+        .await?;
+        self.set_work_state(child, work_state).await?;
+        self.mq_enqueue(target, message).await
+    }
+
+    /// 测试替身支持「状态写入前失败」注入，用于验证调用方收敛。
+    async fn settle_terminal_without_result(
+        &self,
+        child: &ThreadId,
+        status: AgentStatus,
+        work_state: WorkState,
+    ) -> SessionResourceResult<TerminalSettlementOutcome> {
+        self.ensure_writable()?;
+        let current = self.load_session_meta(child).await?.agent_status;
+        if current.is_terminal() {
+            return Ok(TerminalSettlementOutcome::AlreadyTerminal(current));
+        }
+        self.set_work_state(child, work_state).await?;
+        if self
+            .terminal_status_failures
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(SessionResourceError::new(
+                SessionResourceErrorKind::Internal {
+                    detail: "injected terminal status failure".into(),
+                },
+            ));
+        }
+        self.update_session_meta(
+            child,
+            &SessionMetaPatch {
+                status: Some(status),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(TerminalSettlementOutcome::Settled)
+    }
+
+    async fn set_context_usage(
+        &self,
+        id: &ThreadId,
+        tokens: Option<u64>,
+    ) -> SessionResourceResult<()> {
+        self.ensure_writable()?;
+        self.write_context_usage(id, tokens);
         Ok(())
     }
 

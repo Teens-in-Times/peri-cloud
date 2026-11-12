@@ -1,4 +1,6 @@
 //! Manual context maintenance is a deployment-owned turn, not a chat prompt.
+use peri_acp_types::messages::BaseMessage;
+
 use super::*;
 
 impl CloudAgent {
