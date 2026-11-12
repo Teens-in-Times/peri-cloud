@@ -33,6 +33,16 @@ struct Uncertain {
     request_hash: Option<[u8; 32]>,
 }
 
+/// 受理阶段结果（P2-5）：POST 完成后要么已有最终输出（后台/断连/错误），
+/// 要么进入等待阶段——等待在 admission 锁外进行。
+enum SubmitStage {
+    Done(Result<ToolOutput>),
+    Await {
+        job: Box<JobSnapshot>,
+        wait: Duration,
+    },
+}
+
 impl RemoteSession {
     pub async fn open(
         client: Arc<DeviceClient>,
@@ -227,8 +237,7 @@ impl RemoteSession {
     }
 
     async fn record_request(&self, request: &SubmitJob) -> Result<()> {
-        let hash: [u8; 32] =
-            Sha256::digest(serde_json::to_vec(request).map_err(|_| Error::Protocol)?).into();
+        let hash = request_fingerprint(request)?;
         let mut uncertain = self.uncertain.lock().await;
         let pending = uncertain.entry(request.invocation_id).or_default();
         if pending
@@ -299,10 +308,12 @@ impl RemoteSession {
         ctx: ToolContext<'_>,
     ) -> Result<ToolOutput> {
         let id = self.invocation_id(&ctx)?;
-        // Serialize admission through the result boundary. Parallel provider
-        // calls cannot pass this gate before a lost receipt has been recorded.
-        // Control queries/cancellation remain available while a call is waiting.
-        let _admission = self.admission.lock().await;
+        // 受理边界互斥（executor review 2026-10-26 P2-5）：uncertain 检查、
+        // GET 预检、record_request 与 POST 必须整体串行——并行调用不能在
+        // 「丢失回执已落账」之前越过这道门。POST 返回后即释放 admission：
+        // 结果等待阶段由 uncertain map 自身阻塞新操作（新调用观察到未决
+        // id 即拒绝提交），只读查询/取消全程可用，无需把锁握满整个等待窗。
+        let admission = self.admission.lock().await;
         let previously_uncertain = {
             let uncertain = self.uncertain.lock().await;
             if let Some(other) = uncertain.keys().filter(|other| **other != id).min() {
@@ -311,7 +322,16 @@ impl RemoteSession {
             }
             uncertain.contains_key(&id)
         };
-        let result = self.invoke_bound(id, tool, input, ctx).await;
+        // 受理阶段在 admission 锁内完成（GET 预检 → record → POST）；
+        // 锁在 POST 返回后释放，等待阶段放行。
+        let stage = self.submit_bound(id, tool, input, &ctx).await;
+        drop(admission);
+        let result = match stage {
+            SubmitStage::Done(output) => output,
+            SubmitStage::Await { job, wait } => {
+                self.wait_for_job(id, *job, wait, ctx.cancellation).await
+            }
+        };
         if let Ok(output) = &result {
             if output.execution.as_ref().is_some_and(|evidence| {
                 !matches!(evidence.status, ToolExecutionStatus::Unknown)
@@ -330,13 +350,15 @@ impl RemoteSession {
         result
     }
 
-    async fn invoke_bound(
+    /// 受理阶段（uncertain 检查之后：GET 预检 → record → POST）。
+    /// 调用方在 admission 锁内执行本函数；返回待等待的 job 或已完成输出。
+    async fn submit_bound(
         &self,
         id: Uuid,
         tool: &str,
         input: serde_json::Value,
-        ctx: ToolContext<'_>,
-    ) -> Result<ToolOutput> {
+        ctx: &ToolContext<'_>,
+    ) -> SubmitStage {
         let wait = if tool == "Bash" {
             Duration::from_millis(
                 parse_foreground_timeout_for_platform(
@@ -355,9 +377,22 @@ impl RemoteSession {
             tool: tool.into(),
             input,
         };
+        if let Some(original) = self
+            .uncertain
+            .lock()
+            .await
+            .get(&id)
+            .and_then(|entry| entry.request_hash)
+        {
+            match request_fingerprint(&request) {
+                Ok(fingerprint) if fingerprint == original => {}
+                Ok(_) => return SubmitStage::Done(Err(Error::Rejected(409))),
+                Err(error) => return SubmitStage::Done(Err(error)),
+            }
+        }
         let existing = match self.client.job(self.binding.session_id, id).await {
             Ok(job) => Some(job),
-            Err(Error::Rejected(404)) if ctx.cancellation.is_cancelled() => {
+            Err(Error::Rejected(404)) => {
                 if self
                     .uncertain
                     .lock()
@@ -365,20 +400,22 @@ impl RemoteSession {
                     .get(&id)
                     .is_some_and(|pending| pending.submitted)
                 {
-                    return Ok(disconnected_output(id));
+                    return SubmitStage::Done(Ok(disconnected_output(id)));
                 }
-                return Ok(pending_output(
-                    id,
-                    ToolExecutionStatus::Cancelled,
-                    "Invocation was cancelled before admission; no request was submitted.",
-                ));
+                if ctx.cancellation.is_cancelled() {
+                    return SubmitStage::Done(Ok(pending_output(
+                        id,
+                        ToolExecutionStatus::Cancelled,
+                        "Invocation was cancelled before admission; no request was submitted.",
+                    )));
+                }
+                None
             }
-            Err(Error::Rejected(404)) => None,
             Err(error) if ambiguous(&error) => {
                 self.mark_uncertain(id, false).await;
-                return Ok(disconnected_output(id));
+                return SubmitStage::Done(Ok(disconnected_output(id)));
             }
-            Err(error) => return Err(error),
+            Err(error) => return SubmitStage::Done(Err(error)),
         };
         let existing_pending = existing
             .as_ref()
@@ -386,14 +423,17 @@ impl RemoteSession {
         // Record before POST, so dropping this future cannot lose the fact
         // that the executor may still own a committed request. Retain its input
         // identity even when a lost original admission still queries as 404.
-        self.record_request(&request).await?;
+        if let Err(error) = self.record_request(&request).await {
+            // 指纹冲突（409）：同 id 换参数重放，按冲突透传。
+            return SubmitStage::Done(Err(error));
+        }
         // Exact request comparison remains executor-owned, even for terminal
         // invocations. The same ID with changed input still conflicts.
         let job = match self.client.submit(&request).await {
             Ok(receipt) => receipt.job,
             Err(error) if ambiguous(&error) => {
                 self.mark_uncertain(id, true).await;
-                return Ok(disconnected_output(id));
+                return SubmitStage::Done(Ok(disconnected_output(id)));
             }
             Err(error) => {
                 if !existing_pending
@@ -401,13 +441,16 @@ impl RemoteSession {
                 {
                     self.uncertain.lock().await.remove(&id);
                 }
-                return Err(error);
+                return SubmitStage::Done(Err(error));
             }
         };
         if background && !ctx.cancellation.is_cancelled() {
-            return Ok(snapshot_output(job));
+            return SubmitStage::Done(Ok(snapshot_output(job)));
         }
-        self.wait_for_job(id, job, wait, ctx.cancellation).await
+        SubmitStage::Await {
+            job: Box::new(job),
+            wait,
+        }
     }
 
     async fn wait_for_job(
@@ -469,6 +512,13 @@ impl RemoteSession {
     }
 }
 
+fn request_fingerprint(request: &SubmitJob) -> Result<[u8; 32]> {
+    let mut value = serde_json::to_value(request).map_err(|_| Error::Protocol)?;
+    value.sort_all_objects();
+    let bytes = serde_json::to_vec(&value).map_err(|_| Error::Protocol)?;
+    Ok(Sha256::digest(bytes).into())
+}
+
 fn ambiguous(error: &Error) -> bool {
     matches!(
         error,
@@ -516,6 +566,7 @@ fn pending_output(id: Uuid, status: ToolExecutionStatus, text: &str) -> ToolOutp
             exit_code: None,
             output_ref: None,
             output_truncated: false,
+            encoding_loss: false,
             task_id: Some(id.to_string()),
         },
     )

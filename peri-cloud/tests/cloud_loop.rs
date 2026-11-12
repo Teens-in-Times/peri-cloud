@@ -141,13 +141,16 @@ impl Harness {
         let stop = CancellationToken::new();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = web::router(executor.clone());
+        let app = web::router(executor.clone(), listener.local_addr().unwrap());
         let shutdown = stop.clone();
         let executor_server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown.cancelled_owned())
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+            .unwrap();
         });
         let client =
             DeviceClient::connect(address, transport_token.clone(), executor.info().device_id)

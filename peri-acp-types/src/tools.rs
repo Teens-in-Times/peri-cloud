@@ -59,6 +59,11 @@ pub struct ToolExecutionEvidence {
     /// that the output was complete.
     #[serde(default)]
     pub output_truncated: bool,
+    /// Whether the text lost information through a lossy UTF-8 decode
+    /// (invalid bytes were replaced with U+FFFD). Honest encoding reporting:
+    /// consumers must not treat the text as byte-faithful when this is set.
+    #[serde(default)]
+    pub encoding_loss: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
 }

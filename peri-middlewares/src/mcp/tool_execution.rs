@@ -9,6 +9,7 @@ fn evidence(status: ToolExecutionStatus, task_id: Option<String>) -> ToolExecuti
         exit_code: None,
         output_ref: None,
         output_truncated: false,
+        encoding_loss: false,
     }
 }
 

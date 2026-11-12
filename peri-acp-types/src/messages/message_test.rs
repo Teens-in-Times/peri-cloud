@@ -96,6 +96,7 @@ fn test_tool_execution_evidence_persists_and_legacy_payload_is_unknown() {
         exit_code: Some(9),
         output_ref: Some("/tmp/full-output.txt".into()),
         output_truncated: true,
+        encoding_loss: false,
         task_id: None,
     };
     let message =

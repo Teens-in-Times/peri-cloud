@@ -240,6 +240,7 @@ impl WorkspaceMcpServer {
                 exit_code: None,
                 output_ref: None,
                 output_truncated: false,
+                encoding_loss: false,
             };
             return Ok(CallToolResponse::Complete(
                 peri_mcp_common::result_mapping::with_execution(

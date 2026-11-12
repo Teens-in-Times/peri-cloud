@@ -224,13 +224,16 @@ impl Fixture {
         let stop = CancellationToken::new();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
-        let app = web::router(executor.clone());
+        let app = web::router(executor.clone(), listener.local_addr().unwrap());
         let signal = stop.clone();
         let executor_server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(signal.cancelled_owned())
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(signal.cancelled_owned())
+            .await
+            .unwrap();
         });
         let wire = Arc::new(Wire {
             executor,

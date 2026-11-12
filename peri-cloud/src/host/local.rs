@@ -39,7 +39,8 @@ impl LocalExecutor {
         let endpoint = listener.local_addr().map_err(|_| HostError::Io)?;
         let stop = CancellationToken::new();
         let cancelled = stop.clone();
-        let router = peri_executor::web::router(executor.clone());
+        let router = peri_executor::web::router(executor.clone(), endpoint)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
         let worker = tokio::spawn(async move {
             axum::serve(listener, router)
                 .with_graceful_shutdown(cancelled.cancelled_owned())

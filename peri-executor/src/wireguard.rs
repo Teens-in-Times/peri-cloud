@@ -17,10 +17,15 @@ pub async fn supervise(
         let attempt = async {
             config.source_address(true).await?;
             let listener = tokio::net::TcpListener::bind(config.endpoint).await?;
+            let listen_addr = listener.local_addr()?;
             tracing::info!(component = "wireguard", "Verified WireGuard listener ready");
-            axum::serve(listener, web::router(executor.clone()))
-                .with_graceful_shutdown(stop.clone().cancelled_owned())
-                .await
+            axum::serve(
+                listener,
+                web::router(executor.clone(), listen_addr)
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(stop.clone().cancelled_owned())
+            .await
         };
         let result = attempt.await;
         if stop.is_cancelled() {

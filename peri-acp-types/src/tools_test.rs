@@ -300,6 +300,7 @@ fn test_tool_execution_evidence_serde_roundtrip() {
         exit_code: None,
         output_ref: Some("/tmp/peri-tool-output-1.txt".into()),
         output_truncated: true,
+        encoding_loss: false,
         task_id: Some("shell-1".into()),
     };
     let encoded = serde_json::to_string(&evidence).unwrap();
@@ -316,6 +317,7 @@ fn test_tool_output_bounded_projection_always_keeps_execution_summary() {
             exit_code: Some(7),
             output_ref: Some("/tmp/full-output.txt".into()),
             output_truncated: true,
+            encoding_loss: false,
             task_id: None,
         },
     );
@@ -334,6 +336,7 @@ fn test_tool_output_small_limits_do_not_cut_status_names() {
             exit_code: None,
             output_ref: Some("/tmp/a-very-long-output-reference.txt".into()),
             output_truncated: true,
+            encoding_loss: false,
             task_id: Some("shell-123".into()),
         },
     );
@@ -357,6 +360,7 @@ fn test_tool_output_compact_summary_prioritizes_status_then_facts() {
             exit_code: Some(7),
             output_ref: Some("/tmp/a-very-long-output-reference.txt".into()),
             output_truncated: true,
+            encoding_loss: false,
             task_id: None,
         },
     );
@@ -376,6 +380,7 @@ fn test_tool_output_compact_summary_prioritizes_status_then_facts() {
             exit_code: Some(0),
             output_ref: None,
             output_truncated: false,
+            encoding_loss: false,
             task_id: None,
         },
     )
@@ -391,6 +396,7 @@ fn test_tool_output_exact_summary_is_not_appended_twice() {
         exit_code: Some(7),
         output_ref: Some("/tmp/full-output.txt".into()),
         output_truncated: true,
+        encoding_loss: false,
         task_id: None,
     };
     let summary = evidence.render_summary();

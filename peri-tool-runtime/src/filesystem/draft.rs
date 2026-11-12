@@ -7,19 +7,19 @@
 use std::collections::HashMap;
 
 /// 一次失败写入的完整内容。
-pub(crate) struct DraftEntry {
+pub struct DraftEntry {
     /// draft_id,形如 draft_{uuid v7}(与 tmp.{uuid} 命名同源,前缀 draft_)
-    pub(crate) id: String,
+    pub id: String,
     /// 保存时的目标路径(resolve_path / validate_path 的 canonical 输出;恢复时校验 file_path 一致)
-    pub(crate) target: String,
+    pub target: String,
     /// 已写出的文本:rename 失败为 tmp 实际文本,其余为 content 参数原文
-    pub(crate) content: String,
+    pub content: String,
     /// 原始调用的 append 标记:append 失败的草稿恢复时保持 append 语义,避免覆盖文件原内容
-    pub(crate) append: bool,
+    pub append: bool,
 }
 
 /// 读取 exact id entry 的结果。
-pub(crate) enum DraftAccessError<E> {
+pub enum DraftAccessError<E> {
     Unknown,
     WrongTarget,
     Operation(E),
@@ -27,17 +27,17 @@ pub(crate) enum DraftAccessError<E> {
 
 /// 进程级草稿存储:target → 最新草稿(同 target 覆盖,旧 draft_id 立即失效)。不设上限。
 #[derive(Default)]
-pub(crate) struct DraftStore {
+pub struct DraftStore {
     by_target: HashMap<String, DraftEntry>,
 }
 
 impl DraftStore {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
     /// 保存草稿并返回新 draft_id;同 target 已有草稿时覆盖(旧 id 失效)。
-    pub(crate) fn save(&mut self, target: &str, content: String, append: bool) -> String {
+    pub fn save(&mut self, target: &str, content: String, append: bool) -> String {
         let id = format!("draft_{}", uuid::Uuid::now_v7());
         self.by_target.insert(
             target.to_string(),
@@ -52,7 +52,7 @@ impl DraftStore {
     }
 
     /// 在锁内读取 exact id，并仅在操作成功后删除该 exact id。
-    pub(crate) fn with_exact_entry<T, E>(
+    pub fn with_exact_entry<T, E>(
         &mut self,
         draft_id: &str,
         target: &str,
@@ -76,13 +76,13 @@ impl DraftStore {
     }
 
     /// 只读查看草稿(不消费)。用于恢复前先校验 target 一致性,避免误消费导致无法用原路径重试。
-    pub(crate) fn peek(&self, draft_id: &str) -> Option<&DraftEntry> {
+    pub fn peek(&self, draft_id: &str) -> Option<&DraftEntry> {
         self.by_target.values().find(|e| e.id == draft_id)
     }
 
     /// 按 draft_id 消费性取出草稿(调用方须先 peek 确认)。线性扫描:草稿实际规模 = 会话内失败次数,
     /// 远小于 HashMap 扫描成本;无上限决策下可接受。
-    pub(crate) fn take(&mut self, draft_id: &str) -> Option<DraftEntry> {
+    pub fn take(&mut self, draft_id: &str) -> Option<DraftEntry> {
         let key = self
             .by_target
             .iter()
@@ -92,13 +92,13 @@ impl DraftStore {
     }
 
     /// 成功写入后清理同 target 草稿(幂等)。
-    pub(crate) fn remove_by_target(&mut self, target: &str) {
+    pub fn remove_by_target(&mut self, target: &str) {
         self.by_target.remove(target);
     }
 }
 
 /// 草稿开关:PERI_WRITE_DRAFT=0 或 false(不区分大小写)关闭,其余默认开启。构造时读取一次。
-pub(crate) fn draft_enabled() -> bool {
+pub fn draft_enabled() -> bool {
     match std::env::var("PERI_WRITE_DRAFT") {
         Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
         Err(_) => true,
@@ -109,7 +109,7 @@ pub(crate) fn draft_enabled() -> bool {
 /// 前置空格拼接:`format!("Error ...: {e}{hint}")`;禁用时 hint 为空串。
 /// 文案已核对:不含 PathSuggester ERROR_KEYWORDS("not found"/"no such file"/"does not exist"/
 /// "not a directory"/"search path does not exist")。
-pub(crate) fn draft_hint_en(id: &str, content: &str) -> String {
+pub fn draft_hint_en(id: &str, content: &str) -> String {
     format!(
         " A draft was saved: {id} ({} lines, {} bytes). Retry with from_draft={id}.",
         content.lines().count(),
@@ -120,7 +120,7 @@ pub(crate) fn draft_hint_en(id: &str, content: &str) -> String {
 /// 中文草稿提示后缀(SandboxWrite 工具)。同上,规避关键词。
 /// 格式与英文版对齐:`{id} ({n} 行,{m} 字节)`——id 与统计信息间保留空格,
 /// 便于按空白切分提取 draft_id。
-pub(crate) fn draft_hint_zh(id: &str, content: &str) -> String {
+pub fn draft_hint_zh(id: &str, content: &str) -> String {
     format!(
         " 内容草稿已保存: {id} ({} 行,{} 字节)。可改用 from_draft={id} 重试。",
         content.lines().count(),

@@ -459,6 +459,7 @@ fn closure_requires_terminal_evidence_and_no_live_task() {
             exit_code: None,
             output_ref: None,
             output_truncated: false,
+            encoding_loss: false,
         });
         assert!(closed_calls(&[(call.clone(), result.clone())]).is_empty());
     }

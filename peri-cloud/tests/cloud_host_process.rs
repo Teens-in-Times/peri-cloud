@@ -412,13 +412,16 @@ async fn actual_host_qq_buttons_execute_then_restart_restores_session_and_shutdo
     let token_file = executor_root.path().join("transport-token");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
-    let app = web::router(executor.clone());
+    let app = web::router(executor.clone(), listener.local_addr().unwrap());
     let signal = stop.clone();
     let executor_server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(signal.cancelled_owned())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(signal.cancelled_owned())
+        .await
+        .unwrap();
     });
     let wire = Arc::new(Wire::default());
     *wire.device_id.lock() = Some(device);

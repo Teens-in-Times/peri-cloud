@@ -137,13 +137,6 @@ impl WriteSandboxTool {
         }
     }
 
-    /// 成功写入后清理同 target 草稿(幂等;禁用时 no-op)
-    fn remove_draft(&self, target: &str) {
-        if let Some(store) = &self.drafts {
-            store.lock().unwrap().remove_by_target(target);
-        }
-    }
-
     /// 格式化允许的沙箱目录列表，用于错误信息。
     /// 使用原始相对路径（如 `.peri/plans/`），而非 canonicalized 绝对路径，
     /// 因为工具只接受相对路径，展示绝对路径会与约束矛盾。
@@ -349,62 +342,88 @@ impl BaseTool for WriteSandboxTool {
 
         let line_count = content.lines().count();
 
-        // 原子写入：先写临时文件再 rename（复用 WriteFileTool 逻辑）
-        let tmp_ext = format!("tmp.{}", uuid::Uuid::now_v7());
-        let tmp_path = target.with_extension(tmp_ext);
+        // 原子写入：先写临时文件（fsync）再 rename。
+        // 阻塞文件系统操作必须离开 async runtime worker（P2-4）：整个
+        // 写入链在 spawn_blocking 中执行，timeout 只约束 JoinHandle，
+        // 不再把 runtime 线程挂住 2 分钟。
+        let content_for_timeout = content.clone();
+        let drafts = self.drafts.clone();
+        let cwd = self.cwd.clone();
+        let write_target = target.clone();
+        let write_target_str = target_str.clone();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            tokio::task::spawn_blocking(move || {
+                let tmp_ext = format!("tmp.{}", uuid::Uuid::now_v7());
+                let tmp_path = write_target.with_extension(tmp_ext);
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(120), async {
-            if let Err(e) = std::fs::write(&tmp_path, &content) {
-                let hint = self
-                    .save_draft(&target_str, &content, false)
-                    .map(|id| draft_hint_zh(&id, &content))
-                    .unwrap_or_default();
-                return Err(format!("WriteSandbox: 写入失败: {}{}", e, hint).into());
-            }
+                let save_draft = |content: &str| -> Option<String> {
+                    drafts.as_ref().map(|store| {
+                        let id = store.lock().unwrap().save(
+                            &write_target_str,
+                            content.to_string(),
+                            false,
+                        );
+                        draft_hint_zh(&id, content)
+                    })
+                };
 
-            // 如果目标已存在，保留 Unix 权限位
-            if let Ok(metadata) = std::fs::metadata(&target) {
-                #[cfg(unix)]
-                {
-                    let _ = std::fs::set_permissions(&tmp_path, metadata.permissions());
-                }
-                #[cfg(not(unix))]
-                let _ = &metadata;
-            }
-
-            match std::fs::rename(&tmp_path, &target) {
-                Ok(_) => {
-                    let rel = target
-                        .strip_prefix(&self.cwd)
-                        .unwrap_or(&target)
-                        .display()
-                        .to_string();
-                    let lines_label = if line_count == 1 { "line" } else { "lines" };
-                    self.remove_draft(&target_str);
-                    Ok(format!("Wrote {} {} {}", line_count, lines_label, rel))
-                }
-                Err(e) => {
-                    // 读 tmp 实际文本 → 存草稿 → 删 tmp(顺序固定,先读后删)
-                    let draft_content =
-                        std::fs::read_to_string(&tmp_path).unwrap_or_else(|_| content.to_string());
-                    let hint = self
-                        .save_draft(&target_str, &draft_content, false)
-                        .map(|id| draft_hint_zh(&id, &draft_content))
-                        .unwrap_or_default();
+                let write = std::fs::File::create(&tmp_path).and_then(|mut file| {
+                    use std::io::Write;
+                    file.write_all(content.as_bytes())?;
+                    // 与 Write/Edit 提交路径一致：rename 前先落盘（P1-4）。
+                    file.sync_all()
+                });
+                if let Err(e) = write {
                     let _ = std::fs::remove_file(&tmp_path);
-                    Err(format!("WriteSandbox: rename 临时文件失败: {}{}", e, hint).into())
+                    let hint = save_draft(&content).unwrap_or_default();
+                    return Err(format!("WriteSandbox: 写入失败: {e}{hint}").into());
                 }
-            }
-        })
+
+                // 如果目标已存在，保留 Unix 权限位
+                if let Ok(metadata) = std::fs::metadata(&write_target) {
+                    #[cfg(unix)]
+                    {
+                        let _ = std::fs::set_permissions(&tmp_path, metadata.permissions());
+                    }
+                    #[cfg(not(unix))]
+                    let _ = &metadata;
+                }
+
+                match std::fs::rename(&tmp_path, &write_target) {
+                    Ok(_) => {
+                        let rel = write_target
+                            .strip_prefix(&cwd)
+                            .unwrap_or(&write_target)
+                            .display()
+                            .to_string();
+                        let lines_label = if line_count == 1 { "line" } else { "lines" };
+                        if let Some(store) = &drafts {
+                            store.lock().unwrap().remove_by_target(&write_target_str);
+                        }
+                        Ok(format!("Wrote {} {} {}", line_count, lines_label, rel))
+                    }
+                    Err(e) => {
+                        // 读 tmp 实际文本 → 存草稿 → 删 tmp(顺序固定,先读后删)
+                        let draft_content = std::fs::read_to_string(&tmp_path)
+                            .unwrap_or_else(|_| content.to_string());
+                        let hint = save_draft(&draft_content).unwrap_or_default();
+                        let _ = std::fs::remove_file(&tmp_path);
+                        Err(format!("WriteSandbox: rename 临时文件失败: {e}{hint}").into())
+                    }
+                }
+            }),
+        )
         .await;
 
         match result {
-            Ok(inner) => inner,
+            Ok(Ok(inner)) => inner,
+            Ok(Err(_join)) => Err("WriteSandbox: 写入工作线程意外终止".into()),
             Err(_elapsed) => {
                 // 草稿 = content 原文;新 id 自洽(恢复写入超时存的是恢复出的内容)
                 let hint = self
-                    .save_draft(&target_str, &content, false)
-                    .map(|id| draft_hint_zh(&id, &content))
+                    .save_draft(&target_str, &content_for_timeout, false)
+                    .map(|id| draft_hint_zh(&id, &content_for_timeout))
                     .unwrap_or_default();
                 Err(format!("WriteSandbox: 操作超时（超过 2 分钟）{}", hint).into())
             }

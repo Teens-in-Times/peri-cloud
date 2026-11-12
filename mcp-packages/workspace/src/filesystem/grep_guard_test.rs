@@ -34,7 +34,8 @@ fn test_grep_cancelled_skips_walk() {
         fixed_strings: false,
         max_depth: None,
     };
-    let cancelled = Arc::new(AtomicBool::new(true));
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    cancelled.cancel();
     let result = execute_search(
         &parsed,
         &[],

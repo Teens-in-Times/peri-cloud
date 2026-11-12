@@ -501,47 +501,52 @@ impl Fixture {
         self.submission_release.push(release.clone());
         self.submissions.push(submissions.clone());
         self.hidden_receipts.push(hidden.clone());
-        let app = web::router(executor.clone()).layer(axum::middleware::from_fn(
-            move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let submissions = submissions.clone();
-                let cancellations = cancellations.clone();
-                let hidden = hidden.clone();
-                let held = held.clone();
-                let release = release.clone();
-                async move {
-                    if request.method() == axum::http::Method::POST
-                        && request.uri().path().ends_with("/cancel")
-                    {
-                        cancellations.fetch_add(1, Ordering::SeqCst);
+        let app = web::router(executor.clone(), listener.local_addr().unwrap()).layer(
+            axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let submissions = submissions.clone();
+                    let cancellations = cancellations.clone();
+                    let hidden = hidden.clone();
+                    let held = held.clone();
+                    let release = release.clone();
+                    async move {
+                        if request.method() == axum::http::Method::POST
+                            && request.uri().path().ends_with("/cancel")
+                        {
+                            cancellations.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let submission = request.method() == axum::http::Method::POST
+                            && request.uri().path().ends_with("/jobs");
+                        if request.method() == axum::http::Method::POST
+                            && request.uri().path().ends_with("/jobs")
+                        {
+                            submissions.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if request.method() == axum::http::Method::GET
+                            && request.uri().path().contains("/jobs/")
+                            && hidden.load(Ordering::SeqCst)
+                        {
+                            return axum::response::IntoResponse::into_response(
+                                axum::http::StatusCode::NOT_FOUND,
+                            );
+                        }
+                        let response = next.run(request).await;
+                        if submission && held.load(Ordering::SeqCst) {
+                            release.notified().await;
+                        }
+                        response
                     }
-                    let submission = request.method() == axum::http::Method::POST
-                        && request.uri().path().ends_with("/jobs");
-                    if request.method() == axum::http::Method::POST
-                        && request.uri().path().ends_with("/jobs")
-                    {
-                        submissions.fetch_add(1, Ordering::SeqCst);
-                    }
-                    if request.method() == axum::http::Method::GET
-                        && request.uri().path().contains("/jobs/")
-                        && hidden.load(Ordering::SeqCst)
-                    {
-                        return axum::response::IntoResponse::into_response(
-                            axum::http::StatusCode::NOT_FOUND,
-                        );
-                    }
-                    let response = next.run(request).await;
-                    if submission && held.load(Ordering::SeqCst) {
-                        release.notified().await;
-                    }
-                    response
-                }
-            },
-        ));
+                },
+            ),
+        );
         self.servers.push(tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown.cancelled_owned())
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+            .unwrap();
         }));
         self.crash_config["clients"].as_array_mut().unwrap().push(json!({"address":client_address.to_string(),"token":token,"device":executor.info().device_id}));
         let client = DeviceClient::connect(client_address, token, executor.info().device_id)

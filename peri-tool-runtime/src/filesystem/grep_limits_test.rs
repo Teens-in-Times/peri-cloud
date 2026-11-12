@@ -145,8 +145,18 @@ fn test_grep_cancelled_skips_walk() {
         fixed_strings: false,
         max_depth: None,
     };
-    let cancelled = Arc::new(AtomicBool::new(true));
-    let result = execute_search(&parsed, dir.path().to_str().unwrap(), 250, cancelled).unwrap();
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    cancelled.cancel();
+    let result = execute_search(
+        &parsed,
+        &[],
+        dir.path().to_str().unwrap(),
+        250,
+        250,
+        0,
+        cancelled,
+    )
+    .unwrap();
     assert!(
         result.contains("No matches found"),
         "cancelled 预置应跳过整个遍历: {result}"

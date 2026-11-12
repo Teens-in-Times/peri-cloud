@@ -18,6 +18,8 @@ pub enum Error {
     RecoveryRequired,
     #[error("executor is shutting down")]
     ShuttingDown,
+    #[error("path is executor-private state and cannot be accessed by file tools")]
+    ProtectedPath,
     #[error("another executor owns this state directory")]
     AlreadyRunning,
     #[error("executor state storage failed")]

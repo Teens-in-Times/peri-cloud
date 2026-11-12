@@ -393,7 +393,7 @@ pub fn persist_truncated_output_with_ref(full_content: &str) -> (String, Option<
 /// Persist a full tool output in the process-private temp directory and return
 /// the written path. Callers own the user-facing hint wording.
 pub fn persist_private_output(full_content: &str) -> std::io::Result<std::path::PathBuf> {
-    crate::private_temp::write_output(full_content)
+    peri_tool_runtime::output::write_private_output(full_content)
 }
 
 /// The caller owns this future until the TERM/KILL sequence has completed.

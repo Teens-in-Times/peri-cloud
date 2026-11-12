@@ -3,8 +3,10 @@
 //! This crate has no model loop, account login, or approval middleware. The
 //! cloud host authorizes a bound invocation before selecting its backend.
 
+pub mod budget;
 pub mod filesystem;
 pub mod numeric;
 pub mod output;
+mod private_temp;
 pub mod shell;
 pub mod shell_contract;

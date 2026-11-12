@@ -87,12 +87,15 @@ async fn browser_cookie_and_csrf_approve_the_existing_channel_request_once() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let signal = stop.clone();
-    let app = web::router(executor.clone());
+    let app = web::router(executor.clone(), listener.local_addr().unwrap());
     servers.push(tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(signal.cancelled_owned())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(signal.cancelled_owned())
+        .await
+        .unwrap();
     }));
     let device_client = DeviceClient::connect(address, token, executor.info().device_id)
         .await

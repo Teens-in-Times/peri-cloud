@@ -1,24 +1,24 @@
 /// 从 args 数组中解析搜索参数
-pub(crate) struct ParsedArgs {
-    pub(crate) pattern: String,
-    pub(crate) path: Option<String>,        // 搜索路径，None 表示 cwd
-    pub(crate) glob_filters: Vec<String>,   // -g 参数
-    pub(crate) _type_filters: Vec<String>,  // -t 参数（暂不实现）
-    pub(crate) _type_excludes: Vec<String>, // -T 参数（暂不实现）
-    pub(crate) output_mode: OutputMode,     // 默认/文件名/计数/无匹配文件
-    pub(crate) before_context: usize,       // -B 参数
-    pub(crate) after_context: usize,        // -A 参数
-    pub(crate) case_insensitive: bool,      // -i 参数
-    pub(crate) whole_word: bool,            // -w 参数
-    pub(crate) multiline: bool,             // 多行模式
-    pub(crate) line_number: bool,           // 显示行号
-    pub(crate) invert_match: bool,          // -v 反转匹配
-    pub(crate) fixed_strings: bool,         // -F 固定字符串
-    pub(crate) max_depth: Option<usize>,    // 搜索深度限制
+pub struct ParsedArgs {
+    pub pattern: String,
+    pub path: Option<String>,        // 搜索路径，None 表示 cwd
+    pub glob_filters: Vec<String>,   // -g 参数
+    pub _type_filters: Vec<String>,  // -t 参数（暂不实现）
+    pub _type_excludes: Vec<String>, // -T 参数（暂不实现）
+    pub output_mode: OutputMode,     // 默认/文件名/计数/无匹配文件
+    pub before_context: usize,       // -B 参数
+    pub after_context: usize,        // -A 参数
+    pub case_insensitive: bool,      // -i 参数
+    pub whole_word: bool,            // -w 参数
+    pub multiline: bool,             // 多行模式
+    pub line_number: bool,           // 显示行号
+    pub invert_match: bool,          // -v 反转匹配
+    pub fixed_strings: bool,         // -F 固定字符串
+    pub max_depth: Option<usize>,    // 搜索深度限制
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) enum OutputMode {
+pub enum OutputMode {
     Default,           // 显示匹配行
     FilesOnly,         // -l
     CountOnly,         // -c
@@ -26,28 +26,28 @@ pub(crate) enum OutputMode {
 }
 
 /// Grep 工具的结构化输入参数，从 JSON 直接反序列化
-pub(crate) struct GrepInput {
-    pub(crate) pattern: String,
-    pub(crate) path: Option<String>,
-    pub(crate) glob: Option<String>,
-    pub(crate) type_filter: Option<String>,
-    pub(crate) output_mode: Option<String>, // "content" | "files_with_matches" | "count" | "files_without_matches"
-    pub(crate) case_insensitive: bool,      // 对应 -i，默认 false
-    pub(crate) context: Option<usize>,      // 对应 -C
-    pub(crate) before_context: Option<usize>, // 对应 -B
-    pub(crate) after_context: Option<usize>, // 对应 -A
-    pub(crate) line_number: bool,           // 对应 -n，默认 true
-    pub(crate) multiline: bool,             // 多行模式，默认 false
-    pub(crate) whole_word: bool,            // -w，默认 false
-    pub(crate) invert_match: bool,          // -v，默认 false
-    pub(crate) fixed_strings: bool,         // -F，默认 false
-    pub(crate) head_limit: usize,           // 默认 250
-    pub(crate) offset: Option<usize>,       // 跳过前 N 行
-    pub(crate) max_depth: Option<usize>,    // 搜索深度限制
+pub struct GrepInput {
+    pub pattern: String,
+    pub path: Option<String>,
+    pub glob: Option<String>,
+    pub type_filter: Option<String>,
+    pub output_mode: Option<String>, // "content" | "files_with_matches" | "count" | "files_without_matches"
+    pub case_insensitive: bool,      // 对应 -i，默认 false
+    pub context: Option<usize>,      // 对应 -C
+    pub before_context: Option<usize>, // 对应 -B
+    pub after_context: Option<usize>, // 对应 -A
+    pub line_number: bool,           // 对应 -n，默认 true
+    pub multiline: bool,             // 多行模式，默认 false
+    pub whole_word: bool,            // -w，默认 false
+    pub invert_match: bool,          // -v，默认 false
+    pub fixed_strings: bool,         // -F，默认 false
+    pub head_limit: usize,           // 默认 250
+    pub offset: Option<usize>,       // 跳过前 N 行
+    pub max_depth: Option<usize>,    // 搜索深度限制
 }
 
 /// 将 type 参数（如 "rust"、"js"）映射为 glob 模式列表
-pub(crate) fn type_to_glob(type_name: &str) -> Vec<&'static str> {
+pub fn type_to_glob(type_name: &str) -> Vec<&'static str> {
     match type_name {
         "rust" => vec!["*.rs"],
         "js" => vec!["*.js", "*.mjs"],
@@ -74,7 +74,7 @@ pub(crate) fn type_to_glob(type_name: &str) -> Vec<&'static str> {
 
 impl GrepInput {
     /// 将结构化参数转译为搜索引擎所需的 ParsedArgs
-    pub(crate) fn to_parsed_args(&self) -> Result<ParsedArgs, String> {
+    pub fn to_parsed_args(&self) -> Result<ParsedArgs, String> {
         // output_mode 字符串 → OutputMode 枚举（默认 "content"）
         let mode_str = self.output_mode.as_deref().unwrap_or("content");
         let output_mode = match mode_str {

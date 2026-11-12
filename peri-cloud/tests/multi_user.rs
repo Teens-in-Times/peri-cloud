@@ -106,12 +106,15 @@ impl Fixture {
         let address = listener.local_addr().unwrap();
         let stop = CancellationToken::new();
         let cancelled = stop.clone();
-        let app = peri_executor::web::router(executor.clone());
+        let app = peri_executor::web::router(executor.clone(), listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(cancelled.cancelled_owned())
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(cancelled.cancelled_owned())
+            .await
+            .unwrap();
         });
         let token = std::fs::read_to_string(root.path().join("executor/transport-token")).unwrap();
         let client = DeviceClient::connect(address, token, executor.info().device_id)

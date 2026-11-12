@@ -50,7 +50,7 @@ pub(crate) struct SearchSink {
     pub(crate) total_lines: Arc<AtomicUsize>,
     pub(crate) total_bytes: Arc<AtomicUsize>,
     pub(crate) max_limit: usize,
-    pub(crate) cancelled: Arc<AtomicBool>,
+    pub(crate) cancelled: tokio_util::sync::CancellationToken,
     pub(crate) stopped: Arc<AtomicBool>,
     pub(crate) display_path: String,
     pub(crate) match_count: Cell<usize>,
@@ -93,7 +93,7 @@ impl Sink for SearchSink {
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
         // 超时取消：所有模式立即停止当前文件搜索
-        if self.cancelled.load(Ordering::Relaxed) {
+        if self.cancelled.is_cancelled() {
             return Ok(false);
         }
 
@@ -132,7 +132,7 @@ impl Sink for SearchSink {
         _searcher: &Searcher,
         ctx: &SinkContext<'_>,
     ) -> Result<bool, Self::Error> {
-        if self.cancelled.load(Ordering::Relaxed) {
+        if self.cancelled.is_cancelled() {
             return Ok(false);
         }
         if self.output_mode != OutputMode::Default {

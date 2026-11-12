@@ -5,7 +5,6 @@ pub mod glob;
 pub(crate) mod glob_patterns;
 pub mod grep;
 pub(crate) mod grep_args;
-pub(crate) mod grep_format;
 pub(crate) mod path_hints;
 pub mod read;
 pub(crate) mod transaction;
@@ -59,6 +58,7 @@ pub async fn parse_json_input(input: &str) -> serde_json::Value {
 }
 
 /// 递归扫描时跳过的目录名
+#[allow(dead_code)]
 pub(crate) fn should_skip_dir(name: &str) -> bool {
     matches!(
         name,
@@ -85,11 +85,3 @@ pub(crate) fn should_skip_dir(name: &str) -> bool {
 #[cfg(test)]
 #[path = "mod_test.rs"]
 mod tests;
-
-/// A dropped RPC must also stop blocking searches at their next checkpoint.
-pub(crate) struct SearchCancellation(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
-impl Drop for SearchCancellation {
-    fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}

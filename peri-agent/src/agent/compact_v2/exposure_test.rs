@@ -104,6 +104,7 @@ fn test_cold_terminal_evidence_requires_success_and_synchronous_typed_status() {
                 exit_code: None,
                 output_ref: None,
                 output_truncated: false,
+                encoding_loss: false,
             }),
         );
         transcript.append(message.clone());
@@ -136,6 +137,7 @@ fn test_cold_completion_reads_canonical_evidence_instead_of_request_metadata() {
             exit_code: None,
             output_ref: None,
             output_truncated: false,
+            encoding_loss: false,
         });
     }
     let receipt = RequestExposure::capture(&[request], &transcript).unwrap();
