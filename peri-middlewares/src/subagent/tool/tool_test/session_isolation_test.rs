@@ -94,11 +94,18 @@ async fn nested_delegation_uses_direct_parent_catalog_and_inbox() {
         .clone()
         .unwrap();
     assert!(!Arc::ptr_eq(&parent_manager, &child_manager));
-    assert!(pool
-        .session_bindings
-        .read()
-        .inbox(&child.child_thread_id)
-        .is_some());
+    // B′：sync 子 Agent 结束后停驻 inbox（binding/owner/queue 保留供 resume 复用）。
+    {
+        let bindings = pool.session_bindings.read();
+        assert!(
+            bindings.inbox(&child.child_thread_id).is_none(),
+            "终态停驻后 inbox 不应再处于注册态"
+        );
+        assert!(
+            bindings.binding(&child.child_thread_id).is_some(),
+            "停驻只翻注册位，owner/queue 必须保留"
+        );
+    }
     let bound = super::super::session_binding::SessionBoundAssembler::new(&tool).bind_tools(
         &child.session,
         vec![Arc::new(tool.clone()), make_tool("Probe")],
@@ -130,14 +137,22 @@ async fn nested_delegation_uses_direct_parent_catalog_and_inbox() {
     assert!(parent_manager.list_tasks_full().is_empty());
     assert_eq!(child_manager.list_tasks_full().len(), 1);
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while !child.session.queue().has_wake_up() {
+        while !child
+            .session
+            .queue()
+            .has_wake_up()
+            .await
+            .expect("test MQ wake")
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    assert!(parent.queue().is_empty());
-    assert!(child.session.queue().drain_all()[0].delivery_id.is_some());
+    assert!(parent.queue().is_empty().await.expect("test MQ len"));
+    assert!(child.session.queue().drain_all_async().await[0]
+        .delivery_id
+        .is_some());
     // 单一继承策略（与工具描述同一契约）：fork 子链不继承 `Agent`（防递归）
     // 与其它子链无持有者能力；工作区/元工具以外的父工具仍按策略过滤。
     assert!(
@@ -165,7 +180,7 @@ async fn nested_delegation_uses_direct_parent_catalog_and_inbox() {
     // resume 携带本次工具调用身份（父侧 provenance 来源）。
     let resume_invocation = "fixture-isolation-nested-resume";
 
-    let config = tool.resume_config_base(
+    let mut config = tool.resume_config_base(
         child.child_thread_id.clone(),
         Some("resume".into()),
         SubagentRunMode::Sync,
@@ -181,6 +196,22 @@ async fn nested_delegation_uses_direct_parent_catalog_and_inbox() {
         cwd,
         Some(resume_invocation.to_string()),
     );
+    // resume 装配会经 bind_agent_session 重新注册直接父级 inbox；sync 结束会再次
+    // 停驻，因此在启动 hook 内观测注册态。
+    let resumed_inbox_registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed_registered = resumed_inbox_registered.clone();
+    let probe_pool = pool.clone();
+    let probe_child = child.child_thread_id.clone();
+    config.on_subagent_start = Some(Arc::new(move |_, _, _| {
+        observed_registered.store(
+            probe_pool
+                .session_bindings
+                .read()
+                .inbox(&probe_child)
+                .is_some(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }));
     let resumed = tool.resume(config).await.unwrap();
     assert!(Arc::ptr_eq(
         &child_manager,
@@ -192,15 +223,20 @@ async fn nested_delegation_uses_direct_parent_catalog_and_inbox() {
             .as_ref()
             .unwrap()
     ));
+    assert!(
+        resumed_inbox_registered.load(std::sync::atomic::Ordering::SeqCst),
+        "resume 装配必须重新注册直接父级 inbox"
+    );
     child
         .session
         .queue()
-        .push(peri_agent::session::QueuedMessage::defer(
+        .push_async(peri_agent::session::QueuedMessage::defer(
             peri_agent::session::MessageSource::SystemInjected,
             BaseMessage::human("after-rebind"),
-        ));
+        ))
+        .await;
     assert_eq!(
-        resumed.session.queue().drain_all()[0]
+        resumed.session.queue().drain_all_async().await[0]
             .message()
             .unwrap()
             .content(),
@@ -225,18 +261,25 @@ async fn agent_binding_retains_task_directory_and_routes_only_to_child() {
     pool.bind_agent_session(
         "child",
         SessionInbox::new(child_queue.clone()).handle(),
+        child_queue.as_ref().clone(),
         manager,
     );
     assert!(manager_weak.upgrade().is_some());
     let inbox = pool.session_bindings.read().inbox("child").unwrap();
-    inbox.push_info(MessageSource::SystemInjected, BaseMessage::human("passive"));
-    assert!(!child_queue.has_wake_up());
-    inbox.push_defer(MessageSource::SystemInjected, BaseMessage::human("result"));
+    inbox
+        .push_info(MessageSource::SystemInjected, BaseMessage::human("passive"))
+        .await
+        .expect("test MQ enqueue");
+    assert!(!child_queue.has_wake_up().await.expect("test MQ wake"));
+    inbox
+        .push_defer(MessageSource::SystemInjected, BaseMessage::human("result"))
+        .await
+        .expect("test MQ enqueue");
     tokio::time::timeout(std::time::Duration::from_secs(1), child_queue.await_wake())
         .await
         .unwrap();
-    assert!(parent_queue.is_empty());
-    assert_eq!(child_queue.len(), 2);
+    assert!(parent_queue.is_empty().await.expect("test MQ len"));
+    assert_eq!(child_queue.len().await.expect("test MQ len"), 2);
     assert!(pool
         .begin_external_task_execution("child", "remote")
         .is_ok());
@@ -246,7 +289,7 @@ async fn agent_binding_retains_task_directory_and_routes_only_to_child() {
     pool.unregister_inbox("child");
     assert!(manager_weak.upgrade().is_some());
     assert!(pool.session_bindings.read().inbox("child").is_none());
-    assert_eq!(child_queue.len(), 2);
+    assert_eq!(child_queue.len().await.expect("test MQ len"), 2);
 }
 
 #[tokio::test]
@@ -272,6 +315,7 @@ async fn completed_child_shell_blocks_shared_close_and_reopen_rebuilds_binding()
     pool.bind_agent_session(
         &child_id,
         SessionInbox::new(old_queue.clone()).handle(),
+        old_queue.as_ref().clone(),
         old_manager.clone(),
     );
     let parent = Session::new(
@@ -318,6 +362,7 @@ async fn completed_child_shell_blocks_shared_close_and_reopen_rebuilds_binding()
     );
     assert!(pool
         .verify_shared_environment_close(&root_id)
+        .await
         .unwrap_err()
         .contains("Incomplete"));
     assert!(!child.session.config().cancel_token.is_cancelled());
@@ -334,10 +379,21 @@ async fn completed_child_shell_blocks_shared_close_and_reopen_rebuilds_binding()
         .await
         .unwrap();
     assert!(old_manager.session_close_settled());
-    old_queue.push(peri_agent::session::QueuedMessage::defer(
-        MessageSource::SystemInjected,
-        BaseMessage::human("closed runtime pending"),
-    ));
+    // E：close 结算开始后入队闸门关闭，迟到写入必须被明确拒绝且不落存储。
+    let late_error = old_queue
+        .enqueue(peri_agent::session::QueuedMessage::defer(
+            MessageSource::SystemInjected,
+            BaseMessage::human("closed runtime pending"),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        late_error
+            .downcast_ref::<peri_acp_types::session::QueueClosed>()
+            .is_some(),
+        "close 后迟到入队必须返回 QueueClosed: {late_error}"
+    );
+    assert_eq!(old_queue.len().await.expect("test MQ len"), 0);
     let config = tool.resume_config_base(
         child_id.clone(),
         Some("new conversation turn".into()),
@@ -362,9 +418,25 @@ async fn completed_child_shell_blocks_shared_close_and_reopen_rebuilds_binding()
         .clone()
         .unwrap();
     assert!(!Arc::ptr_eq(&old_manager, &new_manager));
-    assert_eq!(old_queue.len(), 1);
-    assert!(reopened.session.queue().is_empty());
-    assert!(pool.verify_shared_environment_close(&root_id).is_ok());
+    assert_eq!(old_queue.len().await.expect("test MQ len"), 0);
+    assert!(reopened
+        .session
+        .queue()
+        .is_empty()
+        .await
+        .expect("test MQ len"));
+    // 新 bind 重新开放入队：reopened 队列可接纳并消费合法消息。
+    let reopened_queue = reopened.session.queue();
+    assert!(!reopened_queue.is_admission_closed());
+    reopened_queue
+        .push_async(peri_agent::session::QueuedMessage::defer(
+            MessageSource::SystemInjected,
+            BaseMessage::human("reopened runtime pending"),
+        ))
+        .await;
+    assert_eq!(reopened_queue.len().await.expect("test MQ len"), 1);
+    assert_eq!(reopened_queue.drain_all_async().await.len(), 1);
+    assert!(pool.verify_shared_environment_close(&root_id).await.is_ok());
     assert!(old_manager.spawn_owned(Box::pin(async {})).is_err());
 }
 
@@ -462,9 +534,14 @@ async fn background_grandchild_resumes_route_to_direct_parent_with_unique_delive
         wait_for_background_idle(&manager).await;
         assert!(task_ids.insert(resumed.task_id.clone().unwrap()));
         assert_eq!(resumed.child_thread_id, grandchild.child_thread_id);
-        assert!(root.queue().is_empty());
-        assert!(resumed.session.queue().is_empty());
-        let delivered = child.session.queue().drain_all();
+        assert!(root.queue().is_empty().await.expect("test MQ len"));
+        assert!(resumed
+            .session
+            .queue()
+            .is_empty()
+            .await
+            .expect("test MQ len"));
+        let delivered = child.session.queue().drain_all_async().await;
         assert_eq!(delivered.len(), 1);
         assert!(delivery_ids.insert(delivered[0].delivery_id.unwrap()));
         let mut terminal = None;
@@ -477,8 +554,8 @@ async fn background_grandchild_resumes_route_to_direct_parent_with_unique_delive
         assert_eq!(result.task_id, resumed.task_id.unwrap());
         // 事件只有可读任务身份，不能重新取得 producer 的结算资格。
         // 原票据的重复回调/淘汰后幂等由 registry projection_retention_tests 覆盖。
-        assert!(child.session.queue().is_empty());
-        assert!(root.queue().is_empty());
+        assert!(child.session.queue().is_empty().await.expect("test MQ len"));
+        assert!(root.queue().is_empty().await.expect("test MQ len"));
         assert_eq!(
             store
                 .load_meta(&grandchild.child_thread_id)
@@ -554,18 +631,18 @@ async fn configured_background_callback_overrides_live_parent_and_retries_origin
     tokio::time::timeout(std::time::Duration::from_secs(3), attempted.notified())
         .await
         .unwrap();
-    assert!(parent.queue().is_empty());
-    assert!(target.queue().is_empty());
+    assert!(parent.queue().is_empty().await.expect("test MQ len"));
+    assert!(target.queue().is_empty().await.expect("test MQ len"));
     assert_eq!(manager.active_count(), 1);
     allowed.store(true, Ordering::SeqCst);
     manager.retry_pending_deliveries();
     wait_for_background_idle(&manager).await;
-    assert!(parent.queue().is_empty());
-    let delivered = target.queue().drain_all();
+    assert!(parent.queue().is_empty().await.expect("test MQ len"));
+    let delivered = target.queue().drain_all_async().await;
     assert_eq!(delivered.len(), 1);
     assert!(delivered[0].delivery_id.is_some());
     let result = result.lock().unwrap().clone().unwrap();
     delivery(&result, peri_acp_types::tasks::BgTaskKind::Agent).unwrap();
-    assert!(target.queue().is_empty());
-    assert!(parent.queue().is_empty());
+    assert!(target.queue().is_empty().await.expect("test MQ len"));
+    assert!(parent.queue().is_empty().await.expect("test MQ len"));
 }

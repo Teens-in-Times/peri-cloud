@@ -17,12 +17,6 @@ pub(crate) mod process;
 #[path = "client/process_wasm.rs"]
 pub(crate) mod process;
 mod queries;
-// System MCP 启动准入 seam：清单发布与闸门已接线（`initialize` / `middleware`），
-// 仍有三处冻结但尚无生产读取方的成员——`DiscoveryEvidence::is_complete`（只有测试在问）、
-// `NegotiatedSystemMcp::handle`（协商结果保留句柄，消费方只读 `requirement`/`generation`）、
-// `SystemReadinessError::CatalogPublicationFailed`（清单发布失败分支待接）。三者都由
-// crate 内测试覆盖，接线波次落地后连同本豁免一起删除。
-#[allow(dead_code)]
 mod readiness;
 mod rewind;
 mod service;
@@ -66,14 +60,8 @@ use std::{
 pub(crate) use cache::cache_scope_allows_persistence;
 pub(crate) use cache::ConnectionResourceCache;
 pub use oauth::OAuthStartDisposition;
-// System MCP 启动准入（IF-M3）：证据、等待与类型化错误；子模块声明留在本文件，
-// 不占 `mcp/mod.rs`（其 owner 为 C-INJ-02 / D-02）。消费方：B-02（证据提交 /
-// 清单发布，已接线）、B-03（闸门与 C 接线，W4 消费 `NegotiatedSystemMcp` /
-// `SystemMcpRequirement` / `SystemReadinessError`）。
-#[allow(unused_imports)]
 pub(crate) use readiness::{
-    DiscoveryEvidence, NegotiatedSystemMcp, SystemMcpManifest, SystemMcpRequirement,
-    SystemReadinessError,
+    DiscoveryEvidence, NegotiatedSystemMcp, SystemMcpManifest, SystemReadinessError,
 };
 #[cfg(test)]
 pub(crate) use service::ControlledMcpService;
@@ -159,6 +147,10 @@ pub struct McpClientPool {
     /// 会话首 turn 的 `first_turn_reminder` 概览已覆盖初始连接结果，避免与
     /// 逐台上线事件重复（初始化未完成时，迟到的连接成功自然成为运行中变化）。
     pub(crate) initialized: std::sync::atomic::AtomicBool,
+    /// System MCP（启动依赖）是否已处理完。普通 MCP 不是启动依赖：会话创建
+    /// 只等这个位，不等整池 `initPhase`，否则不可达的普通 transport 会拖住
+    /// 首个会话（每个 HTTP 连接失败要等满超时）。
+    pub(crate) system_settled: std::sync::atomic::AtomicBool,
     /// 运行中状态变化的待注入文本缓冲（McpMiddleware::before_model drain 后
     /// 以 Info 消息推送进模型上下文；全局缓冲，任一会话消费一次即清空）。
     pub(crate) pending_changes: parking_lot::Mutex<Vec<String>>,
@@ -313,6 +305,7 @@ impl McpClientPool {
             plugin_sources: parking_lot::RwLock::new(HashMap::new()),
             init_status: parking_lot::RwLock::new(McpInitStatus::Pending),
             initialized: std::sync::atomic::AtomicBool::new(false),
+            system_settled: std::sync::atomic::AtomicBool::new(false),
             pending_changes: parking_lot::Mutex::new(Vec::new()),
             notifier: parking_lot::RwLock::new(None),
             oauth_event_callback: parking_lot::RwLock::new(None),
@@ -959,6 +952,7 @@ impl McpClientPool {
 
 mod ports;
 mod session_bindings;
+mod workspace_watch;
 
 #[cfg(test)]
 #[path = "client_test.rs"]

@@ -14,15 +14,19 @@ use peri_acp_types::history_window::{
     HistoryBodyChunk, HistoryCommittedTail, HistoryReadTicket, HistorySource,
 };
 use peri_acp_types::messages::MessageId;
+use peri_acp_types::session::{
+    MqCancelOutcome, MqEnqueueOutcome, MqEntry, MqFilter, MqHeader, MqInput, MqReceiveOutcome,
+    MqReceiveSelection, MqWatermark,
+};
 use peri_acp_types::session_resources::{
     ActiveSessionSnapshot, BindingState, ChildSnapshot, ForkSnapshot, FrozenSnapshotBytes,
     FrozenState, HistoryWindowPagePlan, HistoryWindowRows, NewSession, PersistenceRecovery,
     RewindBoundary, RewindCandidate, RewindOutcome, SessionHistoryWindowBounds, SessionMetaPatch,
-    SessionResourceResult, SessionSnapshot,
+    SessionResourceResult, SessionSnapshot, TerminalSettlementOutcome,
 };
 use peri_acp_types::store::{CompactionChange, MessageFlags, PersistedPayload};
 use peri_acp_types::system_reminder::TrustedSystemReminder;
-use peri_acp_types::thread::{ThreadId, ThreadMeta};
+use peri_acp_types::thread::{ThreadId, ThreadMeta, WorkState};
 use peri_acp_types::workspace::{
     ResolvedWorkspace, ScopedThreadPage, ScopedThreadQuery, SessionBinding,
 };
@@ -422,6 +426,23 @@ pub(crate) trait SessionDataPort: Send + Sync {
     /// 因此「这条会话属于哪棵树」只能由持有 canonical 父链的一侧回答。
     async fn session_root(&self, id: &ThreadId) -> SessionResourceResult<ThreadId>;
 
+    /// 恢复范围：先严格解析根，再读该根子树里仍为 `working` 的候选。
+    ///
+    /// 只读事实；根缺失或父链成环按 `Corrupt` 报告，不退回自身（范围变窄不能
+    /// 把未知当已知）。旧代际库没有工作快照列时读作 `idle`，自然零候选。
+    async fn recovery_scope(
+        &self,
+        id: &ThreadId,
+    ) -> SessionResourceResult<peri_acp_types::recovery::RecoveryScope>;
+
+    /// 留待收敛的 child 事实：根子树中 `active` 且 `idle`/`stopped` 的非根 thread。
+    ///
+    /// 只读；旧代际库没有工作快照列时返回空候选人，不把「读不到」当 `idle`。
+    async fn interrupted_threads(
+        &self,
+        id: &ThreadId,
+    ) -> SessionResourceResult<Vec<peri_acp_types::recovery::InterruptedThread>>;
+
     /// 分页列举：过滤在数据端完成。
     async fn list_sessions(
         &self,
@@ -544,6 +565,31 @@ pub(crate) trait SessionDataPort: Send + Sync {
         patch: &SessionMetaPatch,
     ) -> SessionResourceResult<()>;
 
+    /// 只写 durable 工作意图这一列，不改 `updated_at`，也不改运行态。
+    ///
+    /// 默认实现返回 `Unsupported`：工作意图要么如实持久化，要么显式拒绝。
+    async fn set_work_state(&self, _id: &ThreadId, _state: WorkState) -> SessionResourceResult<()> {
+        Err(super::failure::unsupported())
+    }
+
+    /// 收尾收敛到 `idle`：没有待处理的 `EnsureProcessing` 条目才写，`stopped` 不解除。
+    ///
+    /// 默认实现只有单列读写能力（用于 mock / 其他 adapter）：先读后写，只把
+    /// `working` 收敛为 `idle`，其余状态返回 `false` 且不写入。具备事务能力的
+    /// 后端应在同一次提交里判定待处理消息，见 SQLite 实现。
+    async fn settle_work_state_after_turn(&self, id: &ThreadId) -> SessionResourceResult<bool> {
+        settle_work_state_after_turn_default(self, id).await
+    }
+
+    /// 只写上下文占用快照这一列；`None` 写 NULL（未知，不是零占用）。
+    async fn set_context_usage(
+        &self,
+        _id: &ThreadId,
+        _tokens: Option<u64>,
+    ) -> SessionResourceResult<()> {
+        Err(super::failure::unsupported())
+    }
+
     /// 删除会话树：删除即删除，数据删除之后本机与远端都不再持有该会话的终态证据。
     async fn delete_tree(&self, id: &ThreadId) -> SessionResourceResult<()>;
 
@@ -556,12 +602,144 @@ pub(crate) trait SessionDataPort: Send + Sync {
         &self,
         id: &ThreadId,
     ) -> SessionResourceResult<PersistenceRecovery>;
-
     /// 排空该会话已排队的持久化写入（有界等待）。
     async fn drain(&self, id: &ThreadId) -> SessionResourceResult<()>;
 
+    // ── Thread MQ（持久收件箱） ──
+    //
+    // 默认实现是显式「不支持」：adapter 要么提供原子移交，要么让调用方看到 typed 错误，
+    // 不允许退化成两次独立写入（先写历史再删 MQ）。
+
+    async fn mq_enqueue(
+        &self,
+        _thread_id: &ThreadId,
+        _input: MqInput,
+    ) -> SessionResourceResult<MqEnqueueOutcome> {
+        Err(super::failure::unsupported())
+    }
+
+    async fn mq_query(
+        &self,
+        _thread_id: &ThreadId,
+        _filter: MqFilter,
+    ) -> SessionResourceResult<Vec<MqEntry>> {
+        Err(super::failure::unsupported())
+    }
+
+    /// 控制面投影：默认退回完整查询；SQLite adapter 覆盖为只读列投影。
+    async fn mq_headers(
+        &self,
+        thread_id: &ThreadId,
+        filter: MqFilter,
+    ) -> SessionResourceResult<Vec<MqHeader>> {
+        Ok(self
+            .mq_query(thread_id, filter)
+            .await?
+            .into_iter()
+            .map(|entry| entry.header())
+            .collect())
+    }
+
+    async fn mq_count(&self, thread_id: &ThreadId) -> SessionResourceResult<usize> {
+        Ok(self.mq_query(thread_id, MqFilter::default()).await?.len())
+    }
+
+    async fn mq_exists(&self, thread_id: &ThreadId) -> SessionResourceResult<bool> {
+        Ok(!self
+            .mq_query(thread_id, MqFilter::default())
+            .await?
+            .is_empty())
+    }
+
+    async fn mq_watermark(
+        &self,
+        thread_id: &ThreadId,
+    ) -> SessionResourceResult<Option<MqWatermark>> {
+        Ok(self
+            .mq_query(thread_id, MqFilter::default())
+            .await?
+            .last()
+            .map(MqEntry::watermark))
+    }
+
+    async fn mq_cancel(
+        &self,
+        _thread_id: &ThreadId,
+        _id: MessageId,
+    ) -> SessionResourceResult<MqCancelOutcome> {
+        Err(super::failure::unsupported())
+    }
+
+    async fn mq_receive(
+        &self,
+        _thread_id: &ThreadId,
+        _selection: MqReceiveSelection,
+    ) -> SessionResourceResult<MqReceiveOutcome> {
+        Err(super::failure::unsupported())
+    }
+
+    async fn mq_clear(&self, _thread_id: &ThreadId) -> SessionResourceResult<()> {
+        Err(super::failure::unsupported())
+    }
+
+    /// 按稳定消息 ID 查询本 thread 的历史事实（只读、单条有界）。
+    async fn mq_history_contains(
+        &self,
+        _thread_id: &ThreadId,
+        _id: MessageId,
+    ) -> SessionResourceResult<bool> {
+        Err(super::failure::unsupported())
+    }
+
+    /// 原子终态与 MQ 结算；无实现时拒绝，不降级成分步写入。
+    async fn finalize_child_terminal(
+        &self,
+        _child: &ThreadId,
+        _status: peri_acp_types::thread::AgentStatus,
+        _work_state: WorkState,
+        _target: &ThreadId,
+        _message: MqInput,
+    ) -> SessionResourceResult<MqEnqueueOutcome> {
+        Err(super::failure::unsupported())
+    }
+
+    /// 原子写入无结果终态与工作意图；已有终态不得覆盖。
+    async fn settle_terminal_without_result(
+        &self,
+        _child: &ThreadId,
+        _status: peri_acp_types::thread::AgentStatus,
+        _work_state: WorkState,
+    ) -> SessionResourceResult<TerminalSettlementOutcome> {
+        Err(super::failure::unsupported())
+    }
+
+    /// 提醒写入与 MQ 快照水位删除必须同批提交。
+    async fn settle_retained_mq(
+        &self,
+        _thread_id: &ThreadId,
+        _reminders: &[peri_acp_types::session::RetainedReminder],
+        _rows: &[MqEntry],
+    ) -> SessionResourceResult<()> {
+        Err(super::failure::unsupported())
+    }
+
     /// 关闭数据端口：返回后不再接受新写入。
     async fn close(&self) -> SessionResourceResult<()>;
+}
+
+/// 默认收尾的条件写：只有 `working` 才收敛为 `idle`，返回是否真的写入。
+///
+/// 读后写在本机 SQLite 之外没有事务保证；默认实现只服务于不具备原子判定的
+/// adapter，语义仍是「不覆盖显式停止」，并如实返回是否写入。
+pub(super) async fn settle_work_state_after_turn_default(
+    port: &(impl SessionDataPort + ?Sized),
+    id: &ThreadId,
+) -> SessionResourceResult<bool> {
+    if port.load_meta(id).await?.work_state != WorkState::Working {
+        return Ok(false);
+    }
+    port.set_work_state(id, WorkState::Idle).await?;
+    Ok(true)
 }
 
 // ─── child 快照的输入一致性：唯一一条规则 ─────────────────────────────────────

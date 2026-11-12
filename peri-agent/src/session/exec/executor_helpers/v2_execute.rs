@@ -17,7 +17,7 @@ use peri_acp_types::{
     tasks::{BgTaskKind, TaskManager},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::agent::{
     async_tasks::TaskManager as AgentTaskManager,
@@ -229,6 +229,7 @@ pub async fn build_and_execute_agent_v2(req: V2ExecuteRequest) -> ExecOutcome {
                 },
             );
             return ExecOutcome {
+                execution_binding: None,
                 ok: false,
                 stop_reason: PromptStopReason::EndTurn,
                 failure: Some(failure),
@@ -275,17 +276,57 @@ pub async fn build_and_execute_agent_v2(req: V2ExecuteRequest) -> ExecOutcome {
     // 「继续」按钮一点就停且无模型调用）。空 human 不写入 transcript
     // （append_messages_to_transcript 跳过空 Prompt），也不产生空 user 气泡。
     // continuation（含队列交接路径）不 push——其输入经 mailbox handoff 入队。
-    if !req.continuation {
-        v2_out.context.session.queue.push(QueuedMessage::prompt(
-            V2MessageSource::UserInput,
-            BaseMessage::human(req.agent_input.content.clone()),
-        ));
-    }
-
     let input_ticket = req
         .user_input_mailbox
         .as_ref()
         .and_then(|mailbox| mailbox.active_run_ticket());
+    if !req.continuation {
+        if let Err(error) = v2_out
+            .context
+            .session
+            .queue
+            .enqueue_sent(QueuedMessage::prompt(
+                V2MessageSource::UserInput,
+                BaseMessage::human(req.agent_input.content.clone()),
+            ))
+            .await
+        {
+            // 初始指令没有进入 MQ：本轮不得继续跑并报告 Completed。
+            error!(session_id = %req.session_id, %error, "initial prompt enqueue failed");
+            let failure = ExecutionFailure::internal(format!(
+                "Initial prompt could not be admitted to the thread MQ: {error}"
+            ));
+            let source = UnstampedEvent::new(
+                String::new(),
+                String::new(),
+                None,
+                EventDeliveryClass::Critical,
+            );
+            req.publisher.publish_event(
+                &req.session_id,
+                &source,
+                ExecutorEvent::AgentExecutionFailed {
+                    message: failure.public_message.clone(),
+                },
+            );
+            if let (Some(mailbox), Some(ticket)) = (&req.user_input_mailbox, &input_ticket) {
+                mailbox.record_attempt_outcome(
+                    ticket,
+                    crate::session::user_input_mailbox::UserInputAttemptOutcome::Failed,
+                );
+            }
+            return ExecOutcome {
+                execution_binding: Some(v2_out.context.session.turn.execution_binding()),
+                ok: false,
+                stop_reason: PromptStopReason::EndTurn,
+                failure: Some(failure),
+                history_replaced_by_compaction: false,
+                persisted_payloads: req.history_payloads,
+                persistence_inconsistent: false,
+                agent_state: AgentState::new(&req.cwd),
+            };
+        }
+    }
 
     // Phase 2: bg event pump（复用 V2AgentOutput.bg_event_rx）
     // 事件三层化：发射点统一经 `EventPublisher`（身份：v2 循环 turn_id / 主
@@ -460,11 +501,19 @@ pub async fn build_and_execute_agent_v2(req: V2ExecuteRequest) -> ExecOutcome {
         {
             Ok(reminders) if !reminders.is_empty() => {
                 for text in reminders {
-                    v2_out.context.session.queue.push(QueuedMessage::new(
-                        MessageKind::Info,
-                        V2MessageSource::SystemInjected,
-                        BaseMessage::human(text),
-                    ));
+                    if let Err(error) = v2_out
+                        .context
+                        .session
+                        .queue
+                        .enqueue(QueuedMessage::new(
+                            MessageKind::Info,
+                            V2MessageSource::SystemInjected,
+                            BaseMessage::human(text),
+                        ))
+                        .await
+                    {
+                        tracing::warn!(%error, "first turn reminder enqueue failed");
+                    }
                 }
             }
             Ok(_) => {}
@@ -476,6 +525,9 @@ pub async fn build_and_execute_agent_v2(req: V2ExecuteRequest) -> ExecOutcome {
     // Phase 6.5: clone recall_buffer 的 Arc，便于 Phase 8.5 在 context 被
     // run_react_loop 消费后仍可访问累积的 recall。
     let recall_buffer = Arc::clone(&v2_out.context.recall_buffer);
+    // token_tracker 同样随 StageContext 被消费；保留共享句柄供 Phase 8
+    // 把本轮累积的占用快照交回 AgentState（collect_result 的唯一取值来源）。
+    let token_tracker = Arc::clone(&v2_out.context.compact.token_tracker);
 
     // Phase 7: 运行 v2 ReAct 循环
     // langfuse v2: capture turn_id before move, emit TurnStarted
@@ -528,19 +580,34 @@ pub async fn build_and_execute_agent_v2(req: V2ExecuteRequest) -> ExecOutcome {
         LoopResult::Completed | LoopResult::HookStopped { .. }
     ) {
         let queue = v2_out.session.queue();
-        if queue.has_ensure_processing() {
-            if let Some(ref tx) = req.continuation_notify {
-                let _ = tx.send(crate::session::exec::executor::ContinuationRequest {
-                    session_id: req.session_id.clone(),
-                    kind: BgTaskKind::Agent,
-                    mq_steering: true,
-                    pending_result: false,
-                });
-                tracing::debug!(
+        match queue.has_ensure_processing().await {
+            Ok(true) => {
+                if let Some(ref tx) = req.continuation_notify {
+                    let _ = tx.send(crate::session::exec::executor::ContinuationRequest {
+                        session_id: req.session_id.clone(),
+                        kind: BgTaskKind::Agent,
+                        mq_steering: true,
+                        pending_result: false,
+                        recovery: false,
+                    });
+                    let queue_len = queue.len().await.unwrap_or(0);
+                    tracing::debug!(
+                        session_id = %req.session_id,
+                        queue_len,
+                        "[v2] MQ steering continuation notified after run_react_loop"
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                // 查询失败不能当作「没有待处理工作」：交还 listener 重查，
+                // 否则本轮结束前投递的 MQ 提醒会一直搁置到下一次入队。
+                warn!(
                     session_id = %req.session_id,
-                    queue_len = queue.len(),
-                    "[v2] MQ steering continuation notified after run_react_loop"
+                    %error,
+                    "[v2] MQ steering check failed; requesting listener recheck"
                 );
+                queue.request_recheck();
             }
         }
     }
@@ -570,18 +637,18 @@ pub async fn build_and_execute_agent_v2(req: V2ExecuteRequest) -> ExecOutcome {
     } else {
         None
     };
-    let compact_uncertain = v2_out
+    let history_commit_uncertain = v2_out
         .session
         .transcript()
         .read()
         .compaction_commit_state()
         .is_uncertain();
-    let persistence_inconsistent = flush_error.is_some() || compact_uncertain;
+    let persistence_inconsistent = flush_error.is_some() || history_commit_uncertain;
     let persistence_failure = if persistence_inconsistent {
         if let Some(error) = &flush_error {
             error!(session_id = %req.session_id, turn_id = %loop_turn_id, stage = "transcript_flush", error = %format_args!("{error:#}"), causes = ?error.chain().map(ToString::to_string).collect::<Vec<_>>(), "[v2] phase 8 transcript flush failed");
         } else {
-            error!(session_id = %req.session_id, "[v2] compact persistence outcome is unconfirmed");
+            error!(session_id = %req.session_id, "[v2] history persistence outcome is unconfirmed");
         }
         // A store call can commit before its future is cancelled or returns an error.
         // A successful writer barrier alone cannot confirm that lifecycle's memory view.
@@ -636,6 +703,9 @@ pub async fn build_and_execute_agent_v2(req: V2ExecuteRequest) -> ExecOutcome {
     let mut agent_state = AgentState::with_messages(req.cwd.clone(), messages);
     agent_state.set_context("session_id", &req.session_id);
     agent_state.set_context("run_id", uuid::Uuid::now_v7().to_string());
+    // 本轮真实累积的 tracker 随 StageContext 一起结束；回填到结果态，
+    // 让 collect_result 读到最近一次有效占用而不是默认空 tracker。
+    agent_state.token_tracker = token_tracker.read().clone();
 
     // Phase 8.5: 把 v2 recall_buffer（middleware hook 期间累积）灌入 agent_state。
     // 下游 collect_result() 调用 agent_state.drain_recall() 取出 recall_items，
@@ -733,6 +803,7 @@ pub async fn build_and_execute_agent_v2(req: V2ExecuteRequest) -> ExecOutcome {
     }
 
     ExecOutcome {
+        execution_binding: Some(loop_turn.execution_binding()),
         ok: terminal.ok,
         stop_reason: terminal.stop_reason,
         failure: terminal.failure,

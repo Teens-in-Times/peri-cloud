@@ -39,13 +39,18 @@ fn owner_of(session: &Arc<Session>) -> Option<Arc<ParkedChildOwner>> {
         .and_then(|host| host.child_owner.clone())
 }
 
-fn has_obligations(
+async fn has_obligations(
     manager: &crate::agent::async_tasks::TaskManager,
     context: &StageContext,
     execution: &peri_acp_types::session::ExecutionBinding,
 ) -> bool {
     manager.has_unsettled_tasks()
-        || context.session.queue.has_required_for_run(execution)
+        || context
+            .session
+            .queue
+            .has_required_for_run(execution)
+            .await
+            .unwrap_or(false)
         || !context.async_ctx.received_after_deadline.lock().is_empty()
         || !context.async_ctx.unprocessed_tool_calls.lock().is_empty()
 }
@@ -114,6 +119,43 @@ pub(super) async fn run_child_until_terminal(
 }
 
 pub(super) async fn run_child_with_handoff_signal(
+    context: StageContext,
+    max_iterations: usize,
+    session: &Arc<Session>,
+    handoff_start: Option<tokio::sync::oneshot::Sender<ChildHandoffReceipt>>,
+) -> ChildRunOutcome {
+    // tracker 随 StageContext 一起被循环消费；先保留共享句柄，执行结束后
+    // 才能把本轮真实占用快照交给宿主展示（sync/background 共用此入口）。
+    let token_tracker = Arc::clone(&context.compact.token_tracker);
+    let outcome =
+        run_child_with_handoff_signal_inner(context, max_iterations, session, handoff_start).await;
+    // 读锁 guard 不能跨 await：先取出快照再落库。
+    let tokens = token_tracker.read().estimated_context_tokens();
+    persist_context_usage(session, tokens).await;
+    outcome
+}
+
+/// 只刷新 `threads.context_usage_tokens` 展示快照，不参与终态提交：
+/// 写失败只记录，不影响子 Agent 的结算结果；无有效 usage 时写回 NULL。
+async fn persist_context_usage(session: &Arc<Session>, tokens: Option<u64>) {
+    let Some(thread_id) = session.store().thread_id.clone() else {
+        return;
+    };
+    let Some(resources) = session
+        .subagent_host()
+        .and_then(|host| host.session_resources.clone())
+    else {
+        return;
+    };
+    if let Err(error) = resources
+        .set_context_usage(&peri_acp_types::thread::ThreadId::from(thread_id), tokens)
+        .await
+    {
+        tracing::warn!(%error, "child context usage write failed");
+    }
+}
+
+async fn run_child_with_handoff_signal_inner(
     mut context: StageContext,
     max_iterations: usize,
     session: &Arc<Session>,
@@ -183,7 +225,7 @@ pub(super) async fn run_child_with_handoff_signal(
                 unprocessed_tool_calls,
             } => {
                 if unprocessed_tool_calls.is_empty()
-                    && !has_obligations(&manager, &context, &execution)
+                    && !has_obligations(&manager, &context, &execution).await
                 {
                     return ChildRunOutcome::Settled;
                 }
@@ -215,7 +257,8 @@ pub(super) async fn run_child_with_handoff_signal(
                     return ChildRunOutcome::Interrupted;
                 }
                 let pending_tool_calls = pending_act_tool_calls(&context);
-                if pending_tool_calls.is_empty() && !has_obligations(&manager, &context, &execution)
+                if pending_tool_calls.is_empty()
+                    && !has_obligations(&manager, &context, &execution).await
                 {
                     return ChildRunOutcome::Failed {
                         error,
@@ -279,7 +322,7 @@ pub(super) async fn run_child_with_handoff_signal(
             };
         }
 
-        let obligations = has_obligations(&manager, &context, &execution);
+        let obligations = has_obligations(&manager, &context, &execution).await;
         if !obligations {
             // 消费最后一次 activity 复核，防止终态与通知竞态被误判为已完成。
             if activity.has_changed().unwrap_or(false) {
@@ -317,7 +360,14 @@ pub(super) async fn run_child_with_handoff_signal(
             };
         }
 
-        if !stopped_by_hook && context.session.queue.has_required_for_run(&execution) {
+        if !stopped_by_hook
+            && context
+                .session
+                .queue
+                .has_required_for_run(&execution)
+                .await
+                .unwrap_or(false)
+        {
             let remaining = max_iterations.saturating_sub(context.session.turn.current_step());
             result = run_react_loop(context.clone(), remaining).await;
             continue;
@@ -362,14 +412,15 @@ pub(super) async fn run_child_with_handoff_signal(
                         }
                     }
                 };
-                context.session.queue.push(
-                    QueuedMessage::system_reminder(
-                        MessageKind::Defer,
-                        MessageSource::SystemInjected,
-                        reminder,
-                    )
-                    .with_policy(MessagePolicy::continue_current_run(execution.clone())),
-                );
+                let message = QueuedMessage::system_reminder(
+                    MessageKind::Defer,
+                    MessageSource::SystemInjected,
+                    reminder,
+                )
+                .with_policy(MessagePolicy::continue_current_run(execution.clone()));
+                if let Err(error) = context.session.queue.enqueue(message).await {
+                    tracing::warn!(%error, "child shell reminder enqueue failed");
+                }
                 result = run_react_loop(context.clone(), remaining).await;
                 continue;
             }

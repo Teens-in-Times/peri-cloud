@@ -1,5 +1,3 @@
-use super::*;
-
 #[tokio::test]
 async fn test_schema3_identity_migration_reuses_binding_and_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -85,8 +83,8 @@ async fn test_schema3_identity_migration_reuses_binding_and_survives_reopen() {
 ///
 /// 登记空间的**载体与列名**随版本变化：v12 之前是 `workspaces(root, root_identity)`，
 /// v12..v18 是改名为 `legacy_execution_registrations` 的原表，v19 起并回
-/// `workspaces(path, identity)`。同一 id 下的五元组 (id, project_id, 根, 根身份, 发现)
-/// 在搬运中逐字不变，所以投影按当前形状选择，跨版本的比较仍然落在同一份事实上。
+/// `workspaces(path, ...)`。文件对象身份列在 v15 退役，因此投影只取跨代稳定的事实
+/// (id, project_id, 根路径, 发现快照)——根路径在搬运中逐字不变。
 async fn identity_bytes(connection: &mut SqliteConnection) -> Vec<String> {
     let registrations = column_names(connection, "legacy_execution_registrations")
         .await
@@ -94,21 +92,21 @@ async fn identity_bytes(connection: &mut SqliteConnection) -> Vec<String> {
     let workspaces = column_names(connection, "workspaces").await.unwrap();
     let registration_query = match (registrations.is_empty(), workspaces.contains("root")) {
         (false, _) => {
-            "SELECT json_array(id, project_id, root, root_identity, discovery)
+            "SELECT json_array(id, project_id, root, discovery)
              FROM legacy_execution_registrations ORDER BY id"
         }
         (true, true) => {
-            "SELECT json_array(id, project_id, root, root_identity, discovery)
+            "SELECT json_array(id, project_id, root, discovery)
              FROM workspaces ORDER BY id"
         }
         (true, false) => {
-            "SELECT json_array(id, project_id, path, identity, discovery)
+            "SELECT json_array(id, project_id, path, discovery)
              FROM workspaces ORDER BY id"
         }
     };
     let mut values = Vec::new();
     for query in [
-        "SELECT json_array(id, locator, object_identity) FROM projects ORDER BY id",
+        "SELECT json_array(id, locator) FROM projects ORDER BY id",
         registration_query,
         "SELECT json_array(thread_id, schema_version, project_id, workspace_id, relative_cwd) FROM session_bindings ORDER BY thread_id",
     ] {
@@ -136,10 +134,23 @@ async fn test_version2_upgrade_removes_required_revision_and_preserves_identity(
     let store = SqliteThreadStore::new(&path).await.unwrap();
     let mut connection = store.database.pool.acquire().await.unwrap();
     assert_eq!(history_bytes(&mut connection).await, before_history);
-    let migrated_identity = identity_bytes(&mut connection).await;
-    assert!(migrated_identity
-        .iter()
-        .all(|value| !value.contains("birth_")));
+    // v15 起身份列整体退役：`projects` / `workspaces` / `session_bindings` 都不再有它们。
+    // `workspaces.discovery` 的字节**不做清洗**（历史证据原样保留），因此这里断言的是列，
+    // 不是快照内容。
+    for (table, column) in [
+        ("projects", "object_identity"),
+        ("workspaces", "identity"),
+        ("workspaces", "root_identity"),
+        ("session_bindings", "evidence_origin"),
+    ] {
+        assert!(
+            !column_names(&mut connection, table)
+                .await
+                .unwrap()
+                .contains(column),
+            "{table}.{column} 必须在 v15 退役"
+        );
+    }
     assert!(!column_names(&mut connection, "session_bindings")
         .await
         .unwrap()

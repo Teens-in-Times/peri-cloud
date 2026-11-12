@@ -174,7 +174,7 @@ async fn cancel_just_after_deadline_hands_off_without_cancelling_shell() {
 async fn admitted_act_tool_result_hands_off_instead_of_settled() {
     let manager = Arc::new(TaskManager::new());
     let child = make_child(manager.clone(), true);
-    child.queue().push(QueuedMessage::prompt(
+    child.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         crate::messages::BaseMessage::human("use a tool"),
     ));
@@ -225,7 +225,7 @@ async fn admitted_act_tool_result_parent_result_is_failure() {
     let manager = Arc::new(TaskManager::new());
     let parent_manager = Arc::new(TaskManager::new());
     let child = make_child(manager, true);
-    child.queue().push(QueuedMessage::prompt(
+    child.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         crate::messages::BaseMessage::human("use a tool"),
     ));
@@ -253,6 +253,17 @@ async fn admitted_act_tool_result_parent_result_is_failure() {
     window.start();
     built.context.async_ctx.child_settlement = Some(window);
     let child_id = child.store().thread_id.clone().unwrap();
+    let terminal_route = child
+        .subagent_host()
+        .and_then(|host| host.child_owner.clone())
+        .and_then(|owner| owner.resources.clone())
+        .map(
+            |store| crate::session::subagent::terminal_settlement::TerminalMqRoute {
+                store,
+                target: child_id.clone(),
+                mailbox: None,
+            },
+        );
     let task_id = crate::session::subagent::run_sync::new_sync_task_id();
     let (delivered_tx, delivered_rx) = tokio::sync::oneshot::channel();
     let delivered_tx = parking_lot::Mutex::new(Some(delivered_tx));
@@ -273,6 +284,7 @@ async fn admitted_act_tool_result_parent_result_is_failure() {
                     Ok(())
                 },
             )),
+            terminal_route,
             move |handoff, _| async move {
                 crate::session::subagent::run_sync::run_sync_subagent(
                     &run_id,
@@ -420,7 +432,7 @@ async fn assert_act_receipt(stop: bool) {
         child_owner: Some(owner),
         ..Default::default()
     });
-    child.queue().push(QueuedMessage::prompt(
+    child.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         crate::messages::BaseMessage::human("执行工具"),
     ));
@@ -469,7 +481,7 @@ async fn assert_act_receipt(stop: bool) {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(manager.active_count(), 0);
     assert!(!manager.has_pending_deliveries());
-    assert!(!child.queue().has_required());
+    assert!(!child.queue().has_required_sync());
     assert!(receipt.tasks.is_empty());
     assert!(receipt.message_ids.is_empty());
     assert_eq!(receipt.unprocessed_tool_calls, vec!["call-1"]);
@@ -511,7 +523,7 @@ async fn hook_stop_after_act_hands_off_tool_result_and_parent_fails() {
     let manager = Arc::new(TaskManager::new());
     let parent_manager = Arc::new(TaskManager::new());
     let child = make_child(manager, true);
-    child.queue().push(QueuedMessage::prompt(
+    child.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         crate::messages::BaseMessage::human("run a tool then stop"),
     ));
@@ -541,6 +553,17 @@ async fn hook_stop_after_act_hands_off_tool_result_and_parent_fails() {
         )),
     );
     let child_id = child.store().thread_id.clone().unwrap();
+    let terminal_route = child
+        .subagent_host()
+        .and_then(|host| host.child_owner.clone())
+        .and_then(|owner| owner.resources.clone())
+        .map(
+            |store| crate::session::subagent::terminal_settlement::TerminalMqRoute {
+                store,
+                target: child_id.clone(),
+                mailbox: None,
+            },
+        );
     let task_id = crate::session::subagent::run_sync::new_sync_task_id();
     let (delivered_tx, delivered_rx) = tokio::sync::oneshot::channel();
     let delivered_tx = parking_lot::Mutex::new(Some(delivered_tx));
@@ -561,6 +584,7 @@ async fn hook_stop_after_act_hands_off_tool_result_and_parent_fails() {
                     Ok(())
                 },
             )),
+            terminal_route,
             move |handoff, _| async move {
                 crate::session::subagent::run_sync::run_sync_subagent(
                     &run_id,

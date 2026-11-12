@@ -8,7 +8,7 @@ use peri_acp_types::interaction::UserInteractionBroker;
 use peri_acp_types::permission::SharedPermissionMode;
 use peri_agent::middleware::chain::MiddlewareChain;
 use peri_agent::middleware::r#trait::Middleware;
-use peri_agent::session::factory::{ChainSlot, MiddlewareChainAssembler};
+use peri_agent::session::factory::{AssemblyError, ChainSlot, MiddlewareChainAssembler};
 use peri_agent::tools::BaseTool;
 use peri_mcp_web::{web_fetch::WebFetchTool, web_search::WebSearchTool};
 use peri_middlewares::hitl::HumanInTheLoopMiddleware;
@@ -113,7 +113,11 @@ impl MiddlewareChainAssembler for CloudChainAssembler {
     type Context = CloudAssemblyContext;
     type Output = MiddlewareChain;
 
-    fn assemble(&self, blueprint: &[ChainSlot], ctx: &Self::Context) -> Self::Output {
+    fn assemble(
+        &self,
+        blueprint: &[ChainSlot],
+        ctx: &Self::Context,
+    ) -> Result<Self::Output, AssemblyError> {
         let mut chain = MiddlewareChain::new();
         // v4 removed the Filesystem/Terminal slots. The device tools are
         // installed explicitly before approval, preserving the old chain order.
@@ -206,7 +210,7 @@ impl MiddlewareChainAssembler for CloudChainAssembler {
             )));
             chain.add(Box::new(crate::memory::tools::MemoryTools(scope.clone())));
         }
-        chain
+        Ok(chain)
     }
 }
 

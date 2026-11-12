@@ -64,9 +64,11 @@
 //!
 //! 已实现（C-05 第二批，边界实验）：P5/P6/P7 边界实验（`cloud_limit_test.rs`：取消在途调用、
 //! 超大单批、收据保留与空间成本）。**删除不写墓碑**：v10 撤销本机生命周期锚点后，
-//! `delete_tree` 在一个托管批里对子树每个节点先清子行（`messages` → `session_bindings`）
-//! 再清会话行（`threads`），整棵子树要么全在要么全不在，没有「deleting → deleted」这种
-//! 中间态（见 `session_lifecycle.rs` 的删除文档）。
+//! `delete_tree` 在一个托管批里按递归子查询清理子行（`messages` → `session_bindings` →
+//! close intents → `thread_mq` → inherited 派生索引）再清会话行（`threads`）；子树范围在批内
+//! 重新计算，整棵子树要么全在要么全不在。撤销的子会话判据与 child 创建的父存在性同样是批内
+//! 守卫：删除与 child 创建互相串行化，不会留下悬挂的 `parent_thread_id`（见
+//! `session_lifecycle.rs` 与 `session_tree_race_test.rs`）。
 //!
 //! 消费侧接入（E）已落地：TUI、print、ACP stdio 与 `peri meta session` 都经同一个装配点
 //! `Resources::open_deployment`（见 `context.rs`），真实云端端到端回归见
@@ -128,6 +130,10 @@ mod schema_upgrade_tests;
 mod schema_upgrade_additive_tests;
 
 #[cfg(test)]
+#[path = "schema_v15_cleanup_test.rs"]
+mod schema_v15_cleanup_tests;
+
+#[cfg(test)]
 #[path = "schema_probe_test.rs"]
 mod schema_probe_tests;
 
@@ -141,8 +147,10 @@ mod session_data;
 mod session_evidence;
 mod session_history;
 mod session_lifecycle;
+mod session_mq;
 mod session_read;
 mod session_schema;
+mod session_settlement;
 mod session_sql;
 mod session_write;
 mod sql;
@@ -188,6 +196,14 @@ mod session_shape_tests;
 mod session_history_page_tests;
 
 #[cfg(test)]
+#[path = "session_mq_test.rs"]
+mod session_mq_tests;
+
+#[cfg(test)]
+#[path = "session_work_state_test.rs"]
+mod session_work_state_tests;
+
+#[cfg(test)]
 #[path = "session_rewind_candidates_test.rs"]
 mod session_rewind_candidates_tests;
 
@@ -198,6 +214,10 @@ mod session_history_rewind_tests;
 #[cfg(test)]
 #[path = "session_child_guard_test.rs"]
 mod session_child_guard_tests;
+
+#[cfg(test)]
+#[path = "session_tree_race_test.rs"]
+mod session_tree_race_tests;
 
 #[cfg(test)]
 #[path = "session_close_test.rs"]

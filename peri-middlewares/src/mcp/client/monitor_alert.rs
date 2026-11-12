@@ -59,19 +59,16 @@ impl MonitorAlertState {
         self.next_allowed
     }
 
-    /// Choose the action for one observation.
+    /// Choose the action for one observation while the task is still running.
     ///
     /// `hits` is the server-side cumulative count. A zero initial `processed`
     /// means the first observation with `hits > 0` delivers immediately,
     /// including matches that happened before the first poll: there is no
-    /// baseline snapshot. Terminal observations bypass the merge window so
-    /// unreported hits are flushed before settlement; they do not create a
-    /// second reminder when the count is unchanged.
+    /// baseline snapshot.
     pub(crate) fn decide(
         &mut self,
         hits: u64,
         now: Instant,
-        terminal: bool,
         has_inbox: bool,
     ) -> MonitorAlertAction {
         if hits <= self.processed {
@@ -81,12 +78,25 @@ impl MonitorAlertState {
             self.processed = hits;
             return MonitorAlertAction::DropOffline { hits };
         }
-        if terminal || self.next_allowed.is_none_or(|next| now >= next) {
+        if self.next_allowed.is_none_or(|next| now >= next) {
             self.processed = hits;
             self.next_allowed = Some(now + MONITOR_ALERT_MERGE_WINDOW);
             return MonitorAlertAction::Send { hits };
         }
         MonitorAlertAction::Suppressed
+    }
+
+    /// Consume hits that no alert reminder has reported yet.
+    ///
+    /// Terminal settlement merges them into the single terminal reminder, so
+    /// they bypass the merge window but still advance `processed`: a repeated
+    /// terminal observation must not merge the same hits twice.
+    pub(crate) fn take_unreported(&mut self, hits: u64) -> u64 {
+        let unreported = hits.saturating_sub(self.processed);
+        if unreported > 0 {
+            self.processed = hits;
+        }
+        unreported
     }
 }
 
@@ -109,14 +119,17 @@ pub(crate) fn parse_monitor_meta(
 /// `processed` has already advanced before this call (the decision is final),
 /// so a missing inbox race or a rejected reminder is a deterministic drop, not
 /// a retry. Returns `false` when nothing was pushed.
-pub(crate) fn push_monitor_alert(
+pub(crate) async fn push_monitor_alert(
     pool: &McpClientPool,
     session_id: &str,
     raw_monitor_id: &str,
     meta: &MonitorAlertMeta,
     hits: u64,
 ) -> bool {
-    let inbox = pool.session_bindings.read().inbox(session_id);
+    let inbox = {
+        let bindings = pool.session_bindings.read();
+        bindings.inbox(session_id)
+    };
     let Some(inbox) = inbox else {
         tracing::warn!(
             session_id = %session_id,
@@ -144,12 +157,24 @@ pub(crate) fn push_monitor_alert(
             return false;
         }
     };
-    inbox.push_system_reminder_with_delivery_id(
-        MessageKind::Defer,
-        MessageSource::McpNotification,
-        reminder,
-        monitor_alert_delivery_id(raw_monitor_id, hits),
-    );
+    let outcome = inbox
+        .push_system_reminder_with_delivery_id(
+            MessageKind::Defer,
+            MessageSource::McpNotification,
+            reminder,
+            monitor_alert_delivery_id(raw_monitor_id, hits),
+        )
+        .await;
+    if let Err(error) = outcome {
+        tracing::warn!(
+            session_id = %session_id,
+            task_id = %raw_monitor_id,
+            hits,
+            %error,
+            "monitor alert reminder enqueue failed"
+        );
+        return false;
+    }
     tracing::debug!(
         session_id = %session_id,
         task_id = %raw_monitor_id,

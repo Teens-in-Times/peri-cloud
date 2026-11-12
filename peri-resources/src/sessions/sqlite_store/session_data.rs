@@ -23,18 +23,22 @@ use peri_acp_types::history_page::{
     HistorySegment, HistorySegmentPlan,
 };
 use peri_acp_types::messages::MessageId;
+use peri_acp_types::session::{
+    MqCancelOutcome, MqEnqueueOutcome, MqEntry, MqFilter, MqInput, MqReceiveOutcome,
+    MqReceiveSelection,
+};
 use peri_acp_types::session_resources::{
     ActiveSessionSnapshot, BindingState, ChildSnapshot, CloseSettlement, ForkSnapshot,
     FrozenSnapshotBytes, FrozenState, NewSession, NewSessionDraft, PersistenceRecovery,
     RewindBoundary, RewindCandidate, RewindOutcome, SessionMetaPatch, SessionResourceError,
-    SessionResourceErrorKind, SessionResourceResult, SessionSnapshot,
+    SessionResourceErrorKind, SessionResourceResult, SessionSnapshot, TerminalSettlementOutcome,
 };
 use peri_acp_types::store::{
     deserialize_persisted_payload, serialize_persisted_payload, CompactionChange, InheritedContext,
     MessageFlags, PersistedPayload,
 };
 use peri_acp_types::system_reminder::TrustedSystemReminder;
-use peri_acp_types::thread::{AgentStatus, ThreadId, ThreadMeta};
+use peri_acp_types::thread::{AgentStatus, ThreadId, ThreadMeta, WorkState};
 use peri_acp_types::workspace::{
     ResolvedWorkspace, ScopedThreadPage, ScopedThreadQuery, SessionBinding, WorkspaceError,
     SESSION_BINDING_VERSION,
@@ -59,12 +63,14 @@ mod history_window;
 mod inherited_blob;
 #[path = "session_data/inherited_facts.rs"]
 mod inherited_facts;
-#[path = "session_data/inherited_index.rs"]
-pub(super) mod inherited_index;
 #[path = "session_data/inherited_page.rs"]
 mod inherited_page;
+#[path = "session_data/interrupted.rs"]
+mod interrupted;
 #[path = "session_data/lifecycle.rs"]
 mod lifecycle;
+#[path = "session_data/mq.rs"]
+mod mq;
 #[path = "session_data/rewind_candidates.rs"]
 mod rewind_candidates;
 
@@ -99,10 +105,6 @@ mod history_window_incremental_tests;
 #[cfg(test)]
 #[path = "session_data/inherited_facts_test.rs"]
 mod inherited_facts_tests;
-
-#[cfg(test)]
-#[path = "session_data/inherited_index_test.rs"]
-mod inherited_index_tests;
 
 #[cfg(test)]
 #[path = "session_data/inherited_perf_test.rs"]

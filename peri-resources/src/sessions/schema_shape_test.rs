@@ -10,7 +10,9 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{AssertSqlSafe, Connection, SqliteConnection};
 
 fn current_table(name: &str) -> Option<&'static TableShape> {
-    CURRENT_TABLES.iter().find(|table| table.name == name)
+    current_tables()
+        .into_iter()
+        .find(|table| table.name == name)
 }
 
 fn input_table(name: &str) -> Option<&'static InputTable> {
@@ -68,7 +70,7 @@ async fn declared_current_shape_matches_a_fresh_database() {
     for name in tables.keys() {
         assert!(current_table(name).is_some(), "undeclared table {name}");
     }
-    assert_eq!(tables.len(), CURRENT_TABLES.len());
+    assert_eq!(tables.len(), current_tables().len());
 }
 
 /// 可选表（凭证、关闭意图）缺表不是漂移，而必需表缺表必须失败——两条容忍线的分界。
@@ -88,6 +90,36 @@ async fn optional_tables_may_be_absent_but_mandatory_tables_may_not() {
         .unwrap();
     let error = check_current_shape(&tables).unwrap_err();
     assert!(error.contains("machines"), "{error}");
+}
+
+/// `thread_mq` 是本代新增且**必需**的表：缺表即拒绝，声明覆盖全部待发事实列。
+#[tokio::test]
+async fn thread_mq_is_a_mandatory_current_table_with_exactly_the_pending_columns() {
+    let (_directory, mut connection) = fresh_database().await;
+    let declared = current_table("thread_mq").expect("thread_mq 必须在当前形状声明里");
+    assert!(!declared.optional, "MQ 没有回退来源，缺表不能容忍");
+    assert_eq!(
+        declared.columns,
+        &[
+            "thread_id",
+            "id",
+            "enqueued_at",
+            "kind",
+            "source",
+            "policy_json",
+            "payload_json",
+            "original_draft",
+        ],
+        "MQ 只保存待发事实：没有终态、墓碑、seq 或执行状态列"
+    );
+    assert_eq!(declared.primary_key, &["thread_id", "id"]);
+
+    execute(&mut connection, "DROP TABLE thread_mq").await;
+    let tables = read_local_columns(&mut connection, CURRENT_COLUMNS_SQL)
+        .await
+        .unwrap();
+    let error = check_current_shape(&tables).unwrap_err();
+    assert!(error.contains("thread_mq"), "{error}");
 }
 
 /// 可选表存在时仍必须同形：同名异形的凭证表是别的对象，不能因为「可选」而放行。
@@ -131,14 +163,20 @@ fn missing_table_is_refused() {
     assert!(check_strict(table, &actual).is_err());
 }
 
-/// 压缩前形状的列序列缺失即失败：`workspace_id` / `archived` 是当前形状才有的列。
+/// 压缩前形状的列序列缺失即失败：`workspace_id` / `archived` 与两列工作快照都是当前形状
+/// 才有的列。
 #[test]
 fn current_only_columns_are_not_expected_in_the_input_shape() {
     let table = input_table("threads").unwrap();
     let actual: Vec<ActualColumn> = THREADS_COLUMNS
         .iter()
         .copied()
-        .filter(|name| *name != "workspace_id" && *name != "archived")
+        .filter(|name| {
+            !matches!(
+                *name,
+                "workspace_id" | "archived" | "context_usage_tokens" | "work_state"
+            )
+        })
         .map(|name| ActualColumn::new(name, false, 0))
         .collect();
     check_input(table, &actual).unwrap();
@@ -186,6 +224,10 @@ async fn mixed_input_shape_is_refused() {
 
 /// 删除声明 == 压缩前的建表文本（`canonical::V10_*`）：声明与真实 DDL 的一致性同样由测试守门，
 /// 判定不是另写的一份形状事实。
+///
+/// v15 的两张 inherited 派生索引表也在这里：它们的声明取自 v14 冻结形状，建表文本由
+/// [`INHERITED_INDEX_DDL`] 复现（v15 起 canonical 不再建它们）。形状读取用
+/// `CURRENT_COLUMNS_SQL`，因为它覆盖压缩前对象而不覆盖当前形状表。
 #[tokio::test]
 async fn declared_dropped_shapes_match_the_legacy_ddl() {
     let (_directory, mut connection) = empty_database().await;
@@ -199,9 +241,17 @@ async fn declared_dropped_shapes_match_the_legacy_ddl() {
         canonical::V10_CREATE_OAUTH_CREDENTIALS_TABLE_SQL,
     )
     .await;
-    let tables = read_local_columns(&mut connection, INPUT_COLUMNS_SQL)
+    execute(&mut connection, V14_INHERITED_INDEX_DDL).await;
+    // 与生产同一份读法：输入面 + 删除面（退役表不在输入读取面里）。
+    let mut tables = read_local_columns(&mut connection, INPUT_COLUMNS_SQL)
         .await
         .unwrap();
+    for (table, columns) in read_local_columns(&mut connection, DROPPED_COLUMNS_SQL)
+        .await
+        .unwrap()
+    {
+        tables.entry(table).or_insert(columns);
+    }
     let plan = dropped_plan(&tables).unwrap();
     for table in DROPPED_TABLES {
         assert!(plan.contains(&table.drop_sql), "{}", table.shape.name);
@@ -380,3 +430,38 @@ CREATE INDEX idx_messages_thread_id ON messages(thread_id);
 CREATE INDEX idx_bindings_project ON session_bindings(project_id, thread_id);
 CREATE INDEX idx_bindings_workspace ON session_bindings(workspace_id, relative_cwd, thread_id);
 CREATE INDEX idx_threads_updated ON threads(updated_at DESC, id DESC) WHERE hidden = 0 AND message_count > 0;";
+
+/// v14 冻结形状的两张 inherited 派生索引表建表文本（v15 起 canonical 不再建它们）。
+///
+/// 声明取自 [`V14_TABLES`] 的冻结列清单；这张夹具让「删除声明 == 真实 DDL」这条守门
+/// 也覆盖退役表——同名异形的表不得被迁移顺手删掉。
+const V14_INHERITED_INDEX_DDL: &str = "CREATE TABLE inherited_snapshot_index (
+    snapshot_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, payload_bytes INTEGER NOT NULL,
+    entry_count INTEGER NOT NULL, prepared_at TEXT NOT NULL);
+CREATE TABLE inherited_payload_index (
+    snapshot_id TEXT NOT NULL, ordinal INTEGER NOT NULL, entry_id TEXT NOT NULL,
+    raw_start INTEGER NOT NULL, raw_len INTEGER NOT NULL, logical_len INTEGER,
+    PRIMARY KEY(snapshot_id, ordinal), UNIQUE(snapshot_id, entry_id));";
+
+/// 会话持久化不引入任务绑定表或逐条结果处理标记（设计 §2/§9 #16）。
+#[tokio::test]
+async fn durability_adds_no_auxiliary_binding_tables_or_response_columns() {
+    let (_directory, mut connection) = fresh_database().await;
+    let tables: Vec<(String,)> =
+        sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .fetch_all(&mut connection)
+            .await
+            .unwrap();
+    assert!(
+        !tables.iter().any(|(name,)| name == "agent_task_bindings"),
+        "不得新增异步任务绑定表"
+    );
+    let columns: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info('messages')")
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        !columns.iter().any(|(name,)| name == "awaiting_response"),
+        "不得新增逐条结果处理标记"
+    );
+}

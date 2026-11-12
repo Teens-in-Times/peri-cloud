@@ -40,29 +40,88 @@ pub(in crate::sessions) async fn thread_tree_on(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
+/// 会话树根解析失败：根缺失与成环都让「这棵树」不可解释。
+pub(in crate::sessions) enum ThreadRootFailure {
+    /// 父链上某一行不存在。
+    Missing,
+    /// 父链回到已访问的节点。
+    Cyclic,
+    /// 读取本身失败（锁、IO、解码）。
+    Store(anyhow::Error),
+}
+
 /// 会话树根的持久化事实：沿 parent 链向上回溯。
 pub(in crate::sessions) async fn thread_root_on(
     connection: &mut SqliteConnection,
     id: &ThreadId,
 ) -> anyhow::Result<ThreadId> {
+    match strict_thread_root_on(connection, id).await {
+        Ok(root) => Ok(root),
+        Err(ThreadRootFailure::Missing) => anyhow::bail!("session row is missing"),
+        Err(ThreadRootFailure::Cyclic) => anyhow::bail!("cyclic thread ancestry"),
+        Err(ThreadRootFailure::Store(error)) => Err(error),
+    }
+}
+
+/// 同 [`thread_root_on`]，但把「缺失 / 成环」作为可分类事实交给调用方。
+///
+/// 恢复范围必须严格解析根：退回自身会让范围悄悄变窄，把未知父链当成已知的根。
+pub(in crate::sessions) async fn strict_thread_root_on(
+    connection: &mut SqliteConnection,
+    id: &ThreadId,
+) -> Result<ThreadId, ThreadRootFailure> {
     let mut current = id.clone();
     let mut visited = HashSet::new();
     loop {
         if !visited.insert(current.clone()) {
-            anyhow::bail!("cyclic thread ancestry");
+            return Err(ThreadRootFailure::Cyclic);
         }
         let row: Option<(Option<String>,)> =
             sqlx::query_as("SELECT parent_thread_id FROM threads WHERE id = ?1")
                 .bind(current.as_str())
                 .fetch_optional(&mut *connection)
-                .await?;
+                .await
+                .map_err(|error| ThreadRootFailure::Store(error.into()))?;
         match row {
             Some((Some(parent),)) => current = parent,
             Some((None,)) => return Ok(current),
-            None => anyhow::bail!("session row is missing"),
+            None => return Err(ThreadRootFailure::Missing),
         }
     }
 }
+
+/// 恢复范围查询的语句原文：候选 = 根子树中工作意图仍为 `working` 的 thread。
+///
+/// `projection` / `filter` 由 metadata 投影的同一 legacy 开关产出（见
+/// `SqliteSessionDatabase::recovery_scope_sql_parts`）；`UNION`（非 `ALL`）保证环上终止。
+/// 参数只有 `?1 = 根 thread`。
+pub(in crate::sessions) fn recovery_scope_statement_with(projection: &str, filter: &str) -> String {
+    format!(
+        "WITH RECURSIVE thread_scope(id) AS (
+            SELECT id FROM threads WHERE id = ?1
+            UNION
+            SELECT child.id FROM threads AS child
+            JOIN thread_scope AS parent ON child.parent_thread_id = parent.id
+        )
+        SELECT t.id, t.parent_thread_id, {projection}
+        FROM threads AS t JOIN thread_scope AS scope ON scope.id = t.id
+        WHERE {filter}
+        ORDER BY t.created_at ASC"
+    )
+}
+
+/// 进入根时的遗留 Active 候选：根子树中非根、`active` 且 `idle`/`stopped` 的
+/// thread。只读；参数只有 `?1 = 根 thread`。
+pub(in crate::sessions) const INTERRUPTED_TREE_SQL: &str = "WITH RECURSIVE thread_scope(id) AS (
+    SELECT id FROM threads WHERE id = ?1
+    UNION
+    SELECT child.id FROM threads AS child
+    JOIN thread_scope AS parent ON child.parent_thread_id = parent.id
+)
+SELECT t.id, t.work_state
+FROM threads AS t JOIN thread_scope AS scope ON scope.id = t.id
+WHERE t.id <> ?1 AND t.agent_status = 'active' AND t.work_state IN ('idle', 'stopped')
+ORDER BY t.created_at ASC";
 
 /// 绑定行的事实：绑定、指向已消失的登记、或没有绑定行。
 pub(in crate::sessions) enum BindingRowState {
@@ -218,46 +277,107 @@ const MESSAGE_INSERT_COLUMNS: usize = 4;
 /// 行数后分块（当前 225 行/语句）。分块不改变事务边界：调用方仍在同一事务里执行全部分块。
 const MESSAGE_INSERT_MAX_VARIABLES: usize = 900;
 
+/// 序列化正文窗口；超窗单条独占一批，保真写入而不截断。
+const MESSAGE_INSERT_MAX_BYTES: usize = 1024 * 1024;
+
 /// 单条多行 INSERT 的行数上限；列数变化时分块自动收紧。
 pub(in crate::sessions) fn message_insert_chunk_rows() -> usize {
     (MESSAGE_INSERT_MAX_VARIABLES / MESSAGE_INSERT_COLUMNS).max(1)
 }
 
-/// 分块多行插入 `messages`：保持传入顺序，每块仍全部走绑定参数。
+/// 按正文累计字节和绑定变量上限惰性序列化；最多额外持有一条待下批写入的正文。
+pub(super) struct SerializedHistoryChunks<'a> {
+    payloads: std::slice::Iter<'a, PersistedPayload>,
+    pending: Option<MessageInsertRow>,
+}
+
+impl<'a> SerializedHistoryChunks<'a> {
+    pub(super) fn new(payloads: &'a [PersistedPayload]) -> Self {
+        Self {
+            payloads: payloads.iter(),
+            pending: None,
+        }
+    }
+}
+
+impl Iterator for SerializedHistoryChunks<'_> {
+    type Item = anyhow::Result<Vec<MessageInsertRow>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let limit = message_insert_chunk_rows();
+        let mut rows = Vec::with_capacity((self.payloads.len() + 1).min(limit));
+        let mut bytes = 0usize;
+        while rows.len() < limit {
+            let row = match self.pending.take() {
+                Some(row) => row,
+                None => {
+                    let Some(payload) = self.payloads.next() else {
+                        break;
+                    };
+                    let content = match serialize_persisted_payload(payload) {
+                        Ok(content) => content,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    MessageInsertRow {
+                        id: payload.id().as_uuid().to_string(),
+                        role: payload_role(payload),
+                        content,
+                    }
+                }
+            };
+            if !rows.is_empty()
+                && bytes.saturating_add(row.content.len()) > MESSAGE_INSERT_MAX_BYTES
+            {
+                self.pending = Some(row);
+                break;
+            }
+            bytes = bytes.saturating_add(row.content.len());
+            rows.push(row);
+            if bytes >= MESSAGE_INSERT_MAX_BYTES {
+                break;
+            }
+        }
+        (!rows.is_empty()).then_some(Ok(rows))
+    }
+}
+
+/// 写入一个有界窗口：保持传入顺序，每行仍全部走绑定参数。
 ///
 /// 中途失败直接上抛，已写入的块由调用方的事务整批回滚（与本函数出现前的逐行插入同一
 /// 可观察结果）。`thread_id` 每行重复绑定一次，不为省变量数复用到跨行占位符。
 pub(in crate::sessions) async fn insert_message_rows(
     connection: &mut SqliteConnection,
     thread_id: &ThreadId,
-    rows: &[MessageInsertRow],
+    rows: Vec<MessageInsertRow>,
 ) -> Result<(), sqlx::Error> {
-    for chunk in rows.chunks(message_insert_chunk_rows()) {
-        let mut statement =
-            String::from("INSERT INTO messages (message_id, thread_id, role, content) VALUES ");
-        for index in 0..chunk.len() {
-            if index > 0 {
-                statement.push(',');
-            }
-            let base = index * MESSAGE_INSERT_COLUMNS;
-            statement.push_str(&format!(
-                "(?{},?{},?{},?{})",
-                base + 1,
-                base + 2,
-                base + 3,
-                base + 4
-            ));
-        }
-        let mut query = sqlx::query(AssertSqlSafe(statement));
-        for row in chunk {
-            query = query
-                .bind(&row.id)
-                .bind(thread_id.as_str())
-                .bind(row.role)
-                .bind(&row.content);
-        }
-        query.execute(&mut *connection).await?;
+    if rows.is_empty() {
+        return Ok(());
     }
+    debug_assert!(rows.len() <= message_insert_chunk_rows());
+    let mut statement =
+        String::from("INSERT INTO messages (message_id, thread_id, role, content) VALUES ");
+    for index in 0..rows.len() {
+        if index > 0 {
+            statement.push(',');
+        }
+        let base = index * MESSAGE_INSERT_COLUMNS;
+        statement.push_str(&format!(
+            "(?{},?{},?{},?{})",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4
+        ));
+    }
+    let mut query = sqlx::query(AssertSqlSafe(statement));
+    for row in rows {
+        query = query
+            .bind(row.id)
+            .bind(thread_id.as_str())
+            .bind(row.role)
+            .bind(row.content);
+    }
+    query.execute(&mut *connection).await?;
     Ok(())
 }
 
@@ -268,20 +388,20 @@ pub(in crate::sessions) async fn insert_history_rows(
     payloads: &[PersistedPayload],
 ) -> anyhow::Result<HashSet<MessageId>> {
     let mut ids = HashSet::with_capacity(payloads.len());
-    let mut rows = Vec::with_capacity(payloads.len());
     for payload in payloads {
         if !ids.insert(payload.id()) {
             anyhow::bail!("history batch repeats a message id");
         }
-        rows.push(MessageInsertRow {
-            id: payload.id().as_uuid().to_string(),
-            role: payload_role(payload),
-            content: serialize_persisted_payload(payload)?,
-        });
     }
-    insert_message_rows(connection, thread_id, &rows).await?;
+    for chunk in SerializedHistoryChunks::new(payloads) {
+        insert_message_rows(connection, thread_id, chunk?).await?;
+    }
     Ok(ids)
 }
+
+#[cfg(test)]
+#[path = "session_data_helpers_test.rs"]
+mod tests;
 
 pub(in crate::sessions) fn projection_json(
     flags: &MessageFlags,

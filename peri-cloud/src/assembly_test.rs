@@ -70,6 +70,7 @@ fn context(web: CloudWebTools) -> CloudAssemblyContext {
 
 fn tools(context: &CloudAssemblyContext) -> BTreeMap<String, Arc<dyn BaseTool>> {
     build_middleware_chain(&CloudChainAssembler, context)
+        .unwrap()
         .collect_tools("")
         .into_iter()
         .map(|tool| (tool.name().to_owned(), Arc::from(tool)))
@@ -198,6 +199,7 @@ fn workspace(
 
 fn contributions(context: &CloudAssemblyContext) -> String {
     build_middleware_chain(&CloudChainAssembler, context)
+        .unwrap()
         .collect_prompt_contributions()
         .unwrap()
 }

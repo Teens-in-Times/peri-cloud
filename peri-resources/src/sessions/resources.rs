@@ -1,6 +1,8 @@
 //! 会话数据资源门面：工作区校验、读写权限与持久化结清。
 //! 执行所有权由 peri-sdk 维护，本模块不登记或认领执行者。
 
+mod admission;
+mod assembly;
 mod claim;
 mod evidence;
 mod gate;
@@ -22,6 +24,10 @@ use peri_acp_types::history_window::{
     HistoryBodyChunk, HistoryCommittedTail, HistoryReadTicket, HistorySource,
 };
 use peri_acp_types::messages::MessageId;
+use peri_acp_types::session::{
+    MqCancelOutcome, MqEnqueueOutcome, MqEntry, MqFilter, MqInput, MqReceiveOutcome,
+    MqReceiveSelection,
+};
 use peri_acp_types::session_resources::{
     AccessMode, ActiveSessionSnapshot, BindingRecheck, BindingState, ChildResumeClaim,
     ChildSnapshot, CloseSettlement, DataCapabilities, ExecutionAvailability, ForkSnapshot,
@@ -29,10 +35,10 @@ use peri_acp_types::session_resources::{
     NewSessionDraft, PersistenceRecovery, RewindBoundary, RewindCandidate, RewindOutcome,
     SessionAvailability, SessionHistoryWindowBounds, SessionInitialization, SessionMetaPatch,
     SessionResourceError, SessionResourceErrorKind, SessionResourceResult, SessionResources,
-    SessionSnapshot,
+    SessionSnapshot, TerminalSettlementOutcome,
 };
 use peri_acp_types::store::{CompactionChange, MessageFlags, PersistedPayload};
-use peri_acp_types::thread::{AgentStatus, ThreadId, ThreadMeta};
+use peri_acp_types::thread::{AgentStatus, ThreadId, ThreadMeta, WorkState};
 use peri_acp_types::workspace::{
     ResolvedWorkspace, ScopedThreadPage, ScopedThreadQuery, SessionBinding, WorkspaceError,
 };
@@ -111,152 +117,10 @@ pub struct SessionResourcesImpl {
 }
 
 impl SessionResourcesImpl {
-    /// 打开或创建会话库，原地升级已知旧 schema 并保留历史数据。
-    #[cfg(not(target_os = "emscripten"))]
-    pub async fn open(db_path: impl Into<PathBuf>) -> anyhow::Result<Self> {
-        Ok(Self::from_local(LocalExecution::open(db_path).await?))
-    }
-
-    /// 以只读方式打开已存在的会话库；不创建目录、库、schema 或锁文件。
-    #[cfg(not(target_os = "emscripten"))]
-    pub async fn open_existing_read_only(
-        db_path: impl AsRef<Path>,
-    ) -> Result<Self, ReadOnlyThreadStoreError> {
-        Ok(Self::from_local(
-            LocalExecution::open_existing_read_only(db_path).await?,
-        ))
-    }
-
-    /// 默认数据库位置 `~/.peri/threads/threads.db`；不创建目录、数据库或连接。
-    #[cfg(not(target_os = "emscripten"))]
-    pub fn default_database_path() -> anyhow::Result<PathBuf> {
-        LocalExecution::default_database_path()
-    }
-
-    /// 与迁移桥共享同一个库句柄（迁移期唯一装配点 `SqliteThreadStore::open_shared*` 使用）。
-    ///
-    /// 本机组合：数据面与执行面由同一个库句柄回答（同一条连接真相），两个端口因此只是
-    /// 同一实现的两张面孔。
-    #[cfg(not(target_os = "emscripten"))]
-    pub(in crate::sessions) fn from_local(local: LocalExecution) -> Self {
-        let data = Arc::new(local.data_port());
-        Self::from_ports(data, Arc::new(local), SessionDataHome::LocalLibrary)
-    }
-
-    /// 组合层装配点：数据面 + 本机执行面，两者由调用方决定指向哪个后端。
-    ///
-    /// 门面不持有任何后端判断，只按 `home`（组合层给出的**事实**）决定 `create_session`
-    /// 是一步还是两步；公开行为仍只有 [`SessionResources`] 这一套。
-    pub(in crate::sessions) fn from_ports(
-        data: Arc<dyn SessionDataPort>,
-        local: Arc<dyn LocalExecutionPort>,
-        home: SessionDataHome,
-    ) -> Self {
-        let lifecycle = Lifecycle::new();
-        let gate = MutationGate::new(data, local, lifecycle.clone(), home);
-        Self {
-            gate,
-            lifecycle,
-            close_confirm: tokio::sync::Mutex::new(()),
-            credential_operations: Arc::new(tokio::sync::RwLock::new(())),
-            home,
-        }
-    }
-
-    async fn execution_availability(
-        &self,
-        id: &ThreadId,
-    ) -> SessionResourceResult<ExecutionAvailability> {
-        let local = self.gate.local();
-        if local.is_read_only() {
-            return Ok(ExecutionAvailability::ReadOnlyStore);
-        }
-        if !self.gate.data().session_exists(id).await? {
-            return Err(not_found());
-        }
-        if let Some(machine_id) = self.gate.data().machine_id_of(id).await? {
-            if machine_id
-                != local.machine_id().map_err(|_| {
-                    crate::sessions::failure::unavailable("machine identity is not initialized")
-                })?
-            {
-                return Ok(ExecutionAvailability::WorkspaceUnavailable);
-            }
-        }
-        let meta = self.gate.data().load_meta(id).await?;
-        if matches!(self.home, SessionDataHome::RemoteStore)
-            && self
-                .gate
-                .data()
-                .binding_discovery_snapshot(id)
-                .await?
-                .is_none()
-        {
-            return Ok(ExecutionAvailability::WorkspaceUnavailable);
-        }
-        if !local.directory_available(Path::new(&meta.cwd)).await {
-            return Ok(ExecutionAvailability::WorkspaceUnavailable);
-        }
-        if matches!(self.home, SessionDataHome::RemoteStore) {
-            match self.recheck_binding_of(id, true).await {
-                Ok(_) => {}
-                Err(error) if matches!(error.kind(), SessionResourceErrorKind::Workspace(_)) => {
-                    return Ok(ExecutionAvailability::WorkspaceUnavailable);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(ExecutionAvailability::Available)
-    }
-
-    /// 完整创建的重试：不可变事实一致时只重新建立执行准入。
-    ///
-    /// 前提（又是同一次创建、工作区证据仍然一致）成立时补上准入；否则保留 identity 并
-    /// 如实报告「已保存、未准入」——既不重造 binding/frozen，也不谎称「确定未创建」。
-    async fn admit_saved_creation(&self, input: &NewSession) -> SessionResourceResult<()> {
-        let id = &input.thread_id;
-        let saved = self.gate.data().load_snapshot(id).await?;
-        let created_at = chrono::DateTime::parse_from_rfc3339(&input.created_at)
-            .map_err(|_| invalid_input("invalid session creation timestamp"))?;
-        let snapshot_at = input
-            .meta
-            .snapshot_at_message_id
-            .map(|message| message.as_uuid().to_string());
-        if saved.meta.id != *id
-            || saved.meta.created_at != created_at
-            || saved.meta.cwd != input.meta.cwd
-            || saved.meta.parent_thread_id != input.meta.parent_thread_id
-            || saved.meta.snapshot_at_message_id != snapshot_at
-            || saved.binding != BindingState::Bound(input.binding.clone())
-            || saved.frozen != FrozenState::Present(input.frozen.clone())
-        {
-            return Err(SessionResourceError::conflict(
-                "session identity has different immutable creation facts",
-            ));
-        }
-        if !matches!(
-            self.execution_availability(id).await?,
-            ExecutionAvailability::Available
-        ) {
-            return Err(SessionResourceError::saved_but_not_admitted(id.clone()));
-        }
-        self.recheck_binding(Some(&input.binding), false).await?;
-        Ok(())
-    }
-
     fn workspace_mismatch() -> SessionResourceError {
         SessionResourceError::new(SessionResourceErrorKind::Workspace(
             WorkspaceError::ExecutionBindingMismatch,
         ))
-    }
-
-    /// 测试用：本机组合背后的 SQLite 连接池（逐条构造事实的夹具使用）。
-    #[cfg(all(test, not(target_os = "emscripten")))]
-    pub(super) fn local_pool(&self) -> &sqlx::SqlitePool {
-        self.gate
-            .local()
-            .sqlite_pool()
-            .expect("local composition always has a SQLite pool")
     }
 }
 
@@ -633,6 +497,20 @@ impl SessionResources for SessionResourcesImpl {
         self.gate.data().load_meta(id).await
     }
 
+    async fn load_recovery_scope(
+        &self,
+        id: &ThreadId,
+    ) -> SessionResourceResult<peri_acp_types::recovery::RecoveryScope> {
+        self.gate.data().recovery_scope(id).await
+    }
+
+    async fn load_interrupted_threads(
+        &self,
+        id: &ThreadId,
+    ) -> SessionResourceResult<Vec<peri_acp_types::recovery::InterruptedThread>> {
+        self.gate.data().interrupted_threads(id).await
+    }
+
     async fn session_environment_id(&self, id: &ThreadId) -> SessionResourceResult<Option<String>> {
         self.gate.data().machine_id_of(id).await
     }
@@ -770,14 +648,16 @@ impl SessionResources for SessionResourcesImpl {
                 "child session does not belong to the claimed root",
             ));
         }
-        // 认领在写侧门禁内完成「读状态 + 写 active」：并发认领里只有一个能看到非 active。
-        let previous = self
+        // 认领在写侧门禁内完成「读状态 + 读工作意图 + 分配世代 + 写 active」：并发
+        // 认领里只有一个能看到非 active；工作意图与状态在补偿时也要一起恢复。
+        let (previous, previous_work_state, claim_nonce) = self
             .gate
             .with_exclusive(root, || async {
                 let previous = self.gate.data().load_child_resume_record(child).await?;
                 if previous.status.is_active() {
                     return Err(invalid_input("child session is still active"));
                 }
+                let previous_work_state = self.gate.data().load_meta(child).await?.work_state;
                 self.gate
                     .data()
                     .store_child_resume_record(
@@ -788,13 +668,17 @@ impl SessionResources for SessionResourcesImpl {
                         },
                     )
                     .await?;
-                Ok(previous)
+                // 写入成功后才登记世代：失败的认领不会让旧 handle 失去补偿资格。
+                let claim_nonce = self.gate.issue_claim(child);
+                Ok((previous, previous_work_state, claim_nonce))
             })
             .await?;
         Ok(Box::new(ChildResumeClaimHandle::new(
             self.gate.clone(),
             child.clone(),
             previous,
+            previous_work_state,
+            claim_nonce,
         )))
     }
 
@@ -855,12 +739,54 @@ impl SessionResources for SessionResourcesImpl {
             .await
     }
 
-    async fn delete_session_tree(&self, id: &ThreadId) -> SessionResourceResult<()> {
+    async fn set_work_state(&self, id: &ThreadId, state: WorkState) -> SessionResourceResult<()> {
         self.gate
-            .with_mutation(id, || self.gate.data().delete_tree(id))
+            .with_mutation(id, || self.gate.data().set_work_state(id, state))
             .await
     }
 
+    async fn settle_work_state_after_turn(&self, id: &ThreadId) -> SessionResourceResult<bool> {
+        self.gate
+            .with_mutation(id, || self.gate.data().settle_work_state_after_turn(id))
+            .await
+    }
+    async fn set_context_usage(
+        &self,
+        id: &ThreadId,
+        tokens: Option<u64>,
+    ) -> SessionResourceResult<()> {
+        self.gate
+            .with_mutation(id, || self.gate.data().set_context_usage(id, tokens))
+            .await
+    }
+    async fn delete_session_tree(&self, id: &ThreadId) -> SessionResourceResult<()> {
+        // root 在删除前解析：删除整棵树后无法再从存储确认归属。
+        let root = self.gate.data().session_root(id).await?;
+        // 子树身份也必须在删除前取得：删除后无法再知道哪些认领世代随行消失。
+        // 没有认领登记时跳过这次读取；读取失败只放弃回收，不影响删除本身。
+        let claim_targets: Vec<ThreadId> = if self.gate.has_claims() {
+            match self.gate.data().list_session_tree(id).await {
+                Ok(tree) => tree.into_iter().map(|meta| meta.id).collect(),
+                Err(error) => {
+                    tracing::warn!(%error, %id, "session tree claim cleanup skipped");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let result = self
+            .gate
+            .with_mutation(id, || self.gate.data().delete_tree(id))
+            .await;
+        if result.is_ok() {
+            self.gate.release_claims(&claim_targets);
+            if root == *id {
+                self.gate.release_pending_for(&root);
+            }
+        }
+        result
+    }
     async fn recover_session_persistence(
         &self,
         id: &ThreadId,
@@ -870,6 +796,134 @@ impl SessionResources for SessionResourcesImpl {
 
     async fn drain_persistence(&self, id: &ThreadId) -> SessionResourceResult<()> {
         self.gate.drain(id).await
+    }
+
+    async fn mq_enqueue(
+        &self,
+        thread_id: &ThreadId,
+        input: MqInput,
+    ) -> SessionResourceResult<MqEnqueueOutcome> {
+        self.gate
+            .with_mutation(thread_id, || self.gate.data().mq_enqueue(thread_id, input))
+            .await
+    }
+
+    async fn mq_query(
+        &self,
+        thread_id: &ThreadId,
+        filter: MqFilter,
+    ) -> SessionResourceResult<Vec<MqEntry>> {
+        // 只读投影：不经过 mutation 门禁，也不建立写屏障。
+        self.gate.data().mq_query(thread_id, filter).await
+    }
+
+    async fn mq_headers(
+        &self,
+        thread_id: &ThreadId,
+        filter: MqFilter,
+    ) -> SessionResourceResult<Vec<peri_acp_types::session::MqHeader>> {
+        self.gate.data().mq_headers(thread_id, filter).await
+    }
+
+    async fn mq_count(&self, thread_id: &ThreadId) -> SessionResourceResult<usize> {
+        self.gate.data().mq_count(thread_id).await
+    }
+
+    async fn mq_exists(&self, thread_id: &ThreadId) -> SessionResourceResult<bool> {
+        self.gate.data().mq_exists(thread_id).await
+    }
+
+    async fn mq_watermark(
+        &self,
+        thread_id: &ThreadId,
+    ) -> SessionResourceResult<Option<peri_acp_types::session::MqWatermark>> {
+        self.gate.data().mq_watermark(thread_id).await
+    }
+
+    async fn mq_cancel(
+        &self,
+        thread_id: &ThreadId,
+        id: MessageId,
+    ) -> SessionResourceResult<MqCancelOutcome> {
+        self.gate
+            .with_mutation(thread_id, || self.gate.data().mq_cancel(thread_id, id))
+            .await
+    }
+
+    async fn mq_receive(
+        &self,
+        thread_id: &ThreadId,
+        selection: MqReceiveSelection,
+    ) -> SessionResourceResult<MqReceiveOutcome> {
+        self.gate
+            .with_mutation(thread_id, || {
+                self.gate.data().mq_receive(thread_id, selection)
+            })
+            .await
+    }
+
+    async fn mq_clear(&self, thread_id: &ThreadId) -> SessionResourceResult<()> {
+        self.gate
+            .with_mutation(thread_id, || self.gate.data().mq_clear(thread_id))
+            .await
+    }
+
+    async fn mq_history_contains(
+        &self,
+        thread_id: &ThreadId,
+        id: MessageId,
+    ) -> SessionResourceResult<bool> {
+        // 只读事实查询：不经过 mutation 门禁，也不建立写屏障。
+        self.gate.data().mq_history_contains(thread_id, id).await
+    }
+
+    /// 终态与结果接纳一次提交：门禁按 child 的树根进入，`target` 必须同属该树。
+    async fn finalize_child_terminal(
+        &self,
+        child: &ThreadId,
+        status: AgentStatus,
+        work_state: WorkState,
+        target: &ThreadId,
+        message: MqInput,
+    ) -> SessionResourceResult<MqEnqueueOutcome> {
+        self.gate
+            .with_mutation(child, || {
+                self.gate
+                    .data()
+                    .finalize_child_terminal(child, status, work_state, target, message)
+            })
+            .await
+    }
+
+    /// 无结果终态与门禁同一条树根：事务边界在数据端口，门面只负责排空与互斥。
+    async fn settle_terminal_without_result(
+        &self,
+        child: &ThreadId,
+        status: AgentStatus,
+        work_state: WorkState,
+    ) -> SessionResourceResult<TerminalSettlementOutcome> {
+        self.gate
+            .with_mutation(child, || {
+                self.gate
+                    .data()
+                    .settle_terminal_without_result(child, status, work_state)
+            })
+            .await
+    }
+
+    async fn settle_retained_mq(
+        &self,
+        thread_id: &ThreadId,
+        reminders: &[peri_acp_types::session::RetainedReminder],
+        rows: &[MqEntry],
+    ) -> SessionResourceResult<()> {
+        self.gate
+            .with_mutation(thread_id, || {
+                self.gate
+                    .data()
+                    .settle_retained_mq(thread_id, reminders, rows)
+            })
+            .await
     }
 }
 

@@ -7,6 +7,7 @@
 
 mod archive;
 mod archive_fork;
+mod binding_evidence;
 mod canonical;
 mod data;
 #[cfg(not(target_os = "emscripten"))]
@@ -21,6 +22,7 @@ pub use machine::adopt_file_identity;
 pub use machine::current as current_machine_id;
 #[cfg(target_os = "emscripten")]
 pub(crate) use machine::set_explicit as set_explicit_machine_id;
+mod mq_rows;
 mod open;
 mod remote;
 mod schema_cleanup;

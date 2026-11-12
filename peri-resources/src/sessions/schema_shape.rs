@@ -76,16 +76,19 @@ pub(super) struct InputTable {
 }
 
 const MACHINES_COLUMNS: &[&str] = &["id", "name", "identity_kind"];
-const PROJECTS_COLUMNS: &[&str] = &["id", "locator", "object_identity"];
+
+/// v15 的 `projects`：唯一键收窄为 `UNIQUE(locator)`，不再有 `object_identity`。
+const PROJECTS_COLUMNS: &[&str] = &["id", "locator"];
+/// v15 的 `workspaces`：`identity` 退役后只剩归属键与发现证据。
 const WORKSPACES_COLUMNS: &[&str] = &[
     "id",
     "machine_id",
     "path",
     "path_source",
     "project_id",
-    "identity",
     "discovery",
 ];
+/// 当前（v14）`threads` 列：v13 的 16 列 + 工作意图与上下文占用快照。
 const THREADS_COLUMNS: &[&str] = &[
     "id",
     "title",
@@ -103,7 +106,49 @@ const THREADS_COLUMNS: &[&str] = &[
     "agent_status",
     "workspace_id",
     "archived",
+    "context_usage_tokens",
+    "work_state",
 ];
+
+/// v13 冻结的 `threads` 列（= v14 形状去掉两列工作快照）；v12 的 `threads` 形状与它相同。
+const V13_THREADS_COLUMNS: &[&str] = &[
+    "id",
+    "title",
+    "cwd",
+    "created_at",
+    "updated_at",
+    "message_count",
+    "parent_thread_id",
+    "snapshot_at_message_id",
+    "hidden",
+    "cancel_policy",
+    "config",
+    "frozen_context",
+    "inherited_context",
+    "agent_status",
+    "workspace_id",
+    "archived",
+];
+
+/// 当前（v14）的 `threads` 声明；`work_state` 非空，占用快照可空（NULL = 未知）。
+const CURRENT_THREADS_TABLE: TableShape = TableShape {
+    name: "threads",
+    optional: false,
+    columns: THREADS_COLUMNS,
+    not_null: &[
+        "cwd",
+        "created_at",
+        "updated_at",
+        "message_count",
+        "hidden",
+        "cancel_policy",
+        "agent_status",
+        "workspace_id",
+        "archived",
+        "work_state",
+    ],
+    primary_key: &["id"],
+};
 const MESSAGES_COLUMNS: &[&str] = &[
     "message_id",
     "thread_id",
@@ -113,6 +158,7 @@ const MESSAGES_COLUMNS: &[&str] = &[
     "excluded",
     "projection",
 ];
+/// v15 的 `session_bindings`：`evidence_origin` 退役，只剩绑定本身与最小执行根。
 const BINDINGS_COLUMNS: &[&str] = &[
     "thread_id",
     "schema_version",
@@ -120,7 +166,6 @@ const BINDINGS_COLUMNS: &[&str] = &[
     "workspace_id",
     "relative_cwd",
     "discovery_snapshot",
-    "evidence_origin",
 ];
 const OAUTH_COLUMNS: &[&str] = &[
     "principal_id",
@@ -130,6 +175,29 @@ const OAUTH_COLUMNS: &[&str] = &[
     "updated_at",
 ];
 const CLOSE_INTENTS_COLUMNS: &[&str] = &["thread_id", "requested_at"];
+/// v14 冻结的 `projects` 列（含已退役的 `object_identity`）。
+const V14_PROJECTS_COLUMNS: &[&str] = &["id", "locator", "object_identity"];
+/// v14 冻结的 `workspaces` 列（含已退役的 `identity`）。
+const V14_WORKSPACES_COLUMNS: &[&str] = &[
+    "id",
+    "machine_id",
+    "path",
+    "path_source",
+    "project_id",
+    "identity",
+    "discovery",
+];
+/// v14 冻结的 `session_bindings` 列（含已退役的 `evidence_origin`）。
+const V14_BINDINGS_COLUMNS: &[&str] = &[
+    "thread_id",
+    "schema_version",
+    "project_id",
+    "workspace_id",
+    "relative_cwd",
+    "discovery_snapshot",
+    "evidence_origin",
+];
+/// v14 冻结的 inherited 派生索引列（该代表整体退役，只在形状判定里出现）。
 const INHERITED_SNAPSHOT_INDEX_COLUMNS: &[&str] = &[
     "snapshot_id",
     "thread_id",
@@ -145,9 +213,26 @@ const INHERITED_PAYLOAD_INDEX_COLUMNS: &[&str] = &[
     "raw_len",
     "logical_len",
 ];
+/// Thread MQ 列（`docs/design/thread-mq.md` §3）：待发事实 + 派生的入队时间，没有状态列。
+const THREAD_MQ_COLUMNS: &[&str] = &[
+    "thread_id",
+    "id",
+    "enqueued_at",
+    "kind",
+    "source",
+    "policy_json",
+    "payload_json",
+    "original_draft",
+];
 
-/// 当前形状（canonical 10 张表）的逐表声明。顺序与 `canonical::CANONICAL_TABLES` 一致。
-pub(super) const CURRENT_TABLES: &[TableShape] = &[
+/// 上一代当前形状（v12）的逐表声明：本代（v15）当前形状去掉 `thread_mq` 与两列工作快照后的
+/// **冻结快照**。v13 的 `threads` 形状与它相同，因此同一份声明同时服务 v12 与 v13 的
+/// 形状判定。
+///
+/// 冻结而不是复用当前声明：v12 的库只有这些表，判定必须按代际比对，不能因为本代新增了
+/// 一张表就把健康的 v12 库判成漂移（那会关掉升级路径）。顺序与
+/// `canonical::CANONICAL_TABLES` 的父表在前顺序一致。
+pub(super) const V12_TABLES: &[TableShape] = &[
     TableShape {
         name: "machines",
         optional: false,
@@ -158,21 +243,21 @@ pub(super) const CURRENT_TABLES: &[TableShape] = &[
     TableShape {
         name: "projects",
         optional: false,
-        columns: PROJECTS_COLUMNS,
+        columns: V14_PROJECTS_COLUMNS,
         not_null: &["locator", "object_identity"],
         primary_key: &["id"],
     },
     TableShape {
         name: "workspaces",
         optional: false,
-        columns: WORKSPACES_COLUMNS,
+        columns: V14_WORKSPACES_COLUMNS,
         not_null: &["machine_id", "path", "path_source"],
         primary_key: &["id"],
     },
     TableShape {
         name: "threads",
         optional: false,
-        columns: THREADS_COLUMNS,
+        columns: V13_THREADS_COLUMNS,
         not_null: &[
             "cwd",
             "created_at",
@@ -196,7 +281,7 @@ pub(super) const CURRENT_TABLES: &[TableShape] = &[
     TableShape {
         name: "session_bindings",
         optional: false,
-        columns: BINDINGS_COLUMNS,
+        columns: V14_BINDINGS_COLUMNS,
         not_null: &[
             "schema_version",
             "project_id",
@@ -212,13 +297,8 @@ pub(super) const CURRENT_TABLES: &[TableShape] = &[
         // 悄悄换成「没有凭证」），因此缺表必须在判定里可接受。
         optional: true,
         columns: OAUTH_COLUMNS,
-        not_null: &[
-            "principal_id",
-            "workspace_id",
-            "server_key",
-            "credentials_blob",
-            "updated_at",
-        ],
+        // 本表所有已知列都是 NOT NULL：列清单与 NOT NULL 集合同一份声明。
+        not_null: OAUTH_COLUMNS,
         primary_key: &["principal_id", "workspace_id", "server_key"],
     },
     TableShape {
@@ -232,7 +312,7 @@ pub(super) const CURRENT_TABLES: &[TableShape] = &[
     TableShape {
         name: "inherited_snapshot_index",
         // 可选：派生索引。缺表只意味着读取回退全列扫描，不影响 inherited 事实本身；
-        // 写打开按 canonical DDL 幂等补齐，存在时必须同形。
+        // v14 形状里写打开按 canonical DDL 幂等补齐，存在时必须同形。
         optional: true,
         columns: INHERITED_SNAPSHOT_INDEX_COLUMNS,
         not_null: &["thread_id", "payload_bytes", "entry_count", "prepared_at"],
@@ -249,7 +329,136 @@ pub(super) const CURRENT_TABLES: &[TableShape] = &[
     },
 ];
 
-/// 压缩前形状的 `threads` 列（= 当前形状去掉 `workspace_id` / `archived`）。
+/// v15 的 `projects` 声明：唯一键收窄为 `UNIQUE(locator)`，`locator` 即项目身份。
+const CURRENT_PROJECTS_TABLE: TableShape = TableShape {
+    name: "projects",
+    optional: false,
+    columns: PROJECTS_COLUMNS,
+    not_null: &["locator"],
+    primary_key: &["id"],
+};
+/// v15 的 `workspaces` 声明：`identity` 退役，`discovery` 仍可空（历史惰性行）。
+const CURRENT_WORKSPACES_TABLE: TableShape = TableShape {
+    name: "workspaces",
+    optional: false,
+    columns: WORKSPACES_COLUMNS,
+    not_null: &["machine_id", "path", "path_source"],
+    primary_key: &["id"],
+};
+/// v15 的 `session_bindings` 声明：`evidence_origin` 退役。
+const CURRENT_BINDINGS_TABLE: TableShape = TableShape {
+    name: "session_bindings",
+    optional: false,
+    columns: BINDINGS_COLUMNS,
+    not_null: &[
+        "schema_version",
+        "project_id",
+        "workspace_id",
+        "relative_cwd",
+    ],
+    primary_key: &["thread_id"],
+};
+
+/// Thread MQ：当前形状必需的表（缺失即不是本代形状，不得直接读写）。
+///
+/// 与「派生索引可选」不同：MQ 承载唯一一份待发事实，没有回退来源；缺表必须让升级路径
+/// 建出来，而不是让仓库把它当成空队列。
+pub(super) const THREAD_MQ_TABLE: TableShape = TableShape {
+    name: "thread_mq",
+    optional: false,
+    columns: THREAD_MQ_COLUMNS,
+    not_null: &[
+        "thread_id",
+        "id",
+        "enqueued_at",
+        "kind",
+        "source",
+        "policy_json",
+        "payload_json",
+    ],
+    primary_key: &["thread_id", "id"],
+};
+
+/// 把声明里的 `threads` 换成给定形状，其余表原样保留。///
+/// 各代之间只有 `threads` 在变长（v14 补两列工作快照），逐代另抄一份全表声明会让形状
+/// 第二次各自维护；`TableShape` 没有 `Copy`，所以这里按引用替换。
+fn with_threads<'a>(tables: Vec<&'a TableShape>, threads: &'a TableShape) -> Vec<&'a TableShape> {
+    tables
+        .into_iter()
+        .map(|table| {
+            if table.name == threads.name {
+                threads
+            } else {
+                table
+            }
+        })
+        .collect()
+}
+
+/// v14 冻结声明：v12 的全部表 + `thread_mq` + 带两列工作快照的 `threads`。
+///
+/// v13 与 v14 只差 `threads` 末尾两列，因此同一份声明也服务 v13（替换回
+/// [`V13_THREADS_COLUMNS`]），见 [`check_v13_shape`]。
+pub(super) fn v14_tables() -> Vec<&'static TableShape> {
+    with_threads(
+        V12_TABLES
+            .iter()
+            .chain(std::iter::once(&THREAD_MQ_TABLE))
+            .collect(),
+        &CURRENT_THREADS_TABLE,
+    )
+}
+
+/// v13 冻结的 `threads` 声明（16 列，缺两列工作快照）。
+const V13_THREADS_TABLE: TableShape = TableShape {
+    name: "threads",
+    optional: false,
+    columns: V13_THREADS_COLUMNS,
+    not_null: &[
+        "cwd",
+        "created_at",
+        "updated_at",
+        "message_count",
+        "hidden",
+        "cancel_policy",
+        "agent_status",
+        "workspace_id",
+        "archived",
+    ],
+    primary_key: &["id"],
+};
+
+/// 当前形状（v15）的逐表声明：v14 去掉两张 inherited 派生索引表，三张被重建的表换成
+/// v15 形状（`projects` 无 `object_identity`、`workspaces` 无 `identity`、
+/// `session_bindings` 无 `evidence_origin`）。
+///
+/// 用函数而不是 `const` 拼接：本代形状就是「上一代声明 − 退役表 + 本代改形的表」，另抄
+/// 一份全表声明会让两份形状第二次各自维护。
+pub(super) fn current_tables() -> Vec<&'static TableShape> {
+    let v14 = v14_tables();
+    v14.iter()
+        .filter(|table| {
+            table.name != "inherited_snapshot_index" && table.name != "inherited_payload_index"
+        })
+        .map(|table| match table.name {
+            "projects" => &CURRENT_PROJECTS_TABLE,
+            "workspaces" => &CURRENT_WORKSPACES_TABLE,
+            "session_bindings" => &CURRENT_BINDINGS_TABLE,
+            _ => *table,
+        })
+        .collect()
+}
+
+/// 当前形状（v15）的表名序列：`current_tables()`（九张表，两张 inherited 派生索引已退役）。
+///
+/// 远端打开按它逐表下发 `PRAGMA table_xinfo`：探测面与 [`check_current_shape`] 的判定面
+/// 必须逐表一致，否则会出现「读了却没判」的表。
+pub(super) fn current_table_names() -> impl Iterator<Item = &'static str> {
+    current_tables().into_iter().map(|table| table.name)
+}
+
+/// 压缩前形状的 `threads` 列（14 列；当前形状的 `workspace_id` / `archived` 与两列工作
+/// 快照都不在其中）。
 const INPUT_THREADS_COLUMNS: &[&str] = &[
     "id",
     "title",
@@ -266,6 +475,10 @@ const INPUT_THREADS_COLUMNS: &[&str] = &[
     "inherited_context",
     "agent_status",
 ];
+
+/// 迁移输入 `workspaces` 的已知列：下界与上界相同（重建后由当前 DDL 定形）。
+const INPUT_WORKSPACE_COLUMNS: &[&str] =
+    &["id", "project_id", "root", "root_identity", "discovery"];
 
 /// 压缩前形状的 `mcp_oauth_credentials` 列（machine 作用域；当前形状换成 workspace 作用域）。
 /// 同一份清单同时是迁移输入的列上界（[`INPUT_TABLES`]）与删除前的形状判定（[`DROPPED_TABLES`]）。
@@ -286,8 +499,8 @@ pub(super) const INPUT_TABLES: &[InputTable] = &[
         name: "threads",
         required_table: true,
         required: INPUT_THREADS_COLUMNS,
-        // 上界 = 当前列 ∪ 正式发布里退役的两个缓存列（`removal_plan` 在搬运开始前显式删除
-        // 它们，因此允许出现；重建只搬运当前列，除此之外的列没有去处）。
+        // 上界 = 14 列下界 ∪ 正式发布里退役的两个缓存列（`removal_plan` 在搬运开始前显式
+        // 删除它们，因此允许出现；重建只搬运当前列，除此之外的列没有去处）。
         allowed: Some(&[
             "id",
             "title",
@@ -310,8 +523,8 @@ pub(super) const INPUT_TABLES: &[InputTable] = &[
     InputTable {
         name: "workspaces",
         required_table: true,
-        required: &["id", "project_id", "root", "root_identity", "discovery"],
-        allowed: Some(&["id", "project_id", "root", "root_identity", "discovery"]),
+        required: INPUT_WORKSPACE_COLUMNS,
+        allowed: Some(INPUT_WORKSPACE_COLUMNS),
     },
     InputTable {
         name: "session_bindings",
@@ -391,6 +604,31 @@ pub(super) const DROPPED_TABLES: &[DroppedTable] = &[
         always_dropped: false,
         drop_sql: "DROP TABLE mcp_oauth_credentials",
     },
+    DroppedTable {
+        shape: TableShape {
+            name: "inherited_payload_index",
+            optional: true,
+            columns: INHERITED_PAYLOAD_INDEX_COLUMNS,
+            not_null: &["snapshot_id", "ordinal", "entry_id", "raw_start", "raw_len"],
+            primary_key: &["snapshot_id", "ordinal"],
+        },
+        // 只是派生索引：内容可从 `threads.inherited_context` 重建。缺表（远端从未建过）跳过；
+        // 同名异形仍由 `check_dropped_shape` 拦下——迁移不认识的表不删。
+        always_dropped: false,
+        drop_sql: "DROP TABLE inherited_payload_index",
+    },
+    DroppedTable {
+        shape: TableShape {
+            name: "inherited_snapshot_index",
+            optional: true,
+            columns: INHERITED_SNAPSHOT_INDEX_COLUMNS,
+            not_null: &["thread_id", "payload_bytes", "entry_count", "prepared_at"],
+            primary_key: &["snapshot_id"],
+        },
+        // 顺序在 payload 之后：payload 行经 `snapshot_id` 关联它。
+        always_dropped: false,
+        drop_sql: "DROP TABLE inherited_snapshot_index",
+    },
 ];
 
 /// 迁移中显式删除的一表声明。
@@ -413,8 +651,7 @@ pub(super) const CURRENT_COLUMNS_SQL: &str = "SELECT 'machines' AS t, name, \"no
     UNION ALL SELECT 'session_bindings', name, \"notnull\", pk, cid FROM pragma_table_xinfo('session_bindings')
     UNION ALL SELECT 'mcp_oauth_credentials', name, \"notnull\", pk, cid FROM pragma_table_xinfo('mcp_oauth_credentials')
     UNION ALL SELECT 'session_close_intents', name, \"notnull\", pk, cid FROM pragma_table_xinfo('session_close_intents')
-    UNION ALL SELECT 'inherited_snapshot_index', name, \"notnull\", pk, cid FROM pragma_table_xinfo('inherited_snapshot_index')
-    UNION ALL SELECT 'inherited_payload_index', name, \"notnull\", pk, cid FROM pragma_table_xinfo('inherited_payload_index')
+    UNION ALL SELECT 'thread_mq', name, \"notnull\", pk, cid FROM pragma_table_xinfo('thread_mq')
     ORDER BY 1, 5";
 
 /// 读回迁移输入形状的全部列形状（缺表在结果里没有行，由[`check_input`]判定）。
@@ -511,16 +748,66 @@ pub(super) fn check_input(table: &InputTable, actual: &[ActualColumn]) -> Result
     Ok(())
 }
 
-/// 完整当前形状：8 张表逐表严格判定（[`TableShape::optional`] 表缺表容忍，存在即逐项相符）。
-pub(super) fn check_current_shape(
-    tables: &HashMap<String, Vec<ActualColumn>>,
-) -> Result<(), String> {
-    for table in CURRENT_TABLES {
+/// 完整上一代当前形状（v12，10 张表）的判定：只用于把 v11/v12 的库认成升级来源。
+pub(super) fn check_v12_shape(tables: &HashMap<String, Vec<ActualColumn>>) -> Result<(), String> {
+    for table in V12_TABLES {
         let actual = tables.get(table.name).map(Vec::as_slice).unwrap_or(&[]);
         check_strict(table, actual)?;
     }
     Ok(())
 }
+
+/// 完整上一代当前形状（v14，11 张表）的判定：只用于把 v14 的库认成升级来源。
+///
+/// v14 与 v13 的差别只有 `threads` 末尾两列，与 v15 的差别是三列退役加两张表退役——
+/// 判定链因此必须按「v14 → v13 → v12」逐级退让，任一成立即进入对应的升级路径。
+pub(super) fn check_v14_shape(tables: &HashMap<String, Vec<ActualColumn>>) -> Result<(), String> {
+    for table in v14_tables() {
+        let actual = tables.get(table.name).map(Vec::as_slice).unwrap_or(&[]);
+        check_strict(table, actual)?;
+    }
+    Ok(())
+}
+
+/// 上一代当前形状（v13）的判定：v14 的表集合、`threads` 换回 16 列后逐表严格判定。
+///
+/// v13 是 v12 的升级终点里「只差两列」的那一档：同一份读回结果既能回答「这是不是 v13」，
+/// 也能回答「这是不是 v12」——两者的差别是 `thread_mq`，与 v14 的差别只是 `threads` 末尾
+/// 两列。
+pub(super) fn check_v13_shape(tables: &HashMap<String, Vec<ActualColumn>>) -> Result<(), String> {
+    for table in v14_tables() {
+        let threads: &TableShape = if table.name == "threads" {
+            &V13_THREADS_TABLE
+        } else {
+            table
+        };
+        let actual = tables.get(threads.name).map(Vec::as_slice).unwrap_or(&[]);
+        check_strict(threads, actual)?;
+    }
+    Ok(())
+}
+
+/// 完整当前形状（v15）：`current_tables()` 逐表严格判定。
+pub(super) fn check_current_shape(
+    tables: &HashMap<String, Vec<ActualColumn>>,
+) -> Result<(), String> {
+    for table in current_tables() {
+        let actual = tables.get(table.name).map(Vec::as_slice).unwrap_or(&[]);
+        check_strict(table, actual)?;
+    }
+    Ok(())
+}
+
+/// 读回**要删除**对象的列形状（v14 冻结声明里的两张 inherited 派生索引表 + 压缩前对象）。
+///
+/// 这些表既不在当前形状的读取面里（v15 已退役），也可能不在迁移输入的读取面里（远端
+/// 从未建过），因此单独一条只读语句；调用方把它并入形状映射后交给 [`check_dropped_shape`]。
+pub(super) const DROPPED_COLUMNS_SQL: &str =
+    "SELECT 'inherited_snapshot_index' AS t, name, \"notnull\", pk, cid FROM pragma_table_xinfo('inherited_snapshot_index')
+    UNION ALL SELECT 'inherited_payload_index', name, \"notnull\", pk, cid FROM pragma_table_xinfo('inherited_payload_index')
+    UNION ALL SELECT 'session_environments', name, \"notnull\", pk, cid FROM pragma_table_xinfo('session_environments')
+    UNION ALL SELECT 'mcp_oauth_credentials', name, \"notnull\", pk, cid FROM pragma_table_xinfo('mcp_oauth_credentials')
+    ORDER BY 1, 5";
 
 /// 删除前的形状判定：缺表不算错（要不要删见 [`dropped_plan`]），存在即必须逐项相符。
 ///
@@ -568,6 +855,35 @@ pub(super) fn check_input_shape(tables: &HashMap<String, Vec<ActualColumn>>) -> 
         check_input(table, actual)?;
     }
     Ok(())
+}
+
+/// v15 退役的两张 inherited 派生索引表：先判定形状，再给出实际要下发的删除。
+///
+/// 与 [`dropped_plan`] 分开，是因为 v15 清理作用在**当前形状**的库上，那里
+/// `mcp_oauth_credentials` 已是 workspace 作用域的新形状——按完整的迁移期删除清单判定
+/// 会把它误判成同名异形。这里只覆盖两张派生表：
+///
+/// - 缺表合法（远端从未建过派生索引，本机也可能手工删过）；
+/// - 存在时必须与 v14 冻结声明逐列相符，同名异形的表**不删**并拒绝整段升级。
+pub(super) fn inherited_retirement_plan(
+    tables: &HashMap<String, Vec<ActualColumn>>,
+) -> Result<Vec<&'static str>, String> {
+    let mut plan = Vec::new();
+    for table in DROPPED_TABLES
+        .iter()
+        .filter(|table| table.shape.name.starts_with("inherited_"))
+    {
+        let actual = tables
+            .get(table.shape.name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if actual.is_empty() {
+            continue;
+        }
+        check_strict(&table.shape, actual)?;
+        plan.push(table.drop_sql);
+    }
+    Ok(plan)
 }
 
 /// 按 `(表名, 列名, NOT NULL, 主键)` 的四列读取结果分组为逐表列序列。

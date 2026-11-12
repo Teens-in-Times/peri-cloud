@@ -67,10 +67,17 @@ pub(super) async fn migrate_shape(connection: &mut SqliteConnection) -> Result<(
     // 形状判定先于任何改写：输入形状必须落在本构建认识的边界内（未知列没有去处，不能静默
     // 搬丢），要删除的压缩前对象必须与声明同形（同名的别的表不删）。判定不过即拒绝，
     // 事务回滚后库保持原版本，旧二进制仍可打开。
-    let tables =
+    let mut tables =
         schema_shape::read_local_columns(&mut *connection, schema_shape::INPUT_COLUMNS_SQL).await?;
     schema_shape::check_input_shape(&tables)
         .map_err(|reason| anyhow::anyhow!("storage v11 migration refuses this shape: {reason}"))?;
+    // 要删除的对象（含 v15 退役的两张 inherited 表）不在输入读取面里，单独读一次再判定。
+    let dropped_columns =
+        schema_shape::read_local_columns(&mut *connection, schema_shape::DROPPED_COLUMNS_SQL)
+            .await?;
+    for (table, columns) in dropped_columns {
+        tables.entry(table).or_insert(columns);
+    }
     let dropped = schema_shape::dropped_plan(&tables).map_err(|reason| {
         anyhow::anyhow!("storage v11 migration refuses to drop this object: {reason}")
     })?;
@@ -136,15 +143,14 @@ pub(super) async fn migrate_shape(connection: &mut SqliteConnection) -> Result<(
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("non-UTF-8 workspace path"))?;
         sqlx::query(
-            "INSERT INTO workspaces(id, machine_id, path, path_source, project_id, identity, discovery)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO workspaces(id, machine_id, path, path_source, project_id, discovery)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind(row.id.to_string())
         .bind(&row.machine_id)
         .bind(path)
         .bind(path_source_name(row.path_source))
         .bind(&row.project_id)
-        .bind(&row.identity)
         .bind(&row.discovery)
         .execute(&mut *connection)
         .await?;
@@ -166,6 +172,16 @@ pub(super) async fn migrate_shape(connection: &mut SqliteConnection) -> Result<(
             .execute(&mut *connection)
             .await?;
     }
+    // v14 的两列工作快照也赶在重建之前补上：重建语句按当前形状逐列搬运，输入形状
+    // （≤10 / 登记形状）本来不含这两列。旧行取 `idle` 与 NULL，不唤醒历史会话。
+    for (name, definition) in canonical::THREADS_V14_COLUMNS {
+        // 标识符和列定义来自 `canonical` 的静态清单，未包含外部输入。
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE threads ADD COLUMN {name} {definition}"
+        )))
+        .execute(&mut *connection)
+        .await?;
+    }
     rebuild_threads(connection).await?;
 
     sqlx::query(canonical::CREATE_BINDINGS_TABLE_SQL)
@@ -173,8 +189,8 @@ pub(super) async fn migrate_shape(connection: &mut SqliteConnection) -> Result<(
         .await?;
     for row in plan_binding_rows(&bindings, &input.plan, &input.registrations)? {
         sqlx::query(
-            "INSERT INTO session_bindings(thread_id, schema_version, project_id, workspace_id, relative_cwd, discovery_snapshot, evidence_origin)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO session_bindings(thread_id, schema_version, project_id, workspace_id, relative_cwd, discovery_snapshot)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind(&row.thread_id)
         .bind(row.schema_version)
@@ -182,7 +198,6 @@ pub(super) async fn migrate_shape(connection: &mut SqliteConnection) -> Result<(
         .bind(row.workspace_id.to_string())
         .bind(&row.relative_cwd)
         .bind(&row.discovery_snapshot)
-        .bind(row.evidence_origin)
         .execute(&mut *connection)
         .await?;
     }
@@ -200,14 +215,12 @@ pub(super) async fn migrate_shape(connection: &mut SqliteConnection) -> Result<(
     sqlx::query(canonical::CREATE_SESSION_CLOSE_INTENTS_TABLE_SQL)
         .execute(&mut *connection)
         .await?;
-    // 派生索引表不是搬运输入的一部分：迁移终点按 canonical DDL 幂等建齐，读取路径
-    // 在索引缺失时本来就回退扫描，因此这里不阻塞升级。
-    for statement in canonical::CREATE_INHERITED_INDEX_TABLES {
-        // 语句文本来自 `canonical` 的静态清单，不含外部输入。
-        sqlx::query(sqlx::AssertSqlSafe((*statement).to_owned()))
-            .execute(&mut *connection)
-            .await?;
-    }
+    // 两张 inherited 派生索引表随 v15 一起退役：搬运既不建也不搬（内容可从
+    // `threads.inherited_context` 重建），迁移终点不再有它们。
+    // MQ 表属于当前形状的必需表（13）：搬运终点与新建库下发同一份 DDL。
+    sqlx::query(canonical::CREATE_THREAD_MQ_TABLE_SQL)
+        .execute(&mut *connection)
+        .await?;
     // 迁移终点必须带齐 canonical 索引集：`DROP TABLE` 会把旧表上的索引一并删掉，而输入库
     // 也可能本来就缺索引（`user_version` 已是 11 的开发期库）。整表重放一次是幂等的，
     // 也是「一个 schema、两种执行器」在索引上的同一份语句（远端批次末尾同样整表重放）。
@@ -242,12 +255,10 @@ pub(super) async fn migrate_shape(connection: &mut SqliteConnection) -> Result<(
              they stay readable and are re-linked on demand from the saved directory evidence"
         );
     }
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "PRAGMA user_version = {}",
-        canonical::CURRENT_SCHEMA_VERSION
-    )))
-    .execute(&mut *connection)
-    .await?;
+    // 搬运终点先落在 v14 形状（三张重建表仍是 v14 定义），再由 v15 清理把 `projects` /
+    // `workspaces` / `session_bindings` 重建为 v15、删除退役表并推进 `user_version`。
+    // 同一事务内完成：版本只在形状收敛之后推进。
+    crate::sessions::sqlite_store::schema::migrate_v15_cleanup(&mut *connection).await?;
     Ok(())
 }
 

@@ -1,7 +1,67 @@
+/// monitor 的终态（成功/失败）各向发起会话投递恰好一条终态提醒。
+#[tokio::test]
+async fn monitor_terminal_settlement_wakes_the_owner_once() {
+    for success in [true, false] {
+        let (messages, status) = settle_registered_task(
+            "monitor",
+            Some(ConfigSource::Builtin {
+                instance: "monitor".into(),
+            }),
+            true,
+            success,
+        )
+        .await;
+        assert_eq!(
+            messages.len(),
+            1,
+            "monitor terminal settlement must queue exactly one reminder (success={success}): \
+             {messages:?}"
+        );
+        assert_eq!(messages[0].kind, MessageKind::Defer);
+        assert_eq!(messages[0].source, MessageSource::McpNotification);
+        assert!(
+            messages[0].delivery_id.is_some(),
+            "the terminal reminder keeps the settlement delivery id"
+        );
+        let QueuedPayload::SystemReminder(reminder) = &messages[0].payload else {
+            panic!(
+                "expected a canonical reminder, got {:?}",
+                messages[0].payload
+            )
+        };
+        assert_eq!(
+            reminder.as_reminder().summary.as_deref(),
+            Some(if success {
+                "Monitor task succeeded"
+            } else {
+                "Monitor task failed"
+            })
+        );
+        assert_eq!(
+            status,
+            if success { "completed" } else { "failed" },
+            "terminal projection must still be observable through the task manager"
+        );
+    }
+}
+
+/// B9 回归：非 monitor 实例的终态投递保持不变。
+#[tokio::test]
+async fn non_monitor_terminal_settlement_still_wakes_the_owner() {
+    let (messages, status) = settle_registered_task("workflow", None, false, true).await;
+    assert_eq!(status, "completed");
+    assert_eq!(
+        messages.len(),
+        1,
+        "non-monitor terminal delivery must be unchanged"
+    );
+    assert_eq!(messages[0].kind, MessageKind::Defer);
+    assert_eq!(messages[0].source, MessageSource::McpNotification);
+}
 
 /// B9：身份以 `ConfigSource::Builtin { instance }` 为准，不依赖 server key 字面量。
 #[tokio::test]
-async fn monitor_instance_alias_terminal_settlement_never_wakes_the_owner() {
+async fn monitor_instance_alias_terminal_settlement_wakes_the_owner_once() {
     let (messages, status) = settle_registered_task(
         "monitor-alias",
         Some(ConfigSource::Builtin {
@@ -11,9 +71,10 @@ async fn monitor_instance_alias_terminal_settlement_never_wakes_the_owner() {
         true,
     )
     .await;
-    assert!(
-        messages.is_empty(),
-        "monitor instance identity must suppress terminal delivery regardless of server key"
+    assert_eq!(
+        messages.len(),
+        1,
+        "monitor instance identity must deliver one terminal reminder regardless of server key"
     );
     assert_eq!(status, "completed");
 }
@@ -21,7 +82,8 @@ async fn monitor_instance_alias_terminal_settlement_never_wakes_the_owner() {
 //
 // A non-builtin server named `monitor` matches the identity fallback but has no
 // obligation to project `_meta["peri/monitor"]`. The subscription loop must
-// still settle such a terminal task; only the alert reminder is lost.
+// still deliver the terminal reminder and settle such a task; only the merged
+// alert counts are lost.
 
 /// Alert projection returned by the fixture's `tasks/get`.
 #[derive(Clone, Copy)]
@@ -94,32 +156,22 @@ impl ServerHandler for TerminalMonitorServer {
 /// Concrete manager behind the decorator.
 type ConcreteTasks = peri_agent::agent::async_tasks::TaskManager;
 
-/// Task manager decorator: records whether the alert reminder was already in the
-/// inbox when settlement started, and can fail the first settlement attempt.
+/// Task manager decorator: can fail the first settlement attempt so the
+/// subscription retries against the cached terminal observation.
 struct RecordingManager {
     inner: Arc<ConcreteTasks>,
-    queue: Arc<MessageQueue>,
     fail_first_settle: bool,
     settle_attempts: AtomicUsize,
-    alert_before_settle: AtomicBool,
 }
 
 impl RecordingManager {
-    fn new(inner: Arc<ConcreteTasks>, queue: Arc<MessageQueue>, fail_first_settle: bool) -> Self {
+    fn new(inner: Arc<ConcreteTasks>, fail_first_settle: bool) -> Self {
         Self {
             inner,
-            queue,
             fail_first_settle,
             settle_attempts: AtomicUsize::new(0),
-            alert_before_settle: AtomicBool::new(false),
         }
     }
-}
-
-fn has_monitor_alert(queue: &MessageQueue) -> bool {
-    queue.snapshot().iter().any(|message| {
-        message.kind == MessageKind::Defer && message.source == MessageSource::McpNotification
-    })
 }
 
 impl TaskManager for RecordingManager {
@@ -137,9 +189,6 @@ impl TaskManager for RecordingManager {
         result: BackgroundTaskResult,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
     {
-        if has_monitor_alert(&self.queue) {
-            self.alert_before_settle.store(true, Ordering::SeqCst);
-        }
         let attempt = self.settle_attempts.fetch_add(1, Ordering::SeqCst);
         if attempt == 0 && self.fail_first_settle {
             return Box::pin(async { Err("fixture: first settlement fails".to_owned()) });
@@ -294,7 +343,6 @@ async fn terminal_monitor_fixture(
     pool.register_inbox("session", SessionInbox::new(Arc::clone(&queue)).handle());
     let manager = Arc::new(RecordingManager::new(
         Arc::new(peri_agent::agent::async_tasks::TaskManager::new()),
-        Arc::clone(&queue),
         fail_first_settle,
     ));
     let bound: Arc<dyn TaskManager> = Arc::clone(&manager) as Arc<dyn TaskManager>;
@@ -375,7 +423,7 @@ fn reminder_body(message: &QueuedMessage) -> String {
     }
 }
 
-/// 终态无 `_meta`：warn 后跳过提醒，仍结算并退出订阅循环。
+/// 终态无 `_meta`：warn 后只投递不含计数的终态提醒，仍结算并退出订阅循环。
 #[tokio::test]
 async fn terminal_monitor_without_meta_still_settles() {
     let fixture = terminal_monitor_fixture(TerminalMeta::Missing, false).await;
@@ -386,9 +434,18 @@ async fn terminal_monitor_without_meta_still_settles() {
         1,
         "the terminal observation must settle directly instead of re-polling"
     );
+    let messages = fixture.queue.drain_all_sync();
+    assert_eq!(
+        messages.len(),
+        1,
+        "a missing alert projection must still deliver the terminal reminder: {messages:?}"
+    );
+    assert_eq!(messages[0].kind, MessageKind::Defer);
+    let body = reminder_body(&messages[0]);
+    assert!(body.contains("finished with status Completed"), "{body}");
     assert!(
-        fixture.queue.drain_all().is_empty(),
-        "a missing alert projection must not deliver a reminder"
+        !body.contains("time(s)"),
+        "a missing projection must not invent alert counts: {body}"
     );
     assert!(
         fixture
@@ -402,7 +459,7 @@ async fn terminal_monitor_without_meta_still_settles() {
     shutdown_fixture(fixture).await;
 }
 
-/// 终态 `_meta` 字段类型错误：与缺失同样只跳过提醒，不阻塞结算。
+/// 终态 `_meta` 字段类型错误：与缺失同样只省略计数，不阻塞终态提醒与结算。
 #[tokio::test]
 async fn terminal_monitor_with_malformed_meta_still_settles() {
     let fixture = terminal_monitor_fixture(TerminalMeta::Malformed, false).await;
@@ -413,9 +470,17 @@ async fn terminal_monitor_with_malformed_meta_still_settles() {
         1,
         "a malformed projection must not keep the terminal task polling"
     );
+    let messages = fixture.queue.drain_all_sync();
+    assert_eq!(
+        messages.len(),
+        1,
+        "a malformed alert projection must still deliver the terminal reminder: {messages:?}"
+    );
+    let body = reminder_body(&messages[0]);
+    assert!(body.contains("finished with status Completed"), "{body}");
     assert!(
-        fixture.queue.drain_all().is_empty(),
-        "a malformed alert projection must not deliver a reminder"
+        !body.contains("time(s)"),
+        "a malformed projection must not invent alert counts: {body}"
     );
     assert!(
         fixture
@@ -429,32 +494,35 @@ async fn terminal_monitor_with_malformed_meta_still_settles() {
     shutdown_fixture(fixture).await;
 }
 
-/// 终态有新命中：提醒在 `settle_external` 入口前已经进入 inbox。
+/// 终态有新命中：未报告计数并入唯一一条终态提醒。
 #[tokio::test]
-async fn terminal_alert_enters_the_inbox_before_settlement() {
+async fn terminal_alert_is_merged_into_the_terminal_reminder() {
     let fixture = terminal_monitor_fixture(TerminalMeta::Hits(2), false).await;
     wait_settled(&fixture.manager).await;
     wait_subscription_exit(&fixture.owner).await;
-    assert!(
-        fixture.manager.alert_before_settle.load(Ordering::SeqCst),
-        "the terminal alert must be delivered before settlement starts"
+    let messages = fixture.queue.drain_all_sync();
+    assert_eq!(
+        messages.len(),
+        1,
+        "the terminal round must deliver exactly one reminder: {messages:?}"
     );
-    let messages = fixture.queue.drain_all();
-    assert_eq!(messages.len(), 1, "one alert observation: {messages:?}");
     assert_eq!(messages[0].kind, MessageKind::Defer);
     assert_eq!(messages[0].source, MessageSource::McpNotification);
-    assert_eq!(
+    assert!(messages[0].delivery_id.is_some());
+    assert_ne!(
         messages[0].delivery_id,
         Some(monitor_alert_delivery_id("mon-1", 2)),
-        "the reminder keeps its canonical delivery id"
+        "the merged reminder keeps the terminal delivery id, not the alert id"
     );
     let body = reminder_body(&messages[0]);
     assert!(body.contains("mon-1"), "{body}");
     assert!(body.contains("2 time(s)"), "{body}");
+    assert!(body.contains("2 hit(s) were not reported"), "{body}");
+    assert!(body.contains("finished with status Completed"), "{body}");
     shutdown_fixture(fixture).await;
 }
 
-/// 结算失败重试：第二次结算复用终态缓存，且不重复投递同一提醒。
+/// 结算失败重试：复用终态缓存并只投递一条终态提醒。
 #[tokio::test]
 async fn failed_settlement_retry_does_not_duplicate_the_alert() {
     let fixture = terminal_monitor_fixture(TerminalMeta::Hits(1), true).await;
@@ -470,15 +538,20 @@ async fn failed_settlement_retry_does_not_duplicate_the_alert() {
         1,
         "the retry reuses the cached terminal observation"
     );
-    let messages = fixture.queue.drain_all();
+    let messages = fixture.queue.drain_all_sync();
     assert_eq!(
         messages.len(),
         1,
-        "a retried settlement must not deliver the alert twice: {messages:?}"
+        "a retried settlement must not deliver the reminder twice: {messages:?}"
     );
-    assert_eq!(
+    assert!(messages[0].delivery_id.is_some());
+    assert_ne!(
         messages[0].delivery_id,
-        Some(monitor_alert_delivery_id("mon-1", 1))
+        Some(monitor_alert_delivery_id("mon-1", 1)),
+        "the retried terminal reminder keeps its own delivery id"
     );
+    let body = reminder_body(&messages[0]);
+    assert!(body.contains("1 time(s)"), "{body}");
+    assert!(body.contains("1 hit(s) were not reported"), "{body}");
     shutdown_fixture(fixture).await;
 }

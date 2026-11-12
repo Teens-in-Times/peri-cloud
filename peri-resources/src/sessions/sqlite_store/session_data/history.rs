@@ -1,4 +1,5 @@
 use super::*;
+use crate::sessions::sqlite_store::row_mapping::THREAD_META_COLUMNS;
 use peri_acp_types::history_window::{
     HistoryBodyChunk, HistoryEntryId, HistoryInheritedSnapshot, HistoryWindowError,
 };
@@ -363,10 +364,11 @@ impl SqliteSessionData {
                     .await
                     .map_err(|error| map_sqlx(&error))?;
                 let rows = read_content_lengths(&mut tx, rows).await?;
-                let inherited = context::load_inherited_context_on(&mut tx, id)
-                    .await
-                    .map_err(read_failure)?
-                    .payloads;
+                let inherited =
+                    context::load_inherited_context_on(&mut tx, id, THREAD_META_COLUMNS)
+                        .await
+                        .map_err(read_failure)?
+                        .payloads;
                 (inherited, tail, rows)
             }
             Some((after, tail)) => {
@@ -509,18 +511,12 @@ impl SqliteSessionData {
             // 目标会话不存在与「外键拒绝」是两个不同的原因，前者更可诊断。
             return Err(not_found());
         }
-        let mut rows = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            rows.push(MessageInsertRow {
-                id: payload.id().as_uuid().to_string(),
-                role: payload_role(payload),
-                content: serialize_persisted_payload(payload)
-                    .map_err(|_| corrupt("history entry is not serializable"))?,
-            });
+        for chunk in SerializedHistoryChunks::new(payloads) {
+            let rows = chunk.map_err(|_| corrupt("history entry is not serializable"))?;
+            insert_message_rows(&mut tx, id, rows)
+                .await
+                .map_err(|error| map_sqlx(&error))?;
         }
-        insert_message_rows(&mut tx, id, &rows)
-            .await
-            .map_err(|error| map_sqlx(&error))?;
         let now = peri_time::now_utc_rfc3339();
         let updated = sqlx::query(
             "UPDATE threads SET updated_at = ?1,
@@ -535,12 +531,8 @@ impl SqliteSessionData {
         if updated.rows_affected() != 1 {
             return Err(not_found());
         }
-        let messages = payloads
-            .iter()
-            .filter_map(PersistedPayload::as_message)
-            .cloned()
-            .collect::<Vec<_>>();
-        if let Some(title) = extract_title(&messages) {
+        if let Some(title) = extract_title(payloads.iter().filter_map(PersistedPayload::as_message))
+        {
             sqlx::query("UPDATE threads SET title = ?1 WHERE id = ?2 AND title IS NULL")
                 .bind(&title)
                 .bind(id.as_str())
@@ -601,6 +593,13 @@ impl SqliteSessionData {
                 // 边界删除与有效视图重建同属这一事务：任何一半生效都会让热态与冷恢复分叉。
                 super::history_projection::reconcile_rewind(&mut tx, id, clear_excluded).await?;
                 refresh_history_derivations(&mut tx, id).await?;
+                // rewind 把历史退回到某个边界：仍留在 MQ 的待发项属于被退回的那段上下文，
+                // 与边界删除同一事务清理（设计 §5.5「rewind 按现有作用域规则清理 MQ」）。
+                sqlx::query(crate::sessions::canonical::DELETE_THREAD_MQ_BY_THREAD_SQL)
+                    .bind(id.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| map_sqlx(&error))?;
                 RewindOutcome::Applied
             }
             None => RewindOutcome::BoundaryMissing,

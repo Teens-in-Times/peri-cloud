@@ -157,10 +157,22 @@ pub(super) async fn resume_subagent_impl(
     )
     .await?;
 
+    let completion_target = super::completion_target(
+        parent,
+        on_bg_complete.as_ref(),
+        super::spawn::parent_thread_id_of(parent),
+    );
     // The claim remains owned across history I/O and session construction. A
     // dropped caller closes its decision channel, leaving ordered rollback to
     // the worker that performed the active write.
     let restored = async {
+        super::persist_completion_target(
+            session_resources.as_ref(),
+            &thread_id,
+            completion_target.as_deref(),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
         // 一次一致快照：inherit 区与自有 payload/flags 同一次读取（不再分三次）。
         // 恢复只重建有效视图：已排除 own 正文不属于续聊的当前上下文。
         let snapshot = session_resources
@@ -258,7 +270,7 @@ pub(super) async fn resume_subagent_impl(
     // 6. 重建 session（thread_id 固定 = config.thread_id；ancestor/own 显式分区，
     //    两区 flags 均恢复后绑定持久化——helper 内）
     //    不注入 parent_messages / identity System / skill_names（F4 / R-H1）
-    let (session, v2_ctx) = build_subagent_session_v2(
+    let (session, mut v2_ctx) = build_subagent_session_v2(
         cwd.clone(),
         frozen,
         cancel_token.clone(),
@@ -286,6 +298,10 @@ pub(super) async fn resume_subagent_impl(
         identity.is_some(),
     )
     .await?;
+    let parent_thread = super::spawn::parent_thread_id_of(parent);
+    v2_ctx.context.session.model_parent =
+        crate::agent::model_call::capture_tool_parent(parent_tool_call_id.as_deref())
+            .filter(|parent| Some(parent.owner.as_str()) == parent_thread.as_deref());
 
     // Assembly is synchronous but can observe cancellation from another task
     // (or a callback). Sync callers still receive the established interrupted
@@ -308,16 +324,41 @@ pub(super) async fn resume_subagent_impl(
     // 7. prompt 入队：Some(p) 原样追加（不套 fork directive——恢复目标仍是原
     //    任务，直接追加指令）；None 注入隐式 continue 常量（issue 决策 9）
     let prompt_text = prompt.unwrap_or_else(|| IMPLICIT_CONTINUE_PROMPT.to_string());
-    v2_ctx.context.session.queue.push(QueuedMessage::new(
+    let prompt_message = QueuedMessage::new(
         MessageKind::Prompt,
         MessageSource::UserInput,
         BaseMessage::human(prompt_text.clone()),
-    ));
+    );
+    if let Err(error) = v2_ctx
+        .context
+        .session
+        .queue
+        .enqueue_sent(prompt_message)
+        .await
+    {
+        // 没有接纳到初始指令的恢复不得继续跑：先撤销本次认领，再把失败交给调用方。
+        let detail = format!("resume prompt enqueue failed: {error}");
+        if let Err(rollback) = claim.rollback().await {
+            return Err(format!("{detail}; resume claim rollback failed: {rollback}").into());
+        }
+        return Err(detail.into());
+    }
 
     // 8. 执行（run mode 由本次调用决定，issue 决策 8）
     // 认领已写入 Active；准备门在进入执行前释放，避免与本次 run 的
     // 执行 permit 互斥（并发的第二次 resume 由 claim/status 拒绝）。
     drop(preparation);
+    // 终态结果投递到父会话的 MQ（无父 thread 时不做跨会话投递）。
+    let terminal_route =
+        completion_target.map(
+            |target| super::super::terminal_settlement::TerminalMqRoute {
+                store: Arc::clone(&session_resources),
+                target: peri_acp_types::thread::ThreadId::from(target.as_str()),
+                mailbox: parent
+                    .filter(|_| super::spawn::parent_thread_id_of(parent).as_ref() == Some(&target))
+                    .map(|parent| parent.async_result_mailbox()),
+            },
+        );
     match run_mode {
         SubagentRunMode::Sync => {
             let run_thread_id = thread_id.clone();
@@ -334,6 +375,7 @@ pub(super) async fn resume_subagent_impl(
                     .and_then(|host| host.task_manager.clone()),
                 Some(sync_task_id.clone()),
                 super::completion_delivery(parent, on_bg_complete),
+                terminal_route,
                 move |handoff_start, handed_off| async move {
                     run_sync_subagent(
                         &run_thread_id,
@@ -422,6 +464,7 @@ pub(super) async fn resume_subagent_impl(
                 super::completion_delivery(parent, on_bg_complete),
                 langfuse_bridge,
                 Some(Arc::clone(&session_resources)),
+                terminal_route,
                 deregister_runtime,
                 on_subagent_start,
                 on_subagent_stop,

@@ -6,7 +6,7 @@ use peri_acp_types::device_executor::{JobSnapshot, JobStatus};
 use peri_acp_types::event_v2::{EventBus, EventHandles, RenderEvent};
 use peri_acp_types::identity::AgentId;
 use peri_acp_types::interaction::UserInteractionBroker;
-use peri_acp_types::messages::{BaseMessage, MessageContent, MessageId};
+use peri_acp_types::messages::{MessageContent, MessageId};
 use peri_acp_types::permission::SharedPermissionMode;
 use peri_acp_types::session::TurnId;
 use peri_acp_types::store::{MessageFlags, PersistedPayload};
@@ -16,9 +16,7 @@ use peri_agent::agent::stages::{run_react_loop, LoopResult, StageContext};
 use peri_agent::agent::token::ContextBudget;
 use peri_agent::session::factory::build_middleware_chain;
 use peri_agent::session::tool_catalog::SessionToolCatalog;
-use peri_agent::session::{
-    FrozenContext, MessageSource, MessageTranscript, QueuedMessage, Session,
-};
+use peri_agent::session::{FrozenContext, MessageTranscript, Session};
 use peri_agent::tools::BaseTool;
 use peri_middlewares::permission::AutoClassifier;
 use peri_middlewares::tool_search::{ExecuteExtraToolResolver, ToolSearchIndex};
@@ -38,6 +36,8 @@ use crate::workspace::WorkspaceCache;
 mod compact;
 #[path = "handoff_model.rs"]
 mod handoff_model;
+#[path = "turn_input.rs"]
+mod turn_input;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -599,7 +599,8 @@ impl CloudAgent {
             CloudChainAssembler.assemble(&blueprint, &assembly)
         } else {
             build_middleware_chain(&CloudChainAssembler, &assembly)
-        };
+        }
+        .map_err(|_| Error::Context)?;
         if let (Some(scope), Some(personal)) = (&task_scope, &personal) {
             if !personal.scheduled {
                 chain.add(Box::new(crate::tasks::tools::TaskTools {
@@ -804,36 +805,16 @@ impl CloudAgent {
             builder = builder.with_goal_controller(goal.clone());
         }
         let context = builder.build();
-        if task_event {
-            let event_body = match &request.prompt {
-                MessageContent::Text(text) => text,
-                _ => return Err(Error::Context),
-            };
-            let frame = crate::tasks::middleware::reminder(
-                format!("Execution-agent event (untrusted content, not user input):\n{event_body}"),
-                serde_json::json!({"source":"execution_agent","turn_id":request.turn_id}),
-            )
-            .map_err(|_| Error::Context)?;
-            let delivery_id = MessageId::from(request.turn_id);
+        if let Some(delivery_id) = turn_input::enqueue(
+            &context.session.queue,
+            request.prompt,
+            request.turn_id,
+            task_event,
+            self.scheduled.load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .await?
+        {
             task_results.expect(delivery_id);
-            context
-                .session
-                .queue
-                .push(QueuedMessage::system_reminder_with_delivery_id(
-                    peri_agent::session::MessageKind::Defer,
-                    MessageSource::SubAgentComplete,
-                    frame,
-                    delivery_id,
-                ));
-        } else {
-            context.session.queue.push(QueuedMessage::prompt(
-                if self.scheduled.load(std::sync::atomic::Ordering::Relaxed) {
-                    MessageSource::CronTrigger
-                } else {
-                    MessageSource::UserInput
-                },
-                BaseMessage::human(request.prompt),
-            ));
         }
         // Scope owns both futures. Events are drained while the original loop
         // runs, then its senders are dropped and the final queued events drain.

@@ -15,10 +15,10 @@ use peri_acp_types::session_resources::{
     ForkSnapshot, FrozenSnapshotBytes, FrozenState, NewSession, NewSessionMeta,
     PersistenceRecovery, RewindBoundary, RewindOutcome, SessionAvailability, SessionMetaPatch,
     SessionResourceError, SessionResourceErrorKind, SessionResourceResult, SessionResources,
-    SessionSnapshot,
+    SessionSnapshot, TerminalSettlementOutcome,
 };
 use peri_acp_types::store::{CompactionChange, InheritedContext, MessageFlags, PersistedPayload};
-use peri_acp_types::thread::{AgentStatus, ThreadId, ThreadMeta};
+use peri_acp_types::thread::{AgentStatus, ThreadId, ThreadMeta, WorkState};
 use peri_acp_types::workspace::{
     ResolvedWorkspace, ScopedThreadPage, ScopedThreadQuery, SessionBinding, WorkspaceError,
     SESSION_BINDING_VERSION,
@@ -114,6 +114,16 @@ fn child_meta(id: &ThreadId, meta: &NewSessionMeta, hidden: bool) -> ThreadMeta 
     thread
 }
 
+/// 进程内认领世代：区分「本次认领」与后续新认领。
+///
+/// 与资源实现同构：持久状态无法表达归属，新 run 的 `Active + Working` 与旧认领
+/// 的中间态完全相同，只能靠世代判断旧补偿是否还有资格。
+#[derive(Default)]
+struct ClaimLedger {
+    next: u64,
+    current: HashMap<ThreadId, u64>,
+}
+
 pub(crate) struct MockSessionResources {
     /// 每个会话 id 的独立数据区：测试替身也按会话隔离（不同 thread 不串扰）。
     ///
@@ -132,22 +142,22 @@ pub(crate) struct MockSessionResources {
     statuses: Arc<Mutex<Vec<(ThreadId, AgentStatus)>>>,
     pub(crate) status_changed: Arc<tokio::sync::Notify>,
     pub(crate) load_gate: Mutex<Option<ResumeLoadGate>>,
+    pub(crate) append_gate: Mutex<Option<ResumeLoadGate>>,
     pub(crate) inherited_load_gate: Mutex<Option<ResumeLoadGate>>,
     pub(crate) flags_load_gate: Mutex<Option<ResumeLoadGate>>,
     pub(crate) active_write_gate: Mutex<Option<ResumeLoadGate>>,
+    pub(crate) working_write_gate: Mutex<Option<ResumeLoadGate>>,
+    pub(crate) fail_working_write: AtomicBool,
+    /// 交接提醒的持久化门：让用例在「flush 已成功、提醒尚未写入」之间观察。
+    pub(crate) reminder_append_gate: Mutex<Option<ResumeLoadGate>>,
     pub(crate) archive_probe_gate: Mutex<Option<ResumeLoadGate>>,
-    /// 下一次 canonical reminder 提交的阶段门：进入后等待用例放行。
-    reminder_append_gate: Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Receiver<()>,
-        )>,
-    >,
     /// 认领事实：`claim_child_resume` 成功返回后置位，结清时复位。
     ///
     /// 阶段门（[`ResumeLoadGate`]）只在**认领后**的快照读取生效：resume 的第一次读取是
     /// 认领前的绑定分类，认领后才是 history 装载——用例的门语义按后者定义。
     claimed: Arc<AtomicBool>,
+    /// 进程内认领世代：新认领覆盖旧值，旧 handle 随即失去补偿资格。
+    claim_ledger: Arc<Mutex<ClaimLedger>>,
     /// 快照读取故障注入：在第 N 次 `load_session_snapshot`（1-based）返回 Err，0 = 关闭。
     ///
     /// resume 路径有两次快照读取（认领前的绑定分类、认领后的 history 装载），用例据此
@@ -160,6 +170,30 @@ pub(crate) struct MockSessionResources {
     history_read_only: AtomicBool,
     /// 单次 compaction 成功写入替身数据区后、返回前触发（测试精确取消时序用）。
     compaction_applied_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// MQ 行事实：替身也必须提供持久收件箱，Receive 才能像生产路径一样原子移交。
+    ///
+    /// 提交后的载荷同步写回本区 `payloads`，让 `load_session_history` 与 MQ 看到同一份事实。
+    mq: peri_acp_types::session::InMemoryMqStore,
+    /// 故障注入：置位后所有 MQ 入队返回内部错误（验证启动路径不得吞掉接纳失败）。
+    mq_enqueue_failure: AtomicBool,
+    /// 故障注入：置位后历史查询返回内部错误（验证 `Unknown` 不得被当作不存在）。
+    mq_history_failure: AtomicBool,
+    /// 故障注入：剩余多少次 MQ 查询返回内部错误（验证查询失败不清理运行期状态）。
+    mq_query_failures: AtomicUsize,
+    /// 故障注入：剩余多少次终态结算在写入前返回错误（验证同身份重试）。
+    finalize_failures: AtomicUsize,
+    /// 已发生的终态结算次数（含注入失败）。
+    finalize_attempts: AtomicUsize,
+    /// 每次 `finalize_child_terminal` 收到的结果消息身份（含注入失败的重试）。
+    finalize_message_ids: Mutex<Vec<MessageId>>,
+    /// 已发生的状态写入次数（含同值去重前的调用），用于断言唯一写入者。
+    status_writes: AtomicUsize,
+    /// 模拟远端 `active` 守卫：仅 child 仍 active 时允许 finalize。
+    finalize_requires_active: AtomicBool,
+    /// 故障注入：剩余多少次无结果终态写入在写完工作意图、写状态前失败。
+    terminal_status_failures: AtomicUsize,
+    /// `enqueued_at` 生成器：同一进程内单调递增，测试不依赖真实时钟。
+    mq_clock: Mutex<u64>,
 }
 
 impl MockSessionResources {
@@ -173,22 +207,82 @@ impl MockSessionResources {
             statuses: Arc::new(Mutex::new(Vec::new())),
             status_changed: Arc::new(tokio::sync::Notify::new()),
             load_gate: Mutex::new(None),
+            append_gate: Mutex::new(None),
             inherited_load_gate: Mutex::new(None),
             flags_load_gate: Mutex::new(None),
             active_write_gate: Mutex::new(None),
-            archive_probe_gate: Mutex::new(None),
+            working_write_gate: Mutex::new(None),
+            fail_working_write: AtomicBool::new(false),
             reminder_append_gate: Mutex::new(None),
+            archive_probe_gate: Mutex::new(None),
             claimed: Arc::new(AtomicBool::new(false)),
+            claim_ledger: Arc::default(),
             fail_snapshot_at: AtomicUsize::new(0),
             snapshot_reads: AtomicUsize::new(0),
             history_read_only: AtomicBool::new(false),
             compaction_applied_hook: Mutex::new(None),
+            mq: peri_acp_types::session::InMemoryMqStore::new(),
+            mq_enqueue_failure: AtomicBool::new(false),
+            mq_history_failure: AtomicBool::new(false),
+            mq_query_failures: AtomicUsize::new(0),
+            finalize_failures: AtomicUsize::new(0),
+            finalize_attempts: AtomicUsize::new(0),
+            finalize_message_ids: Mutex::new(Vec::new()),
+            status_writes: AtomicUsize::new(0),
+            finalize_requires_active: AtomicBool::new(false),
+            terminal_status_failures: AtomicUsize::new(0),
+            mq_clock: Mutex::new(0),
         })
     }
 
     /// 注册一次 compaction 已写入后的回调；回调在成功返回前执行一次。
     pub(crate) fn on_compaction_applied(&self, hook: impl Fn() + Send + Sync + 'static) {
         *self.compaction_applied_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// 故障注入：让后续 MQ 入队全部失败。
+    pub(crate) fn fail_mq_enqueues(&self) {
+        self.mq_enqueue_failure.store(true, Ordering::SeqCst);
+    }
+
+    /// 故障注入：让后续 MQ 历史查询全部失败。
+    pub(crate) fn fail_mq_history_lookup(&self) {
+        self.mq_history_failure.store(true, Ordering::SeqCst);
+    }
+
+    /// 故障注入：让接下来的 `count` 次 MQ 查询失败。
+    pub(crate) fn fail_next_mq_queries(&self, count: usize) {
+        self.mq_query_failures.store(count, Ordering::SeqCst);
+    }
+
+    /// 故障注入：让接下来的 `count` 次终态结算在写入前失败。
+    pub(crate) fn fail_next_finalizes(&self, count: usize) {
+        self.finalize_failures.store(count, Ordering::SeqCst);
+    }
+
+    /// 故障注入：让接下来的 `count` 次无结果终态写入在写完工作意图、写状态前失败。
+    ///
+    /// 用来验证「部分写入不产生 Done + working」以及同一轮重试能否收敛。
+    pub(crate) fn fail_next_terminal_status_writes(&self, count: usize) {
+        self.terminal_status_failures.store(count, Ordering::SeqCst);
+    }
+
+    pub(crate) fn finalize_attempts(&self) -> usize {
+        self.finalize_attempts.load(Ordering::SeqCst)
+    }
+
+    /// 每次 finalize 尝试携带的结果消息身份；重试必须保持同一身份。
+    pub(crate) fn finalize_message_ids(&self) -> Vec<MessageId> {
+        self.finalize_message_ids.lock().unwrap().clone()
+    }
+
+    pub(crate) fn status_writes(&self) -> usize {
+        self.status_writes.load(Ordering::SeqCst)
+    }
+
+    /// 模拟远端 `active` 守卫：非 active 的 child 不得再被结算。
+    pub(crate) fn require_active_for_finalize(&self) {
+        self.finalize_requires_active.store(true, Ordering::SeqCst);
     }
 
     /// 当前 meta 状态序列（`(thread_id, status)`），只含真实发生变更的写入。
@@ -274,6 +368,7 @@ impl MockSessionResources {
 
     /// 状态写入入口：只在值真的变化时记录并唤醒等待者。
     fn write_status(&self, id: &ThreadId, status: AgentStatus) {
+        self.status_writes.fetch_add(1, Ordering::SeqCst);
         write_status_shared(
             &self.regions,
             &self.statuses,
@@ -283,17 +378,22 @@ impl MockSessionResources {
         );
     }
 
-    /// 下一次 canonical reminder 提交进入后暂停，返回 (entered, release)。
-    pub(crate) fn gate_next_reminder_append(
-        &self,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *self.reminder_append_gate.lock().unwrap() = Some((entered_tx, release_rx));
-        (entered_rx, release_tx)
+    /// durable 工作意图写入：只改 meta 的那一列，不进入状态序列。
+    fn write_work_state(&self, id: &ThreadId, state: WorkState) {
+        write_work_state_shared(&self.regions, id, state);
+    }
+
+    /// 上下文占用快照写入：只改 meta 的那一列。
+    fn write_context_usage(&self, id: &ThreadId, tokens: Option<u64>) {
+        self.with_region(id, |region| {
+            let mut meta = region
+                .meta
+                .clone()
+                .unwrap_or_else(|| ThreadMeta::new_at("/test", peri_time::now_wall()));
+            meta.id = id.clone();
+            meta.context_usage_tokens = tokens;
+            region.meta = Some(meta);
+        });
     }
 
     /// 切换为只读能力面（测试后端能力差异用）。
@@ -360,18 +460,39 @@ fn write_status_shared(
     status_changed.notify_waiters();
 }
 
+fn write_work_state_shared(
+    regions: &Mutex<HashMap<ThreadId, Region>>,
+    id: &ThreadId,
+    state: WorkState,
+) {
+    let mut regions = regions.lock().unwrap();
+    let region = regions.entry(id.clone()).or_default();
+    let mut meta = region
+        .meta
+        .clone()
+        .unwrap_or_else(|| ThreadMeta::new_at("/test", peri_time::now_wall()));
+    meta.id = id.clone();
+    meta.work_state = state;
+    region.meta = Some(meta);
+}
+
 fn status_name(status: AgentStatus) -> &'static str {
     status.as_str()
 }
 
-/// `claim_child_resume` 返回的认领：语义与资源实现一致——结清时恢复到认领前的状态。
+/// `claim_child_resume` 返回的认领：语义与资源实现一致——结清时恢复到认领前的
+/// 状态与工作意图，且记录已被新任务改写时放弃补偿。
 struct MockResumeClaim {
     claimed: Arc<AtomicBool>,
     regions: Arc<Mutex<HashMap<ThreadId, Region>>>,
     statuses: Arc<Mutex<Vec<(ThreadId, AgentStatus)>>>,
     status_changed: Arc<tokio::sync::Notify>,
+    claim_ledger: Arc<Mutex<ClaimLedger>>,
+    claim_nonce: u64,
     child: ThreadId,
     previous: AgentStatus,
+    previous_work_state: WorkState,
+    settled: AtomicBool,
 }
 
 #[async_trait]
@@ -392,27 +513,93 @@ impl ChildResumeClaim for MockResumeClaim {
     }
 
     async fn mark_failed(&self) -> SessionResourceResult<()> {
-        self.settle();
+        self.settle(None);
         Ok(())
     }
 
     async fn mark_terminated(&self) -> SessionResourceResult<()> {
-        self.settle();
+        self.settle(None);
         Ok(())
+    }
+
+    async fn finish_with_status(&self, status: AgentStatus) -> SessionResourceResult<bool> {
+        Ok(self.settle(Some(status)))
     }
 }
 
 impl MockResumeClaim {
-    /// 恢复到认领前的状态：终态写入由调用方在结清之后单独提交。
-    fn settle(&self) {
+    /// 恢复到认领前的状态；请求终态时在同一把锁内提交，返回是否仍归本次认领所有。
+    ///
+    /// 与资源实现同构：先校验世代仍属于本次认领，再检查状态列未被第三方改写，
+    /// 两列在同一把锁内恢复；重复结清是 no-op。
+    fn settle(&self, terminal: Option<AgentStatus>) -> bool {
+        if self.settled.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        let owns_generation = self
+            .claim_ledger
+            .lock()
+            .unwrap()
+            .current
+            .get(&self.child)
+            .copied()
+            == Some(self.claim_nonce);
+        if !owns_generation {
+            tracing::warn!(
+                thread_id = %self.child,
+                claim_nonce = self.claim_nonce,
+                "mock resume claim rollback skipped: a newer claim owns this child"
+            );
+            return false;
+        }
+        let mut restored = None;
+        {
+            let mut regions = self.regions.lock().unwrap();
+            let Some(region) = regions.get_mut(&self.child) else {
+                return false;
+            };
+            let Some(meta) = region.meta.as_mut() else {
+                return false;
+            };
+            if meta.agent_status != AgentStatus::Active {
+                tracing::warn!(
+                    thread_id = %self.child,
+                    status = ?meta.agent_status,
+                    work_state = ?meta.work_state,
+                    previous_status = ?self.previous,
+                    previous_work_state = ?self.previous_work_state,
+                    "mock resume claim rollback skipped: record no longer belongs to this claim"
+                );
+                return false;
+            }
+            // 工作意图可能已被本次运行写成终态：只跳过这一列的回滚，终态仍由本次
+            // 认领提交。
+            if meta.work_state == WorkState::Working || meta.work_state == self.previous_work_state
+            {
+                meta.work_state = self.previous_work_state;
+                meta.agent_status = self.previous;
+                restored = Some(self.previous);
+            }
+            if let Some(status) = terminal {
+                meta.agent_status = status;
+            }
+        }
+        {
+            let mut statuses = self.statuses.lock().unwrap();
+            // 与门面写入同构：只记录真实状态转换。终态与恢复值相同时，两次写入
+            // 只产生一个序列项。
+            if let Some(previous) = restored {
+                statuses.push((self.child.clone(), previous));
+            }
+            if let Some(status) = terminal {
+                if restored != Some(status) {
+                    statuses.push((self.child.clone(), status));
+                }
+            }
+        }
+        self.status_changed.notify_waiters();
         self.claimed.store(false, Ordering::SeqCst);
-        write_status_shared(
-            &self.regions,
-            &self.statuses,
-            &self.status_changed,
-            &self.child,
-            self.previous,
-        );
+        true
     }
 }
 

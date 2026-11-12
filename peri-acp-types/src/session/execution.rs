@@ -192,6 +192,9 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 /// 单轮 prompt 执行结果（ACP 协议面 / 执行薄壳消费；Agent 层命令执行体与
 /// 执行句柄经本类型回传）。
 pub struct PromptResult {
+    /// Actual Agent execution that produced this result; absent when no turn was started.
+    /// Auxiliary work triggered by completion must use this fact, not a user-input ticket ID.
+    pub execution_binding: Option<crate::session::ExecutionBinding>,
     /// Canonical transcript snapshot captured after Agent persistence barrier.
     /// 只含**有效**（未排除）条目：Full Compact 提交释放的 own 原文不在其中，
     /// 完整历史（含归档原文）只能从存储读取。
@@ -214,6 +217,10 @@ pub struct PromptResult {
     /// turn 退出时仍未结算的后台任务数（§7.3 有界等待摘要）。
     /// `0` = 无未结算任务，宿主不在 ACP 响应上附加 pending 标记。
     pub pending_tasks: u32,
+    /// 最近一次有效上下文占用（token）；`None` = 本次取不到有效值。
+    ///
+    /// 它是最后提交的展示快照，不是下一次请求的精确 usage。
+    pub context_usage_tokens: Option<u64>,
 }
 
 impl Default for PromptResult {
@@ -223,6 +230,7 @@ impl Default for PromptResult {
     /// 不能让空 payload 覆盖 host 的历史快照。
     fn default() -> Self {
         Self {
+            execution_binding: None,
             persisted_payloads: Vec::new(),
             messages: Vec::new(),
             ok: false,
@@ -231,6 +239,7 @@ impl Default for PromptResult {
             persistence_inconsistent: true,
             recall_items: Vec::new(),
             pending_tasks: 0,
+            context_usage_tokens: None,
             failure: Some(ExecutionFailure::missing_result()),
         }
     }

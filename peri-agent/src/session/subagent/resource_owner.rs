@@ -28,6 +28,14 @@ pub struct ParkedChildOwner {
     parent: parking_lot::Mutex<Option<std::sync::Weak<TaskManager>>>,
     writer: parking_lot::Mutex<Option<Arc<tokio::sync::mpsc::UnboundedSender<PersistOp>>>>,
     state: parking_lot::Mutex<OwnerState>,
+    /// 仅测试：暂停 close 的结算前快照，复现「关闸后被迟到入队」窗口。
+    #[cfg(test)]
+    settle_gate: parking_lot::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 #[derive(Default)]
@@ -101,6 +109,8 @@ impl ParkedChildOwner {
             parent: parking_lot::Mutex::new(None),
             writer: parking_lot::Mutex::new(None),
             state: parking_lot::Mutex::new(OwnerState::default()),
+            #[cfg(test)]
+            settle_gate: parking_lot::Mutex::new(None),
         })
     }
 
@@ -167,12 +177,43 @@ impl ParkedChildOwner {
     }
 
     /// 用于状态提交后判断 owner 是否仍有未确认的委托义务。
-    pub fn has_unsettled_obligations(&self) -> bool {
+    pub async fn has_unsettled_obligations(&self) -> bool {
         let unconfirmed = {
             let state = self.state.lock();
             state.failure.is_some() || state.pending_receipt.is_some()
         };
-        unconfirmed || self.manager.has_unsettled_tasks() || self.queue.has_required()
+        unconfirmed
+            || self.manager.has_unsettled_tasks()
+            || self.queue.has_required().await.unwrap_or(true)
+    }
+
+    /// 仅测试：同步适配同一 async 判定。
+    #[cfg(test)]
+    pub fn has_unsettled_obligations_sync(&self) -> bool {
+        futures::executor::block_on(self.has_unsettled_obligations())
+    }
+
+    /// 仅测试：下一次 close 在关闸后、结算读取前暂停；返回（进入通知，放行信号）。
+    #[cfg(test)]
+    pub fn gate_next_close_settlement(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.settle_gate.lock() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    async fn wait_close_settlement_gate(&self) {
+        let gate = self.settle_gate.lock().take();
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
     }
 
     pub fn freeze_receipt(
@@ -273,8 +314,15 @@ impl ParkedChildOwner {
                 "Incomplete: child settlement is unconfirmed ({reason}); resources closed but owner and frozen state retained"
             ));
         }
+        // 关闭结算开始：先拒绝新入队并等已通过闸门的写入提交，随后读取的 MQ
+        // 快照才覆盖关闭前的全部外部输入。结算自身的存储写入直接经资源门面，
+        // 不经过该闸门；闸门只存在于本门面，resume 新建 bind 会重新开放。
+        self.queue.close_admission();
+        self.queue.await_pending_enqueues().await;
+        #[cfg(test)]
+        self.wait_close_settlement_gate().await;
         self.settle_retained_messages().await?;
-        if self.queue.has_required() {
+        if self.queue.has_required().await.unwrap_or(true) {
             return Err("Incomplete: retained child messages remain unprocessed".into());
         }
         if let Some(pool) = &self.pool {
@@ -289,7 +337,7 @@ impl ParkedChildOwner {
 
     async fn settle_retained_messages(&self) -> Result<(), String> {
         let Some(resources) = &self.resources else {
-            if self.queue.has_required() {
+            if self.queue.has_required().await.unwrap_or(true) {
                 return Err(
                     "Incomplete: canonical child history unavailable for retained messages".into(),
                 );
@@ -317,94 +365,68 @@ impl ParkedChildOwner {
                 }
             }
         }
-        loop {
-            let drained = self.queue.drain_all();
-            if drained.is_empty() {
-                break;
-            }
-            if let Err(error) = self.commit_retained(resources, &drained).await {
-                self.queue.push_batch(drained);
-                return Err(error);
-            }
+        // 非模型结算：提醒与 MQ 行由存储一次提交。分开写会留下「提醒已写、待发行还在」
+        // 的半完成状态；汇总使用稳定 delivery ID，失败后下一次 close 可原样重试。
+        let entries = self
+            .queue
+            .query(peri_acp_types::session::MqFilter::default())
+            .await
+            .map_err(|error| format!("Incomplete: child MQ query failed: {error}"))?;
+        if entries.is_empty() {
+            return Ok(());
         }
+        let (reminders, rows) = self.retained_settlement(&entries)?;
+        resources
+            .settle_retained_mq(
+                &peri_acp_types::thread::ThreadId::from(self.child_thread_id.as_str()),
+                &reminders,
+                &rows,
+            )
+            .await
+            .map_err(|error| format!("Incomplete: child MQ settlement failed: {error}"))?;
         Ok(())
     }
 
-    async fn commit_retained(
+    /// 结算计划：哪些提醒要写、哪些 MQ 行要被删除。
+    ///
+    /// 纯计算，不触存储：同一份计划交给存储的原子提交，失败时历史与 MQ 都不变。
+    fn retained_settlement(
         &self,
-        resources: &Arc<dyn SessionResources>,
-        messages: &[peri_acp_types::session::QueuedMessage],
-    ) -> Result<(), String> {
-        use peri_acp_types::session::QueuedPayload;
+        entries: &[peri_acp_types::session::MqEntry],
+    ) -> Result<
+        (
+            Vec<peri_acp_types::session::RetainedReminder>,
+            Vec<peri_acp_types::session::MqEntry>,
+        ),
+        String,
+    > {
+        use peri_acp_types::session::{QueuedPayload, RetainedReminder};
+        let queued: Vec<peri_acp_types::session::QueuedMessage> = entries
+            .iter()
+            .cloned()
+            .map(peri_acp_types::session::QueuedMessage::from_mq_entry)
+            .collect();
+        let mut reminders = Vec::new();
         let mut unprocessed = Vec::new();
-        for message in messages {
+        for message in &queued {
             match (&message.delivery_id, &message.payload) {
                 (Some(delivery_id), QueuedPayload::SystemReminder(reminder)) => {
-                    resources
-                        .append_reminder_if_absent(&self.child_thread_id, *delivery_id, reminder)
-                        .await
-                        .map_err(|error| {
-                            format!("Incomplete: retained terminal settlement failed: {error}")
-                        })?;
+                    reminders.push(RetainedReminder {
+                        id: *delivery_id,
+                        reminder: reminder.clone(),
+                    });
                 }
                 _ => unprocessed.push(message.clone()),
             }
         }
-        if unprocessed.is_empty() {
-            return Ok(());
+        if !unprocessed.is_empty() {
+            let delivery_id = close_settlement_delivery_id(&self.child_thread_id, &unprocessed);
+            reminders.push(RetainedReminder {
+                id: delivery_id,
+                reminder: retained_input_record(&self.child_thread_id, delivery_id, &unprocessed)?,
+            });
         }
-        let delivery_id = close_settlement_delivery_id(&self.child_thread_id, &unprocessed);
-        let facts = unprocessed
-            .iter()
-            .map(|message| {
-                let identity = message
-                    .delivery_id
-                    .map(|id| id.as_uuid().to_string())
-                    .or_else(|| {
-                        message
-                            .message()
-                            .map(|body| body.id().as_uuid().to_string())
-                    })
-                    .unwrap_or_else(|| "reminder-without-id".into());
-                let preview: String = message
-                    .message()
-                    .map(|body| body.content().chars().take(200).collect())
-                    .unwrap_or_default();
-                format!(
-                    "{identity} (kind: {:?}, source: {:?}, model_visible: {}, preview: {preview})",
-                    message.kind, message.source, message.policy.model_visible
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        let reminder = crate::session::producer_reminders::try_trusted_reminder(
-            ReminderCategory::Task,
-            "subagent_task_lifecycle",
-            "child_retained_input_unprocessed",
-            ReminderSeverity::Error,
-            ReminderDelivery::Required,
-            format!(
-                "子会话关闭前保留了 {} 条未处理的输入/提醒。它们没有被模型消费，已记录在此；不启动新推理。明细: {facts}",
-                unprocessed.len()
-            ),
-            Some("关闭时仍有未处理输入".into()),
-            serde_json::json!({
-                "child_thread_id": self.child_thread_id,
-                "delivery_id": delivery_id,
-                "unprocessed": unprocessed.iter().map(|message| serde_json::json!({
-                    "kind": format!("{:?}", message.kind),
-                    "source": format!("{:?}", message.source),
-                    "message_id": message.message().map(|body| body.id()),
-                    "delivery_id": message.delivery_id,
-                })).collect::<Vec<_>>(),
-            }),
-        )
-        .map_err(|error| format!("Incomplete: retained input record rejected: {error}"))?;
-        resources
-            .append_reminder_if_absent(&self.child_thread_id, delivery_id, &reminder)
-            .await
-            .map_err(|error| format!("Incomplete: retained input record failed: {error}"))?;
-        Ok(())
+        Ok((reminders, entries.to_vec()))
     }
 
     pub async fn cancel_task(&self, task_id: &str) -> Result<(), String> {
@@ -413,6 +435,59 @@ impl ParkedChildOwner {
             .await
             .map_err(|error| error.to_string())
     }
+}
+
+fn retained_input_record(
+    child_thread_id: &str,
+    delivery_id: peri_acp_types::messages::MessageId,
+    unprocessed: &[peri_acp_types::session::QueuedMessage],
+) -> Result<peri_acp_types::system_reminder::TrustedSystemReminder, String> {
+    let facts = unprocessed
+        .iter()
+        .map(|message| {
+            let identity = message
+                .delivery_id
+                .map(|id| id.as_uuid().to_string())
+                .or_else(|| {
+                    message
+                        .message()
+                        .map(|body| body.id().as_uuid().to_string())
+                })
+                .unwrap_or_else(|| "reminder-without-id".into());
+            let preview: String = message
+                .message()
+                .map(|body| body.content().chars().take(200).collect())
+                .unwrap_or_default();
+            format!(
+                "{identity} (kind: {:?}, source: {:?}, model_visible: {}, preview: {preview})",
+                message.kind, message.source, message.policy.model_visible
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    crate::session::producer_reminders::try_trusted_reminder(
+        ReminderCategory::Task,
+        "subagent_task_lifecycle",
+        "child_retained_input_unprocessed",
+        ReminderSeverity::Error,
+        ReminderDelivery::Required,
+        format!(
+            "子会话关闭前保留了 {} 条未处理的输入/提醒。它们没有被模型消费，已记录在此；不启动新推理。明细: {facts}",
+            unprocessed.len()
+        ),
+        Some("关闭时仍有未处理输入".into()),
+        serde_json::json!({
+            "child_thread_id": child_thread_id,
+            "delivery_id": delivery_id,
+            "unprocessed": unprocessed.iter().map(|message| serde_json::json!({
+                "kind": format!("{:?}", message.kind),
+                "source": format!("{:?}", message.source),
+                "message_id": message.message().map(|body| body.id()),
+                "delivery_id": message.delivery_id,
+            })).collect::<Vec<_>>(),
+        }),
+    )
+    .map_err(|error| format!("Incomplete: retained input record rejected: {error}"))
 }
 
 fn close_settlement_delivery_id(
