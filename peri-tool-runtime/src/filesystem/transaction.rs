@@ -221,6 +221,13 @@ impl CommitGate {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+impl Default for CommitGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub fn gate_next_commit(path: &Path, gate: Arc<CommitGate>) {
     COMMIT_GATES
         .get_or_init(Default::default)

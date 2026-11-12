@@ -94,8 +94,6 @@ impl std::error::Error for SearchError {}
 /// glob 过滤按「相对 search_path 的路径（/ 分隔）优先，basename 回退」匹配
 /// （P0-3：此前只匹配 basename，`src/**/*.rs` 这类含路径的模式永不命中且无提示）。
 ///
-/// `host_cancel`：宿主取消令牌（dropped RPC / 云端取消）。walker 在检查点直接
-/// 检查它（P2-8），与 `cancelled` 协作标志同语义——无 futures 上下文也能退出。
 pub fn execute_search(
     parsed: &ParsedArgs,
     glob_filters: &[glob::Pattern],
@@ -103,8 +101,7 @@ pub fn execute_search(
     collection_limit: usize,
     head_limit: usize,
     offset: usize,
-    cancelled: Arc<AtomicBool>,
-    host_cancel: tokio_util::sync::CancellationToken,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<String, SearchError> {
     // 构建搜索路径
     let search_path = match &parsed.path {
@@ -179,12 +176,11 @@ pub fn execute_search(
         let total_lines = Arc::clone(&total_lines);
         let total_bytes = Arc::clone(&total_bytes);
         let stopped = Arc::clone(&stopped);
-        let cancelled = Arc::clone(&cancelled);
+        let cancel = cancel.clone();
         let cwd = Arc::clone(&cwd);
         let glob_filters = glob_filters.clone();
         let results = Arc::clone(&results);
         let search_path = search_path.clone();
-        let host_cancel = host_cancel.clone();
 
         Box::new(
             move |entry_result: Result<ignore::DirEntry, ignore::Error>| {
@@ -196,10 +192,7 @@ pub fn execute_search(
                 };
 
                 // 检查点：预算置位（stopped）、超时（cancelled）或宿主取消后协作退出整个遍历
-                if stopped.load(Ordering::Relaxed)
-                    || cancelled.load(Ordering::Relaxed)
-                    || host_cancel.is_cancelled()
-                {
+                if stopped.load(Ordering::Relaxed) || cancel.is_cancelled() {
                     return WalkState::Quit;
                 }
                 if !entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -253,7 +246,7 @@ pub fn execute_search(
                     total_lines: Arc::clone(&total_lines),
                     total_bytes: Arc::clone(&total_bytes),
                     max_limit: collection_limit,
-                    cancelled: Arc::clone(&cancelled),
+                    cancelled: cancel.clone(),
                     stopped: Arc::clone(&stopped),
                     display_path: display_path.clone(),
                     match_count: Cell::new(0),
@@ -315,10 +308,7 @@ pub fn execute_search(
                     stopped.store(true, Ordering::Relaxed);
                 }
 
-                if stopped.load(Ordering::Relaxed)
-                    || cancelled.load(Ordering::Relaxed)
-                    || host_cancel.is_cancelled()
-                {
+                if stopped.load(Ordering::Relaxed) || cancel.is_cancelled() {
                     WalkState::Quit
                 } else {
                     WalkState::Continue
@@ -664,15 +654,11 @@ impl BaseTool for GrepTool {
         let cwd = self.cwd.clone();
         // 协作取消标志：超时置位后，spawn_blocking 内的 walker 在检查点尽快退出
         // （与 glob.rs 超时分支对齐；spawn_blocking 无法强制 kill）
-        let cancelled = Arc::new(AtomicBool::new(false));
-        // 宿主取消（dropped RPC / 云端取消）与超时共用同一个协作退出路径；
-        // Drop 兜底覆盖「invoke future 被提前丢弃」的情况（P2-8）。
-        let cancel_on_drop = SearchCancellation(Arc::clone(&cancelled));
-        let host_cancel = ctx.cancellation.clone();
+        let cancel = ctx.cancellation.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
         let result = timeout(
             SEARCH_TIMEOUT,
             tokio::task::spawn_blocking({
-                let cancelled = Arc::clone(&cancelled);
                 move || {
                     execute_search(
                         &parsed,
@@ -681,37 +667,26 @@ impl BaseTool for GrepTool {
                         collection_limit,
                         head_limit,
                         offset,
-                        cancelled,
-                        host_cancel,
+                        cancel,
                     )
                 }
             }),
         )
         .await;
-        drop(cancel_on_drop);
 
+        if ctx.cancellation.is_cancelled() {
+            return Err("Grep search cancelled".into());
+        }
         match result {
-            Err(_) => {
-                cancelled.store(true, Ordering::Relaxed);
-                Err(format!(
-                    "Error: Search timed out after {} seconds. Please use a more specific pattern.",
-                    SEARCH_TIMEOUT.as_secs()
-                )
-                .into())
-            }
+            Err(_) => Err(format!(
+                "Error: Search timed out after {} seconds. Please use a more specific pattern.",
+                SEARCH_TIMEOUT.as_secs()
+            )
+            .into()),
             Ok(Err(e)) => Err(format!("Error: {e}").into()),
             Ok(Ok(Err(e))) => Err(format!("Error: {e}").into()),
             Ok(Ok(Ok(output))) => Ok(output),
         }
-    }
-}
-
-/// invoke future 被提前丢弃（如 RPC 断连）时置位协作取消标志，
-/// 阻塞搜索在下一个检查点退出。
-pub(crate) struct SearchCancellation(pub Arc<AtomicBool>);
-impl Drop for SearchCancellation {
-    fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

@@ -31,7 +31,7 @@ impl Store {
         let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
-        if !matches!(version, 0 | 1 | 2) {
+        if !(0..=2).contains(&version) {
             return Err(Error::Invalid(
                 "unsupported executor database version".into(),
             ));

@@ -1,6 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::SystemTime;
 
 use peri_acp_types::tools::BaseTool;
@@ -155,7 +153,7 @@ pub fn narrow_root(base: &Path, plan: &WalkPlan) -> Option<(PathBuf, usize)> {
 
 /// 收集匹配文件（同步，在 spawn_blocking 中运行；单一事实源，两侧封装共用）。
 ///
-/// 返回是否因超过 MAX_RESULTS 提前停止。`cancelled` 置位或宿主取消令牌触发后
+/// 返回是否因超过 MAX_RESULTS 提前停止。取消令牌触发后
 /// 最多再处理 256 个条目即退出——spawn_blocking 无法强制中止，协作停止是超时
 /// 与取消后的兜底保护（P2-8）。
 pub(crate) fn collect_files(
@@ -164,8 +162,7 @@ pub(crate) fn collect_files(
     consumed: usize,
     patterns: &[glob::Pattern],
     plan: &WalkPlan,
-    cancelled: &AtomicBool,
-    host_cancel: &tokio_util::sync::CancellationToken,
+    cancel: &tokio_util::sync::CancellationToken,
     results: &mut Vec<(Option<SystemTime>, String)>,
 ) -> bool {
     let walker = walkdir::WalkDir::new(walk_root)
@@ -200,9 +197,7 @@ pub(crate) fn collect_files(
 
     let mut early_stopped = false;
     for (entries_seen, entry) in walker.enumerate() {
-        if entries_seen.is_multiple_of(256)
-            && (cancelled.load(Ordering::Relaxed) || host_cancel.is_cancelled())
-        {
+        if entries_seen.is_multiple_of(256) && cancel.is_cancelled() {
             break;
         }
         match entry {
@@ -236,8 +231,7 @@ pub fn run_glob(
     base: &Path,
     patterns: &[glob::Pattern],
     plan: &WalkPlan,
-    cancelled: &AtomicBool,
-    host_cancel: &tokio_util::sync::CancellationToken,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> String {
     let mut results: Vec<(Option<SystemTime>, String)> = Vec::new();
     // root 收窄：静态字面前缀目录链存在时直接从 base+前缀起步（如 `src/**/*.rs`
@@ -249,8 +243,7 @@ pub fn run_glob(
         consumed,
         patterns,
         plan,
-        cancelled,
-        host_cancel,
+        cancel,
         &mut results,
     );
 
@@ -395,25 +388,20 @@ impl BaseTool for GlobFilesTool {
         }
 
         let plan = plan_walk(pattern);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        // 宿主取消（dropped RPC / 云端取消，P2-8）与超时共用同一个协作退出路径；
-        // Drop 兜底覆盖「invoke future 被提前丢弃」的情况。
-        let cancel_on_drop = super::grep::SearchCancellation(Arc::clone(&cancelled));
-        let host_cancel = ctx.cancellation.clone();
+        let cancel = ctx.cancellation.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
 
         // 扫描是同步阻塞链（遍历 + 排序 + 落盘），必须移入 blocking pool，不能占用
-        // async runtime worker。超时后置位 cancelled，线程在下一个检查点协作退出
+        // async runtime worker。取消后，线程在下一个检查点协作退出
         // （spawn_blocking 无法强制 kill，协作停止是真实保护）。
         let scan = tokio::task::spawn_blocking({
-            let cancelled = Arc::clone(&cancelled);
-            move || run_glob(&search_root, &compiled, &plan, &cancelled, &host_cancel)
+            move || run_glob(&search_root, &compiled, &plan, &cancel)
         });
 
         let body = match timeout(SCAN_TIMEOUT, scan).await {
             Err(_) => {
                 // 注意：超时与协作取消路径无法在确定性测试中覆盖（SCAN_TIMEOUT 为 15s，
                 // 测试中不可触发），该路径仅由代码审查保障，未经自动化验证。
-                cancelled.store(true, Ordering::Relaxed);
                 return Err(
                     "Error: Search timed out after 15 seconds. Please use a more specific pattern."
                         .into(),
@@ -422,8 +410,10 @@ impl BaseTool for GlobFilesTool {
             Ok(Err(e)) => return Err(format!("Error: {e}").into()),
             Ok(Ok(body)) => body,
         };
-        drop(cancel_on_drop);
 
+        if ctx.cancellation.is_cancelled() {
+            return Err("Glob scan cancelled".into());
+        }
         if let Some(warn) = pattern_warn {
             Ok(format!("Note: {warn}\n\n{body}"))
         } else {

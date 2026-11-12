@@ -7,8 +7,6 @@
 
 use peri_mcp_common::failure::ToolFailure;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use peri_agent::tools::BaseTool;
 use peri_time::timeout;
@@ -126,23 +124,20 @@ impl BaseTool for GlobFilesTool {
         }
 
         let plan = plan_walk(pattern);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let _cancel_on_drop = super::SearchCancellation(Arc::clone(&cancelled));
-        let host_cancel = ctx.cancellation.clone();
+        let cancel = ctx.cancellation.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
 
         // 扫描是同步阻塞链（遍历 + 排序 + 落盘），必须移入 blocking pool，不能占用
-        // async runtime worker。超时后置位 cancelled，线程在下一个检查点协作退出
+        // async runtime worker。取消后，线程在下一个检查点协作退出
         // （spawn_blocking 无法强制 kill，协作停止是真实保护）。
         let scan = tokio::task::spawn_blocking({
-            let cancelled = Arc::clone(&cancelled);
-            move || run_glob(&search_root, &compiled, &plan, &cancelled, &host_cancel)
+            move || run_glob(&search_root, &compiled, &plan, &cancel)
         });
 
         let body = match timeout(SCAN_TIMEOUT, scan).await {
             Err(_) => {
                 // 注意：超时与协作取消路径无法在确定性测试中覆盖（SCAN_TIMEOUT 为 15s，
                 // 测试中不可触发），该路径仅由代码审查保障，未经自动化验证。
-                cancelled.store(true, Ordering::Relaxed);
                 return Err(ToolFailure::new(
                     "Search timed out. Please use a more specific pattern.",
                     "Error: Search timed out after 15 seconds. Please use a more specific pattern.",
@@ -153,6 +148,9 @@ impl BaseTool for GlobFilesTool {
             Ok(Ok(body)) => body,
         };
 
+        if ctx.cancellation.is_cancelled() {
+            return Err("Glob scan cancelled".into());
+        }
         if let Some(warn) = pattern_warn {
             Ok(format!("Note: {warn}\n\n{body}"))
         } else {

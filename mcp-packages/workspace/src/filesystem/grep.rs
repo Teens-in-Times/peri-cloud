@@ -4,9 +4,6 @@
 //! 本文件只做参数解析、glob 编译校验、错误文案映射（ToolFailure + path 提示）。
 
 #[allow(unused_imports)]
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-#[allow(unused_imports)]
 use std::time::Duration;
 
 use peri_agent::tools::BaseTool;
@@ -297,13 +294,11 @@ impl BaseTool for GrepTool {
         let cwd = self.cwd.clone();
         // 协作取消标志：超时置位后，spawn_blocking 内的 walker 在检查点尽快退出
         // （与 glob.rs 超时分支对齐；spawn_blocking 无法强制 kill）
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let _cancel_on_drop = super::SearchCancellation(Arc::clone(&cancelled));
-        let host_cancel = ctx.cancellation.clone();
+        let cancel = ctx.cancellation.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
         let result = peri_time::timeout(
             SEARCH_TIMEOUT,
             tokio::task::spawn_blocking({
-                let cancelled = Arc::clone(&cancelled);
                 move || {
                     execute_search(
                         &parsed,
@@ -312,17 +307,18 @@ impl BaseTool for GrepTool {
                         collection_limit,
                         head_limit,
                         offset,
-                        cancelled,
-                        host_cancel,
+                        cancel,
                     )
                 }
             }),
         )
         .await;
 
+        if ctx.cancellation.is_cancelled() {
+            return Err("Grep search cancelled".into());
+        }
         match result {
             Err(_) => {
-                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
                 Err(ToolFailure::new(
                     "Search timed out. Please use a more specific pattern.",
                     format!(

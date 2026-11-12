@@ -37,7 +37,10 @@ struct Uncertain {
 /// 要么进入等待阶段——等待在 admission 锁外进行。
 enum SubmitStage {
     Done(Result<ToolOutput>),
-    Await { job: JobSnapshot, wait: Duration },
+    Await {
+        job: Box<JobSnapshot>,
+        wait: Duration,
+    },
 }
 
 impl RemoteSession {
@@ -326,7 +329,7 @@ impl RemoteSession {
         let result = match stage {
             SubmitStage::Done(output) => output,
             SubmitStage::Await { job, wait } => {
-                self.wait_for_job(id, job, wait, ctx.cancellation).await
+                self.wait_for_job(id, *job, wait, ctx.cancellation).await
             }
         };
         if let Ok(output) = &result {
@@ -444,7 +447,10 @@ impl RemoteSession {
         if background && !ctx.cancellation.is_cancelled() {
             return SubmitStage::Done(Ok(snapshot_output(job)));
         }
-        SubmitStage::Await { job, wait }
+        SubmitStage::Await {
+            job: Box::new(job),
+            wait,
+        }
     }
 
     async fn wait_for_job(
