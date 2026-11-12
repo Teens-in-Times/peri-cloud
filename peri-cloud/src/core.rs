@@ -807,6 +807,7 @@ impl CloudAgent {
         let context = builder.build();
         if let Some(delivery_id) = turn_input::enqueue(
             &context.session.queue,
+            &transcript,
             request.prompt,
             request.turn_id,
             task_event,
