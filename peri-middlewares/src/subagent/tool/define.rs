@@ -423,6 +423,7 @@ impl BaseTool for SubAgentTool {
                 exit_code: None,
                 output_ref: None,
                 output_truncated: false,
+                encoding_loss: false,
                 task_id: spawned.task_id.clone(),
             },
         ))

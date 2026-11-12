@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::audit::AuditLog;
 use crate::config::DeviceConfig;
 use crate::native::{is_shell, NativeTools};
 use crate::shell::{failure_outcome, Outcome};
@@ -25,6 +26,9 @@ pub struct Executor {
     config: DeviceConfig,
     root: PathBuf,
     store: Store,
+    audit: AuditLog,
+    retention: AsyncMutex<Option<JoinHandle<()>>>,
+    retention_stop: CancellationToken,
     admission: AsyncMutex<()>,
     shutdown_gate: AsyncMutex<()>,
     settlement_gate: AsyncMutex<()>,
@@ -32,6 +36,16 @@ pub struct Executor {
     sessions: Mutex<HashMap<Uuid, Arc<NativeTools>>>,
     workers: Mutex<HashMap<Uuid, Worker>>,
     slots: Arc<Semaphore>,
+}
+
+async fn cleanup_tool_outputs() {
+    if let Ok(removed) =
+        tokio::task::spawn_blocking(peri_tool_runtime::output::cleanup_persisted_outputs).await
+    {
+        if removed > 0 {
+            tracing::info!(removed, "cleaned stale persisted tool outputs");
+        }
+    }
 }
 
 impl Executor {
@@ -42,10 +56,38 @@ impl Executor {
         let config =
             tokio::task::spawn_blocking(move || DeviceConfig::open(&config_root, &name)).await??;
         let store = Store::open(&root).await?;
+        if let Err(error) = store.enforce_retention(&root).await {
+            tracing::warn!(%error, "startup executor retention failed");
+        }
+        cleanup_tool_outputs().await;
+        let retention_store = store.clone();
+        let retention_root = root.clone();
+        let retention_stop = CancellationToken::new();
+        let cancelled = retention_stop.clone();
+        let retention = tokio::spawn(async move {
+            let period = std::time::Duration::from_secs(3600);
+            let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancelled.cancelled() => break,
+                    _ = ticker.tick() => {
+                        if let Err(error) = retention_store.enforce_retention(&retention_root).await {
+                            tracing::warn!(%error, "scheduled executor retention failed");
+                        }
+                        cleanup_tool_outputs().await;
+                    }
+                }
+            }
+        });
         Ok(Self {
             config,
-            root,
+            root: root.clone(),
             store,
+            audit: AuditLog::open(&root),
+            retention: AsyncMutex::new(Some(retention)),
+            retention_stop,
             admission: AsyncMutex::new(()),
             shutdown_gate: AsyncMutex::new(()),
             settlement_gate: AsyncMutex::new(()),
@@ -91,7 +133,7 @@ impl Executor {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .entry(id)
-            .or_insert_with(|| Arc::new(NativeTools::new(session.clone())));
+            .or_insert_with(|| Arc::new(NativeTools::new(session.clone(), &self.root)));
         Ok(session)
     }
 
@@ -111,7 +153,7 @@ impl Executor {
         }
         let tools = self.session_tools(request.session_id).await?;
         crate::workspace::verify(&tools.binding).await?;
-        tools.validate(&request)?;
+        tools.validate(&request, &self.store).await?;
         let (created, job) = self.store.create_job(&request).await?;
         if !created {
             return Ok(JobReceipt { created, job });
@@ -122,9 +164,25 @@ impl Executor {
         let root = self.root.clone();
         let slots = self.slots.clone();
         let lease = self.config.execution_lease();
+        let audit = self.audit.clone();
         let id = request.invocation_id;
         let handle = tokio::spawn(async move {
             let _lease = lease;
+            let started = std::time::Instant::now();
+            // 设备侧审计（P1-5）：只记身份与结论，不含参数正文与输出。
+            let audit_event_session = request.session_id;
+            let audit_event_tool = request.tool.clone();
+            audit
+                .record(&crate::audit::AuditEvent {
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    kind: "admitted",
+                    session_id: audit_event_session,
+                    invocation_id: id,
+                    tool: &audit_event_tool,
+                    status: None,
+                    duration_ms: None,
+                })
+                .await;
             let slot = tokio::select! {
                 biased;
                 _ = worker_cancel.cancelled() => None,
@@ -151,7 +209,8 @@ impl Executor {
                     Ok(_) => run_native(&request, tools, &root, &store, worker_cancel).await,
                 }
             };
-            if let Err(error) = store
+            let settled_status = outcome.status;
+            let settled = store
                 .update(id, |job| {
                     job.status = outcome.status;
                     job.output = outcome.output;
@@ -160,10 +219,22 @@ impl Executor {
                         job.finished_at = Some(Utc::now().to_rfc3339());
                     }
                 })
-                .await
-            {
+                .await;
+            if let Err(error) = settled {
                 tracing::error!(invocation_id = %id, %error, "could not persist invocation result");
+                return;
             }
+            audit
+                .record(&crate::audit::AuditEvent {
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    kind: "settled",
+                    session_id: audit_event_session,
+                    invocation_id: id,
+                    tool: &audit_event_tool,
+                    status: Some(status_key_plain(settled_status)),
+                    duration_ms: Some(started.elapsed().as_millis() as u64),
+                })
+                .await;
         });
         self.workers
             .lock()
@@ -293,6 +364,12 @@ impl Executor {
         if let Some(error) = persistence_error {
             return Err(error);
         }
+        self.retention_stop.cancel();
+        let mut retention = self.retention.lock().await;
+        if let Some(task) = retention.as_mut() {
+            let _ = task.await;
+            *retention = None;
+        }
         self.store.close().await;
         Ok(())
     }
@@ -319,7 +396,7 @@ impl Executor {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         Ok(sessions
             .entry(id)
-            .or_insert_with(|| Arc::new(NativeTools::new(binding)))
+            .or_insert_with(|| Arc::new(NativeTools::new(binding, &self.root)))
             .clone())
     }
 
@@ -363,6 +440,7 @@ impl Executor {
 
 impl Drop for Executor {
     fn drop(&mut self) {
+        self.retention_stop.cancel();
         self.closed.store(true, Ordering::Release);
         let workers = self.workers.get_mut().unwrap_or_else(|e| e.into_inner());
         for worker in workers.values() {
@@ -387,7 +465,10 @@ async fn run_native(
             Err(_) => failure_outcome(JobStatus::RecoveryRequired, "shell_result_unconfirmed", "Shell execution failed without confirmed final evidence. Inspect the process and logs before recovery."),
         }
     } else {
-        match tools.invoke_file(request.clone(), cancellation).await {
+        match tools
+            .invoke_file(request.clone(), store, cancellation)
+            .await
+        {
             Ok(output) => Outcome {
                 status: JobStatus::Completed,
                 output: Some(output),
@@ -395,5 +476,17 @@ async fn run_native(
             },
             Err(message) => failure_outcome(JobStatus::Failed, "native_tool_failed", &message),
         }
+    }
+}
+
+fn status_key_plain(status: JobStatus) -> &'static str {
+    match status {
+        JobStatus::Queued => "Queued",
+        JobStatus::Running => "Running",
+        JobStatus::Completed => "Completed",
+        JobStatus::Failed => "Failed",
+        JobStatus::Cancelled => "Cancelled",
+        JobStatus::TimedOut => "TimedOut",
+        JobStatus::RecoveryRequired => "RecoveryRequired",
     }
 }

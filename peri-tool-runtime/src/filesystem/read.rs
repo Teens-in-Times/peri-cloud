@@ -3,6 +3,7 @@ use serde_json::Value;
 
 use super::folder::list_folder;
 use super::resolve_path;
+use crate::budget::READ_OUTPUT_BYTES;
 use crate::output::truncate_bytes;
 
 /// Read tool - 与 TypeScript read_tool 对齐
@@ -16,23 +17,112 @@ impl ReadFileTool {
     }
 }
 
-const MAX_LINES: usize = 2000;
+pub const MAX_LINES: usize = 2000;
 /// 最大允许读取的文件大小（32 MB）
-const MAX_FILE_SIZE: u64 = 32 * 1024 * 1024;
+pub const MAX_FILE_SIZE: u64 = 32 * 1024 * 1024;
 /// 单行最大字符数（超过则截断）
-const MAX_CHARS_PER_LINE: usize = 65536;
+pub const MAX_CHARS_PER_LINE: usize = 65536;
 /// 输出最大字节数（超过后按行截断并提示分段读取；Read 不落盘——落盘文件会被
 /// 模型二次 Read 再编号，产生两重行号，且丢失 offset 语义）
-const MAX_OUTPUT_BYTES: usize = 5_000;
+pub const MAX_OUTPUT_BYTES: usize = READ_OUTPUT_BYTES;
 
 const READ_FILE_DESCRIPTION: &str = include_str!("descriptions/read.md");
+
+/// offset 越界错误（核心层结构化，两侧封装各自映射文案）。
+#[derive(Debug)]
+pub struct OffsetBeyondEnd {
+    pub offset: usize,
+    pub total_lines: usize,
+}
+
+/// 行号化 + 行内截断 + 输出预算渲染核心（单一事实源，两侧封装共用）。
+///
+/// `offset` 是 1-based 行号；返回渲染后的带行号文本（含分段续读提示）。
+pub fn render_lines(content: &str, offset: usize, limit: usize) -> Result<String, OffsetBeyondEnd> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    // 1-based 行号 → 0-based 切片索引
+    let start = offset - 1;
+    if start >= lines.len() {
+        return Err(OffsetBeyondEnd {
+            offset,
+            total_lines: lines.len(),
+        });
+    }
+    let end = start.saturating_add(limit).min(lines.len());
+    let selected = &lines[start..end];
+
+    let mut numbered: Vec<String> = Vec::new();
+    for (i, line) in selected.iter().enumerate() {
+        let line_num = start + i + 1;
+        // 将截断元数据放在内容前，确保后续输出级截断不会隐藏该信息。
+        let line_char_count = line.chars().count();
+        let content = if line_char_count > MAX_CHARS_PER_LINE {
+            format!(
+                "[LINE TRUNCATED: {line_char_count} characters total; retained first {MAX_CHARS_PER_LINE} characters before output-level truncation] {}",
+                line.chars().take(MAX_CHARS_PER_LINE).collect::<String>()
+            )
+        } else {
+            (*line).to_string()
+        };
+        numbered.push(format!("{:>6}\t{}", line_num, content));
+    }
+
+    let mut output = numbered.join("\n");
+
+    // 总输出超过上限时按行截断并提示分段读取，不落盘：
+    // 落盘文件会被模型二次 Read 再编号（两重行号），且失去 offset 语义。
+    if output.len() > MAX_OUTPUT_BYTES {
+        let original_output_bytes = output.len();
+        let total_lines = lines.len();
+
+        // 在字节预算内保留尽可能多的完整行（`{:>6}\t` 前缀 + 内容）。
+        let mut budget = MAX_OUTPUT_BYTES;
+        let mut kept_lines = 0usize;
+        for l in &numbered {
+            if l.len() + 1 > budget {
+                break;
+            }
+            budget -= l.len() + 1;
+            kept_lines += 1;
+        }
+
+        if kept_lines == 0 {
+            // 当前行自身就超过上限（issue #287）：offset/limit 是行号语义，
+            // 无法表达行内续读。不能沿用 start + 2：单行文件会越界，多行
+            // 文件会静默跳过该行剩余内容。
+            let line_no = start + 1;
+            let truncated_line = truncate_bytes(&numbered[0], MAX_OUTPUT_BYTES);
+            let continuation = if line_no < total_lines {
+                format!(
+                    "continue with offset={} for the following lines",
+                    line_no + 1
+                )
+            } else {
+                "use a byte-oriented tool such as Bash to inspect the remainder".to_string()
+            };
+            output = format!(
+                "{truncated_line}\n[Output truncated: {original_output_bytes} bytes total; line {line_no} alone exceeds the {MAX_OUTPUT_BYTES}-byte output limit, so the rest of this line cannot be read with line-based offset/limit; {continuation}]"
+            );
+        } else {
+            let shown_start = start + 1;
+            let shown_end = start + kept_lines;
+            let next_offset = shown_end + 1;
+            output = format!(
+                "{}\n[Output truncated: {original_output_bytes} bytes total; showing lines {shown_start}..={shown_end} of {total_lines}; continue reading with offset={next_offset}]",
+                numbered[..kept_lines].join("\n")
+            );
+        }
+    }
+
+    Ok(output)
+}
 
 /// 解析 1-based 行号/行数参数（offset/limit）。
 ///
 /// 语义与 schema 描述一致：offset 是 1-based 行号（1 = 首行），limit 是行数。
 /// 缺省时返回 `default`；显式传入非正整数（0、负数、小数、非数字）一律报错，
 /// 避免 `as_u64()` 对浮点静默回退为默认值、导致读到错误位置。
-fn parse_line_number(
+pub(crate) fn parse_line_number(
     value: &Value,
     name: &str,
     default: usize,
@@ -52,7 +142,7 @@ fn parse_line_number(
     Ok(n as usize)
 }
 
-fn is_binary_extension(ext: &str) -> bool {
+pub fn is_binary_extension(ext: &str) -> bool {
     matches!(
         ext,
         "png"
@@ -158,8 +248,12 @@ impl BaseTool for ReadFileTool {
     async fn invoke(
         &self,
         input: Value,
-        _ctx: peri_acp_types::tools::ToolContext<'_>,
+        ctx: peri_acp_types::tools::ToolContext<'_>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // 宿主取消（P2-8）：受理前已取消的调用直接拒绝，不再读文件。
+        if ctx.cancellation.is_cancelled() {
+            return Err("Error: invocation was cancelled before the file was read.".into());
+        }
         let file_path = input["file_path"]
             .as_str()
             .ok_or("The 'file_path' parameter is required for the Read tool. Provide the absolute path to the file.")?;
@@ -206,7 +300,7 @@ impl BaseTool for ReadFileTool {
             }
             Err(e) => return Err(e.into()),
             Ok(meta) if meta.is_dir() => {
-                return list_folder(&resolved).map(|listing| {
+                return list_folder(&resolved, &ctx.cancellation).map(|listing| {
                     format!(
                         "[DIRECTORY DETECTED]\n\nRead received a directory path and converted it to a directory listing. Use folder_operations with operation=\"list\" for explicit directory operations.\n\n{}",
                         listing
@@ -228,84 +322,19 @@ impl BaseTool for ReadFileTool {
             },
         };
 
-        let lines: Vec<&str> = content.split('\n').collect();
-        // 1-based 行号 → 0-based 切片索引
-        let start = offset - 1;
-        if start >= lines.len() {
-            return Err(format!(
-                "Error: offset {offset} exceeds file length ({} lines). Valid offsets are 1..={}; omit offset to read from the beginning. Do not guess another offset or use offset to probe the file end.",
-                lines.len(),
-                lines.len()
+        // 大文件读取后再查一次取消（P2-8）：云端已取消的调用不做渲染。
+        if ctx.cancellation.is_cancelled() {
+            return Err("Error: invocation was cancelled before the file was rendered.".into());
+        }
+
+        match render_lines(&content, offset, limit) {
+            Ok(output) => Ok(output),
+            Err(e) => Err(format!(
+                "Error: offset {} exceeds file length ({} lines). Valid offsets are 1..={}; omit offset to read from the beginning. Do not guess another offset or use offset to probe the file end.",
+                e.offset, e.total_lines, e.total_lines
             )
-            .into());
+            .into()),
         }
-        let end = (start + limit).min(lines.len());
-        let selected = &lines[start..end];
-
-        let mut numbered: Vec<String> = Vec::new();
-        for (i, line) in selected.iter().enumerate() {
-            let line_num = start + i + 1;
-            // 将截断元数据放在内容前，确保后续输出级截断不会隐藏该信息。
-            let line_char_count = line.chars().count();
-            let content = if line_char_count > MAX_CHARS_PER_LINE {
-                format!(
-                    "[LINE TRUNCATED: {line_char_count} characters total; retained first {MAX_CHARS_PER_LINE} characters before output-level truncation] {}",
-                    line.chars().take(MAX_CHARS_PER_LINE).collect::<String>()
-                )
-            } else {
-                (*line).to_string()
-            };
-            numbered.push(format!("{:>6}\t{}", line_num, content));
-        }
-
-        let mut output = numbered.join("\n");
-
-        // 总输出超过上限时按行截断并提示分段读取，不落盘：
-        // 落盘文件会被模型二次 Read 再编号（两重行号），且失去 offset 语义。
-        if output.len() > MAX_OUTPUT_BYTES {
-            let original_output_bytes = output.len();
-            let total_lines = lines.len();
-
-            // 在字节预算内保留尽可能多的完整行（`{:>6}\t` 前缀 + 内容）。
-            let mut budget = MAX_OUTPUT_BYTES;
-            let mut kept_lines = 0usize;
-            for l in &numbered {
-                if l.len() + 1 > budget {
-                    break;
-                }
-                budget -= l.len() + 1;
-                kept_lines += 1;
-            }
-
-            if kept_lines == 0 {
-                // 当前行自身就超过上限（issue #287）：offset/limit 是行号语义，
-                // 无法表达行内续读。不能沿用 start + 2：单行文件会越界，多行
-                // 文件会静默跳过该行剩余内容。
-                let line_no = start + 1;
-                let truncated_line = truncate_bytes(&numbered[0], MAX_OUTPUT_BYTES);
-                let continuation = if line_no < total_lines {
-                    format!(
-                        "continue with offset={} for the following lines",
-                        line_no + 1
-                    )
-                } else {
-                    "use a byte-oriented tool such as Bash to inspect the remainder".to_string()
-                };
-                output = format!(
-                    "{truncated_line}\n[Output truncated: {original_output_bytes} bytes total; line {line_no} alone exceeds the {MAX_OUTPUT_BYTES}-byte output limit, so the rest of this line cannot be read with line-based offset/limit; {continuation}]"
-                );
-            } else {
-                let shown_start = start + 1;
-                let shown_end = start + kept_lines;
-                let next_offset = shown_end + 1;
-                output = format!(
-                    "{}\n[Output truncated: {original_output_bytes} bytes total; showing lines {shown_start}..={shown_end} of {total_lines}; continue reading with offset={next_offset}]",
-                    numbered[..kept_lines].join("\n")
-                );
-            }
-        }
-
-        Ok(output)
     }
 
     fn prefers_persist(&self) -> bool {

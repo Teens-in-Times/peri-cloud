@@ -20,6 +20,89 @@ struct Harness {
 }
 
 #[tokio::test]
+async fn executor_http_checks_host_and_exact_origin_before_admission() {
+    let h = Harness::new().await;
+    let url = format!("{}/v1/info", h.base);
+    for (name, value) in [
+        ("Host", "untrusted.example"),
+        ("Origin", "http://untrusted.example"),
+        ("Origin", "http://127.0.0.1:1"),
+        ("Origin", "null"),
+    ] {
+        let response = h
+            .client
+            .get(&url)
+            .bearer_auth(&h.token)
+            .header(name, value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403, "{name} {value}");
+    }
+    assert_eq!(
+        h.client
+            .get(&url)
+            .bearer_auth(&h.token)
+            .header("Origin", &h.base)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        h.client
+            .get(&url)
+            .header("Origin", &h.base)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn native_read_allows_only_the_original_session_to_read_its_shell_log() {
+    let h = Harness::new().await;
+    let shell = h.request("Bash", serde_json::json!({"command":"echo owned-log"}));
+    h.submit(&shell).await;
+    let job = h.finished(shell.invocation_id).await;
+    assert_eq!(job.status, JobStatus::Completed);
+    let path = job.stdout_path.unwrap();
+    let read = h.request("Read", serde_json::json!({"file_path":path}));
+    h.submit(&read).await;
+    let result = h.finished(read.invocation_id).await;
+    assert!(result.output.unwrap().text.contains("owned-log"));
+
+    let session = Uuid::new_v4();
+    h.executor
+        .bind_session(
+            session,
+            OpenSession {
+                workspace: h.workspace.path().to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut cross = h.request("Read", read.input);
+    cross.session_id = session;
+    assert_eq!(
+        h.client
+            .post(format!("{}/v1/jobs", h.base))
+            .bearer_auth(&h.token)
+            .json(&cross)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    h.close().await;
+}
+
+#[tokio::test]
 async fn environment_is_authenticated_binding_scoped_and_does_not_launch_jobs() {
     let h = Harness::new().await;
     let capabilities_url = format!("{}/v1/capabilities", h.base);
@@ -112,7 +195,8 @@ impl Harness {
         let token = std::fs::read_to_string(state.path().join("transport-token")).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let app = web::router(executor.clone());
+        let app = web::router(executor.clone(), listener.local_addr().unwrap())
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
         let stop = CancellationToken::new();
         let signal = stop.clone();
         let server = tokio::spawn(async move {
@@ -457,14 +541,17 @@ async fn stopping_the_http_transport_does_not_cancel_admitted_shell_work() {
     h.server.await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     h.base = format!("http://{}", listener.local_addr().unwrap());
-    let app = web::router(h.executor.clone());
+    let app = web::router(h.executor.clone(), listener.local_addr().unwrap());
     h.stop = CancellationToken::new();
     let stop = h.stop.clone();
     h.server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(stop.cancelled_owned())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(stop.cancelled_owned())
+        .await
+        .unwrap();
     });
     let job = h.finished(request.invocation_id).await;
     assert_eq!(job.status, JobStatus::Completed, "{job:?}");

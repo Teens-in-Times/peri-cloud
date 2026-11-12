@@ -3,6 +3,7 @@ use std::path::Path;
 use chrono::{TimeZone, Utc};
 use peri_acp_types::tools::BaseTool;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::resolve_path;
@@ -21,17 +22,39 @@ impl FolderOperationsTool {
 }
 
 /// 列表操作最多返回的条目数，防止撑爆 LLM context window
-const MAX_LIST_ENTRIES: usize = 500;
+pub const MAX_LIST_ENTRIES: usize = 500;
+
+fn check_scan_cancelled(cancel: &CancellationToken) -> std::io::Result<()> {
+    if cancel.is_cancelled() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "Folder scan cancelled",
+        ));
+    }
+    Ok(())
+}
 
 const FOLDER_OPERATIONS_DESCRIPTION: &str = include_str!("descriptions/folder.md");
 
-pub fn list_folder(resolved: &Path) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let entries = std::fs::read_dir(resolved)?;
+/// 目录列表核心（单一事实源，两侧封装共用）。
+pub fn list_folder(
+    resolved: &Path,
+    cancel: &CancellationToken,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    check_scan_cancelled(cancel)?;
+    // A complete enumeration is required before reporting a total count.
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(resolved)? {
+        check_scan_cancelled(cancel)?;
+        entries.push(entry?);
+    }
+    entries.sort_by_key(|entry| entry.file_name());
 
     let mut folders: Vec<String> = Vec::new();
     let mut files: Vec<String> = Vec::new();
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        check_scan_cancelled(cancel)?;
         let metadata = entry.metadata()?;
         let name = entry.file_name().to_string_lossy().to_string();
         let size = metadata.len();
@@ -76,9 +99,9 @@ pub fn list_folder(resolved: &Path) -> Result<String, Box<dyn std::error::Error 
         let full_text = format!("{}\n{}", full_list, total_summary);
         persist_hint = persist_truncated_output(&full_text);
 
-        // 公平分配截断
+        // 两组均有机会展示；较少的一组用不完配额时交给另一组。
         let half = MAX_LIST_ENTRIES / 2;
-        folders.truncate(half.min(folders.len()));
+        folders.truncate(half.max(MAX_LIST_ENTRIES.saturating_sub(files.len())));
         files.truncate((MAX_LIST_ENTRIES - folders.len()).min(files.len()));
     }
 
@@ -103,8 +126,10 @@ pub fn list_folder(resolved: &Path) -> Result<String, Box<dyn std::error::Error 
 
     if truncated {
         result.push_str(&format!(
-            "\n[Output truncated: {} total entries, showing first {}]{}",
-            total, MAX_LIST_ENTRIES, persist_hint
+            "\n[Output truncated: {} total entries, showing {}]{}",
+            total,
+            folders.len() + files.len(),
+            persist_hint
         ));
     }
 
@@ -118,9 +143,10 @@ pub fn list_folder(resolved: &Path) -> Result<String, Box<dyn std::error::Error 
 
 /// 递归扫描目录树，使用 unicode tree formatting 输出。
 /// `max_depth`: 1 = 仅根目录直接子项, 2 = 含一级子目录内容, ...
-fn deep_scan_folder(
+pub fn deep_scan_folder(
     resolved: &Path,
     max_depth: usize,
+    cancel: &CancellationToken,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let walker = walkdir::WalkDir::new(resolved)
         .max_depth(max_depth)
@@ -139,6 +165,7 @@ fn deep_scan_folder(
         path: std::path::PathBuf,
         name: String,
         is_dir: bool,
+        is_symlink: bool,
         depth: usize,
         size: u64,
         modified: String,
@@ -146,11 +173,15 @@ fn deep_scan_folder(
     }
 
     let mut entries: Vec<Entry> = Vec::new();
+    let mut complete = true;
 
+    check_scan_cancelled(cancel)?;
     for item in walker {
+        check_scan_cancelled(cancel)?;
         let item = match item {
             Ok(e) => e,
             Err(e) => {
+                complete = false;
                 debug!(error = %e, "deep_scan walk error (skipped)");
                 continue;
             }
@@ -161,6 +192,7 @@ fn deep_scan_folder(
         let metadata = match item.metadata() {
             Ok(m) => m,
             Err(e) => {
+                complete = false;
                 debug!(error = %e, "deep_scan metadata error (skipped): {}", item.path().display());
                 continue;
             }
@@ -183,6 +215,7 @@ fn deep_scan_folder(
             path: item.path().to_path_buf(),
             name: item.file_name().to_string_lossy().to_string(),
             is_dir: item.file_type().is_dir(),
+            is_symlink: item.file_type().is_symlink(),
             depth: item.depth(),
             size,
             modified,
@@ -193,11 +226,13 @@ fn deep_scan_folder(
     // 按路径排序保证确定性输出
     entries.sort_by(|a, b| a.path.cmp(&b.path));
 
-    // 计算 is_last：若下一个条目的父目录与当前条目不同，则当前为 last
-    for i in 0..entries.len() {
-        let current_parent = entries[i].path.parent();
-        let next_parent = entries.get(i + 1).and_then(|e| e.path.parent());
-        entries[i].is_last = current_parent != next_parent;
+    // 子树夹在兄弟节点之间；按共同父目录找最后一项，不能比较相邻行。
+    let mut last_children = std::collections::HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        last_children.insert(entry.path.parent().unwrap().to_path_buf(), index);
+    }
+    for index in last_children.into_values() {
+        entries[index].is_last = true;
     }
 
     // 构建 tree 输出
@@ -234,12 +269,20 @@ fn deep_scan_folder(
             ancestor_last[entry.depth - 1] = entry.is_last;
         }
 
-        let icon = if entry.is_dir {
+        let icon = if entry.is_symlink {
+            "🔗"
+        } else if entry.is_dir {
             "\u{1F4C1}"
         } else {
             "\u{1F4C4}"
         };
-        let trailing = if entry.is_dir { "/" } else { "" };
+        let trailing = if entry.is_symlink {
+            " [symlink; not followed]"
+        } else if entry.is_dir {
+            "/"
+        } else {
+            ""
+        };
         output.push_str(&format!(
             "{}{} {}{} ({} bytes, {})\n",
             prefix, icon, entry.name, trailing, entry.size, entry.modified
@@ -256,7 +299,7 @@ fn deep_scan_folder(
         persist_hint = persist_truncated_output(&full_text);
         // 保留头部 + 前 MAX_LIST_ENTRIES 个条目行
         let lines: Vec<&str> = output.lines().collect();
-        let header_lines = 3; // root 行 + 空行 + (无额外 header)
+        let header_lines = 2; // root 行 + 空行
         let max_lines = header_lines + MAX_LIST_ENTRIES;
         if lines.len() > max_lines {
             output = lines[..max_lines].join("\n");
@@ -264,13 +307,24 @@ fn deep_scan_folder(
     }
 
     if truncated {
+        let count = if complete {
+            format!("{total} total entries")
+        } else {
+            format!("{total} entries collected; total unknown")
+        };
         output.push_str(&format!(
-            "\n[Output truncated: {} total entries, showing first {}]{}",
-            total, MAX_LIST_ENTRIES, persist_hint
+            "\n[Output truncated: {count}, showing {}]{}",
+            MAX_LIST_ENTRIES, persist_hint
         ));
     }
 
-    output.push_str(&format!("\nTotal: {} entries", total));
+    if complete {
+        output.push_str(&format!("\nTotal: {} entries", total));
+    } else {
+        output.push_str(&format!(
+            "\nCollected: {total} entries; total unknown (some entries could not be read)"
+        ));
+    }
 
     Ok(output)
 }
@@ -311,7 +365,7 @@ impl BaseTool for FolderOperationsTool {
                 "operation": {
                     "type": "string",
                     "enum": ["create", "list", "exists", "deep_scan"],
-                    "description": "The folder operation to perform: \"create\" to create a directory, \"list\" to list directory contents, \"exists\" to check if a path exists, \"deep_scan\" to recursively scan directory tree with depth control"
+                    "description": "The folder operation to perform: \"create\" to create a directory, \"list\" to list directory contents, \"exists\" to check a path exists, \"deep_scan\" to recursively scan directory tree with depth control"
                 },
                 "folder_path": {
                     "type": "string",
@@ -335,8 +389,14 @@ impl BaseTool for FolderOperationsTool {
     async fn invoke(
         &self,
         input: Value,
-        _ctx: peri_acp_types::tools::ToolContext<'_>,
+        ctx: peri_acp_types::tools::ToolContext<'_>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // 宿主取消（P2-8）：受理前已取消的调用直接拒绝，不再做文件系统工作。
+        if ctx.cancellation.is_cancelled() {
+            return Err(
+                "Error: invocation was cancelled before the folder operation started.".into(),
+            );
+        }
         let operation = input["operation"]
             .as_str()
             .ok_or("Missing operation parameter")?;
@@ -388,7 +448,7 @@ impl BaseTool for FolderOperationsTool {
                         format!("Path exists but is not a folder: {}", resolved.display()).into(),
                     );
                 }
-                list_folder(&resolved)
+                list_folder(&resolved, &ctx.cancellation)
             }
 
             "deep_scan" => {
@@ -407,7 +467,7 @@ impl BaseTool for FolderOperationsTool {
                         Some(n) => (n as usize).clamp(1, 10),
                         None => 3,
                     };
-                deep_scan_folder(&resolved, max_depth)
+                deep_scan_folder(&resolved, max_depth, &ctx.cancellation)
             }
 
             other => Err(format!("Unknown operation: {other}").into()),

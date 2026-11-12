@@ -91,10 +91,15 @@ async fn server(
     let stop = CancellationToken::new();
     let signal = stop.clone();
     let task = tokio::spawn(async move {
-        axum::serve(listener, web::router(executor))
-            .with_graceful_shutdown(signal.cancelled_owned())
-            .await
-            .unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        axum::serve(
+            listener,
+            web::router(executor, listen_addr)
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(signal.cancelled_owned())
+        .await
+        .unwrap();
     });
     (address, stop, task)
 }

@@ -35,6 +35,10 @@ impl Executor {
 #[path = "directories_test.rs"]
 mod tests;
 
+// 目录分页实现说明（executor review 2026-10-26 P2-6）：每页都对全目录做一次
+// 完整枚举 + 排序再 skip/take，复杂度 O(N)/页（翻完整目录是 O(N²)）。对当前
+// 上限（100k 目录、100/页）可接受；若未来需要大目录高效翻页，应改为键集分页
+// （以 (lowercased_name, name) 为游标），此处保留语义简单的全量排序方案。
 fn browse(query: DirectoryQuery) -> Result<DirectoryListing> {
     let path = std::fs::canonicalize(query.path)?;
     let current = display(&path)?;
@@ -53,12 +57,13 @@ fn browse(query: DirectoryQuery) -> Result<DirectoryListing> {
         let Ok(child) = display(&entry.path()) else {
             continue;
         };
-        children.push(DirectoryEntry { name, path: child });
-        if children.len() > 100_000 {
+        // 上限在 push 之前判定：原实现先积累到 100_001 条再报错。
+        if children.len() >= 100_000 {
             return Err(Error::Invalid(
                 "directory has too many entries; specify a narrower path".into(),
             ));
         }
+        children.push(DirectoryEntry { name, path: child });
     }
     children.sort_by(|a, b| {
         a.name

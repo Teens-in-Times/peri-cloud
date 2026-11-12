@@ -109,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let executor = Arc::new(Executor::open(&args.state_dir, &name).await?);
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    let listen_addr = listener.local_addr()?;
     let tunnel_stop = tokio_util::sync::CancellationToken::new();
     let server_stop = tokio_util::sync::CancellationToken::new();
     let wireguard_server = wireguard.map(|config| {
@@ -177,12 +178,16 @@ async fn main() -> anyhow::Result<()> {
     );
     tracing::info!(device_id = %executor.info().device_id, listen = %listener.local_addr()?, state_dir = %args.state_dir.display(), "Executor started");
     let shutdown_stop = server_stop.clone();
-    let server_result = axum::serve(listener, web::router(executor.clone()))
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            shutdown_stop.cancel();
-        })
-        .await;
+    let server_result = axum::serve(
+        listener,
+        web::router(executor.clone(), listen_addr)
+            .into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        shutdown_stop.cancel();
+    })
+    .await;
     server_stop.cancel();
     if let Some(server) = wireguard_server {
         server.await.context("WireGuard listener owner failed")?;

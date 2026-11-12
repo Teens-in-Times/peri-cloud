@@ -1,5 +1,6 @@
 //! Device execution without an agent loop or a second approval layer.
 
+mod audit;
 mod config;
 mod directories;
 mod environment;

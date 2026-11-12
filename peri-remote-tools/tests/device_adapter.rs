@@ -30,10 +30,15 @@ async fn serve(
     let stop = CancellationToken::new();
     let signal = stop.clone();
     let server = tokio::spawn(async move {
-        axum::serve(listener, web::router(executor))
-            .with_graceful_shutdown(signal.cancelled_owned())
-            .await
-            .unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        axum::serve(
+            listener,
+            web::router(executor, listen_addr)
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(signal.cancelled_owned())
+        .await
+        .unwrap();
     });
     (address, stop, server)
 }
@@ -112,6 +117,129 @@ fn context<'a>(session: &str, turn: &str, call: &str) -> ToolContext<'a> {
     context.turn_generation = Some(turn.into());
     context.invocation_id = Some(call.into());
     context
+}
+
+#[tokio::test]
+async fn another_call_cannot_submit_while_the_original_admission_is_pending() {
+    let h = Harness::new().await;
+    let shell = h
+        .session
+        .tools()
+        .into_iter()
+        .find(|tool| tool.name() == "Bash")
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let mut ctx = context("cloud-session", "turn", "first");
+    ctx.cancellation = cancel.clone();
+    let id = h.session.invocation_id(&ctx).unwrap();
+    let command = if cfg!(windows) {
+        "Start-Sleep -Seconds 30"
+    } else {
+        "sleep 30"
+    };
+    let first = tokio::spawn(async move {
+        shell
+            .invoke_output(json!({"command":command,"timeout":30000}), ctx)
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if h.executor.job(id).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let second = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.invoke(
+            "Write",
+            json!({"file_path":"unexpected.txt","content":"bad"}),
+            "second",
+            "turn",
+        ),
+    )
+    .await
+    .unwrap();
+    let evidence = second.execution.unwrap();
+    assert_eq!(evidence.status, ToolExecutionStatus::Unknown);
+    assert_eq!(evidence.task_id.as_deref(), Some(id.to_string().as_str()));
+    assert!(!h.workspace.path().join("unexpected.txt").exists());
+    cancel.cancel();
+    first.await.unwrap();
+    h.close().await;
+}
+
+#[tokio::test]
+async fn missing_receipt_does_not_replay_an_unconfirmed_submit() {
+    use axum::extract::Request;
+    use axum::http::{Method, StatusCode};
+    use axum::middleware::{self, Next};
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let h = Harness::new().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let count = posts.clone();
+    let app = web::router(h.executor.clone(), address).layer(middleware::from_fn(
+        move |request: Request, next: Next| {
+            let count = count.clone();
+            async move {
+                if request.method() == Method::POST && request.uri().path() == "/v1/jobs" {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    return StatusCode::GATEWAY_TIMEOUT.into_response();
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    let stop = CancellationToken::new();
+    let shutdown = stop.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await
+        .unwrap();
+    });
+    h.client.reconnect(address).await.unwrap();
+    let input = json!({"file_path":"lost.txt","content":"original"});
+    for _ in 0..2 {
+        let outcome = h.invoke("Write", input.clone(), "lost", "turn").await;
+        assert_eq!(
+            outcome.execution.unwrap().status,
+            ToolExecutionStatus::Unknown
+        );
+    }
+    let write = h
+        .session
+        .tools()
+        .into_iter()
+        .find(|tool| tool.name() == "Write")
+        .unwrap();
+    let error = write
+        .invoke_output(
+            json!({"file_path":"lost.txt","content":"changed"}),
+            context("cloud-session", "turn", "lost"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<Error>(),
+        Some(Error::Rejected(409))
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    assert!(!h.workspace.path().join("lost.txt").exists());
+    stop.cancel();
+    server.await.unwrap();
+    h.close().await;
 }
 
 #[tokio::test]

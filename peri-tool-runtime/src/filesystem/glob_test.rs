@@ -126,7 +126,7 @@ async fn test_glob_truncation_persists_collected_output() {
         "应显示截断信息: {result}"
     );
     assert!(
-        result.contains("Read tool"),
+        result.contains("`Read` to view"),
         "应包含 Read tool 提示: {result}"
     );
     assert!(

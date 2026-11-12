@@ -49,7 +49,7 @@ async fn invocation_identity_deduplicates_and_rejects_changed_requests() {
 }
 
 #[tokio::test]
-async fn completed_results_survive_reopening_without_replay() {
+async fn completed_results_survive_v1_migration_without_replay() {
     let root = tempfile::tempdir().unwrap();
     let store = Store::open(root.path()).await.unwrap();
     let session = store.bind(binding(root.path())).await.unwrap();
@@ -63,8 +63,21 @@ async fn completed_results_survive_reopening_without_replay() {
         })
         .await
         .unwrap();
+    sqlx::query("DROP TABLE tombstones")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA user_version = 1")
+        .execute(&store.pool)
+        .await
+        .unwrap();
     store.close().await;
     let reopened = Store::open(root.path()).await.unwrap();
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&reopened.pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 2);
     let (created, job) = reopened.create_job(&request).await.unwrap();
     assert!(!created);
     assert_eq!(job.status, JobStatus::Completed);
@@ -127,5 +140,79 @@ async fn workspace_binding_cannot_change_directory_or_object_identity() {
         Err(Error::SessionConflict)
     ));
     assert_eq!(store.session(session.session_id).await.unwrap(), session);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn retention_expires_old_terminal_jobs_into_tombstones() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path()).await.unwrap();
+    let session = store.bind(binding(root.path())).await.unwrap();
+    let old_stamp = (Utc::now() - chrono::Duration::days(20)).to_rfc3339();
+
+    let old = invocation(session.session_id);
+    store.create_job(&old).await.unwrap();
+    store
+        .update(old.invocation_id, |job| {
+            job.status = JobStatus::TimedOut;
+            job.finished_at = Some(old_stamp.clone());
+        })
+        .await
+        .unwrap();
+    let logs = root.path().join("logs").join(old.invocation_id.to_string());
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(logs.join("stdout.log"), b"stale").unwrap();
+
+    let fresh = invocation(session.session_id);
+    store.create_job(&fresh).await.unwrap();
+    store
+        .update(fresh.invocation_id, |job| {
+            job.status = JobStatus::Completed;
+            job.finished_at = Some(Utc::now().to_rfc3339());
+        })
+        .await
+        .unwrap();
+
+    let blocked = invocation(session.session_id);
+    store.create_job(&blocked).await.unwrap();
+    store
+        .update(blocked.invocation_id, |job| {
+            job.status = JobStatus::RecoveryRequired;
+            job.finished_at = Some(old_stamp);
+        })
+        .await
+        .unwrap();
+
+    store.enforce_retention(root.path()).await.unwrap();
+
+    // 过期终态：行被删、日志目录被删，但幂等受理经墓碑仍然成立。
+    let expired = store.job(old.invocation_id).await.unwrap();
+    assert_eq!(expired.status, JobStatus::TimedOut);
+    assert_eq!(expired.session_id, session.session_id);
+    assert!(expired.stdout_path.is_none());
+    assert!(!logs.exists());
+    let (created, replay) = store.create_job(&old).await.unwrap();
+    assert!(!created);
+    assert_eq!(
+        serde_json::to_value(&replay).unwrap(),
+        serde_json::to_value(expired).unwrap()
+    );
+    assert_eq!(replay.failure.unwrap().code, "retention_expired");
+    let mut changed = old.clone();
+    changed.input["content"] = serde_json::json!("replayed-differently");
+    assert!(matches!(
+        store.create_job(&changed).await,
+        Err(Error::InvocationConflict)
+    ));
+
+    // 新鲜终态与 RecoveryRequired 不受保留策略影响。
+    assert_eq!(
+        store.job(fresh.invocation_id).await.unwrap().status,
+        JobStatus::Completed
+    );
+    assert_eq!(
+        store.job(blocked.invocation_id).await.unwrap().status,
+        JobStatus::RecoveryRequired
+    );
     store.close().await;
 }

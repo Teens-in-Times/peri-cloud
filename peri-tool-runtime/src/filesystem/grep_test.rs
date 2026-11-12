@@ -569,7 +569,7 @@ async fn test_grep_truncation_persists_full_output() {
         "应显示截断信息: {result}"
     );
     assert!(
-        result.contains("Read tool"),
+        result.contains("`Read` to view"),
         "应包含 Read tool 提示: {result}"
     );
     assert!(

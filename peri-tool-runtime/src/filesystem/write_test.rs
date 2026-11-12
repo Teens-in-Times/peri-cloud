@@ -2,6 +2,33 @@
 
 use super::*;
 
+#[tokio::test]
+async fn empty_content_truncates_only_the_expected_file_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("note.txt");
+    std::fs::write(&file, "current").unwrap();
+    let tool = WriteFileTool::new(dir.path().to_str().unwrap());
+    let input =
+        |digest| serde_json::json!({"file_path":"note.txt","content":"","expected_sha256":digest});
+    assert!(tool
+        .invoke(
+            input(hex_sha256(b"stale")),
+            peri_acp_types::tools::ToolContext::new(&[], ".")
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("expected_sha256"));
+    assert_eq!(std::fs::read(&file).unwrap(), b"current");
+    tool.invoke(
+        input(hex_sha256(b"current")),
+        peri_acp_types::tools::ToolContext::new(&[], "."),
+    )
+    .await
+    .unwrap();
+    assert!(std::fs::read(&file).unwrap().is_empty());
+}
+
 /// 从错误消息中提取 draft_id(消息中 draft 信息在开头,hint 内可能出现两次)
 /// 仅被 #[cfg(unix)] 测试使用,需同步 cfg 以免非 unix 平台报 dead_code
 #[cfg(unix)]

@@ -1,12 +1,20 @@
-pub(crate) mod draft;
+//! 文件系统工具：共享核心 + 薄封装。
+//!
+//! 算法核心（execute_search、commit_guarded、run_glob、list_folder 等）在本
+//! crate 内单一实现；本地 workspace 实例（mcp-packages/workspace）与远程执行器
+//! （peri-executor）两侧各自挂在自己的 BaseTool trait 上的封装层都委托到这里，
+//! 消除双拷贝漂移面（executor review 2026-10-26 P0-1b）。
+
+pub mod draft;
 pub mod edit;
 pub mod folder;
 pub mod glob;
+pub mod glob_patterns;
 pub mod grep;
-pub(crate) mod grep_args;
+pub mod grep_args;
 pub(crate) mod grep_format;
 pub mod read;
-pub(crate) mod transaction;
+pub mod transaction;
 pub mod write;
 pub mod write_sandbox;
 
@@ -49,7 +57,7 @@ pub async fn parse_json_input(input: &str) -> serde_json::Value {
 }
 
 /// 递归扫描时跳过的目录名
-pub(crate) fn should_skip_dir(name: &str) -> bool {
+pub fn should_skip_dir(name: &str) -> bool {
     matches!(
         name,
         "node_modules"

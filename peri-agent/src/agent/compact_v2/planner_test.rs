@@ -262,6 +262,7 @@ fn test_running_receipt_and_unconsumed_terminal_are_hard_protected() {
             exit_code: None,
             output_ref: None,
             output_truncated: false,
+            encoding_loss: false,
             task_id: Some("task".into()),
         });
     }
@@ -740,6 +741,7 @@ fn test_report_requires_closed_consumed_evidence_and_never_becomes_fact_summary(
             exit_code: None,
             output_ref: None,
             output_truncated: false,
+            encoding_loss: false,
         });
     }
     transcript.replace_by_id(unknown);
@@ -923,6 +925,7 @@ fn test_typed_unsuccessful_terminal_without_error_flag_is_not_wholly_archived() 
                 exit_code: None,
                 output_ref: None,
                 output_truncated: false,
+                encoding_loss: false,
             });
         }
         transcript.replace_by_id(message);

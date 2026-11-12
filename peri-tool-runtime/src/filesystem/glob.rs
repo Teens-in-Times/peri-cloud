@@ -9,6 +9,7 @@ use tokio::time::{timeout, Duration};
 
 use super::resolve_path;
 use super::should_skip_dir;
+use crate::budget::SEARCH_OUTPUT_BYTES;
 use crate::output::persist_truncated_output;
 
 /// Glob tool — aligned with the TypeScript glob_tool.
@@ -25,17 +26,17 @@ impl GlobFilesTool {
 /// Maximum number of files returned; protects the LLM context window from exploding.
 const MAX_RESULTS: usize = 1_000;
 /// Maximum output bytes; beyond this, the full payload is persisted to a temp file and only the first N paths are returned inline with a hint.
-const MAX_OUTPUT_BYTES: usize = 20_000;
+const MAX_OUTPUT_BYTES: usize = SEARCH_OUTPUT_BYTES;
 /// When the byte limit is hit, how many paths to keep inline so the LLM can see them directly.
 const HEAD_RESULTS_ON_BYTES_OVERFLOW: usize = 100;
 
 const GLOB_FILES_DESCRIPTION: &str = include_str!("descriptions/glob.md");
 
 /// 扫描超时：与 Grep 工具对齐，防止大目录树上长时间占用 blocking pool。
-const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
+pub const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Soft-warn pattern — still executes, but prepends a warning. A hit strongly suggests the caller actually wanted to list a directory.
-fn soft_warn_pattern(pattern: &str) -> Option<&'static str> {
+pub fn soft_warn_pattern(pattern: &str) -> Option<&'static str> {
     match pattern.trim() {
         "*" => Some(
             "Bare `*` matches files at any depth (wildcards cross `/`); use folder_operations or Bash ls to list a directory instead.",
@@ -50,9 +51,10 @@ fn soft_warn_pattern(pattern: &str) -> Option<&'static str> {
 /// 返回 pattern 中第一个元字符（`* ? [ {`）的字节下标。
 ///
 /// 注意：glob 0.3.3 无反斜杠转义——`\` 是字面字符，`\*` 中 `*` 仍是元字符
-/// （`Pattern::escape` 用 `[x]` 包裹而非 `\`）。`{` 在 glob 0.3.3 中也没有
-/// 交替语义（按字面匹配），这里按保守集合识别：把 `{` 当作元字符只会让剪枝
-/// 更保守（回退全遍历），不影响正确性。若未来升级 glob 版本，需重审此集合。
+/// （`Pattern::escape` 用 `[x]` 包裹而非 `\`）。`{` 在 glob crate 中也没有
+/// 交替语义（按字面匹配）；交替由 `glob_patterns.rs` 在编译前展开，这里把 `{`
+/// 当元字符仍只会让剪枝更保守（回退全遍历），不影响正确性。若未来升级 glob
+/// 版本或改变展开位置，需重审此集合。
 fn first_meta_index(pattern: &str) -> Option<usize> {
     pattern
         .char_indices()
@@ -60,17 +62,17 @@ fn first_meta_index(pattern: &str) -> Option<usize> {
 }
 
 /// Walk 边界规划：在不改变匹配结果的前提下，把遍历限制到模式约束的子树。
-struct WalkPlan {
+pub struct WalkPlan {
     /// 元字符之前的完整字面目录链（如 `src/**/*.rs` → ["src"]）：下钻时只有名字
     /// 匹配的目录会被进入。任何命中路径都必须以这些目录为前缀，剪枝不会漏报。
-    prefix_dirs: Vec<String>,
+    pub prefix_dirs: Vec<String>,
     /// 目录下钻的最大深度。仅对无元字符的纯字面 pattern 生效：
     /// `glob::Pattern::matches` 默认 `require_literal_separator = false`，`*`/`?`
     /// 可跨 `/`，含元字符的 pattern 可在任意深度命中，深度剪枝不安全。
-    max_depth: Option<usize>,
+    pub max_depth: Option<usize>,
 }
 
-fn plan_walk(pattern: &str) -> WalkPlan {
+pub fn plan_walk(pattern: &str) -> WalkPlan {
     let leading_slash = pattern.starts_with('/');
     let meta_idx = first_meta_index(pattern);
 
@@ -127,7 +129,7 @@ fn plan_walk(pattern: &str) -> WalkPlan {
 ///   末段不查：收窄后由 filter 的 depth 0 黑名单检查自动拒绝，行为不变。
 /// - 任一段为 `.`/`..`：walk 出的 rel 路径不含这两段，拼接只会改变遍历范围，
 ///   保守回退。
-fn narrow_root(base: &Path, plan: &WalkPlan) -> Option<(PathBuf, usize)> {
+pub fn narrow_root(base: &Path, plan: &WalkPlan) -> Option<(PathBuf, usize)> {
     let prefix_dirs = &plan.prefix_dirs;
     if prefix_dirs.is_empty() {
         return None;
@@ -151,17 +153,19 @@ fn narrow_root(base: &Path, plan: &WalkPlan) -> Option<(PathBuf, usize)> {
     Some((root, prefix_dirs.len()))
 }
 
-/// 收集匹配文件（同步，在 spawn_blocking 中运行）。
+/// 收集匹配文件（同步，在 spawn_blocking 中运行；单一事实源，两侧封装共用）。
 ///
-/// 返回是否因超过 MAX_RESULTS 提前停止。`cancelled` 置位后最多再处理 256 个条目
-/// 即退出——spawn_blocking 无法强制中止，协作停止是超时后的兜底保护。
-fn collect_files(
+/// 返回是否因超过 MAX_RESULTS 提前停止。`cancelled` 置位或宿主取消令牌触发后
+/// 最多再处理 256 个条目即退出——spawn_blocking 无法强制中止，协作停止是超时
+/// 与取消后的兜底保护（P2-8）。
+pub(crate) fn collect_files(
     base: &Path,
     walk_root: &Path,
     consumed: usize,
-    pattern: &glob::Pattern,
+    patterns: &[glob::Pattern],
     plan: &WalkPlan,
     cancelled: &AtomicBool,
+    host_cancel: &tokio_util::sync::CancellationToken,
     results: &mut Vec<(Option<SystemTime>, String)>,
 ) -> bool {
     let walker = walkdir::WalkDir::new(walk_root)
@@ -196,7 +200,9 @@ fn collect_files(
 
     let mut early_stopped = false;
     for (entries_seen, entry) in walker.enumerate() {
-        if entries_seen.is_multiple_of(256) && cancelled.load(Ordering::Relaxed) {
+        if entries_seen.is_multiple_of(256)
+            && (cancelled.load(Ordering::Relaxed) || host_cancel.is_cancelled())
+        {
             break;
         }
         match entry {
@@ -205,7 +211,7 @@ fn collect_files(
                     let abs_path = e.path().to_string_lossy().to_string();
                     if let Ok(rel) = e.path().strip_prefix(base) {
                         let rel_str = rel.to_string_lossy().replace('\\', "/");
-                        if pattern.matches(&rel_str) {
+                        if patterns.iter().any(|pattern| pattern.matches(&rel_str)) {
                             // mtime 在收集时读取一次并缓存，排序阶段不再做任何 syscall。
                             let mtime = e.metadata().ok().and_then(|m| m.modified().ok());
                             results.push((mtime, abs_path));
@@ -226,11 +232,12 @@ fn collect_files(
 }
 
 /// 排序 + 组装输出（同步，与 collect_files 一起在 spawn_blocking 中运行）。
-fn run_glob(
+pub fn run_glob(
     base: &Path,
-    pattern: &glob::Pattern,
+    patterns: &[glob::Pattern],
     plan: &WalkPlan,
     cancelled: &AtomicBool,
+    host_cancel: &tokio_util::sync::CancellationToken,
 ) -> String {
     let mut results: Vec<(Option<SystemTime>, String)> = Vec::new();
     // root 收窄：静态字面前缀目录链存在时直接从 base+前缀起步（如 `src/**/*.rs`
@@ -240,9 +247,10 @@ fn run_glob(
         base,
         &walk_root,
         consumed,
-        pattern,
+        patterns,
         plan,
         cancelled,
+        host_cancel,
         &mut results,
     );
 
@@ -263,20 +271,23 @@ fn run_glob(
             .join("\n");
         let truncated = &results[..MAX_RESULTS];
         let persist_hint = persist_truncated_output(&full);
-        let stop_note = if early_stopped {
-            " (collection stopped at the result limit)"
+        // 早停时不得把已收集量说成树中总数（与 workspace 侧既有契约一致）。
+        let count_note = if early_stopped {
+            format!(
+                "{} files collected; total unknown (collection stopped at the result limit)",
+                results.len()
+            )
         } else {
-            ""
+            format!("{} files total", results.len())
         };
         format!(
-            "{}\n\n[Output truncated: {} files total{}, showing first {}]{}",
+            "{}\n\n[Output truncated: {}, showing first {}]{}",
             truncated
                 .iter()
                 .map(|(_, p)| p.as_str())
                 .collect::<Vec<_>>()
                 .join("\n"),
-            results.len(),
-            stop_note,
+            count_note,
             MAX_RESULTS,
             persist_hint
         )
@@ -358,15 +369,16 @@ impl BaseTool for GlobFilesTool {
     async fn invoke(
         &self,
         input: Value,
-        _ctx: peri_acp_types::tools::ToolContext<'_>,
+        ctx: peri_acp_types::tools::ToolContext<'_>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let pattern = input["pattern"]
             .as_str()
             .ok_or("The 'pattern' parameter is required for the Glob tool.")?;
 
         // Pattern 语法预校验 + 只编译一次：collect_files 复用编译结果，
-        // 不再在逐文件热循环里重复 glob::Pattern::new。
-        let compiled = glob::Pattern::new(pattern)
+        // 不再在逐文件热循环里重复 glob::Pattern::new。`{foo,bar}` 交替在这里展开
+        // 成多个 pattern（glob crate 本身只按字面匹配 `{`）。
+        let compiled = super::glob_patterns::compile_glob_patterns(pattern)
             .map_err(|e| format!("Error: Pattern syntax error in {pattern:?}: {e}"))?;
 
         // Pattern soft-warn — record the hint; we still execute so the LLM can see the output size and self-correct.
@@ -384,13 +396,17 @@ impl BaseTool for GlobFilesTool {
 
         let plan = plan_walk(pattern);
         let cancelled = Arc::new(AtomicBool::new(false));
+        // 宿主取消（dropped RPC / 云端取消，P2-8）与超时共用同一个协作退出路径；
+        // Drop 兜底覆盖「invoke future 被提前丢弃」的情况。
+        let cancel_on_drop = super::grep::SearchCancellation(Arc::clone(&cancelled));
+        let host_cancel = ctx.cancellation.clone();
 
         // 扫描是同步阻塞链（遍历 + 排序 + 落盘），必须移入 blocking pool，不能占用
         // async runtime worker。超时后置位 cancelled，线程在下一个检查点协作退出
         // （spawn_blocking 无法强制 kill，协作停止是真实保护）。
         let scan = tokio::task::spawn_blocking({
             let cancelled = Arc::clone(&cancelled);
-            move || run_glob(&search_root, &compiled, &plan, &cancelled)
+            move || run_glob(&search_root, &compiled, &plan, &cancelled, &host_cancel)
         });
 
         let body = match timeout(SCAN_TIMEOUT, scan).await {
@@ -406,6 +422,7 @@ impl BaseTool for GlobFilesTool {
             Ok(Err(e)) => return Err(format!("Error: {e}").into()),
             Ok(Ok(body)) => body,
         };
+        drop(cancel_on_drop);
 
         if let Some(warn) = pattern_warn {
             Ok(format!("Note: {warn}\n\n{body}"))

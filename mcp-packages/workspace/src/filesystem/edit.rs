@@ -1,9 +1,19 @@
+//! Edit 封装层（peri_agent::tools::BaseTool）。
+//!
+//! 编辑应用核心（读 → sha 护栏 → 定位/替换 → 哨兵 → 原子提交）在
+//! `peri-tool-runtime::filesystem::edit::apply_edit` 单一实现（P0-1b），
+//! 本文件只做参数校验（P0-4 new==old）与 ToolFailure/path 提示映射。
+
 use peri_agent::tools::BaseTool;
 use peri_mcp_common::failure::ToolFailure;
 use serde_json::Value;
 
 use super::resolve_path;
-use super::transaction::{with_target_lock, CommitError, SENTINEL_REJECTION};
+#[cfg(test)]
+pub(crate) use peri_tool_runtime::filesystem::edit::build_not_found_hint;
+use peri_tool_runtime::filesystem::edit::{apply_edit, EditCoreError};
+pub(crate) use peri_tool_runtime::filesystem::transaction::SENTINEL_REJECTION;
+use peri_tool_runtime::filesystem::write::{parse_expected_sha256, SHA_MISMATCH_REJECTION};
 
 const EDIT_FILE_DESCRIPTION: &str = include_str!("descriptions/edit.md");
 
@@ -16,71 +26,6 @@ impl EditFileTool {
     pub fn new(cwd: impl Into<String>) -> Self {
         Self { cwd: cwd.into() }
     }
-}
-
-/// 为 old_string not found 错误构建模糊匹配提示。
-///
-/// 策略 1：取 old_string 前 5 行做前缀匹配，报告匹配到的行号范围。
-/// 策略 2：前缀匹配失败时，用滑动窗口找最接近的区域，报告差异行数。
-/// old_string > 5000 字符时跳过，仅返回建议 Read 提示。
-fn build_not_found_hint(content: &str, old_string: &str) -> String {
-    const MAX_FUZZY_LEN: usize = 5000;
-    if old_string.len() > MAX_FUZZY_LEN {
-        return "Please Read this file to get the latest content before retrying.".to_string();
-    }
-
-    // 策略 1：前缀匹配
-    let prefix_lines: Vec<&str> = old_string.lines().take(5).collect();
-    let prefix: String = prefix_lines.join("\n");
-    if !prefix.is_empty() {
-        if let Some(byte_offset) = content.find(&prefix) {
-            let line_start = content[..byte_offset].lines().count() + 1;
-            let line_end = line_start + prefix_lines.len() - 1;
-            return format!(
-                "old_string's first {} lines matched lines {}-{}, but the full string did not match. \
-                 The file may have been modified. Please Read this file to get the latest content before retrying.",
-                prefix_lines.len(),
-                line_start,
-                line_end
-            );
-        }
-    }
-
-    // 策略 2：行数近似匹配（回退）
-    let old_lines: Vec<&str> = old_string.lines().collect();
-    let file_lines: Vec<&str> = content.lines().collect();
-    let window_len = old_lines.len();
-
-    if window_len > 0 && window_len <= file_lines.len() {
-        let mut best_pos = 0;
-        let mut best_common = 0;
-
-        for start in 0..=file_lines.len().saturating_sub(window_len) {
-            let window = &file_lines[start..start + window_len];
-            let common = window
-                .iter()
-                .zip(old_lines.iter())
-                .filter(|(a, b)| a.trim() == b.trim())
-                .count();
-            if common > best_common {
-                best_common = common;
-                best_pos = start;
-            }
-        }
-
-        if best_common > 0 {
-            let line_start = best_pos + 1;
-            let line_end = best_pos + window_len;
-            let diff_count = window_len - best_common;
-            return format!(
-                "Closest match at lines {}-{} ({} of {} lines differ). \
-                 Please Read this file to get the latest content before retrying.",
-                line_start, line_end, diff_count, window_len
-            );
-        }
-    }
-
-    "Please Read this file to get the latest content before retrying.".to_string()
 }
 
 #[async_trait::async_trait]
@@ -131,6 +76,10 @@ impl BaseTool for EditFileTool {
                 "replace_all": {
                     "type": "boolean",
                     "description": "If true, replace all occurrences of old_string. If false (default), replace only the first occurrence. Use this to rename variables or update repeated patterns across the file"
+                },
+                "expected_sha256": {
+                    "type": "string",
+                    "description": "Optional optimistic-concurrency guard: the SHA-256 hex digest of the file content you last read. When provided and the current file no longer matches, the edit is rejected with a conflict instead of applying against newer changes."
                 }
             },
             "required": ["file_path", "old_string", "new_string"]
@@ -169,123 +118,88 @@ impl BaseTool for EditFileTool {
             )
             .into());
         }
+        // 描述声明 "must be different from old_string"，实现必须兑现
+        // （executor review 2026-10-26 P0-4：相同值不应走完整读改写并报成功）。
+        if old_string == new_string {
+            return Err(ToolFailure::new(
+                "new_string is identical to old_string; an edit must change the text. Adjust new_string, or use Read to verify the file before retrying.",
+                "Error: new_string is identical to old_string; an edit must change the text.",
+            )
+            .into());
+        }
+        let expected_sha256 = match parse_expected_sha256(&input["expected_sha256"]) {
+            Ok(value) => value,
+            Err(message) => {
+                return Err(ToolFailure::new(
+                    "expected_sha256 must be a 64-character hex SHA-256 digest.",
+                    message,
+                )
+                .into())
+            }
+        };
 
         let resolved = resolve_path(&self.cwd, file_path);
+        let cwd = self.cwd.clone();
 
-        with_target_lock(&resolved, |locked| {
-            let pre = match locked.read_pre() {
-                Ok(Some(content)) => content,
-                Ok(None) => return Err(ToolFailure::new(super::path_hints::with_path_hint("File not found. Verify file_path or locate the file with Glob.", &self.cwd, &resolved), format!("Error: File not found at {}", resolved.display())).into()),
-                Err(error) => return Err(ToolFailure::new("Edit failed while reading the file. Verify access permissions and UTF-8 encoding.", format!("Edit failed while reading {}: {error}", resolved.display())).into()),
-            };
-            let content = match String::from_utf8(pre.clone()) {
-                Ok(content) => content,
-                Err(error) => return Err(ToolFailure::new("Edit failed while reading the file. Verify access permissions and UTF-8 encoding.", format!("Edit failed while decoding {}: {error}", resolved.display())).into()),
-            };
-
-            let old_lines = old_string.lines().count();
-            let new_lines = new_string.lines().count();
-            let line_diff = new_lines as i64 - old_lines as i64;
-            let rel = resolved
-                .strip_prefix(&self.cwd)
-                .unwrap_or(&resolved)
-                .display()
-                .to_string();
-
-            // 构建行数变化描述。行数不变（Equal）时仍报告被替换的行数
-            // （= old_string 行数，±0 也有变更量）——TUI 依赖摘要中的计数
-            // 展示 `· +N · -N` 后缀；旧文本 "Replaced text (same line count)"
-            // 无计数信息，TUI 无法展示变更摘要。
-            let diff_desc = match line_diff.cmp(&0) {
-                std::cmp::Ordering::Greater => format!(
-                    "Added {} line{}",
-                    line_diff,
-                    if line_diff == 1 { "" } else { "s" }
+        match apply_edit(
+            &resolved,
+            &cwd,
+            old_string,
+            new_string,
+            replace_all,
+            expected_sha256.as_deref(),
+        ) {
+            Ok(message) => Ok(message),
+            Err(EditCoreError::FileNotFound) => Err(ToolFailure::new(
+                super::path_hints::with_path_hint(
+                    "File not found. Verify file_path or locate the file with Glob.",
+                    &self.cwd,
+                    &resolved,
                 ),
-                std::cmp::Ordering::Less => format!(
-                    "Removed {} line{}",
-                    -line_diff,
-                    if -line_diff == 1 { "" } else { "s" }
-                ),
-                std::cmp::Ordering::Equal => format!(
-                    "Replaced {} line{}",
-                    old_lines,
-                    if old_lines == 1 { "" } else { "s" }
-                ),
-            };
-
-            if replace_all {
-                if !content.contains(old_string) {
-                    let hint = build_not_found_hint(&content, old_string);
-                    return Err(ToolFailure::new("old_string not found. Read the file and copy the exact text, including whitespace.", format!(
-                        "Error: old_string not found in {}\n{hint}",
-                        resolved.display()
-                    ))
-                    .into());
-                }
-                let new_content = content.replace(old_string, new_string);
-                let occurrences = content.matches(old_string).count();
-                match locked.guard_and_commit(Some(pre), new_content.into_bytes()) {
-                    Ok(()) => Ok(format!(
-                        "{} to {} (replaced {} occurrence{})",
-                        diff_desc,
-                        rel,
-                        occurrences,
-                        if occurrences == 1 { "" } else { "s" }
-                    )),
-                    Err(CommitError::Sentinel) => Err(ToolFailure::new(SENTINEL_REJECTION, SENTINEL_REJECTION).into()),
-                    Err(CommitError::Io(error)) => Err(ToolFailure::new("Edit failed while committing the file. Check write permissions and available disk space; Read before retrying.", format!("Edit failed while committing {}: {error}", resolved.display())).into()),
-                }
-            } else {
-                let occurrences = content.matches(old_string).count();
-                if occurrences == 0 {
-                    let hint = build_not_found_hint(&content, old_string);
-                    return Err(ToolFailure::new("old_string not found. Read the file and copy the exact text, including whitespace.", format!(
-                        "Error: old_string not found in {}\n{hint}",
-                        resolved.display()
-                    ))
-                    .into());
-                }
-                if occurrences > 1 {
-                    let locations: Vec<String> = content
-                        .match_indices(old_string)
-                        .take(10)
-                        .map(|(offset, _)| {
-                            let line = content[..offset].lines().count() + 1;
-                            let end_line = line + old_string.lines().count().saturating_sub(1);
-                            if end_line > line {
-                                format!("lines {}-{}", line, end_line)
-                            } else {
-                                format!("line {}", line)
-                            }
-                        })
-                        .collect();
-                    let location_text = if occurrences > 10 {
-                        format!(
-                            "{} ({} total, showing first 10)",
-                            locations.join(", "),
-                            occurrences
-                        )
-                    } else {
-                        locations.join(", ")
-                    };
-                    return Err(ToolFailure::new("old_string is not unique. Supply more context or set replace_all=true.", format!(
-                    "Error: old_string is not unique in {} (found {} occurrences).\n\
-                     Match locations: {location_text}.\n\
-                     Please provide more context to make old_string unique, or set replace_all=true.",
-                    resolved.display(),
-                    occurrences
-                ))
-                .into());
-                }
-                let new_content = content.replacen(old_string, new_string, 1);
-                match locked.guard_and_commit(Some(pre), new_content.into_bytes()) {
-                    Ok(()) => Ok(format!("{} to {}", diff_desc, rel)),
-                    Err(CommitError::Sentinel) => Err(ToolFailure::new(SENTINEL_REJECTION, SENTINEL_REJECTION).into()),
-                    Err(CommitError::Io(error)) => Err(ToolFailure::new("Edit failed while committing the file. Check write permissions and available disk space; Read before retrying.", format!("Edit failed while committing {}: {error}", resolved.display())).into()),
-                }
+                format!("Error: File not found at {}", resolved.display()),
+            )
+            .into()),
+            Err(EditCoreError::ReadFailed) => Err(ToolFailure::new(
+                "Edit failed while reading the file. Verify access permissions and UTF-8 encoding.",
+                format!("Edit failed while reading {}", resolved.display()),
+            )
+            .into()),
+            Err(EditCoreError::NotUtf8) => Err(ToolFailure::new(
+                "Edit failed while reading the file. Verify access permissions and UTF-8 encoding.",
+                format!("Edit failed while decoding {}", resolved.display()),
+            )
+            .into()),
+            Err(EditCoreError::ShaMismatch) => {
+                Err(ToolFailure::new(SHA_MISMATCH_REJECTION, SHA_MISMATCH_REJECTION).into())
             }
-        })
+            Err(EditCoreError::OldNotFound { hint }) => Err(ToolFailure::new(
+                "old_string not found. Read the file and copy the exact text, including whitespace.",
+                format!(
+                    "Error: old_string not found in {}\n{hint}",
+                    resolved.display()
+                ),
+            )
+            .into()),
+            Err(EditCoreError::NotUnique {
+                locations_text,
+                occurrences,
+            }) => Err(ToolFailure::new(
+                "old_string is not unique. Provide more context to make it unique, or set replace_all=true.",
+                format!(
+                    "Error: old_string is not unique in {} (found {occurrences} occurrences).\nMatch locations: {locations_text}.\nPlease provide more context to make old_string unique, or set replace_all=true.",
+                    resolved.display()
+                ),
+            )
+            .into()),
+            Err(EditCoreError::Sentinel) => {
+                Err(ToolFailure::new(SENTINEL_REJECTION, SENTINEL_REJECTION).into())
+            }
+            Err(EditCoreError::CommitFailed) => Err(ToolFailure::new(
+                "Edit failed while committing the file. Check write permissions and available disk space; Read before retrying.",
+                format!("Edit failed while committing {}", resolved.display()),
+            )
+            .into()),
+        }
     }
 }
 

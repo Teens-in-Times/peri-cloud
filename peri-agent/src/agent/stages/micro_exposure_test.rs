@@ -44,6 +44,7 @@ impl BaseTool for ReadFixture {
                 exit_code: None,
                 output_ref: None,
                 output_truncated: false,
+                encoding_loss: false,
             },
         ))
     }

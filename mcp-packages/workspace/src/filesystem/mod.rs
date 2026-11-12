@@ -5,7 +5,6 @@ pub mod glob;
 pub(crate) mod glob_patterns;
 pub mod grep;
 pub(crate) mod grep_args;
-pub(crate) mod grep_format;
 pub(crate) mod path_hints;
 pub mod read;
 pub(crate) mod transaction;
@@ -59,6 +58,7 @@ pub async fn parse_json_input(input: &str) -> serde_json::Value {
 }
 
 /// 递归扫描时跳过的目录名
+#[allow(dead_code)]
 pub(crate) fn should_skip_dir(name: &str) -> bool {
     matches!(
         name,

@@ -43,6 +43,7 @@ fn test_grep_cancelled_skips_walk() {
         250,
         0,
         cancelled,
+        tokio_util::sync::CancellationToken::new(),
     )
     .unwrap();
     assert!(

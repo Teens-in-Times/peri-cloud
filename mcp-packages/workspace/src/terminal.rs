@@ -497,6 +497,7 @@ impl BashTool {
                     exit_code: None,
                     output_ref: None,
                     output_truncated: false,
+                    encoding_loss: false,
                     task_id: Some(handle.task_id),
                 },
             ));
@@ -715,6 +716,7 @@ impl BashTool {
                                     exit_code: None,
                                     output_ref: partial_ref.clone(),
                                     output_truncated: true,
+                                    encoding_loss: false,
                                     task_id: Some(task_id),
                                 }).with_recovery(recovery));
                             }
@@ -728,6 +730,7 @@ impl BashTool {
                                 exit_code: None,
                                 output_ref: partial_ref,
                                 output_truncated: true,
+                                encoding_loss: false,
                                 task_id: Some(task_id),
                             }).with_recovery(recovery));
                         }
@@ -748,6 +751,7 @@ impl BashTool {
                                     exit_code: None,
                                     output_ref: partial_ref.clone(),
                                     output_truncated: true,
+                                    encoding_loss: false,
                                     task_id: None,
                                 },
                             ));
@@ -778,6 +782,7 @@ impl BashTool {
                             exit_code: None,
                             output_ref: partial_ref,
                             output_truncated: true,
+                            encoding_loss: false,
                             task_id: None,
                         },
                     ));
@@ -890,6 +895,7 @@ impl BashTool {
                         status: execution_status,
                         exit_code,
                         output_truncated,
+                        encoding_loss: false,
                         output_ref,
                         task_id: background_task_id,
                     },

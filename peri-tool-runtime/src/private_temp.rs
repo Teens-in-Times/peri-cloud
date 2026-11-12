@@ -160,7 +160,7 @@ fn write_owner_only(file: &mut std::fs::File, content: &[u8]) -> io::Result<()> 
 ///
 /// Best effort: every failure only means the leftover survives until the next
 /// process start.
-fn sweep_stale_dirs(parent: &Path) {
+pub(crate) fn sweep_stale_dirs(parent: &Path) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
     };

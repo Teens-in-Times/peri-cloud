@@ -125,5 +125,35 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    drop(file);
+    // Windows ACL 收紧（executor review 2026-10-26 P2-9，参照 reach 的 icacls）：
+    // 用户 profile 默认 ACL 尚可，但 transport-token 是明文，值得去掉继承、
+    // 只留当前用户完全控制。尽力而为——失败只告警，不阻塞启动。
+    #[cfg(windows)]
+    restrict_windows_acl(path);
     Ok(())
+}
+
+#[cfg(windows)]
+fn restrict_windows_acl(path: &Path) {
+    let username = std::env::var("USERNAME").unwrap_or_default();
+    if username.is_empty() {
+        tracing::warn!(path = %path.display(), "cannot tighten ACL: USERNAME unavailable");
+        return;
+    }
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{username}:F"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(exit) if exit.success() => {}
+        otherwise => tracing::warn!(
+            path = %path.display(),
+            ?otherwise,
+            "could not tighten Windows ACL on executor private state"
+        ),
+    }
 }
