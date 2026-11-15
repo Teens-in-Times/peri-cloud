@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use peri_acp_types::tasks::{
     BgRegistryEvent, BgShellHandle, BgTaskKind, BgTaskRegistration, ExternalTaskRegistration,
-    TaskChange, TaskRegistrationTicket, TaskSnapshot,
+    TaskCancelChannel, TaskChange, TaskRegistrationTicket, TaskSnapshot,
 };
 use sha2::{Digest, Sha256};
 
@@ -238,9 +238,13 @@ impl peri_acp_types::tasks::TaskManager for TaskManager {
         self.active_count()
     }
 
+    fn active_count_including_children(&self) -> usize {
+        self.active_count_including_children()
+    }
+
     fn register(&self, request: BgTaskRegistration) -> Result<TaskRegistrationTicket, String> {
-        let cancel_handle = match request.kind {
-            BgTaskKind::Shell => match request.kill {
+        let cancel_handle = match request.kind.cancel_channel() {
+            TaskCancelChannel::Process => match request.kill {
                 Some(kill) => BgCancelHandle::Kill(Some(kill)),
                 None => request
                     .pid
@@ -257,19 +261,14 @@ impl peri_acp_types::tasks::TaskManager for TaskManager {
                             .to_string()
                     })?,
             },
-            BgTaskKind::Workflow => BgCancelHandle::Kill(request.kill),
-            BgTaskKind::Agent => BgCancelHandle::Kill(request.kill),
-            BgTaskKind::Mcp => return Err("MCP tasks must use register_external".into()),
+            TaskCancelChannel::Closure => BgCancelHandle::Kill(request.kill),
+            TaskCancelChannel::External => {
+                return Err("MCP tasks must use register_external".into())
+            }
         };
         let task = BackgroundTask {
             id: request.task_id,
-            agent_name: match request.kind {
-                BgTaskKind::Shell => "bg-shell",
-                BgTaskKind::Agent => "agent",
-                BgTaskKind::Workflow => "workflow",
-                BgTaskKind::Mcp => "mcp",
-            }
-            .to_string(),
+            agent_name: request.kind.task_agent_name().to_string(),
             prompt_summary: request.summary,
             status: BackgroundTaskStatus::Running,
             started_at: peri_time::monotonic_now(),
@@ -759,6 +758,19 @@ impl TaskManager {
 
     pub fn active_count(&self) -> usize {
         self.registry.active_count()
+    }
+
+    /// 当前活跃任务数，含 child-owned 子会话的递归汇总。
+    ///
+    /// 子会话任务由各自的 owner 管理器持有；父会话不汇总会把「子 shell 仍在跑」
+    /// 投影成已完成。树形登记（每个 owner 只挂在直接父会话）保证不重复计数。
+    pub fn active_count_including_children(&self) -> usize {
+        self.active_count()
+            + self
+                .child_owners()
+                .into_iter()
+                .map(|owner| owner.manager.active_count_including_children())
+                .sum::<usize>()
     }
 
     pub fn count_by_kind(&self, kind: BgTaskKind) -> usize {
