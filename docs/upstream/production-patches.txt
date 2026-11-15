@@ -124,3 +124,7 @@ peri-agent/src/agent/stages/micro_exposure_test.rs
 peri-agent/src/agent/stages/micro_turn_exposure_test.rs
 peri-middlewares/src/mcp/tool_execution.rs
 peri-middlewares/src/subagent/tool/define.rs
+
+# Peri 9d27a634：拆分超长测试与 SQLite 接线，保留上游测试及原子更新。
+peri-middlewares/src/mcp/skill_discovery_test.rs
+peri-resources/src/sessions/sqlite_store/session_data/lifecycle.rs

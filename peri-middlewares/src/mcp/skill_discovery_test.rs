@@ -5,8 +5,11 @@
 use super::*;
 use crate::mcp::client::{McpClientHandle, OAuthStatus};
 use crate::mcp::skill_discovery::skills_list::collect_entries;
+use crate::mcp::skill_discovery::skills_list::skill_result_payload;
+use crate::mcp::skill_discovery::skills_list::SkillGetResponse;
 use crate::mcp::ClientStatus;
 use peri_acp_types::mcp_skills::ServerDiscoveryState;
+use rmcp::model::ServerResult;
 use std::sync::Arc;
 
 fn resource(uri: &str) -> Resource {
@@ -260,132 +263,9 @@ fn verify_digest_matches_sha256() {
     );
 }
 
-#[test]
-fn entry_from_dto_extracts_name_description() {
-    let dto: SkillListEntryDto = serde_json::from_value(serde_json::json!({
-        "uri": "skill://a/SKILL.md",
-        "frontmatter": { "name": "a", "description": "A skill", "license": "MIT" },
-        "resources": [{ "uri": "skill://a/SKILL.md", "digest": "sha256:abc" }],
-    }))
-    .unwrap();
-    let entry = entry_from_dto(dto).unwrap();
-    assert_eq!(entry.uri, "skill://a/SKILL.md");
-    // name/description 门闩通过后，frontmatter 原样保留（verbatim，逐字段
-    // 比对用）——附加字段 license 也在其中
-    assert_eq!(
-        entry.frontmatter,
-        serde_json::json!({ "name": "a", "description": "A skill", "license": "MIT" })
-            .as_object()
-            .unwrap()
-            .clone()
-    );
-    assert_eq!(
-        entry.resources,
-        Some(vec![SkillResource {
-            uri: "skill://a/SKILL.md".to_string(),
-            digest: "sha256:abc".to_string(),
-        }])
-    );
-}
-
-#[test]
-fn entry_from_dto_resources_omitted_vs_empty_distinguished() {
-    // 省略 → None（动态生成技能，规范 MAY）
-    let omitted: SkillListEntryDto = serde_json::from_value(serde_json::json!({
-        "uri": "skill://a/SKILL.md",
-        "frontmatter": { "name": "a", "description": "A" },
-    }))
-    .unwrap();
-    let entry = entry_from_dto(omitted).unwrap();
-    assert_eq!(entry.resources, None, "省略 resources → None（动态技能）");
-
-    // 显式空数组 → Some(空)（present 但完整性违规，由 verify_and_build 拒绝）
-    let empty: SkillListEntryDto = serde_json::from_value(serde_json::json!({
-        "uri": "skill://a/SKILL.md",
-        "frontmatter": { "name": "a", "description": "A" },
-        "resources": [],
-    }))
-    .unwrap();
-    let entry = entry_from_dto(empty).unwrap();
-    assert_eq!(
-        entry.resources,
-        Some(vec![]),
-        "显式空数组 → Some(空)（与省略区分）"
-    );
-
-    // 非空 → Some(非空)
-    let full: SkillListEntryDto = serde_json::from_value(serde_json::json!({
-        "uri": "skill://a/SKILL.md",
-        "frontmatter": { "name": "a", "description": "A" },
-        "resources": [{ "uri": "skill://a/SKILL.md", "digest": "sha256:abc" }],
-    }))
-    .unwrap();
-    let entry = entry_from_dto(full).unwrap();
-    assert_eq!(entry.resources.as_ref().unwrap().len(), 1);
-}
-
-#[test]
-fn entry_from_dto_missing_name_reports_field_and_category() {
-    let dto: SkillListEntryDto = serde_json::from_value(serde_json::json!({
-        "uri": "skill://a/SKILL.md",
-        "frontmatter": { "description": "no name" },
-    }))
-    .unwrap();
-    let defect = entry_from_dto(dto).unwrap_err();
-    assert_eq!(defect.field, "name");
-    assert_eq!(defect.category, "missing");
-}
-
-/// M8：非字符串 name/description 同样在 discovery 边界隔离（类别 wrong-type），
-/// 诊断只带字段与类别，不回显字段正文。
-#[test]
-fn entry_from_dto_non_string_field_is_isolated() {
-    let dto: SkillListEntryDto = serde_json::from_value(serde_json::json!({
-        "uri": "skill://a/SKILL.md",
-        "frontmatter": { "name": 7, "description": { "nested": "value" } },
-    }))
-    .unwrap();
-    let defect = entry_from_dto(dto).unwrap_err();
-    assert_eq!(defect.field, "name");
-    assert_eq!(defect.category, "wrong-type");
-
-    let dto: SkillListEntryDto = serde_json::from_value(serde_json::json!({
-        "uri": "skill://a/SKILL.md",
-        "frontmatter": { "name": "a", "description": 7 },
-    }))
-    .unwrap();
-    let defect = entry_from_dto(dto).unwrap_err();
-    assert_eq!(defect.field, "description");
-    assert_eq!(defect.category, "wrong-type");
-}
-
-#[test]
-fn skill_list_response_parses_pagination_and_defaults() {
-    let json = serde_json::json!({
-        "skills": [
-            { "uri": "skill://a/SKILL.md", "frontmatter": { "name": "a", "description": "A" } },
-            {
-                "uri": "skill://b/SKILL.md",
-                "frontmatter": { "name": "b", "description": "B" },
-                "resources": [{ "uri": "skill://b/SKILL.md", "digest": "sha256:abcd" }]
-            }
-        ],
-        "nextCursor": "page-2"
-    });
-    let parsed: SkillListResponse = serde_json::from_value(json).unwrap();
-    assert_eq!(parsed.next_cursor.as_deref(), Some("page-2"));
-    assert_eq!(parsed.skills.len(), 2);
-    // resources 可省略（动态生成技能）：缺省 → None
-    let e0 = entry_from_dto(parsed.skills[0].clone()).unwrap();
-    assert!(e0.resources.is_none(), "省略 resources → None");
-    let e1 = entry_from_dto(parsed.skills[1].clone()).unwrap();
-    assert_eq!(e1.resources.as_ref().unwrap().len(), 1);
-}
-
 // ─── entry_to_metadata（W2：发现期只做结构校验，不读正文）─────────────────
 
 const SPEC_MD: &str = "---\nname: a\ndescription: A skill\n---\n\n# A\n";
-
 fn spec_entry(digest: Option<&str>) -> SkillListEntry {
     let digest = match digest {
         Some(d) => d.to_string(),
@@ -995,3 +875,6 @@ mod entry_validation_tests;
 
 #[path = "skill_discovery/catalog_state_test.rs"]
 mod catalog_state_tests;
+
+#[path = "skill_discovery/response_parse_test.rs"]
+mod response_parse_tests;

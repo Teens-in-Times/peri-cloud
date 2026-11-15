@@ -709,6 +709,17 @@ impl SessionDataPort for SqliteSessionData {
         Ok(())
     }
 
+    async fn settle_child_resume(
+        &self,
+        child: &ThreadId,
+        previous: &ChildResumeRecord,
+        work_state: Option<WorkState>,
+        terminal: Option<AgentStatus>,
+    ) -> SessionResourceResult<()> {
+        self.settle_child_resume_transaction(child, previous, work_state, terminal)
+            .await
+    }
+
     async fn apply_compaction(
         &self,
         id: &ThreadId,
