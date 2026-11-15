@@ -263,6 +263,9 @@ fn verify_digest_matches_sha256() {
     );
 }
 
+// ─── entry_to_metadata（W2：发现期只做结构校验，不读正文）─────────────────
+
+const SPEC_MD: &str = "---\nname: a\ndescription: A skill\n---\n\n# A\n";
 fn spec_entry(digest: Option<&str>) -> SkillListEntry {
     let digest = match digest {
         Some(d) => d.to_string(),

@@ -257,7 +257,3 @@ fn skills_get_typed_result_with_dynamic_resources_normalizes() {
         "动态技能按缺省 resources 保守激活"
     );
 }
-
-// ─── entry_to_metadata（W2：发现期只做结构校验，不读正文）─────────────────
-
-const SPEC_MD: &str = "---\nname: a\ndescription: A skill\n---\n\n# A\n";
