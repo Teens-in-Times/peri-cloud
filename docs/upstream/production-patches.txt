@@ -99,7 +99,6 @@ peri-middlewares/prompts/sections/01_intro.md
 peri-middlewares/prompts/sections/03_doing_tasks.md
 peri-middlewares/prompts/sections/05_using_tools.md
 peri-middlewares/prompts/sections/07_runtime.md
-peri-middlewares/prompts/sections/10_hitl.md
 peri-middlewares/prompts/sections/11_subagent.md
 peri-middlewares/prompts/sections/13_skills.md
 peri-middlewares/src/mcp/builtin/router.rs
@@ -119,6 +118,9 @@ peri-workflow/src/runtime_test.rs
 
 # Regression for the relocated Cloud summary-only entry.
 peri-agent/src/agent/compact_v2/full_test.rs
+
+# Windows once-hook fixture allows concurrent observation of its output.
+peri-middlewares/src/assembly_once_scope_test.rs
 
 # Shared scanner cancellation-token regression wiring.
 mcp-packages/workspace/src/filesystem/folder_test.rs

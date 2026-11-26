@@ -29,8 +29,9 @@ use peri_agent::agent::react::ReactLLM;
 fn once_command_hook(event: HookEvent, log: &std::path::Path) -> RegisteredHook {
     let log_path = log.to_string_lossy();
     let command = if cfg!(windows) {
+        // AppendAllText shares the open file with the polling reader on Windows.
         format!(
-            "Add-Content -LiteralPath '{}' -Value run -Encoding UTF8",
+            "[System.IO.File]::AppendAllText('{}', ('run' + [Environment]::NewLine))",
             log_path.replace('\'', "''")
         )
     } else {
