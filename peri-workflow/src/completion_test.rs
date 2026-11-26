@@ -1,6 +1,7 @@
 //! 终态覆写失败必须可观测：读/写 `state.json` 失败时不得静默遗留
 //! "磁盘 completed + 结果 failed"，且 progress 收敛不得依赖读成功。
 
+use std::fmt::Debug;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -8,7 +9,7 @@ use tracing::field::{Field, Visit};
 use tracing::span;
 use tracing::{Event, Metadata, Subscriber};
 
-use super::RunCompletion;
+use crate::completion::RunCompletion;
 use crate::journal::{RunState, WorkflowJournalStore};
 use crate::progress::{RunStatus, WorkflowProgressStore};
 use crate::protocol::{ProgressEvent, WorkflowLimits};
@@ -43,7 +44,7 @@ struct CaptureSubscriber {
 struct RenderedFields(String);
 
 impl Visit for RenderedFields {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+    fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
         if !self.0.is_empty() {
             self.0.push(' ');
         }
@@ -115,7 +116,7 @@ fn start_tracking(progress: &WorkflowProgressStore, run_id: &str) {
         meta: None,
     });
     assert!(matches!(
-        progress.get_run(run_id).expect("run 应存在").status,
+        progress.run_snapshot(run_id).expect("run 应存在").status,
         RunStatus::Running
     ));
 }
@@ -133,8 +134,12 @@ fn assert_failed_result(result: &crate::runner::WorkflowResult, error: &str) {
 /// 收敛（RunDone{failed}）不得依赖读成功。
 #[test]
 fn read_state_failure_is_logged_and_progress_still_converges() {
-    let tmp = tempfile::tempdir().unwrap();
-    let journal = Arc::new(WorkflowJournalStore::new(tmp.path().to_str().unwrap()));
+    let tmp = tempfile::tempdir().expect("the temporary test directory must be available");
+    let journal = Arc::new(WorkflowJournalStore::new(
+        tmp.path()
+            .to_str()
+            .expect("the fixture text must be valid UTF-8"),
+    ));
     let progress = Arc::new(WorkflowProgressStore::new());
     let run_id = "run-read-fail";
     start_tracking(&progress, run_id);
@@ -165,7 +170,7 @@ fn read_state_failure_is_logged_and_progress_still_converges() {
         "日志必须明确声明磁盘态与上报结果可能不一致，实际: {text:?}"
     );
 
-    let run = progress.get_run(run_id).expect("run 应存在");
+    let run = progress.run_snapshot(run_id).expect("run 应存在");
     assert!(
         matches!(run.status, RunStatus::Failed),
         "progress 不得停留 Running"
@@ -173,17 +178,71 @@ fn read_state_failure_is_logged_and_progress_still_converges() {
     assert_eq!(run.delivery_status, DeliveryStatus::Blocked);
 }
 
+/// `read_state` 失败但内存投影已记录未知副作用：清理失败不得抹掉该观测事实。
+#[test]
+fn read_state_failure_preserves_unknown_side_effects_from_progress() {
+    let tmp = tempfile::tempdir().expect("the temporary test directory must be available");
+    let journal = Arc::new(WorkflowJournalStore::new(
+        tmp.path()
+            .to_str()
+            .expect("the fixture text must be valid UTF-8"),
+    ));
+    let progress = Arc::new(WorkflowProgressStore::new());
+    let run_id = "run-read-fail-side-effects";
+    start_tracking(&progress, run_id);
+    progress.apply_run_done(
+        run_id,
+        "completed",
+        None,
+        None,
+        PostProcessingStatus::Unknown,
+        DeliveryStatus::Unknown,
+        true,
+    );
+    assert!(
+        progress
+            .run_snapshot(run_id)
+            .expect("run 应存在")
+            .unknown_side_effects,
+        "夹具必须先在投影中记录未知副作用"
+    );
+    // 未初始化 run 目录 → read_state 以 NotFound 失败
+    assert!(journal.read_state(run_id).is_err());
+
+    let completion = make_completion(&journal, &progress, run_id);
+    let result = completion.settle_failed_terminal_state("cleanup failed after success");
+
+    assert_failed_result(&result, "cleanup failed after success");
+    assert!(
+        result.unknown_side_effects,
+        "journal 不可读时返回值必须保留已观测的未知副作用"
+    );
+    assert!(
+        progress
+            .run_snapshot(run_id)
+            .expect("run 应存在")
+            .unknown_side_effects,
+        "清理失败不得把未知副作用清成 false"
+    );
+}
+
 /// `write_state` 失败：`state.json` 确实停留在 completed（磁盘/结果不一致），
 /// 但日志必须显式声明该不一致，且 progress 收敛。
 #[test]
 fn write_state_failure_is_logged_and_declares_stale_disk_state() {
-    let tmp = tempfile::tempdir().unwrap();
-    let journal = Arc::new(WorkflowJournalStore::new(tmp.path().to_str().unwrap()));
+    let tmp = tempfile::tempdir().expect("the temporary test directory must be available");
+    let journal = Arc::new(WorkflowJournalStore::new(
+        tmp.path()
+            .to_str()
+            .expect("the fixture text must be valid UTF-8"),
+    ));
     let progress = Arc::new(WorkflowProgressStore::new());
     let run_id = "run-write-fail";
     start_tracking(&progress, run_id);
 
-    journal.init_run(run_id, "return null").unwrap();
+    journal
+        .init_run(run_id, "return null")
+        .expect("the init run fixture result is required for this assertion");
     let completed = RunState {
         run_id: run_id.to_string(),
         workflow_name: "test-workflow".into(),
@@ -192,8 +251,15 @@ fn write_state_failure_is_logged_and_declares_stale_disk_state() {
         acceptance_status: AcceptanceStatus::Unknown,
         post_processing_status: PostProcessingStatus::Blocked,
         delivery_status: DeliveryStatus::Blocked,
+        delivery_reason: None,
+        postcondition_observation: None,
+        git_observation_scope: None,
+        outcome: peri_acp_types::workflow::WorkflowOutcome::Blocked,
+        unknown_side_effects: false,
         write_intent: None,
         limits: WorkflowLimits::default(),
+        limit_breaches: Vec::new(),
+        token_usage: None,
         budget_total: None,
         args: None,
         max_concurrency: 3,
@@ -204,9 +270,12 @@ fn write_state_failure_is_logged_and_declares_stale_disk_state() {
         finished_at: Some("2026-10-06T00:01:00Z".into()),
         error: None,
     };
-    journal.write_state(run_id, &completed).unwrap();
+    journal
+        .write_state(run_id, &completed)
+        .expect("the write state fixture result is required for this assertion");
     // state.json.tmp 被目录占用 → write_state 的 fs::write 失败，read_state 仍可用
-    std::fs::create_dir(journal.run_dir(run_id).join("state.json.tmp")).unwrap();
+    std::fs::create_dir(journal.run_dir(run_id).join("state.json.tmp"))
+        .expect("the test fixture directory must be creatable");
 
     let completion = make_completion(&journal, &progress, run_id);
     let capture = LogCapture::default();
@@ -217,7 +286,10 @@ fn write_state_failure_is_logged_and_declares_stale_disk_state() {
 
     assert_failed_result(&result, "cleanup failed after success");
     assert_eq!(
-        journal.read_state(run_id).unwrap().status,
+        journal
+            .read_state(run_id)
+            .expect("the read state fixture result is required for this assertion")
+            .status,
         "completed",
         "测试前提：写失败后磁盘仍为 expired 成功态"
     );
@@ -237,9 +309,167 @@ fn write_state_failure_is_logged_and_declares_stale_disk_state() {
         "日志必须明确声明磁盘态与上报结果不一致，实际: {text:?}"
     );
 
-    let run = progress.get_run(run_id).expect("run 应存在");
+    let run = progress.run_snapshot(run_id).expect("run 应存在");
     assert!(
         matches!(run.status, RunStatus::Failed),
         "progress 不得停留 Running"
+    );
+}
+
+#[test]
+fn completion_projects_the_saved_return_value_without_upgrading_acceptance() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let journal = Arc::new(WorkflowJournalStore::new(tmp.path().to_str().unwrap()));
+    journal.init_run("preview-run", "script").unwrap();
+    let output = "Confirmed checks and current artifact. ".repeat(12);
+    journal
+        .write_output("preview-run", "report", &output)
+        .unwrap();
+    let progress = Arc::new(WorkflowProgressStore::new());
+    let completion = make_completion(&journal, &progress, "preview-run");
+    let result = completion.project(crate::runner::WorkflowResult {
+        run_id: "preview-run".into(),
+        status: "completed".into(),
+        return_value: Some(serde_json::json!({"report": "${report}"})),
+        error: None,
+        post_processing_status: PostProcessingStatus::NotRequired,
+        delivery_status: DeliveryStatus::Unknown,
+        stderr_tail: None,
+        unknown_side_effects: false,
+    });
+    let preview = result.result_preview.as_ref().unwrap();
+    assert!(preview.complete);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&preview.text).unwrap(),
+        serde_json::json!({"report": output})
+    );
+    assert_eq!(result.acceptance_status, AcceptanceStatus::Unknown);
+    assert_eq!(result.delivery_status, DeliveryStatus::Unknown);
+    assert!(result
+        .background_result()
+        .output
+        .contains("Confirmed checks"));
+}
+
+/// completed 且未请求交付：交付不阻塞，通知不得再声称 “delivery is blocked”。
+#[test]
+fn completion_keeps_unrequested_delivery_out_of_the_blocked_branch() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let journal = Arc::new(WorkflowJournalStore::new(tmp.path().to_str().unwrap()));
+    journal.init_run("unrequested-run", "script").unwrap();
+    let progress = Arc::new(WorkflowProgressStore::new());
+    let completion = make_completion(&journal, &progress, "unrequested-run");
+    let result = completion.project(crate::runner::WorkflowResult {
+        run_id: "unrequested-run".into(),
+        status: "completed".into(),
+        return_value: Some(serde_json::json!({"ok": true})),
+        error: None,
+        post_processing_status: PostProcessingStatus::Unknown,
+        delivery_status: DeliveryStatus::Unknown,
+        stderr_tail: None,
+        unknown_side_effects: false,
+    });
+
+    assert_eq!(
+        result.outcome,
+        peri_acp_types::workflow::WorkflowOutcome::Completed
+    );
+    assert!(result.success);
+    assert_eq!(result.notification_status_phrase(), "completed");
+    let notification = result.to_notification();
+    assert!(
+        !notification.contains("delivery is blocked"),
+        "未请求交付不得显示交付阻塞: {notification}"
+    );
+}
+
+/// 交付“不需要”不能把 failed / killed 运行抬成成功。
+#[test]
+fn completion_never_upgrades_failed_or_killed_runs_to_success() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let journal = Arc::new(WorkflowJournalStore::new(tmp.path().to_str().unwrap()));
+    journal.init_run("not-green-run", "script").unwrap();
+    let progress = Arc::new(WorkflowProgressStore::new());
+    let completion = make_completion(&journal, &progress, "not-green-run");
+
+    for (status, outcome, phrase) in [
+        (
+            "failed",
+            peri_acp_types::workflow::WorkflowOutcome::Failed,
+            "failed",
+        ),
+        (
+            "killed",
+            peri_acp_types::workflow::WorkflowOutcome::Killed,
+            "killed",
+        ),
+    ] {
+        let result = completion.project(crate::runner::WorkflowResult {
+            run_id: "not-green-run".into(),
+            status: status.into(),
+            return_value: None,
+            error: Some("run did not complete".into()),
+            post_processing_status: PostProcessingStatus::Unknown,
+            delivery_status: DeliveryStatus::Unknown,
+            stderr_tail: None,
+            unknown_side_effects: false,
+        });
+        assert_eq!(result.outcome, outcome, "{status} 的执行终态不得被覆盖");
+        assert!(!result.success, "{status} 不得因交付不需要而变绿");
+        assert_eq!(result.notification_status_phrase(), phrase);
+    }
+}
+
+/// 后到的清理失败改写为 failed 时，旧的 `not_requested` 不得继续解释交付结论。
+#[test]
+fn cleanup_failure_clears_the_unrequested_delivery_reason() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let journal = Arc::new(WorkflowJournalStore::new(tmp.path().to_str().unwrap()));
+    journal.init_run("cleanup-run", "script").unwrap();
+    let progress = Arc::new(WorkflowProgressStore::new());
+    let state = RunState {
+        run_id: "cleanup-run".into(),
+        workflow_name: "test-workflow".into(),
+        status: "completed".into(),
+        execution_status: ExecutionStatus::Completed,
+        acceptance_status: AcceptanceStatus::Unknown,
+        post_processing_status: PostProcessingStatus::Unknown,
+        delivery_status: DeliveryStatus::Unknown,
+        delivery_reason: Some(peri_acp_types::workflow::DeliveryReason::NotRequested),
+        postcondition_observation: Some(
+            peri_acp_types::workflow::PostconditionObservation::Complete,
+        ),
+        git_observation_scope: None,
+        outcome: peri_acp_types::workflow::WorkflowOutcome::Completed,
+        unknown_side_effects: false,
+        write_intent: None,
+        limits: WorkflowLimits::default(),
+        limit_breaches: Vec::new(),
+        token_usage: None,
+        budget_total: None,
+        args: None,
+        max_concurrency: 3,
+        attempts: Vec::new(),
+        return_value: None,
+        script: "script".into(),
+        started_at: "2026-11-21T00:00:00Z".into(),
+        finished_at: Some("2026-11-21T00:01:00Z".into()),
+        error: None,
+    };
+    journal.write_state("cleanup-run", &state).unwrap();
+
+    let completion = make_completion(&journal, &progress, "cleanup-run");
+    let result = completion.settle_failed_terminal_state("cleanup failed after success");
+    assert_failed_result(&result, "cleanup failed after success");
+
+    let read = journal.read_state("cleanup-run").unwrap();
+    assert_eq!(read.status, "failed");
+    assert_eq!(
+        read.outcome,
+        peri_acp_types::workflow::WorkflowOutcome::Failed
+    );
+    assert_eq!(
+        read.delivery_reason, None,
+        "failed 终态不得保留 not_requested 作为交付原因"
     );
 }

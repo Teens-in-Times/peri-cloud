@@ -1,14 +1,18 @@
-use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    sync::Arc,
-};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::HashSet;
+use std::fmt::{self, Debug, Formatter};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
-use peri_acp_types::{
-    builtin_mcp::{original_tool_name_of_effective, BUILTIN_MCP_INSTANCES},
-    mcp_control::SessionMcpCatalogSnapshot,
-    ports::SessionMcpCatalogPort,
-};
+
+use peri_acp_types::builtin_mcp::BUILTIN_MCP_INSTANCES;
+use peri_acp_types::mcp_control::SessionMcpCatalogSnapshot;
+use peri_acp_types::mcp_control::SessionToolCatalogPreparation;
+use peri_acp_types::mcp_control::SessionToolCatalogPreparationPort;
+use peri_acp_types::mcp_control::SessionToolCatalogPrepareError;
+use peri_acp_types::mcp_control::SessionToolSource;
+use peri_acp_types::ports::SessionMcpCatalogPort;
 
 use crate::tools::{BaseTool, ToolDefinition};
 
@@ -47,8 +51,8 @@ pub struct StartupToolUpdate {
     pub required: Vec<StartupRequiredTool>,
 }
 
-impl std::fmt::Debug for StartupToolUpdate {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for StartupToolUpdate {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("StartupToolUpdate")
             .field(
@@ -84,8 +88,8 @@ pub struct SessionToolCatalogSnapshot {
     pub aliases: BTreeMap<String, String>,
 }
 
-impl std::fmt::Debug for SessionToolCatalogSnapshot {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for SessionToolCatalogSnapshot {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SessionToolCatalogSnapshot")
             .field("generation", &self.generation)
@@ -97,6 +101,7 @@ impl std::fmt::Debug for SessionToolCatalogSnapshot {
 }
 
 impl SessionToolCatalogSnapshot {
+    #[must_use]
     pub fn tool_map(&self) -> BTreeMap<String, Arc<dyn BaseTool>> {
         self.tools
             .iter()
@@ -118,12 +123,27 @@ impl ToolFilterPolicy {
     /// 关闭策略只识别 MCP 来源及 builtin 实例身份；同名 core 工具或显式远端
     /// workspace 不能被 builtin 的关闭策略误删。闭包同时用于初始目录和后续刷新。
     pub(crate) fn with_mcp_policy(disabled: HashSet<String>, filter: ToolFilter) -> ToolFilter {
+        use peri_acp_types::meta_harness::{AssemblyPlan, ChainSlot, ExecutionProfile};
+
+        let plan = AssemblyPlan::new(&disabled, ExecutionProfile::Child);
+        // Pre-v5 frozen sessions may retain the legacy switch spelling.
+        let closed: HashSet<_> = disabled
+            .iter()
+            .filter_map(|key| peri_acp_types::builtin_mcp::capability_of_switch(key).ok())
+            .map(|capability| capability.name)
+            .collect();
         Arc::new(move |tool| {
             if tool.mcp_server_name().is_some()
-                && (disabled.contains("McpMiddleware")
+                && (!plan.contains(ChainSlot::Mcp)
                     || tool.builtin_mcp_instance().is_some_and(|instance| {
-                        peri_acp_types::builtin_mcp::find(instance)
-                            .is_some_and(|declared| disabled.contains(declared.policy_key))
+                        if peri_acp_types::builtin_mcp::is_v5_server_name(instance) {
+                            tool.mcp_tool_name()
+                                .and_then(peri_acp_types::builtin_mcp::capability_of_original_tool)
+                                .is_some_and(|(capability, _)| closed.contains(capability.name))
+                        } else {
+                            peri_acp_types::builtin_mcp::find(instance)
+                                .is_some_and(|declared| closed.contains(declared.name))
+                        }
                     }))
             {
                 return false;
@@ -133,13 +153,30 @@ impl ToolFilterPolicy {
     }
 
     /// 在按名策略之外校验 MCP 来源；显式 builtin allowlist 不能授权同名外部 raw 工具。
+    #[must_use]
     pub fn canonical(allowed: Option<Vec<String>>, disallowed: Vec<String>) -> ToolFilter {
         let explicit_without_wildcard = allowed
             .as_ref()
             .is_some_and(|names| !names.iter().any(|name| name == "*"));
-        let by_name = Self::name_filter(allowed, disallowed);
+        let by_name = Self::name_filter(allowed.clone(), disallowed.clone());
+        let allow_only = Self::name_filter(allowed, Vec::new());
+        let deny_only = Self::name_filter(None, disallowed);
         Arc::new(move |tool| {
-            if !by_name(tool.name()) {
+            // 旧配置名通过宿主代理工具的 alias 继续命中；外部同名工具没有宿主身份，
+            // 只能按 canonical 名称匹配，不能借用宿主 alias。deny 对 canonical 与 alias 都优先。
+            let is_host_proxy = peri_acp_types::tool_proxy::is_host_proxy_tool_name(tool.name())
+                && tool.mcp_server_name().is_none();
+            let admitted = if is_host_proxy {
+                let aliases = tool.aliases();
+                let allowed_by_name =
+                    allow_only(tool.name()) || aliases.iter().any(|alias| allow_only(alias));
+                let denied =
+                    !deny_only(tool.name()) || aliases.iter().any(|alias| !deny_only(alias));
+                allowed_by_name && !denied
+            } else {
+                by_name(tool.name())
+            };
+            if !admitted {
                 return false;
             }
             if !explicit_without_wildcard
@@ -149,7 +186,9 @@ impl ToolFilterPolicy {
             {
                 return true;
             }
-            let policy_name = original_tool_name_of_effective(tool.name()).unwrap_or(tool.name());
+            let policy_name =
+                peri_acp_types::builtin_mcp::original_tool_name_of_effective(tool.name())
+                    .unwrap_or(tool.name());
             !BUILTIN_MCP_INSTANCES.iter().any(|instance| {
                 instance
                     .tools
@@ -205,7 +244,7 @@ impl ToolFilterPolicy {
 /// 名字字面量只在声明表里声明一份，本模块不得复制或反拆。
 fn name_candidates(name: &str) -> Vec<String> {
     let lowered = name.to_lowercase();
-    match original_tool_name_of_effective(name) {
+    match peri_acp_types::builtin_mcp::original_tool_name_of_effective(name) {
         Some(original) => vec![lowered, original.to_lowercase()],
         None => vec![lowered],
     }
@@ -228,6 +267,7 @@ pub struct SessionToolCatalog {
 }
 
 impl SessionToolCatalog {
+    #[must_use]
     pub fn new(
         base_tools: BTreeMap<String, Arc<dyn BaseTool>>,
         capability: Option<Arc<dyn SessionMcpCatalogPort>>,
@@ -243,6 +283,7 @@ impl SessionToolCatalog {
         Self::try_with_filter(base_tools, capability, Arc::new(|_| true))
     }
 
+    #[must_use]
     pub fn with_filter(
         base_tools: BTreeMap<String, Arc<dyn BaseTool>>,
         capability: Option<Arc<dyn SessionMcpCatalogPort>>,
@@ -282,6 +323,7 @@ impl SessionToolCatalog {
         })
     }
 
+    #[must_use]
     pub fn snapshot(&self) -> Arc<SessionToolCatalogSnapshot> {
         Arc::clone(&self.state.read().published)
     }
@@ -305,6 +347,25 @@ impl SessionToolCatalog {
         )?);
         state.published = Arc::clone(&next);
         Ok(next)
+    }
+
+    /// Build the catalog the next Reason would publish, without replacing the
+    /// current Act view.
+    ///
+    /// Reuses [`build_published`], so filtering and collision handling match the
+    /// published path exactly; only the caller's claim is narrower.
+    pub fn prepare_next(&self) -> Result<SessionToolCatalogPreparation, CatalogRefreshError> {
+        let capability = self.capability.as_ref().map(|port| port.snapshot());
+        let state = self.state.read();
+        let next = build_published(
+            capability
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.generation),
+            &state.base_tools,
+            capability.as_deref(),
+            self.tool_filter.as_ref(),
+        )?;
+        Ok(preparation_of(&next))
     }
 
     /// 把启动闸门准入的整批静态 MCP bridge 原子提交到 static base。
@@ -416,6 +477,32 @@ impl SessionToolCatalog {
             })
             .collect();
         finalize(current.generation, tools).map(Arc::new)
+    }
+}
+
+/// Read-only port used by dynamic MCP loaders to prove that this session can
+/// build its next request catalog. Delegates to the same candidate builder.
+impl SessionToolCatalogPreparationPort for SessionToolCatalog {
+    fn prepare_next(
+        &self,
+    ) -> Result<SessionToolCatalogPreparation, SessionToolCatalogPrepareError> {
+        SessionToolCatalog::prepare_next(self)
+            .map_err(|error| SessionToolCatalogPrepareError::new(error.to_string()))
+    }
+}
+
+fn preparation_of(snapshot: &SessionToolCatalogSnapshot) -> SessionToolCatalogPreparation {
+    let mut admitted: BTreeMap<SessionToolSource, Vec<String>> = BTreeMap::new();
+    for (name, entry) in &snapshot.tools {
+        let source = match &entry.source {
+            ToolSource::CoreOrMiddleware => SessionToolSource::CoreOrMiddleware,
+            ToolSource::Mcp(server) => SessionToolSource::Mcp(server.clone()),
+        };
+        admitted.entry(source).or_default().push(name.clone());
+    }
+    SessionToolCatalogPreparation {
+        generation: snapshot.generation,
+        admitted,
     }
 }
 
@@ -551,6 +638,23 @@ pub(crate) fn warn_tool_collision(winner: &dyn BaseTool, skipped: &dyn BaseTool)
     );
 }
 
+impl Debug for CatalogToolEntry {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CatalogToolEntry")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Debug for SessionToolCatalog {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionToolCatalog")
+            .field("capability_present", &self.capability.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 #[path = "tool_catalog_test.rs"]
 mod tests;
@@ -562,7 +666,7 @@ mod tests;
 /// 裸名与 effective name 两种写法都必须继续生效）。
 #[cfg(test)]
 mod filter_policy_parity_tests {
-    use super::*;
+    use crate::session::tool_catalog::ToolFilterPolicy;
 
     /// 声明表里的 effective name（字面量只在 `peri_acp_types::builtin_mcp` 声明一份）。
     fn effective_name(instance: &str, original_name: &str) -> &'static str {
@@ -573,7 +677,7 @@ mod filter_policy_parity_tests {
                     .iter()
                     .find(|tool| tool.original_name == original_name)
             })
-            .map(|tool| tool.effective_name)
+            .map(|tool| tool.legacy_name)
             .expect("builtin 声明表应声明该 (实例, 原始工具名)")
     }
 
@@ -624,11 +728,15 @@ mod filter_policy_parity_tests {
             "未命中归一表的名字不受 builtin 归一影响"
         );
         assert!(
-            original_tool_name_of_effective(&lowered).is_none(),
+            peri_acp_types::builtin_mcp::original_tool_name_of_effective(&lowered).is_none(),
             "未命中归一表 ⇒ 候选只有原样"
         );
         assert!(
-            original_tool_name_of_effective(effective_name("web", "WebSearch")).is_some(),
+            peri_acp_types::builtin_mcp::original_tool_name_of_effective(effective_name(
+                "web",
+                "WebSearch"
+            ))
+            .is_some(),
             "对照组：冻结字面量必须命中归一表"
         );
         // 通配符语义不变：`*` 只对 allow 生效
@@ -639,5 +747,81 @@ mod filter_policy_parity_tests {
             deny_wildcard("anything"),
             "deny 侧的 * 不是通配（既有语义）"
         );
+    }
+
+    struct ProxyTool {
+        name: &'static str,
+        aliases: &'static [&'static str],
+        mcp_source: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::BaseTool for ProxyTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "proxy filter fixture"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn aliases(&self) -> &[&str] {
+            self.aliases
+        }
+        fn mcp_server_name(&self) -> Option<&str> {
+            self.mcp_source
+        }
+        async fn invoke(
+            &self,
+            _input: serde_json::Value,
+            _ctx: crate::tools::ToolContext<'_>,
+        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(String::new())
+        }
+    }
+
+    /// allow/deny 的旧代理名只对宿主代理生效；外部同名工具不能冒领 alias 身份。
+    #[test]
+    fn canonical_alias_matching_is_limited_to_host_proxy_tools() {
+        use peri_acp_types::tool_proxy::{EXECUTE_EXTRA_TOOL_NAME, TOOL_INVOKE_NAME};
+
+        let host = ProxyTool {
+            name: TOOL_INVOKE_NAME,
+            aliases: &[EXECUTE_EXTRA_TOOL_NAME],
+            mcp_source: None,
+        };
+        let external = ProxyTool {
+            name: TOOL_INVOKE_NAME,
+            aliases: &[EXECUTE_EXTRA_TOOL_NAME],
+            mcp_source: Some("system-server"),
+        };
+
+        // 旧文件名配置命中宿主代理的 canonical 与 alias。
+        for entry in [TOOL_INVOKE_NAME, EXECUTE_EXTRA_TOOL_NAME] {
+            let allowed = ToolFilterPolicy::canonical(Some(vec![entry.to_string()]), Vec::new());
+            assert!(allowed(&host), "allow 条目 {entry} 必须放行宿主代理");
+            let denied = ToolFilterPolicy::canonical(None, vec![entry.to_string()]);
+            assert!(!denied(&host), "deny 条目 {entry} 必须命中宿主代理");
+        }
+
+        // 外部同名工具只能按 canonical 名称匹配，不能借用宿主 alias。
+        let alias_allow = ToolFilterPolicy::canonical(
+            Some(vec![EXECUTE_EXTRA_TOOL_NAME.to_string()]),
+            Vec::new(),
+        );
+        assert!(!alias_allow(&external), "旧别名不得放行同名外部工具");
+        let canonical_allow =
+            ToolFilterPolicy::canonical(Some(vec![TOOL_INVOKE_NAME.to_string()]), Vec::new());
+        assert!(
+            canonical_allow(&external),
+            "canonical 名称仍按普通 allow 规则匹配外部工具"
+        );
+        let alias_deny =
+            ToolFilterPolicy::canonical(None, vec![EXECUTE_EXTRA_TOOL_NAME.to_string()]);
+        assert!(alias_deny(&external), "旧别名不得误伤同名外部工具");
+
+        let other = ToolFilterPolicy::canonical(Some(vec!["Read".to_string()]), Vec::new());
+        assert!(!other(&host), "未列入 allow 的工具照旧被过滤");
     }
 }

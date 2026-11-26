@@ -1,26 +1,24 @@
 //! Stdio subprocesses remain owned by the session pool through handshake cancellation and close.
+use futures::StreamExt;
 use peri_process::ProcessTree;
-use rmcp::{
-    service::{RxJsonRpcMessage, TxJsonRpcMessage},
-    transport::{async_rw::AsyncRwTransport, Transport},
-    RoleClient,
-};
-use std::{
-    collections::HashMap,
-    future::Future,
-    io,
-    path::Path,
-    process::Stdio,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-};
-use tokio::{
-    process::{Child, ChildStdin, ChildStdout},
-    sync::Mutex,
-    task::JoinHandle,
-};
+use rmcp::service::RxJsonRpcMessage;
+use rmcp::service::TxJsonRpcMessage;
+use rmcp::transport::async_rw::AsyncRwTransport;
+use rmcp::transport::Transport;
+use rmcp::RoleClient;
+use std::collections::HashMap;
+use std::future::Future;
+use std::io;
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tokio::process::Child;
+use tokio::process::ChildStdin;
+use tokio::process::ChildStdout;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 pub(crate) struct McpProcessOwner {
     tree: Arc<ProcessTree>,
@@ -133,6 +131,21 @@ impl super::McpClientPool {
         if !self.stdio_available.load(Ordering::Acquire) {
             return Err(io::Error::other(crate::platform::STDIO_UNAVAILABLE));
         }
+        // 未结算的 owner 说明上一次 attempt 只终止、未 join：再起一个会叠加进程。
+        // 调用方的失败清理会重试 close；结算完成前拒绝新连接。
+        if let Some(name) = server_name {
+            let slot = self.server_slot(name);
+            if slot
+                .processes
+                .lock()
+                .iter()
+                .any(|owner| !owner.is_stopped())
+            {
+                return Err(io::Error::other(
+                    "previous MCP process owner has not settled; refusing to spawn another",
+                ));
+            }
+        }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(if stderr_label.is_some() {
@@ -140,7 +153,7 @@ impl super::McpClientPool {
             } else {
                 Stdio::null()
             });
-        let mut tree = ProcessTree::new()?;
+        let mut tree = ProcessTree::try_new()?;
         tree.prepare(&mut cmd);
         let mut child = cmd.spawn()?;
         let attached = tree.attach(&child);
@@ -186,15 +199,18 @@ impl super::McpClientPool {
 
     pub(super) async fn close_processes(&self) -> usize {
         let processes = self.processes.lock().clone();
-        let mut unfinished = 0;
-        for process in processes {
-            if !matches!(
-                peri_time::timeout(super::SHUTDOWN_TIMEOUT, process.close()).await,
-                Ok(Ok(()))
-            ) {
-                unfinished += 1;
-            }
-        }
+        // 子进程彼此独立：并行收口，单项 5s 上限不逐项累加。
+        let outcomes: Vec<bool> = futures::stream::iter(processes)
+            .map(|process| async move {
+                matches!(
+                    peri_time::timeout(super::SHUTDOWN_TIMEOUT, process.close()).await,
+                    Ok(Ok(()))
+                )
+            })
+            .buffer_unordered(super::lifecycle::MAX_PARALLEL_CLOSES)
+            .collect()
+            .await;
+        let unfinished = outcomes.into_iter().filter(|settled| !settled).count();
         self.processes
             .lock()
             .retain(|process| !process.is_stopped());

@@ -1,27 +1,50 @@
 //! 循环/转发终态到 workflow 结果与遥测的投影；不管理任务或事件通道。
 
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
-use peri_acp_types::{
-    command::PromptStopReason,
-    session::{ExecutionFailure, TurnTelemetryOutcome},
-    thread::AgentStatus,
-    workflow::{AgentRunParams, AgentRunResult, Usage},
-};
+use peri_acp_types::command::PromptStopReason;
+use peri_acp_types::session::ExecutionFailure;
+use peri_acp_types::session::TurnTelemetryOutcome;
+use peri_acp_types::thread::AgentStatus;
+use peri_acp_types::workflow::AgentExecutionLimits;
+use peri_acp_types::workflow::AgentRunParams;
+use peri_acp_types::workflow::AgentRunResult;
+use peri_acp_types::workflow::Usage;
 use tracing::{debug, warn};
 
-use super::observation::{RunStats, WorkflowObservation};
-use crate::{agent::stages::LoopResult, session::Session};
+use crate::agent::stages::LoopResult;
+use crate::agent::workflow::agent::observation::{RunStats, WorkflowObservation};
+use crate::session::Session;
 
 pub(super) struct ProjectedResult {
     pub result: AgentRunResult,
+    /// 本次执行实际解析的上限与用量（结算路径交给宿主写入 attempt）。
+    pub execution_limits: AgentExecutionLimits,
     failure: Option<ExecutionFailure>,
 }
 
 impl ProjectedResult {
+    /// Preserve execution telemetry without losing the independent run-fence signal.
+    pub(super) fn after_scope_close(mut self, closed: bool) -> Self {
+        self.result = self.result.after_scope_close(closed);
+        if !closed && self.failure.is_none() {
+            self.failure = Some(ExecutionFailure::internal(
+                "Workflow agent scope did not close; outstanding resources are unconfirmed",
+            ));
+        }
+        self
+    }
+
+    #[must_use]
     pub fn telemetry_outcome(&self) -> TurnTelemetryOutcome {
         match &self.result {
-            AgentRunResult::Dead { reason, .. } if reason.as_deref() == Some("interrupted") => {
+            // scope 未结清时终态已按失败收口，中断不能再投影为取消。
+            AgentRunResult::Dead {
+                reason,
+                scope_close_incomplete,
+                ..
+            } if !*scope_close_incomplete && reason.as_deref() == Some("interrupted") => {
                 TurnTelemetryOutcome::Stopped {
                     reason: PromptStopReason::Cancelled,
                 }
@@ -68,26 +91,47 @@ pub(super) fn terminal_status_after_close(
     }
 }
 
+/// 投影所需的执行上下文（与循环结果无关的本次执行事实）。
+pub(super) struct ProjectionInputs<'a> {
+    pub session: &'a Arc<Session>,
+    pub observation: &'a WorkflowObservation,
+    pub params: &'a AgentRunParams,
+    pub effective_model: &'a str,
+    /// 执行器解析的有效迭代上限与用量；未采集的用量保持 `None`。
+    pub execution_limits: AgentExecutionLimits,
+    pub started_at: Instant,
+}
+
 /// 调用方必须先关闭 EventBus 并 await forwarder，再读取最终统计与输出。
 pub(super) fn project_run_result(
     loop_result: LoopResult,
     forwarder_result: Result<(), ExecutionFailure>,
-    session: &Arc<Session>,
-    observation: &WorkflowObservation,
-    params: &AgentRunParams,
-    effective_model: &str,
-    started_at: Instant,
+    inputs: ProjectionInputs<'_>,
 ) -> ProjectedResult {
+    let ProjectionInputs {
+        session,
+        observation,
+        params,
+        effective_model,
+        execution_limits,
+        started_at,
+    } = inputs;
     if let Err(failure) = forwarder_result {
         warn!(message = %failure.public_message, "Workflow agent: event forwarder failed");
         return ProjectedResult {
-            result: workflow_forwarder_dead_result(),
+            result: dead_result(
+                "event-forwarder-failed",
+                Some("Workflow agent event forwarding failed".into()),
+                started_at,
+                Some(observation.snapshot()),
+            ),
             failure: Some(failure),
+            execution_limits,
         };
     }
     match loop_result {
         LoopResult::Completed | LoopResult::HookStopped { .. } => {
-            let output = crate::session::subagent::extract_last_ai_text(session);
+            let output = super::report::extract_output(session);
             ProjectedResult {
                 result: completed_result(
                     output,
@@ -97,41 +141,75 @@ pub(super) fn project_run_result(
                     started_at,
                 ),
                 failure: None,
+                execution_limits,
             }
         }
         LoopResult::Interrupted => {
             debug!("Workflow agent: execution interrupted");
             ProjectedResult {
-                result: AgentRunResult::Dead {
-                    reason: Some("interrupted".into()),
-                    detail: Some("Workflow agent execution was interrupted".into()),
-                },
+                result: dead_result(
+                    "interrupted",
+                    Some("Workflow agent execution was interrupted".into()),
+                    started_at,
+                    Some(observation.snapshot()),
+                ),
                 failure: None,
+                execution_limits,
             }
         }
         LoopResult::SettlementDue { .. } => {
             debug!("Workflow agent: settlement window expired");
             ProjectedResult {
-                result: AgentRunResult::Dead {
-                    reason: Some("settlement-due".into()),
-                    detail: Some(
+                result: dead_result(
+                    "settlement-due",
+                    Some(
                         "Workflow agent stopped admitting new iterations at its settlement deadline"
                             .into(),
                     ),
-                },
+                    started_at,
+                    Some(observation.snapshot()),
+                ),
                 failure: None,
+                execution_limits,
             }
         }
         LoopResult::Error(error) => {
             debug!(error = %error, "Workflow agent: execution failed");
+            // 迭代耗尽用稳定 reason 编码上报（上限与用量在 execution_limits 里），
+            // 调用方不需要解析错误文案。
+            let reason = if matches!(&error, crate::error::AgentError::MaxIterationsExceeded(_)) {
+                peri_acp_types::workflow::AGENT_DEAD_REASON_MAX_ITERATIONS
+            } else {
+                "runagent-threw"
+            };
             ProjectedResult {
                 failure: Some(ExecutionFailure::from_agent_error(&error)),
-                result: AgentRunResult::Dead {
-                    reason: Some("runagent-threw".into()),
-                    detail: Some(error.to_string()),
-                },
+                result: dead_result(
+                    reason,
+                    Some(error.to_string()),
+                    started_at,
+                    Some(observation.snapshot()),
+                ),
+                execution_limits,
             }
         }
+    }
+}
+
+/// Dead attempts must carry measured duration when the host observed execution;
+/// `None` stays an explicit "not measured" rather than silently missing metrics.
+fn dead_result(
+    reason: &str,
+    detail: Option<String>,
+    started_at: Instant,
+    stats: Option<RunStats>,
+) -> AgentRunResult {
+    AgentRunResult::Dead {
+        scope_close_incomplete: false,
+        reason: Some(reason.into()),
+        detail,
+        duration_ms: Some(started_at.elapsed().as_millis() as u64),
+        token_count: stats.and_then(|stats| stats.reported_output_tokens()),
     }
 }
 
@@ -147,16 +225,13 @@ fn completed_result(
     if tokens == 0 && !output.is_empty() {
         tokens = (output.len() as u64 / 4).max(1);
     }
-    let model = reported_model(stats.last_model, effective_model);
     if let Some(schema) = &params.schema {
         if let Err(error) = validate_json_schema(&output, schema) {
             debug!(error = %error, "Workflow agent: schema validation failed");
-            return AgentRunResult::Dead {
-                reason: Some("no-structured-output".into()),
-                detail: Some(error),
-            };
+            return dead_result("no-structured-output", Some(error), started_at, Some(stats));
         }
     }
+    let model = reported_model(stats.last_model, effective_model);
     AgentRunResult::Ok {
         output: serde_json::Value::String(output),
         usage: Usage {
@@ -170,10 +245,23 @@ fn completed_result(
     }
 }
 
+#[cfg(test)]
+pub(super) fn test_execution_limits() -> AgentExecutionLimits {
+    AgentExecutionLimits {
+        iteration_limit: 200,
+        iteration_limit_source: peri_acp_types::workflow::IterationLimitSource::Default,
+        iterations_used: None,
+    }
+}
+
+#[cfg(test)]
 pub(super) fn workflow_forwarder_dead_result() -> AgentRunResult {
     AgentRunResult::Dead {
+        scope_close_incomplete: false,
         reason: Some("event-forwarder-failed".into()),
         detail: Some("Workflow agent event forwarding failed".into()),
+        duration_ms: None,
+        token_count: None,
     }
 }
 
@@ -333,7 +421,8 @@ fn validate_schema_value(
             let raw_items = raw.and_then(|raw| {
                 serde_json::from_str::<Vec<Box<serde_json::value::RawValue>>>(raw.get()).ok()
             });
-            for (index, item) in items.iter().enumerate() {
+            let paired_items = items.iter().enumerate();
+            for (index, item) in paired_items {
                 let item_path = field_path
                     .map(|parent| format!("{parent}[{index}]"))
                     .unwrap_or_else(|| format!("[{index}]"));

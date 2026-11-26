@@ -110,16 +110,26 @@
 mod composition;
 mod connection;
 mod credentials;
-mod endpoint;
-mod environment;
-mod execution;
-mod failure;
+mod remote_endpoint;
+use remote_endpoint as endpoint;
+mod remote_workspace_environment;
+use remote_workspace_environment as environment;
+mod remote_execution;
+use remote_execution as execution;
+mod remote_failure_class;
+use remote_failure_class as failure;
 mod generation;
 mod ledger;
-mod mutation;
-mod oauth_credentials;
+mod remote_store;
+use remote_store as mutation;
+mod remote_oauth_credentials;
+use remote_oauth_credentials as oauth_credentials;
 mod schema;
 mod schema_upgrade;
+
+#[cfg(test)]
+#[path = "remote_retention_test.rs"]
+mod remote_retention_tests;
 
 #[cfg(test)]
 #[path = "schema_upgrade_test.rs"]
@@ -153,7 +163,8 @@ mod session_schema;
 mod session_settlement;
 mod session_sql;
 mod session_write;
-mod sql;
+mod statement_spec;
+use statement_spec as sql;
 
 pub(crate) use composition::open_remote;
 pub(crate) use composition::open_remote_in_environment;
@@ -194,6 +205,11 @@ mod session_shape_tests;
 #[cfg(test)]
 #[path = "session_history_page_test.rs"]
 mod session_history_page_tests;
+
+// History V2 的完整回放与 frozen 读取夹具；与 V1 分页测试并存。
+#[cfg(test)]
+#[path = "session_history_replay_test.rs"]
+mod session_history_replay_tests;
 
 #[cfg(test)]
 #[path = "session_mq_test.rs"]

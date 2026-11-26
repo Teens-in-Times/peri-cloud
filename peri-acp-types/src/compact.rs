@@ -9,7 +9,10 @@ use crate::messages::BaseMessage;
 /// Full Compact 摘要消息的内部续接标记。
 ///
 /// 必须保持单行：识别方按完整首行匹配，不解析多行结构。
-pub const CONTINUATION_HINT: &str = "[Context has been compacted. The summary below replaced earlier history. If it contains Recovery resources, before any other tool call use SkillTool to reload each listed, non-preloaded skill by its exact canonical name. If a reload fails, use the failure guidance, including DiscoverSkillsTool when directed, or report that the skill cannot be recovered. Rules in the summary are hints; the reloaded body is authoritative. A newer explicit user instruction takes precedence.]";
+pub const CONTINUATION_HINT: &str = "[Context has been compacted. The summary below replaces history. For each active skill in Recovery resources whose body was archived, including preloads, use SkillTool by exact name before any other tool call. Its body is authoritative. If a reload fails, follow its guidance (DiscoverSkillsTool when directed) or report it cannot be recovered. A newer explicit user instruction takes precedence. Wait for needed results. Check state only if it can change the next action.]";
+
+/// 历史摘要使用过的第一版 skill 恢复提示。
+const LEGACY_SKILL_RECOVERY_HINT: &str = "[Context has been compacted. The summary below replaced earlier history. If it contains Recovery resources, before any other tool call use SkillTool to reload each listed, non-preloaded skill by its exact canonical name. If a reload fails, use the failure guidance, including DiscoverSkillsTool when directed, or report that the skill cannot be recovered. Rules in the summary are hints; the reloaded body is authoritative. A newer explicit user instruction takes precedence.]";
 
 /// 历史持久化摘要使用过的旧续接标记。
 ///
@@ -20,12 +23,16 @@ pub const LEGACY_CONTINUATION_HINT: &str =
 /// 摘要续接标记必须作为完整首行出现；同时识别历史持久化格式。
 pub fn is_continuation_hint(text: &str) -> bool {
     let text = text.trim_start();
-    [CONTINUATION_HINT, LEGACY_CONTINUATION_HINT]
-        .into_iter()
-        .any(|hint| {
-            text.strip_prefix(hint)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('\n'))
-        })
+    [
+        CONTINUATION_HINT,
+        LEGACY_SKILL_RECOVERY_HINT,
+        LEGACY_CONTINUATION_HINT,
+    ]
+    .into_iter()
+    .any(|hint| {
+        text.strip_prefix(hint)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('\n'))
+    })
 }
 
 /// 自动 Micro 最小净收益的默认分母：完整上下文窗口的 1/10，向上取整。
@@ -82,6 +89,7 @@ pub enum CompactOutcome {
 
 impl CompactOutcome {
     /// 是否已在 transcript 中应用 Compact 变更。
+    #[must_use]
     pub fn has_applied_change(self) -> bool {
         matches!(
             self,
@@ -95,11 +103,13 @@ impl CompactOutcome {
     }
 
     /// 是否已成功应用 Full Compact。
+    #[must_use]
     pub fn is_full_applied(self) -> bool {
         matches!(self, Self::FullApplied)
     }
 
     /// 是否为「收益不足的主动延后」。延后不是失败。
+    #[must_use]
     pub fn is_deferred(self) -> bool {
         matches!(self, Self::Deferred)
     }
@@ -311,7 +321,7 @@ pub struct CompactConfig {
     pub max_consecutive_failures: u32,
 
     // ── Smart Compact 配置 ──────────────────────────────────────────────
-    /// [DEPRECATED] 不再使用。Smart Compact 已计划废弃并收敛为 Micro Compact。
+    /// `DEPRECATED` 不再使用。Smart Compact 已计划废弃并收敛为 Micro Compact。
     /// 当前仅保留字段以兼容旧配置，但运行时始终按 false 处理。
     #[serde(default = "default_false")]
     pub smart_compact_enabled: bool,
@@ -395,6 +405,7 @@ impl Default for CompactConfig {
 pub const LEGACY_COMPACT_KEYS: [&str; 1] = ["ptl_max_retries"];
 
 impl CompactConfig {
+    #[must_use]
     pub fn has_valid_micro_min_gain_divisor(&self) -> bool {
         self.micro_min_gain_divisor > 0
     }

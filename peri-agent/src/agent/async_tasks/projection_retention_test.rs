@@ -1,6 +1,17 @@
-use super::*;
-use peri_acp_types::tasks::{ExternalTaskRegistration, TaskRegistrationTicket};
+use crate::agent::async_tasks::registry::projection;
+use crate::agent::async_tasks::registry::BackgroundRegistryError;
+use crate::agent::async_tasks::registry::BackgroundTask;
+use crate::agent::async_tasks::registry::BackgroundTaskRegistry;
+use crate::agent::async_tasks::registry::BackgroundTaskStatus;
+use crate::agent::async_tasks::registry::BgCancelHandle;
+use crate::agent::events::BackgroundTaskResult;
+use peri_acp_types::tasks::BgRegistryEvent;
+use peri_acp_types::tasks::BgTaskKind;
+use peri_acp_types::tasks::{ExternalTaskOwner, ExternalTaskRegistration, TaskRegistrationTicket};
+use peri_acp_types::tasks::{TaskOwnerHandle, TaskRecord};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 fn task(id: &str, kind: BgTaskKind) -> BackgroundTask {
     BackgroundTask {
@@ -10,7 +21,7 @@ fn task(id: &str, kind: BgTaskKind) -> BackgroundTask {
         status: BackgroundTaskStatus::Running,
         started_at: std::time::Instant::now(),
         chrono_started_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
+            .expect("the parse from rfc3339 fixture result is required for this assertion")
             .with_timezone(&chrono::Utc),
         kind,
         cancel_handle: BgCancelHandle::Kill(Some(Box::new(|| {}))),
@@ -43,7 +54,7 @@ fn result(id: &str) -> BackgroundTaskResult {
 fn finish(registry: &BackgroundTaskRegistry, id: &str) -> TaskRegistrationTicket {
     let ticket = registry
         .register_with_kind(task(id, BgTaskKind::Agent))
-        .unwrap();
+        .expect("the register with kind fixture result is required for this assertion");
     registry.confirm_external_stopped(&ticket);
     assert!(registry.complete(&ticket, result(id)));
     ticket
@@ -53,6 +64,55 @@ fn pressure(registry: &BackgroundTaskRegistry, prefix: &str) {
     for index in 0..600 {
         finish(registry, &format!("{prefix}-{index}"));
     }
+}
+
+fn owner_record(handle: TaskOwnerHandle) -> TaskRecord {
+    TaskRecord {
+        task_id: "host-mcp".into(),
+        kind: BgTaskKind::Mcp,
+        summary: "owner".into(),
+        started_at: "2026-01-01T00:00:00Z".into(),
+        status: "running".into(),
+        duration_ms: 0,
+        output_preview: None,
+        initiator_session_id: None,
+        child_thread_id: None,
+        external_owner: Some(ExternalTaskOwner {
+            handle,
+            artifact_ref: None,
+        }),
+    }
+}
+
+/// [回归测试] MCP owner 的 server/task_id 与字符串容量都要计入保留字节。
+#[test]
+fn test_retained_bytes_count_mcp_server_and_handle_allocation_capacity() {
+    let small = projection::retained_bytes(&owner_record(TaskOwnerHandle::Mcp {
+        server: "s".into(),
+        task_id: "t".into(),
+    }));
+
+    let mut server = String::with_capacity(4096);
+    server.push('s');
+    let with_big_server = projection::retained_bytes(&owner_record(TaskOwnerHandle::Mcp {
+        server,
+        task_id: "t".into(),
+    }));
+    assert!(
+        with_big_server - small >= 4095,
+        "server 的容量必须计入，不能只算 \"mcp\" 标签"
+    );
+
+    let mut task_id = String::with_capacity(2048);
+    task_id.push('t');
+    let with_big_task_id = projection::retained_bytes(&owner_record(TaskOwnerHandle::Mcp {
+        server: "s".into(),
+        task_id,
+    }));
+    assert!(
+        with_big_task_id - small >= 2047,
+        "owner task_id 必须按 capacity 计入"
+    );
 }
 
 /// [回归测试] 终态数增长不能使正文投影或去重目录跟随增长。
@@ -89,8 +149,14 @@ fn test_accepted_ticket_survives_eviction_and_releases_with_its_producer() {
     let registry = BackgroundTaskRegistry::new();
     let ticket = registry
         .register_with_kind(task("first", BgTaskKind::Agent))
-        .unwrap();
-    let receipt = Arc::downgrade(registry.registrations.lock().get("first").unwrap());
+        .expect("the register with kind fixture result is required for this assertion");
+    let receipt = Arc::downgrade(
+        registry
+            .registrations
+            .lock()
+            .get("first")
+            .expect("the fixture must contain first"),
+    );
     registry.confirm_external_stopped(&ticket);
     assert!(registry.complete(&ticket, result("first")));
     pressure(&registry, "later");
@@ -112,7 +178,7 @@ fn test_old_ticket_cannot_complete_or_confirm_cleanup_for_a_reused_id() {
     let old = finish(&registry, "same-id");
     let new = registry
         .register_with_kind(task("same-id", BgTaskKind::Agent))
-        .unwrap();
+        .expect("the register with kind fixture result is required for this assertion");
     assert!(!old.same_registration(&new));
     assert!(!registry.complete(&old, result("same-id")));
     registry.confirm_external_stopped(&old);
@@ -127,11 +193,11 @@ fn test_old_ticket_cannot_complete_or_confirm_cleanup_for_a_reused_id() {
 /// [回归测试] 接纳结果与实际资源清理是两个边界，展示回收不能代替后者。
 #[test]
 fn test_accepted_terminal_stays_owned_until_execution_cleanup_is_confirmed() {
-    let manager = super::super::TaskManager::new();
+    let manager = crate::agent::async_tasks::manager::TaskManager::new();
     let registry = manager.registry();
     let ticket = registry
         .register_with_kind(task("cleanup", BgTaskKind::Workflow))
-        .unwrap();
+        .expect("the register with kind fixture result is required for this assertion");
     assert!(registry.complete(&ticket, result("cleanup")));
     pressure(registry, "later");
     assert!(ticket.is_settled());
@@ -159,8 +225,10 @@ fn test_cancelled_cleanup_and_pending_delivery_are_not_evicted() {
     let registry = Arc::new(BackgroundTaskRegistry::new());
     let ticket = registry
         .register_with_kind(task("cancelled", BgTaskKind::Shell))
-        .unwrap();
-    registry.cancel(ticket.task_id()).unwrap();
+        .expect("the register with kind fixture result is required for this assertion");
+    registry
+        .cancel(ticket.task_id())
+        .expect("the cancel fixture result is required for this assertion");
     pressure(&registry, "later");
     assert!(registry
         .snapshot()
@@ -191,7 +259,7 @@ fn test_cancelled_cleanup_and_pending_delivery_are_not_evicted() {
     assert!(registry.external_settled());
     assert!(!registry
         .settle_completed(&ticket, result("cancelled"), delivery)
-        .unwrap());
+        .expect("the settle completed fixture result is required for this assertion"));
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert!(registry.registrations.lock().is_empty());
 }
@@ -201,7 +269,7 @@ fn external(deliveries: Arc<AtomicUsize>) -> ExternalTaskRegistration {
         session_id: "owner".into(),
         initiator_session_id: Some("owner".into()),
         owner_identity: "fixture".into(),
-        owner_task_id: "opaque-source-id".into(),
+        owner: ExternalTaskOwner::mcp("fixture", "opaque-source-id"),
         kind: BgTaskKind::Mcp,
         summary: "remote".into(),
         started_at: Some("2026-01-01T00:00:00Z".into()),
@@ -216,15 +284,15 @@ fn external(deliveries: Arc<AtomicUsize>) -> ExternalTaskRegistration {
 /// [回归测试] 外部重复投递的确认不能依赖会淘汰的快照行。
 #[tokio::test]
 async fn test_external_ticket_acknowledges_duplicate_after_projection_eviction() {
-    let manager = super::super::TaskManager::new();
+    let manager = crate::agent::async_tasks::manager::TaskManager::new();
     let deliveries = Arc::new(AtomicUsize::new(0));
     let ticket = manager
         .register_external(external(deliveries.clone()))
-        .unwrap();
+        .expect("the register external fixture result is required for this assertion");
     assert!(manager
         .settle_external(&ticket, "terminal", result(ticket.task_id()))
         .await
-        .unwrap());
+        .expect("the task id fixture result is required for this assertion"));
     pressure(manager.registry(), "later");
     assert!(!manager
         .snapshot()
@@ -233,11 +301,11 @@ async fn test_external_ticket_acknowledges_duplicate_after_projection_eviction()
         .any(|record| record.task_id == ticket.task_id()));
     manager
         .refresh_external(&ticket, external(deliveries.clone()))
-        .unwrap();
+        .expect("the refresh external fixture result is required for this assertion");
     assert!(!manager
         .settle_external(&ticket, "terminal", result(ticket.task_id()))
         .await
-        .unwrap());
+        .expect("the task id fixture result is required for this assertion"));
     assert!(ticket.is_settled());
     assert_eq!(deliveries.load(Ordering::SeqCst), 1);
     assert!(manager.registry().registrations.lock().is_empty());
@@ -245,18 +313,18 @@ async fn test_external_ticket_acknowledges_duplicate_after_projection_eviction()
 
 #[test]
 fn test_duplicate_source_admission_requires_the_original_ticket() {
-    let manager = super::super::TaskManager::new();
+    let manager = crate::agent::async_tasks::manager::TaskManager::new();
     let deliveries = Arc::new(AtomicUsize::new(0));
     let ticket = manager
         .register_external(external(deliveries.clone()))
-        .unwrap();
+        .expect("the register external fixture result is required for this assertion");
     assert!(
         matches!(manager.register_external(external(deliveries.clone())),
         Err(BackgroundRegistryError::DuplicateTask(id)) if id == ticket.task_id())
     );
     manager
         .refresh_external(&ticket, external(deliveries))
-        .unwrap();
+        .expect("the refresh external fixture result is required for this assertion");
     assert_eq!(manager.active_count(), 1);
 }
 
@@ -267,18 +335,28 @@ fn test_failed_start_gate_withdraws_registration_without_fabricating_a_result() 
     let mut changes = registry.subscribe_events();
     let ticket = registry
         .register_pending_start(task("unstarted", BgTaskKind::Agent))
-        .unwrap();
-    assert!(registry.withdraw_unstarted_registration(&ticket).unwrap());
-    assert!(!registry.withdraw_unstarted_registration(&ticket).unwrap());
+        .expect("the register pending start fixture result is required for this assertion");
+    assert!(registry.withdraw_unstarted_registration(&ticket).expect(
+        "the withdraw unstarted registration fixture result is required for this assertion"
+    ));
+    assert!(!registry.withdraw_unstarted_registration(&ticket).expect(
+        "the withdraw unstarted registration fixture result is required for this assertion"
+    ));
     assert!(ticket.is_settled());
     assert!(registry.external_settled());
     assert!(registry.registrations.lock().is_empty());
     assert!(matches!(
-        changes.try_recv().unwrap().event,
+        changes
+            .try_recv()
+            .expect("changes try recv producer must deliver the expected test event before closing")
+            .event,
         BgRegistryEvent::Started { .. }
     ));
     assert!(matches!(
-        changes.try_recv().unwrap().event,
+        changes
+            .try_recv()
+            .expect("changes try recv producer must deliver the expected test event before closing")
+            .event,
         BgRegistryEvent::Cancelled { .. }
     ));
     assert!(changes.try_recv().is_err());
@@ -290,14 +368,20 @@ async fn test_cancel_before_gate_activation_can_withdraw_its_cleanup_reservation
     let mut task = task("before-gate", BgTaskKind::Agent);
     let handle = tokio::spawn(async {});
     task.cancel_handle = BgCancelHandle::Abort(handle);
-    let ticket = registry.register_pending_start(task).unwrap();
-    registry.cancel(ticket.task_id()).unwrap();
+    let ticket = registry
+        .register_pending_start(task)
+        .expect("the register pending start fixture result is required for this assertion");
+    registry
+        .cancel(ticket.task_id())
+        .expect("the cancel fixture result is required for this assertion");
     assert!(!registry.external_settled());
     assert!(matches!(
         registry.mark_execution_started(&ticket),
         Err(BackgroundRegistryError::TaskNotFound(_))
     ));
-    assert!(registry.withdraw_unstarted_registration(&ticket).unwrap());
+    assert!(registry.withdraw_unstarted_registration(&ticket).expect(
+        "the withdraw unstarted registration fixture result is required for this assertion"
+    ));
     assert!(registry.external_settled());
     assert!(registry.cancelled_tasks_waiting_cleanup.lock().is_empty());
     registry.scope.close();
@@ -309,8 +393,10 @@ fn test_started_execution_cannot_use_the_unstarted_withdrawal_path() {
     let registry = BackgroundTaskRegistry::new();
     let ticket = registry
         .register_pending_start(task("started", BgTaskKind::Agent))
-        .unwrap();
-    registry.mark_execution_started(&ticket).unwrap();
+        .expect("the register pending start fixture result is required for this assertion");
+    registry
+        .mark_execution_started(&ticket)
+        .expect("the mark execution started fixture result is required for this assertion");
     assert!(
         matches!(registry.withdraw_unstarted_registration(&ticket), Err(BackgroundRegistryError::TaskAlreadyStarted(id)) if id == "started")
     );
@@ -333,20 +419,27 @@ async fn test_execution_only_agent_cancellation_releases_its_original_ticket() {
     let handle = registry
         .scope
         .spawn(async move {
-            let ticket = receive.await.unwrap();
+            let ticket = receive
+                .await
+                .expect("the receive fixture result is required for this assertion");
             execution_cancel.cancelled().await;
             assert!(!owner
                 .upgrade()
-                .unwrap()
+                .expect("the registry owner remains alive while its execution task is settling")
                 .complete(&ticket, result(ticket.task_id())));
         })
-        .unwrap();
+        .expect("the spawn fixture result is required for this assertion");
     let mut task = task("execution-only", BgTaskKind::Agent);
     task.cancel_handle = BgCancelHandle::Abort(handle);
     task.cancel_token = Some(cancel);
-    let ticket = registry.register_with_kind(task).unwrap();
-    send.send(ticket.clone()).unwrap();
-    registry.cancel(ticket.task_id()).unwrap();
+    let ticket = registry
+        .register_with_kind(task)
+        .expect("the register with kind fixture result is required for this assertion");
+    send.send(ticket.clone())
+        .expect("send send test receiver must remain available for this delivery");
+    registry
+        .cancel(ticket.task_id())
+        .expect("the cancel fixture result is required for this assertion");
     registry.scope.close();
     assert!(registry.scope.wait().await);
     assert!(ticket.is_settled());

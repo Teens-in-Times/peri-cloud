@@ -8,10 +8,16 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    identity::AttemptId,
-    session::{ExecutionBinding, TurnId},
-};
+use crate::identity::AttemptId;
+use crate::session::ExecutionBinding;
+use crate::session::TurnId;
+
+/// Host approval wait: how long a `session/request_permission` stays answerable.
+///
+/// The host's middleware waits this long before settling the tool call as a
+/// policy denial; a gateway that projects `requires_action` must use the same
+/// bound (one source of truth, no second timer in the transport reader).
+pub const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 // ─── ApprovalItem ──────────────────────────────────────────────────────────────
 
@@ -21,6 +27,22 @@ pub struct ApprovalItem {
     pub tool_call_id: String,
     pub tool_name: String,
     pub tool_input: serde_json::Value,
+    /// 绑定的外部 MCP 来源（server + wire 工具名）。
+    ///
+    /// 仅外部 MCP 调用携带；调用方据此把审批绑回具体 server 声明，而不是按
+    /// 工具名猜测（同名工具会误判）。非 MCP 通道（hook / prompt 入口 / 内置
+    /// 工具）为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_origin: Option<ApprovalOrigin>,
+}
+
+/// 外部 MCP 调用的绑定来源（`ApprovalItem::mcp_origin`）。
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalOrigin {
+    /// ACP `mcpServers[].name`（= 声明的 `server_label`）。
+    pub server: String,
+    /// 该 server 上的 wire 工具名。
+    pub tool: String,
 }
 
 // ─── QuestionItem ──────────────────────────────────────────────────────────────
@@ -88,10 +110,10 @@ pub struct QuestionAnswer {
 pub enum InteractionResponse {
     Decisions(Vec<ApprovalDecision>),
     Answers(Vec<QuestionAnswer>),
-    /// 用户明确拒绝了交互（如在 AskUserQuestion 确认弹窗中选择拒绝）
+    /// 用户明确拒绝了交互（如在 AskUserQuestion 确认弹窗中选择 decline，或
+    /// TUI Esc / 生命周期取消产生的裸 `cancel`——用户撤销了本次提问）。
     Rejected,
-    /// 生命周期中断（新指令撤回旧提问、turn 被取代等），与用户拒绝不同：
-    /// 没有作出任何决定，实现方不得把它投影成拒绝或自动批准。
+    /// The host interrupted this interaction without a user decision.
     Interrupted {
         reason: String,
     },
@@ -101,12 +123,20 @@ pub enum InteractionResponse {
     /// （用户拒绝）和空 `Answers`（伪造成功）都不同，工具须如实转述 `cause`
     /// 而不是当作已回答。
     ///
-    /// owner 失效、session/prompt 取消、投递失败等生命周期取消不属此变体：它们
-    /// 保持既有 cancel 语义，不得伪称客户端声明了原因；新指令撤回旧提问用
-    /// [`InteractionResponse::Interrupted`]。审批侧同理：本变体不是
-    /// 「用户拒绝」，实现方不得把它投影成自动批准。
+    /// owner 失效、session/prompt 取消、投递失败等生命周期取消不属此变体：
+    /// 它们以裸 `cancel` 结算，按明确的用户拒绝（[`Self::Rejected`]）处理，
+    /// 不得伪称客户端声明了原因。审批侧同理：本变体不是「用户拒绝」，实现方
+    /// 不得把它投影成自动批准。
     Unanswered {
         cause: UnansweredCause,
+    },
+    /// 交互通道未能完成一次可判定的问答：方法不支持、超时、传输或协议失败。
+    ///
+    /// 与 [`Self::Rejected`]（用户明确拒绝）、[`Self::Unanswered`]（没有任何
+    /// 可作答的人）以及 [`Self::Answers`] 的真实空答案都不同：本变体陈述的是
+    /// **提问通道本身失败**，工具必须以显式失败结算，不得伪造空答案。
+    Failed {
+        failure: InteractionFailure,
     },
 }
 
@@ -115,8 +145,9 @@ pub enum InteractionResponse {
 /// elicitation 响应的 `_meta` 键：客户端声明「问题无法被作答」的原因。
 ///
 /// 无交互界面的客户端（如 `-p` 打印模式）在取消 elicitation 时携带此键，
-/// broker 据此产出 [`InteractionResponse::Unanswered`]；键缺失保持旧兼容，
-/// 键存在但取值无法识别按 [`UnansweredCause::Unknown`] 处理。
+/// broker 据此产出 [`InteractionResponse::Unanswered`]；键缺失表示用户明确
+/// 撤销提问（`Rejected`），不再回落空答案，键存在但取值无法识别按
+/// [`UnansweredCause::Unknown`] 处理。
 pub const ELICITATION_UNANSWERED_META_KEY: &str = "peri.elicitationUnanswered";
 
 /// 客户端无法作答的原因（非用户选择）
@@ -204,9 +235,10 @@ impl UnansweredCause {
 
     /// 从 elicitation 响应的 `_meta` 读取客户端声明的原因。
     ///
-    /// 只有键（乃至整份 `_meta`）缺失才返回 `None` —— 旧客户端的裸 cancel 语义；
-    /// 键存在但取值无法解析时返回 [`UnansweredCause::Unknown`]：声明仍然成立，
-    /// 不得当成未声明而伪造空回答。
+    /// 只有键（乃至整份 `_meta`）缺失才返回 `None` —— 裸 `cancel` 是用户明确
+    /// 撤销提问（`Rejected`），不再是「旧客户端的空答案」；键存在但取值无法
+    /// 解析时返回 [`UnansweredCause::Unknown`]：声明仍然成立，不得当成未声明
+    /// 而伪造回答。
     ///
     /// [`UnansweredCause::NoOnlineEndpoint`] / [`UnansweredCause::OwnerUnmatched`] /
     /// [`UnansweredCause::AttachmentDetached`] 由 Peri 自己铸造（[`Self::meta_entry`]
@@ -254,6 +286,50 @@ impl UnansweredCause {
     }
 }
 
+// ─── InteractionFailure ────────────────────────────────────────────────────────
+
+/// 交互通道失败的原因（非用户决定，也非「无人可作答」）。
+///
+/// 与 [`UnansweredCause`] 的分工是唯一的：`UnansweredCause` 陈述「没有人可以
+/// 作答」，本枚举陈述「通道没有完成这次问答」——方法不支持（客户端可达但无此
+/// 能力）、超时（客户端存活但不响应）、传输/协议失败（连接关闭、无法解析）。
+/// 三者都不可能产生用户答案，因此工具须以显式失败结算，不得伪造空答案。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InteractionFailure {
+    /// 客户端/网关不支持 `elicitation/create`（JSON-RPC `-32601` method not found）：
+    /// 请求可达，但该 endpoint 没有提问能力。
+    MethodUnsupported,
+    /// 客户端存活但未在期限内响应 elicitation。
+    Timeout,
+    /// 传输或协议失败：连接关闭、写入/序列化失败，或响应无法按 elicitation
+    /// 契约解析。`detail` 只承载协议层事实，不包含用户内容。
+    Transport { detail: String },
+}
+
+impl InteractionFailure {
+    /// 供工具如实转述给模型的说明（不含伪造答案，不指导代替用户授权）。
+    pub fn reason_text(&self) -> String {
+        match self {
+            Self::MethodUnsupported => {
+                "客户端/网关不支持 elicitation/create 方法（JSON-RPC -32601）：本次提问\
+                 没有送达任何可作答方，AskUserQuestion 未获得用户回答；这不是用户拒绝，\
+                 也不是空答案，不要把它当作回答或授权"
+                    .to_string()
+            }
+            Self::Timeout => {
+                "提问在期限内没有得到任何响应（超时）：AskUserQuestion 未获得用户回答；\
+                 这不是用户拒绝，也不是空答案，不要把它当作回答或授权"
+                    .to_string()
+            }
+            Self::Transport { detail } => format!(
+                "提问通道失败（{detail}）：本次提问没有完成，AskUserQuestion 未获得用户\
+                 回答；这不是用户拒绝，也不是空答案，不要把它当作回答或授权"
+            ),
+        }
+    }
+}
+
 // ─── TrustedInteractionOwner ───────────────────────────────────────────────────
 
 /// 承载一次 App 交互的连接附件身份。
@@ -278,10 +354,12 @@ impl UnansweredCause {
 pub struct AttachmentId(String);
 
 impl AttachmentId {
+    #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -333,21 +411,25 @@ pub struct ConnectionEpoch(u64);
 
 impl ConnectionEpoch {
     /// 首次连接的纪元（1；0 保留给「未知/未分配」）。
+    #[must_use]
     pub const fn initial() -> Self {
         Self(1)
     }
 
     /// 从已知值构造（0 = 未知纪元的显式表达，不表示「首次连接」）。
+    #[must_use]
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
     /// 递增到下个纪元（重连时调用）。只增不减，旧纪元不得复用。
+    #[must_use]
     pub fn next(self) -> Self {
         Self(self.0.saturating_add(1))
     }
 
     /// 底层值。
+    #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -417,8 +499,9 @@ pub enum InteractionAttribution {
 impl InteractionAttribution {
     /// 从真实 turn 事实铸造模型归属事实。
     ///
-    /// `binding` 必须来自 [`crate::session::TurnContext::execution_binding`] 或其
+    /// `binding` 必须来自 `peri_agent::session::TurnContext::execution_binding` 或其
     /// 等价投影（`InvocationContext`），不得手工拼装。
+    #[must_use]
     pub fn model_turn(session_id: impl Into<String>, binding: ExecutionBinding) -> Self {
         Self::ModelTurn {
             session_id: session_id.into(),
@@ -427,6 +510,7 @@ impl InteractionAttribution {
     }
 
     /// 从 Attachment 事实铸造 App 归属事实。
+    #[must_use]
     pub fn app_attachment(
         app_id: impl Into<String>,
         attachment_id: impl Into<AttachmentId>,
@@ -440,6 +524,7 @@ impl InteractionAttribution {
     }
 
     /// 从 Host 入口事实铸造程序化归属事实。
+    #[must_use]
     pub fn host_request(namespace: impl Into<String>, seq: u64) -> Self {
         Self::HostRequest {
             namespace: namespace.into(),
@@ -591,8 +676,9 @@ pub enum TrustedInteractionOwner {
 impl TrustedInteractionOwner {
     /// 从真实 turn 事实铸造模型归属。
     ///
-    /// `binding` 必须来自 [`crate::session::TurnContext::execution_binding`]
+    /// `binding` 必须来自 `peri_agent::session::TurnContext::execution_binding`
     /// 或其投影（`InvocationContext`），不得手工拼装。
+    #[must_use]
     pub fn model(session_id: impl Into<String>, binding: ExecutionBinding) -> Self {
         Self::Model {
             session_id: session_id.into(),
@@ -602,6 +688,7 @@ impl TrustedInteractionOwner {
     }
 
     /// 从 Attachment 事实铸造 App 归属。
+    #[must_use]
     pub fn app(
         app_id: impl Into<String>,
         attachment_id: impl Into<AttachmentId>,
@@ -615,6 +702,7 @@ impl TrustedInteractionOwner {
     }
 
     /// 从 Host 入口事实铸造程序化归属。
+    #[must_use]
     pub fn host(namespace: impl Into<String>, seq: u64) -> Self {
         Self::Host {
             namespace: namespace.into(),

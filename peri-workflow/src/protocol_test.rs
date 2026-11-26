@@ -1,4 +1,13 @@
-use super::*;
+use crate::protocol::JournalEntry;
+use crate::protocol::WorkflowDoneParams;
+use crate::protocol::WorkflowKillParams;
+use crate::protocol::WorkflowStartParams;
+use peri_acp_types::workflow::AgentRunParams;
+use peri_acp_types::workflow::AgentRunResult;
+use peri_acp_types::workflow::AttemptDisposition;
+use peri_acp_types::workflow::ProgressEvent;
+use peri_acp_types::workflow::RecoveredAttempt;
+use peri_acp_types::workflow::WorkflowAttempt;
 
 #[test]
 fn test_workflow_start_params_serializes_camel_case() {
@@ -11,12 +20,18 @@ fn test_workflow_start_params_serializes_camel_case() {
         limits: None,
         resume_from_run_id: None,
         resume: None,
+        resume_tools: None,
         cwd: "/tmp".into(),
     };
-    let json = serde_json::to_value(&params).unwrap();
+    let json = serde_json::to_value(&params)
+        .expect("to_value must accept this test fixture representation");
     assert!(json.get("runId").is_some(), "runId 应存在，实际: {json}");
     assert!(json.get("maxConcurrency").is_some());
     assert!(json.get("budgetTotal").is_none());
+    assert!(
+        json.get("resumeTools").is_none(),
+        "fresh run 不得出现 resumeTools: {json}"
+    );
     assert!(json.get("run_id").is_none());
     assert!(json.get("max_concurrency").is_none());
 }
@@ -32,12 +47,61 @@ fn test_workflow_start_params_preserves_budget_total() {
         limits: None,
         resume_from_run_id: None,
         resume: None,
+        resume_tools: None,
         cwd: "/tmp".into(),
     };
 
-    let json = serde_json::to_value(&params).unwrap();
+    let json = serde_json::to_value(&params)
+        .expect("to_value must accept this test fixture representation");
 
     assert_eq!(json["budgetTotal"], 9_007_199_254_740_991_u64);
+}
+
+/// issue #407 阶段 2：resume 时 `resumeTools` 按冻结的 camelCase 契约序列化。
+#[test]
+fn test_workflow_start_params_serializes_resume_tools_camel_case() {
+    let entry: crate::protocol::ToolJournalEntry = serde_json::from_value(serde_json::json!({
+        "toolSeq": 0,
+        "agentSeq": 2,
+        "taskId": "tool-1",
+        "toolName": "Read",
+        "arguments": {"file_path": "/tmp/x"},
+        "outcome": {"kind": "ok", "content": "done"}
+    }))
+    .expect("journal entry fixture must deserialize");
+    let params = WorkflowStartParams {
+        run_id: "r1".into(),
+        script: "code".into(),
+        args: None,
+        budget_total: None,
+        max_concurrency: 3,
+        limits: None,
+        resume_from_run_id: Some("old-run".into()),
+        resume: Some(Vec::new()),
+        resume_tools: Some(vec![entry]),
+        cwd: "/tmp".into(),
+    };
+
+    let json = serde_json::to_value(&params)
+        .expect("to_value must accept this test fixture representation");
+
+    assert!(json.get("resume_tools").is_none(), "字段名必须是 camelCase");
+    let tools = json["resumeTools"]
+        .as_array()
+        .expect("resumeTools 必须是数组");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["toolSeq"], 0);
+    assert_eq!(tools[0]["agentSeq"], 2);
+    assert_eq!(tools[0]["taskId"], "tool-1");
+    assert_eq!(tools[0]["toolName"], "Read");
+    assert_eq!(tools[0]["arguments"]["file_path"], "/tmp/x");
+    assert_eq!(tools[0]["outcome"]["kind"], "ok");
+
+    // 读回同一形状（Node → Rust 的重放参数复用该条目）。
+    let decoded: crate::protocol::ToolJournalEntry =
+        serde_json::from_value(tools[0].clone()).expect("resume entry must round-trip");
+    assert_eq!(decoded.tool_seq, 0);
+    assert_eq!(decoded.agent_seq, 2);
 }
 
 #[test]
@@ -51,7 +115,8 @@ fn test_agent_run_params_deserializes_camel_case() {
         "agentType": "general-purpose",
         "allowedTools": ["Read", "Grep"],
     });
-    let params: AgentRunParams = serde_json::from_value(json).unwrap();
+    let params: AgentRunParams = serde_json::from_value(json)
+        .expect("from_value must accept this test fixture representation");
     assert_eq!(params.run_id, "r1");
     assert_eq!(params.agent_id, 0);
     assert_eq!(params.model.as_deref(), Some("haiku"));
@@ -66,7 +131,8 @@ fn test_progress_event_run_started_camel_case() {
         "runId": "r1",
         "workflowName": "test",
     });
-    let event: ProgressEvent = serde_json::from_value(json).unwrap();
+    let event: ProgressEvent = serde_json::from_value(json)
+        .expect("from_value must accept this test fixture representation");
     match event {
         ProgressEvent::RunStarted {
             run_id,
@@ -88,7 +154,8 @@ fn test_progress_event_agent_started_camel_case() {
         "agentId": 3,
         "label": "coder",
     });
-    let event: ProgressEvent = serde_json::from_value(json).unwrap();
+    let event: ProgressEvent = serde_json::from_value(json)
+        .expect("from_value must accept this test fixture representation");
     match event {
         ProgressEvent::AgentStarted {
             run_id,
@@ -111,7 +178,8 @@ fn test_workflow_done_params_camel_case() {
         "status": "completed",
         "returnValue": {"ok": true},
     });
-    let done: WorkflowDoneParams = serde_json::from_value(json).unwrap();
+    let done: WorkflowDoneParams = serde_json::from_value(json)
+        .expect("from_value must accept this test fixture representation");
     assert_eq!(done.run_id, "r1");
     assert_eq!(done.status, "completed");
     assert!(done.return_value.is_some());
@@ -124,7 +192,7 @@ fn test_journal_attempt_round_trip_and_legacy_default() {
         "seq": 7,
         "result": {"kind": "skipped"}
     }))
-    .unwrap();
+    .expect("from_value must accept this test fixture representation");
     assert!(legacy.attempt.is_none());
 
     let entry = JournalEntry {
@@ -135,6 +203,7 @@ fn test_journal_attempt_round_trip_and_legacy_default() {
             run_id: "019-run".into(),
             agent_id: Some(42),
             journal_seq: 7,
+            attempt_index: Some(2),
             recovered_from: Some(RecoveredAttempt {
                 run_id: "018-source".into(),
                 agent_id: Some(9),
@@ -142,9 +211,11 @@ fn test_journal_attempt_round_trip_and_legacy_default() {
             }),
             consumed: true,
             disposition: AttemptDisposition::Recovered,
+            execution: None,
         }),
     };
-    let json = serde_json::to_value(&entry).unwrap();
+    let json = serde_json::to_value(&entry)
+        .expect("to_value must accept this test fixture representation");
     assert_eq!(json["attempt"]["runId"], "019-run");
     assert_eq!(json["attempt"]["agentId"], 42);
     assert_eq!(json["attempt"]["journalSeq"], 7);
@@ -154,6 +225,7 @@ fn test_journal_attempt_round_trip_and_legacy_default() {
 #[test]
 fn test_workflow_kill_params_camel_case() {
     let json = serde_json::json!({"runId": "r1"});
-    let kill: WorkflowKillParams = serde_json::from_value(json).unwrap();
+    let kill: WorkflowKillParams = serde_json::from_value(json)
+        .expect("from_value must accept this test fixture representation");
     assert_eq!(kill.run_id, "r1");
 }

@@ -1,13 +1,25 @@
-use super::*;
+use crate::agent::async_tasks::TaskManager;
+use crate::messages::BaseMessage;
 use crate::session::queue::{MessageSource, QueuedMessage};
+
+use crate::session::subagent::tests::EchoLLM;
+use crate::session::subagent::tests::EmptyChainAssembler;
+use crate::session::subagent::SessionFactory;
+use crate::session::subagent::SubagentCancelPolicy;
 use crate::session::subagent::SubagentHost;
+use crate::session::subagent::SubagentSpawnConfig;
+use crate::session::test_resources::mock::MockSessionResources;
+use crate::session::FrozenContext;
 use crate::session::MessageQueue;
+use crate::session::Session;
+use crate::thread::ThreadId;
 use peri_acp_types::ports::{McpPoolPort, McpPoolShutdownReport};
 use peri_acp_types::session::MqFilter;
 use peri_acp_types::session_resources::SessionResources;
 use peri_acp_types::tasks::{
     BgTaskKind, BgTaskRegistration, OnBgCompleteFn, TaskManager as TaskManagerPort,
 };
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 记录 bind/park 事件；park 后从注册集合移除，模拟真实 broadcast 收件人。
@@ -81,7 +93,6 @@ fn parent_session(
 fn spawn_config(
     store: &Arc<MockSessionResources>,
     manager: &Arc<TaskManager>,
-    run_mode: SubagentRunMode,
     on_bg_complete: Option<OnBgCompleteFn>,
     deregister: Option<crate::session::factory::DeregisterRuntimeFn>,
 ) -> SubagentSpawnConfig {
@@ -92,7 +103,6 @@ fn spawn_config(
         cancel_policy: SubagentCancelPolicy::Independent,
         max_iterations: 50,
         fork_directive_kind: None,
-        run_mode,
         skill_names: Vec::new(),
         llm: crate::session::test_resources::mock::model::fixture_source(
             std::sync::Arc::new(EchoLLM),
@@ -128,22 +138,33 @@ fn spawn_config(
     }
 }
 
-/// 正常结束的 sync child 停驻：注销广播收件人但保留 owner/binding；resume
+/// 正常结束的 child 停驻：注销广播收件人但保留 owner/binding；resume
 /// 重新注册并消费停驻期间积压的 MQ 行（写历史 + 删行）。
 #[tokio::test]
-async fn sync_terminal_parks_then_resume_consumes_parked_backlog() {
+async fn terminal_parks_then_resume_consumes_parked_backlog() {
     let store = MockSessionResources::new();
     let manager = Arc::new(TaskManager::new());
     let pool = Arc::new(RecordingPool::default());
     let parent = parent_session(&store, &manager, &pool);
 
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let finished_tx = parking_lot::Mutex::new(Some(finished_tx));
+    let deregister: crate::session::factory::DeregisterRuntimeFn = Arc::new(move |_| {
+        if let Some(sender) = finished_tx.lock().take() {
+            let _ = sender.send(());
+        }
+    });
     let spawned = SessionFactory::spawn_subagent(
         Some(&parent),
-        spawn_config(&store, &manager, SubagentRunMode::Sync, None, None),
+        spawn_config(&store, &manager, None, Some(deregister)),
     )
     .await
     .expect("spawn must complete");
     let child_id = spawned.child_thread_id;
+    tokio::time::timeout(Duration::from_secs(10), finished_rx)
+        .await
+        .expect("first run must finish")
+        .expect("the expect fixture result is required for this assertion");
     assert!(!pool.is_registered(&child_id), "终态停驻后不再接收广播");
     assert_eq!(pool.count("bind", &child_id), 1);
     assert_eq!(pool.count("park", &child_id), 1);
@@ -161,13 +182,32 @@ async fn sync_terminal_parks_then_resume_consumes_parked_backlog() {
     owner.queue.push_sync(backlog);
     assert_eq!(owner.queue.len_sync(), 1);
 
-    let resumed = SessionFactory::resume_subagent(
-        Some(&parent),
-        resume_config(Arc::clone(&store), child_id.clone()),
-    )
-    .await
-    .expect("parked owner must resume");
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let finished_tx = parking_lot::Mutex::new(Some(finished_tx));
+    let deregister: crate::session::factory::DeregisterRuntimeFn = Arc::new(move |_| {
+        if let Some(sender) = finished_tx.lock().take() {
+            let _ = sender.send(());
+        }
+    });
+    let mut resumed_config = crate::session::subagent::tests::resume_config_with(
+        store.clone(),
+        child_id.clone(),
+        crate::session::test_resources::mock::model::fixture_source(
+            std::sync::Arc::new(EchoLLM),
+            "fixture-scripted",
+        ),
+        Some(manager.clone()),
+        None,
+    );
+    resumed_config.deregister_runtime = Some(deregister);
+    let resumed = SessionFactory::resume_subagent(Some(&parent), resumed_config)
+        .await
+        .expect("parked owner must resume");
     assert_eq!(resumed.child_thread_id, child_id);
+    tokio::time::timeout(Duration::from_secs(10), finished_rx)
+        .await
+        .expect("resume run must finish")
+        .expect("the expect fixture result is required for this assertion");
     assert!(
         owner.check_resume().is_ok(),
         "resume 完成后的新停驻仍保留 owner"
@@ -177,14 +217,14 @@ async fn sync_terminal_parks_then_resume_consumes_parked_backlog() {
         store
             .mq_history_contains(&ThreadId::from(child_id.as_str()), backlog_id)
             .await
-            .unwrap(),
+            .expect("the as str fixture result is required for this assertion"),
         "Receive 将积压行写入历史"
     );
     assert!(
         store
             .mq_query(&ThreadId::from(child_id.as_str()), MqFilter::default())
             .await
-            .unwrap()
+            .expect("the default fixture result is required for this assertion")
             .is_empty(),
         "Receive 删除 MQ 行"
     );
@@ -211,13 +251,7 @@ async fn background_terminal_parks_inbox_and_keeps_owner() {
     let complete: OnBgCompleteFn = Arc::new(|_, _| Ok(()));
     let spawned = SessionFactory::spawn_subagent(
         Some(&parent),
-        spawn_config(
-            &store,
-            &manager,
-            SubagentRunMode::Background,
-            Some(complete),
-            Some(deregister),
-        ),
+        spawn_config(&store, &manager, Some(complete), Some(deregister)),
     )
     .await
     .expect("background spawn must start");
@@ -225,7 +259,7 @@ async fn background_terminal_parks_inbox_and_keeps_owner() {
     tokio::time::timeout(Duration::from_secs(10), finished_rx)
         .await
         .expect("background child must finish")
-        .unwrap();
+        .expect("the expect fixture result is required for this assertion");
 
     assert!(!pool.is_registered(&child_id), "终态停驻后不再接收广播");
     assert_eq!(pool.count("bind", &child_id), 1);
@@ -237,6 +271,8 @@ async fn background_terminal_parks_inbox_and_keeps_owner() {
 }
 
 /// HandedOff 仍可能由交接 wrapper 消费，期间必须保持 inbox 注册。
+/// 暂停时钟下把外层超时放到交接上界（120s）之后：执行在虚拟时间推进到
+/// 上界时完成 HandedOff，测试不会真实等待。
 #[tokio::test(start_paused = true)]
 async fn handed_off_resume_keeps_inbox_registered() {
     let store = MockSessionResources::new();
@@ -244,13 +280,24 @@ async fn handed_off_resume_keeps_inbox_registered() {
     let pool = Arc::new(RecordingPool::default());
     let parent = parent_session(&store, &manager, &pool);
 
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let finished_tx = parking_lot::Mutex::new(Some(finished_tx));
+    let deregister: crate::session::factory::DeregisterRuntimeFn = Arc::new(move |_| {
+        if let Some(sender) = finished_tx.lock().take() {
+            let _ = sender.send(());
+        }
+    });
     let spawned = SessionFactory::spawn_subagent(
         Some(&parent),
-        spawn_config(&store, &manager, SubagentRunMode::Sync, None, None),
+        spawn_config(&store, &manager, None, Some(deregister)),
     )
     .await
-    .expect("first run must complete");
+    .expect("first run must start");
     let child_id = spawned.child_thread_id;
+    tokio::time::timeout(Duration::from_secs(10), finished_rx)
+        .await
+        .expect("first run must finish")
+        .expect("the expect fixture result is required for this assertion");
     assert_eq!(pool.count("park", &child_id), 1);
 
     // 永久 shell 任务让本轮无法 Settled，进入 HandedOff；任务目录属于 parked owner。
@@ -266,17 +313,39 @@ async fn handed_off_resume_keeps_inbox_registered() {
             pid: None,
             kill: Some(Box::new(|| {})),
         })
-        .unwrap();
-    let resumed = SessionFactory::resume_subagent(
-        Some(&parent),
-        resume_config(Arc::clone(&store), child_id.clone()),
-    )
-    .await
-    .expect("handoff resume must return pending");
+        .expect("the register fixture result is required for this assertion");
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+    let completed_tx = parking_lot::Mutex::new(Some(completed_tx));
+    let mut resumed_config = crate::session::subagent::tests::resume_config_with(
+        store.clone(),
+        child_id.clone(),
+        crate::session::test_resources::mock::model::fixture_source(
+            std::sync::Arc::new(EchoLLM),
+            "fixture-scripted",
+        ),
+        Some(manager.clone()),
+        None,
+    );
+    resumed_config.on_bg_complete = Some(Arc::new(move |result, _| {
+        if let Some(sender) = completed_tx.lock().take() {
+            let _ = sender.send(result.clone());
+        }
+        Ok(())
+    }));
+    let resumed = SessionFactory::resume_subagent(Some(&parent), resumed_config)
+        .await
+        .expect("handoff resume must start");
     assert_eq!(resumed.child_thread_id, child_id);
+    let result = tokio::time::timeout(Duration::from_secs(200), completed_rx)
+        .await
+        .expect("handoff completion must be delivered")
+        .expect("the expect fixture result is required for this assertion");
+    assert!(!result.success);
     assert!(
-        !resumed.pending_tasks.is_empty() || resumed.handoff.is_some(),
-        "永久 shell 应产生 HandedOff"
+        result.output.contains("delegation is incomplete")
+            && result.output.contains("pending_tasks: parked-shell"),
+        "永久 shell 应产生 HandedOff: {}",
+        result.output
     );
     assert!(
         pool.is_registered(&child_id),

@@ -1,16 +1,18 @@
+use std::fmt;
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use peri_agent::{
-    interaction::{
-        InteractionContext, InteractionResponse, QuestionItem, QuestionOption,
-        UserInteractionBroker,
-    },
-    tools::BaseTool,
-};
+use peri_agent::interaction::InteractionContext;
+use peri_agent::interaction::InteractionResponse;
+use peri_agent::interaction::QuestionItem;
+use peri_agent::interaction::QuestionOption;
+use peri_agent::interaction::UserInteractionBroker;
+use peri_agent::tools::BaseTool;
 use serde_json::Value;
 
-use crate::ask_user::{ask_user_tool_definition, ASK_USER_TOOL_DESCRIPTION};
+use crate::ask_user;
+use crate::ask_user::ASK_USER_TOOL_DESCRIPTION;
 
 // ─── AskUserTool ──────────────────────────────────────────────────────────────
 
@@ -22,7 +24,16 @@ pub struct AskUserTool {
     broker: Arc<dyn UserInteractionBroker>,
 }
 
+impl Debug for AskUserTool {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AskUserTool")
+            .finish_non_exhaustive()
+    }
+}
+
 impl AskUserTool {
+    #[must_use]
     pub fn new(broker: Arc<dyn UserInteractionBroker>) -> Self {
         Self { broker }
     }
@@ -111,7 +122,7 @@ impl BaseTool for AskUserTool {
     }
 
     fn parameters(&self) -> Value {
-        ask_user_tool_definition().parameters
+        ask_user::ask_user_tool_definition().parameters
     }
 
     fn timeout(&self) -> Option<std::time::Duration> {
@@ -182,7 +193,18 @@ impl BaseTool for AskUserTool {
                     cause: peri_acp_types::error::ToolRejectionCause::ApprovalUnavailable(cause),
                 }))
             }
-            _ => Err("ask_user_question: unexpected response type".into()),
+            // 提问通道失败（方法不支持 / 超时 / 传输或协议错误）：这是工具执行失败，
+            // 不是用户决定，也不是「无人可答」。必须显式失败，不得伪造空答案。
+            InteractionResponse::Failed { failure } => Err(Box::new(
+                peri_agent::error::AgentError::ToolExecutionFailed {
+                    tool: "AskUserQuestion".to_string(),
+                    reason: failure.reason_text(),
+                },
+            )),
+            // 审批响应形状出现在提问路径：协议不匹配，按旧行为拒绝。
+            InteractionResponse::Decisions(_) => {
+                Err("ask_user_question: unexpected response type".into())
+            }
         }
     }
 }

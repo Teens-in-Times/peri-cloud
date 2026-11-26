@@ -1,4 +1,15 @@
-use super::*;
+use crate::agent::async_tasks::TaskManager;
+use crate::messages::BaseMessage;
+use crate::middleware::chain::MiddlewareChain;
+
+use crate::session::subagent::types::SubagentHost;
+use crate::session::subagent::SessionFactory;
+use crate::session::test_resources::mock::MockSessionResources;
+
+use crate::thread::ThreadMeta;
+use peri_acp_types::identity::AgentId;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// 旧执行的 Stop 留在 owner 队列：真实 resume 复用队列后必须抑制它，新 run 仍推理。
 #[tokio::test]
@@ -6,7 +17,8 @@ async fn test_resume_suppresses_stop_intent_from_previous_execution() {
     use crate::agent::async_tasks::TaskManager;
     use crate::messages::BaseMessage;
     use crate::session::queue::{MessageSource, QueuedMessage};
-    use crate::session::subagent::{ParkedChildOwner, SubagentHost};
+    use crate::session::subagent::resource_owner::ParkedChildOwner;
+    use crate::session::subagent::types::SubagentHost;
     use crate::session::{FrozenContext, MessageQueue, Session};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -30,11 +42,14 @@ async fn test_resume_suppresses_stop_intent_from_previous_execution() {
     let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
     meta.id = thread_id.clone();
     meta.parent_thread_id = Some("parent-thread".into());
-    store.create_resumable_thread(meta).await.unwrap();
+    store
+        .create_resumable_thread(meta)
+        .await
+        .expect("the create resumable thread fixture result is required for this assertion");
     store
         .update_thread_status(&thread_id, "error")
         .await
-        .unwrap();
+        .expect("the update thread status fixture result is required for this assertion");
 
     let parent = Session::new(
         Arc::from("/tmp"),
@@ -79,28 +94,30 @@ async fn test_resume_suppresses_stop_intent_from_previous_execution() {
         BaseMessage::human("resume without old stop"),
     ));
     let parent_manager = Arc::new(TaskManager::new());
-    parent_manager.register_child_owner(owner.clone()).unwrap();
+    parent_manager
+        .register_child_owner(owner.clone())
+        .expect("the register child owner fixture result is required for this assertion");
     parent.set_subagent_host(SubagentHost {
-        task_manager: Some(parent_manager),
+        task_manager: Some(parent_manager.clone()),
         session_resources: Some(store.clone()),
         ..Default::default()
     });
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let config = resume_config_with(
+    let config = crate::session::subagent::tests::resume_config_with(
         store.clone(),
         thread_id.clone(),
         crate::session::test_resources::mock::model::fixture_source(
             Arc::new(CountingAnswerLlm(calls.clone())),
             "fixture-scripted",
         ),
-        SubagentRunMode::Sync,
-        None,
+        Some(parent_manager.clone()),
         None,
     );
     SessionFactory::resume_subagent(Some(&parent), config)
         .await
         .expect("resume must accept the handed-off owner");
+    crate::session::subagent::tests::wait_background_idle(&parent_manager).await;
 
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -121,7 +138,8 @@ async fn test_resume_factory_reuses_handoff_owner_queue_and_manager() {
     use crate::agent::async_tasks::TaskManager;
     use crate::messages::BaseMessage;
     use crate::session::queue::{MessageSource, QueuedMessage};
-    use crate::session::subagent::{ParkedChildOwner, SubagentHost};
+    use crate::session::subagent::resource_owner::ParkedChildOwner;
+    use crate::session::subagent::types::SubagentHost;
     use crate::session::{FrozenContext, MessageQueue, Session};
 
     let store = MockSessionResources::new();
@@ -129,11 +147,14 @@ async fn test_resume_factory_reuses_handoff_owner_queue_and_manager() {
     let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
     meta.id = thread_id.clone();
     meta.parent_thread_id = Some("parent-thread".into());
-    store.create_resumable_thread(meta).await.unwrap();
+    store
+        .create_resumable_thread(meta)
+        .await
+        .expect("the create resumable thread fixture result is required for this assertion");
     store
         .update_thread_status(&thread_id, "error")
         .await
-        .unwrap();
+        .expect("the update thread status fixture result is required for this assertion");
 
     let parent_manager = Arc::new(TaskManager::new());
     let parent = Session::new(
@@ -154,20 +175,32 @@ async fn test_resume_factory_reuses_handoff_owner_queue_and_manager() {
         MessageSource::UserInput,
         BaseMessage::human("late handoff context"),
     ));
-    parent_manager.register_child_owner(owner.clone()).unwrap();
+    parent_manager
+        .register_child_owner(owner.clone())
+        .expect("the register child owner fixture result is required for this assertion");
     parent.set_subagent_host(SubagentHost {
-        task_manager: Some(parent_manager),
+        task_manager: Some(parent_manager.clone()),
         session_resources: Some(store.clone()),
         ..Default::default()
     });
 
     let spawned = SessionFactory::resume_subagent(
         Some(&parent),
-        resume_config(store.clone(), thread_id.clone()),
+        crate::session::subagent::tests::resume_config_with(
+            store.clone(),
+            thread_id.clone(),
+            crate::session::test_resources::mock::model::fixture_source(
+                Arc::new(crate::session::subagent::tests::EchoLLM),
+                "fixture-scripted",
+            ),
+            Some(parent_manager.clone()),
+            None,
+        ),
     )
     .await
     .expect("factory resume must accept the handed-off owner");
     assert_eq!(spawned.child_thread_id, thread_id);
+    crate::session::subagent::tests::wait_background_idle(&parent_manager).await;
     assert_eq!(owner.queue.len_sync(), 0, "恢复必须复用并消费原 owner 队列");
     assert!(
         owner.check_resume().is_ok(),
@@ -218,10 +251,13 @@ impl ObserveResumedInput {
 }
 crate::fixture_model_impl!(ObserveResumedInput);
 
-async fn test_failed_model_handoff_then_resume(background: bool, fail_drain: bool) {
-    use crate::session::subagent::{ChildHandoffReason, ParkedChildOwner, SubagentFailure};
+async fn test_failed_model_handoff_then_resume(fail_drain: bool) {
+    use crate::agent::async_tasks::BgTaskKind;
+    use crate::session::subagent::resource_owner::ParkedChildOwner;
+    use crate::session::subagent::types::ChildHandoffReason;
     use crate::session::{FrozenContext, MessageQueue, Session};
-    use peri_acp_types::tasks::{BgTaskKind, BgTaskRegistration, TaskManager as _};
+    use peri_acp_types::tasks::BgTaskRegistration;
+    use peri_acp_types::tasks::TaskManager as _;
     use std::time::Duration;
 
     let store = MockSessionResources::new();
@@ -229,11 +265,14 @@ async fn test_failed_model_handoff_then_resume(background: bool, fail_drain: boo
     let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
     meta.id = child_id.clone();
     meta.parent_thread_id = Some("parent-thread".into());
-    store.create_resumable_thread(meta).await.unwrap();
+    store
+        .create_resumable_thread(meta)
+        .await
+        .expect("the create resumable thread fixture result is required for this assertion");
     store
         .update_thread_status(&child_id, "error")
         .await
-        .unwrap();
+        .expect("the update thread status fixture result is required for this assertion");
     let parent_manager = Arc::new(TaskManager::new());
     let child_manager = Arc::new(TaskManager::new());
     child_manager
@@ -244,7 +283,7 @@ async fn test_failed_model_handoff_then_resume(background: bool, fail_drain: boo
             pid: None,
             kill: Some(Box::new(|| {})),
         })
-        .unwrap();
+        .expect("the register fixture result is required for this assertion");
     let owner = ParkedChildOwner::new(
         child_id.clone(),
         "parent-thread".into(),
@@ -253,7 +292,9 @@ async fn test_failed_model_handoff_then_resume(background: bool, fail_drain: boo
         Some(store.clone()),
         None,
     );
-    parent_manager.register_child_owner(owner.clone()).unwrap();
+    parent_manager
+        .register_child_owner(owner.clone())
+        .expect("the register child owner fixture result is required for this assertion");
     let parent = Session::new(
         Arc::from("/tmp"),
         FrozenContext::builder().build(),
@@ -264,12 +305,7 @@ async fn test_failed_model_handoff_then_resume(background: bool, fail_drain: boo
         session_resources: Some(store.clone()),
         ..Default::default()
     });
-    let mode = if background {
-        SubagentRunMode::Background
-    } else {
-        SubagentRunMode::Sync
-    };
-    let mut config = resume_config_with(
+    let mut config = crate::session::subagent::tests::resume_config_with(
         store.clone(),
         child_id.clone(),
         crate::session::test_resources::mock::model::fixture_source(
@@ -278,7 +314,6 @@ async fn test_failed_model_handoff_then_resume(background: bool, fail_drain: boo
             }),
             "fixture-scripted",
         ),
-        mode,
         Some(parent_manager.clone()),
         None,
     );
@@ -302,28 +337,18 @@ async fn test_failed_model_handoff_then_resume(background: bool, fail_drain: boo
         Ok(())
     }));
     let first = SessionFactory::resume_subagent(Some(&parent), config).await;
-    if background {
-        assert_eq!(first.expect("后台执行须成功启动").child_thread_id, child_id);
-        let result = tokio::time::timeout(Duration::from_secs(10), result_rx)
-            .await
-            .expect("后台失败必须完成")
-            .unwrap();
-        assert!(!result.success);
-        assert!(!result.timed_out);
-        assert_eq!(result.child_thread_id.as_deref(), Some(child_id.as_str()));
-    } else {
-        let error = first.err().expect("模型失败必须返回错误");
-        let failure = error
-            .downcast_ref::<SubagentFailure>()
-            .expect("保留类型化错误");
-        if !fail_drain {
-            assert!(failure.handoff().is_some(), "失败必须携带已提交交接");
-        }
-    }
+    assert_eq!(first.expect("后台执行须成功启动").child_thread_id, child_id);
+    let result = tokio::time::timeout(Duration::from_secs(10), result_rx)
+        .await
+        .expect("后台失败必须完成")
+        .expect("the expect fixture result is required for this assertion");
+    assert!(!result.success);
+    assert!(!result.timed_out);
+    assert_eq!(result.child_thread_id.as_deref(), Some(child_id.as_str()));
     tokio::time::timeout(Duration::from_secs(10), finished_rx)
         .await
         .expect("旧执行必须完成事件排空和 permit 结算")
-        .unwrap();
+        .expect("the expect fixture result is required for this assertion");
     let receipt = owner.receipt().expect("必须保留已确认交接");
     assert_eq!(receipt.reason, ChildHandoffReason::ExecutionFailed);
     assert!(receipt
@@ -337,25 +362,29 @@ async fn test_failed_model_handoff_then_resume(background: bool, fail_drain: boo
     );
     assert_eq!(child_manager.active_count(), 1);
     if fail_drain {
-        assert!(owner.failure().unwrap().contains("event drain failed"));
-        let error = SessionFactory::resume_subagent(Some(&parent), resume_config(store, child_id))
-            .await
-            .err()
-            .expect("事件排空失败必须阻止 resume")
-            .to_string();
+        assert!(owner
+            .failure()
+            .expect("the failure fixture result is required for this assertion")
+            .contains("event drain failed"));
+        let error = SessionFactory::resume_subagent(
+            Some(&parent),
+            crate::session::subagent::tests::resume_config(store, child_id),
+        )
+        .await
+        .expect_err("事件排空失败必须阻止 resume")
+        .to_string();
         assert!(error.contains("settlement is unconfirmed"), "{error}");
         return;
     }
 
     let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let mut resumed_config = resume_config_with(
+    let mut resumed_config = crate::session::subagent::tests::resume_config_with(
         store.clone(),
         child_id.clone(),
         crate::session::test_resources::mock::model::fixture_source(
             Arc::new(ObserveResumedInput(observed.clone())),
             "fixture-scripted",
         ),
-        SubagentRunMode::Sync,
         Some(parent_manager.clone()),
         None,
     );
@@ -366,25 +395,36 @@ async fn test_failed_model_handoff_then_resume(background: bool, fail_drain: boo
             let _ = sender.send(());
         }
     }));
+    // 暂停时钟下把外层超时放到交接上界（120s）之后：新执行在虚拟时间推进到
+    // 上界后完成 HandedOff，测试不会真实等待。
     let resumed = tokio::time::timeout(
-        Duration::from_secs(130),
+        Duration::from_secs(200),
         SessionFactory::resume_subagent(Some(&parent), resumed_config),
     )
     .await
     .expect("新执行必须在有界窗口内返回")
     .expect("已可靠交接的失败必须允许显式 resume");
-    tokio::time::timeout(Duration::from_secs(10), resumed_rx)
+    tokio::time::timeout(Duration::from_secs(200), resumed_rx)
         .await
         .expect("新执行必须完成旧事件排空")
-        .unwrap();
+        .expect("the expect fixture result is required for this assertion");
     assert_eq!(resumed.child_thread_id, child_id);
-    let resumed_host = resumed.session.subagent_host().unwrap();
+    let resumed_host = resumed
+        .session
+        .subagent_host()
+        .expect("the subagent host fixture result is required for this assertion");
     assert!(Arc::ptr_eq(
-        resumed_host.task_manager.as_ref().unwrap(),
+        resumed_host
+            .task_manager
+            .as_ref()
+            .expect("the as ref fixture result is required for this assertion"),
         &child_manager
     ));
     assert!(Arc::ptr_eq(
-        resumed_host.child_owner.as_ref().unwrap(),
+        resumed_host
+            .child_owner
+            .as_ref()
+            .expect("the as ref fixture result is required for this assertion"),
         &owner
     ));
     assert!(observed
@@ -404,16 +444,10 @@ async fn test_failed_model_handoff_then_resume(background: bool, fail_drain: boo
     );
 }
 
-/// [回归测试] 同步模型失败已完成交接，显式恢复必须保留原资源。
-#[tokio::test(start_paused = true)]
-async fn test_failed_model_handoff_sync_can_resume_original_owner() {
-    test_failed_model_handoff_then_resume(false, false).await;
-}
-
 /// [回归测试] 后台模型失败已完成交接，显式恢复必须保留原资源。
 #[tokio::test(start_paused = true)]
 async fn test_failed_model_handoff_background_can_resume_original_owner() {
-    test_failed_model_handoff_then_resume(true, false).await;
+    test_failed_model_handoff_then_resume(false).await;
 }
 
 #[path = "resume_owner_drain_test.rs"]
@@ -424,7 +458,7 @@ mod mailbox_tests;
 /// [回归测试] 真实执行 permit 结算失败时，factory 应给出具体且不含内部错误的拒绝。
 #[tokio::test]
 async fn test_resume_rejects_unconfirmed_settlement_with_specific_diagnostic() {
-    use crate::session::subagent::ParkedChildOwner;
+    use crate::session::subagent::resource_owner::ParkedChildOwner;
     use crate::session::{FrozenContext, MessageQueue, Session};
 
     let store = MockSessionResources::new();
@@ -432,7 +466,10 @@ async fn test_resume_rejects_unconfirmed_settlement_with_specific_diagnostic() {
     let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
     meta.id = child_id.clone();
     meta.parent_thread_id = Some("parent-thread".into());
-    store.create_resumable_thread(meta).await.unwrap();
+    store
+        .create_resumable_thread(meta)
+        .await
+        .expect("the create resumable thread fixture result is required for this assertion");
     let parent_manager = Arc::new(TaskManager::new());
     let owner = ParkedChildOwner::new(
         child_id.clone(),
@@ -447,9 +484,11 @@ async fn test_resume_rejects_unconfirmed_settlement_with_specific_diagnostic() {
         .execution_binding();
     owner
         .acquire(execution)
-        .unwrap()
+        .expect("the acquire fixture result is required for this assertion")
         .finish(Err("内部持久化错误内容".into()));
-    parent_manager.register_child_owner(owner).unwrap();
+    parent_manager
+        .register_child_owner(owner)
+        .expect("the register child owner fixture result is required for this assertion");
     let parent = Session::new(
         Arc::from("/tmp"),
         FrozenContext::builder().build(),
@@ -459,11 +498,13 @@ async fn test_resume_rejects_unconfirmed_settlement_with_specific_diagnostic() {
         task_manager: Some(parent_manager),
         ..Default::default()
     });
-    let error = SessionFactory::resume_subagent(Some(&parent), resume_config(store, child_id))
-        .await
-        .err()
-        .expect("未确认结算必须拒绝恢复")
-        .to_string();
+    let error = SessionFactory::resume_subagent(
+        Some(&parent),
+        crate::session::subagent::tests::resume_config(store, child_id),
+    )
+    .await
+    .expect_err("未确认结算必须拒绝恢复")
+    .to_string();
     assert!(error.contains("settlement is unconfirmed"), "{error}");
     assert!(!error.contains("内部持久化错误内容"));
 }
@@ -482,11 +523,13 @@ impl crate::agent::react::ReactLLM for FailingReactLlm {
     }
 }
 
-async fn test_post_handoff_history_flush_failure(background: bool) {
+async fn test_post_handoff_history_flush_failure() {
+    use crate::agent::async_tasks::BgTaskKind;
     use crate::agent::events::BackgroundTaskResult;
-    use crate::session::subagent::{ParkedChildOwner, SubagentFailure};
+    use crate::session::subagent::resource_owner::ParkedChildOwner;
     use crate::session::{FrozenContext, MessageTranscript, Session};
-    use peri_acp_types::tasks::{BgTaskKind, BgTaskRegistration, TaskManager as _};
+    use peri_acp_types::tasks::BgTaskRegistration;
+    use peri_acp_types::tasks::TaskManager as _;
     use std::time::Duration;
 
     let store = MockSessionResources::new();
@@ -494,11 +537,14 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
     let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
     meta.id = child_id.clone();
     meta.parent_thread_id = Some("parent-thread".into());
-    store.create_resumable_thread(meta).await.unwrap();
+    store
+        .create_resumable_thread(meta)
+        .await
+        .expect("the create resumable thread fixture result is required for this assertion");
     store
         .update_thread_status(&child_id, "error")
         .await
-        .unwrap();
+        .expect("the update thread status fixture result is required for this assertion");
     let parent_manager = Arc::new(TaskManager::new());
     let child_manager = Arc::new(TaskManager::new());
     let ticket = child_manager
@@ -509,7 +555,7 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
             pid: None,
             kill: Some(Box::new(|| {})),
         })
-        .unwrap();
+        .expect("the register fixture result is required for this assertion");
     let child = Session::new(
         Arc::from("/tmp"),
         FrozenContext::builder().build(),
@@ -525,7 +571,9 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
         Some(store.clone()),
         None,
     );
-    parent_manager.register_child_owner(owner.clone()).unwrap();
+    parent_manager
+        .register_child_owner(owner.clone())
+        .expect("the register child owner fixture result is required for this assertion");
     child.set_subagent_host(SubagentHost {
         task_manager: Some(child_manager.clone()),
         child_owner: Some(owner.clone()),
@@ -537,7 +585,7 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
             crate::session::MessageSource::UserInput,
             BaseMessage::human("开始执行"),
         ));
-    let built = build_v2_subagent_context(
+    let built = crate::session::subagent::build_v2_subagent_context(
         Some(child.clone()),
         Box::new(FailingReactLlm),
         Arc::new(MiddlewareChain::new()),
@@ -550,19 +598,22 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
         None,
         None,
         None,
-        Some(agent_id_from_child_thread(&child_id)),
+        Some(crate::session::subagent::agent_id_from_child_thread(
+            &child_id,
+        )),
     );
     // 交接提醒的持久化门：flush 已成功、提醒尚未写入时暂停，
     // 让用例在「canonical 提交」与「后续 flush 失败」之间插入观察。
     let (entered, release) = {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *store.reminder_append_gate.lock().unwrap() =
-            Some(crate::session::test_resources::mock::ResumeLoadGate {
-                entered: entered_tx,
-                release: release_rx,
-                dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            });
+        *store.reminder_append_gate.lock().expect(
+            "store reminder append gate mutex must remain unpoisoned throughout the test",
+        ) = Some(crate::session::test_resources::mock::ResumeLoadGate {
+            entered: entered_tx,
+            release: release_rx,
+            dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
         (entered_rx, release_tx)
     };
     let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
@@ -572,64 +623,35 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
             let _ = sender.send(());
         }
     });
-    let sync_run = if background {
-        crate::session::subagent::background::spawn_background_subagent(
-            "flush-parent-task".into(),
-            child_id.clone(),
-            "fixture".into(),
-            "开始执行".into(),
-            "/tmp".into(),
-            10,
-            None,
-            Some(parent_manager.clone()),
-            None,
-            None,
-            Some(store.clone()),
-            None,
-            Some(deregister),
-            None,
-            None,
-            None,
-            None,
-            None,
-            child.config().cancel_token.as_ref().clone(),
-            built,
-            None,
-        )
-        .await
-        .unwrap();
-        None
-    } else {
-        let run_child = child.clone();
-        let run_id = child_id.clone();
-        let run_store = store.clone();
-        Some(tokio::spawn(async move {
-            crate::session::subagent::run_sync::run_sync_subagent(
-                &run_id,
-                "fixture",
-                "/tmp",
-                10,
-                None,
-                None,
-                None,
-                Some(run_store),
-                None,
-                Some(deregister),
-                None,
-                None,
-                None,
-                built,
-                run_child,
-                None,
-                None,
-            )
-            .await
-        }))
-    };
+    crate::session::subagent::background::spawn_background_subagent(
+        "flush-parent-task".into(),
+        child_id.clone(),
+        "fixture".into(),
+        "开始执行".into(),
+        "/tmp".into(),
+        10,
+        None,
+        Some(parent_manager.clone()),
+        None,
+        None,
+        Some(store.clone()),
+        None,
+        Some(deregister),
+        None,
+        None,
+        None,
+        None,
+        None,
+        child.config().cancel_token.as_ref().clone(),
+        built,
+        None,
+    )
+    .await
+    .expect("the spawn background subagent fixture result is required for this assertion");
     tokio::time::timeout(Duration::from_secs(10), entered)
         .await
         .expect("交接必须到达 canonical 提交")
-        .unwrap();
+        .expect("the expect fixture result is required for this assertion");
     assert!(child_manager.complete(
         &ticket,
         BackgroundTaskResult {
@@ -647,21 +669,22 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
         }
     ));
     child.queue().drain_all_sync();
-    let writer = child.transcript().read().persist_tx_handle().unwrap();
+    let writer = child
+        .transcript()
+        .read()
+        .persist_tx_handle()
+        .expect("the persist tx handle fixture result is required for this assertion");
     child.transcript().read().shutdown_persistence();
     tokio::time::timeout(Duration::from_secs(10), writer.closed())
         .await
         .expect("测试 writer 必须在提交后续阶段前关闭");
-    release.send(()).unwrap();
-    if let Some(run) = sync_run {
-        let error = run.await.unwrap().expect_err("模型错误必须返回");
-        let failure = error.downcast_ref::<SubagentFailure>().unwrap();
-        assert!(failure.handoff().is_some(), "canonical 交接已提交");
-    }
+    release
+        .send(())
+        .expect("release send test receiver must remain available for this delivery");
     tokio::time::timeout(Duration::from_secs(10), finished_rx)
         .await
         .expect("旧执行必须完成")
-        .unwrap();
+        .expect("the expect fixture result is required for this assertion");
     assert!(owner.receipt().is_some(), "交接必须先于后续 flush 失败提交");
     assert!(owner.pending_receipt().is_none());
     assert_eq!(child_manager.active_count(), 0);
@@ -679,12 +702,176 @@ async fn test_post_handoff_history_flush_failure(background: bool) {
         task_manager: Some(parent_manager),
         ..Default::default()
     });
-    let error = SessionFactory::resume_subagent(Some(&parent), resume_config(store, child_id))
-        .await
-        .err()
-        .expect("交接后的 flush 失败必须阻止 resume")
-        .to_string();
+    let error = SessionFactory::resume_subagent(
+        Some(&parent),
+        crate::session::subagent::tests::resume_config(store, child_id),
+    )
+    .await
+    .expect_err("交接后的 flush 失败必须阻止 resume")
+    .to_string();
     assert!(error.contains("settlement is unconfirmed"), "{error}");
 }
 
-include!("resume_owner_settlement_test.rs");
+/// [回归测试] 交接确认后 history flush 失败，不能放行后台执行。
+#[tokio::test(start_paused = true)]
+async fn test_background_post_handoff_history_flush_failure_blocks_resume() {
+    test_post_handoff_history_flush_failure().await;
+}
+
+#[derive(Clone)]
+struct FailWithoutResidual;
+
+impl FailWithoutResidual {
+    async fn respond(
+        &self,
+        _request: peri_model::ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Vec<peri_model::ModelResult<peri_model::ModelStreamEvent>> {
+        vec![Err(peri_model::ModelError::http_status(
+            400,
+            "fixture",
+            None::<&str>,
+        ))]
+    }
+}
+crate::fixture_model_impl!(FailWithoutResidual);
+
+async fn test_failed_without_receipt_resume(late_obligations: bool) {
+    use crate::agent::async_tasks::BgTaskKind;
+    use crate::session::subagent::resource_owner::ParkedChildOwner;
+    use crate::session::{FrozenContext, MessageQueue, Session};
+    use peri_acp_types::tasks::BgTaskRegistration;
+    use peri_acp_types::tasks::TaskManager as _;
+    use std::time::Duration;
+
+    let store = MockSessionResources::new();
+    let child_id = uuid::Uuid::now_v7().to_string();
+    let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
+    meta.id = child_id.clone();
+    meta.parent_thread_id = Some("parent-thread".into());
+    store
+        .create_resumable_thread(meta)
+        .await
+        .expect("the create resumable thread fixture result is required for this assertion");
+    store
+        .update_thread_status(&child_id, "error")
+        .await
+        .expect("the update thread status fixture result is required for this assertion");
+    let parent_manager = Arc::new(TaskManager::new());
+    let child_manager = Arc::new(TaskManager::new());
+    let owner = ParkedChildOwner::new(
+        child_id.clone(),
+        "parent-thread".into(),
+        child_manager.clone(),
+        MessageQueue::new(),
+        Some(store.clone()),
+        None,
+    );
+    parent_manager
+        .register_child_owner(owner.clone())
+        .expect("the register child owner fixture result is required for this assertion");
+    let parent = Session::new(
+        Arc::from("/tmp"),
+        FrozenContext::builder().build(),
+        Some("parent-thread".into()),
+    );
+    parent.set_subagent_host(SubagentHost {
+        task_manager: Some(parent_manager.clone()),
+        ..Default::default()
+    });
+    let mut config = crate::session::subagent::tests::resume_config_with(
+        store.clone(),
+        child_id.clone(),
+        crate::session::test_resources::mock::model::fixture_source(
+            Arc::new(FailWithoutResidual),
+            "fixture-scripted",
+        ),
+        Some(parent_manager),
+        None,
+    );
+    if late_obligations {
+        let late_manager = child_manager.clone();
+        let late_queue = owner.queue.clone();
+        config.on_subagent_stop = Some(Arc::new(move |_, _, _, _, _| {
+            late_manager
+                .register(BgTaskRegistration {
+                    task_id: "late-shell".into(),
+                    kind: BgTaskKind::Shell,
+                    summary: "结算期间新到达的任务".into(),
+                    pid: None,
+                    kill: Some(Box::new(|| {})),
+                })
+                .expect("the register fixture result is required for this assertion");
+            late_queue.push_sync(crate::session::QueuedMessage::prompt(
+                crate::session::MessageSource::UserInput,
+                BaseMessage::human("结算期间到达的输入"),
+            ));
+        }));
+    }
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let finished_tx = parking_lot::Mutex::new(Some(finished_tx));
+    config.deregister_runtime = Some(Arc::new(move |_| {
+        if let Some(sender) = finished_tx.lock().take() {
+            let _ = sender.send(());
+        }
+    }));
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let result_tx = parking_lot::Mutex::new(Some(result_tx));
+    config.on_bg_complete = Some(Arc::new(move |result, _| {
+        if let Some(sender) = result_tx.lock().take() {
+            let _ = sender.send(result.clone());
+        }
+        Ok(())
+    }));
+    let first = SessionFactory::resume_subagent(Some(&parent), config).await;
+    first.expect("后台执行须成功启动");
+    let result = tokio::time::timeout(Duration::from_secs(10), result_rx)
+        .await
+        .expect("后台失败必须完成")
+        .expect("the expect fixture result is required for this assertion");
+    assert!(!result.success);
+    tokio::time::timeout(Duration::from_secs(10), finished_rx)
+        .await
+        .expect("旧执行必须完成")
+        .expect("the expect fixture result is required for this assertion");
+    assert!(owner.receipt().is_none());
+    if !late_obligations {
+        assert!(owner.failure().is_none());
+        assert_eq!(child_manager.active_count(), 0);
+        let resumed = SessionFactory::resume_subagent(
+            Some(&parent),
+            crate::session::subagent::tests::resume_config(store, child_id.clone()),
+        )
+        .await
+        .expect("没有残余义务的失败应允许新执行");
+        assert_eq!(resumed.child_thread_id, child_id);
+        return;
+    }
+    assert_eq!(child_manager.active_count(), 1);
+    assert!(owner.queue.has_required_sync());
+    assert_eq!(
+        owner.failure().as_deref(),
+        Some("child settlement is unconfirmed after execution failure")
+    );
+    let error = SessionFactory::resume_subagent(
+        Some(&parent),
+        crate::session::subagent::tests::resume_config(store, child_id),
+    )
+    .await
+    .expect_err("无交接回执的未确认义务必须阻止 resume")
+    .to_string();
+    assert!(error.contains("settlement is unconfirmed"), "{error}");
+}
+
+/// [回归测试] 无 receipt 的后台失败在结算期间出现新义务时必须阻断。
+#[tokio::test(start_paused = true)]
+async fn test_background_failed_without_receipt_late_obligations_block_resume() {
+    test_failed_without_receipt_resume(true).await;
+}
+
+/// [回归测试] 无 receipt 且无遗留义务的后台失败可以恢复。
+#[tokio::test(start_paused = true)]
+async fn test_background_failed_without_receipt_or_obligations_can_resume() {
+    test_failed_without_receipt_resume(false).await;
+}
+include!("resume_unconfirmed_handoff_cases.rs");

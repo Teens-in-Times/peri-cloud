@@ -18,6 +18,10 @@ use peri_acp_types::mcp_apps::{
 };
 use peri_acp_types::permission::{PermissionMode, SharedPermissionMode};
 use peri_acp_types::tool_invocation::{InvocationId, InvocationOrigin};
+use peri_acp_types::tools::BaseTool;
+use peri_acp_types::workflow::{
+    WorkflowToolCall, WorkflowToolErrorCode, WorkflowToolInvoker, WorkflowToolOutcome,
+};
 use peri_agent::middleware::chain::MiddlewareChain;
 use peri_agent::session::queue::MessageQueue;
 use rmcp::model::{
@@ -29,7 +33,10 @@ use tokio_util::sync::CancellationToken;
 use super::super::apps::{AttachmentRoute, McpAppRecord, McpAppRecordSpec};
 use super::super::client::output_store::tests::Wire;
 use super::super::client::McpClientPool;
-use super::*;
+use super::EffectiveToolErrorCode;
+use super::InvocationRuleChain;
+use super::SessionInvocationInputs;
+use super::SessionInvocationService;
 use peri_acp_types::mcp_apps_facade::AppQualification;
 
 const SESSION: &str = "idle-session";
@@ -222,10 +229,7 @@ impl Fixture {
     /// 附件事实单独记下，供 `app_request` 构造「来自该 View 的请求」——撤销不改变
     /// 这个历史事实，只是它不再有效。
     fn attach_record(&self, connection_id: &str) -> Arc<McpAppRecord> {
-        let handle = self
-            .pool
-            .get_client(SERVER)
-            .expect("fixture server installed");
+        let handle = self.pool.client(SERVER).expect("fixture server installed");
         let generation = self.pool.handle_generation(&handle);
         // 生产同序：会话环境登记运行时世代 → 实例化调用签发 record → 附着连接。
         self.pool
@@ -759,142 +763,4 @@ async fn detaching_one_view_leaves_other_attachments_and_execution_intact() {
     fixture.shutdown().await;
 }
 
-/// [D4] rerun 目标权威：目标身份来自**服务端 outcome 记录**；跨会话 / 未保留 /
-/// 未绑定目标的调用一律显式不可导出（绝不回落客户端字段）。
-#[tokio::test]
-async fn source_target_exports_target_from_retained_outcome_record() {
-    let fixture = Fixture::new(
-        InteractionResponse::Decisions(vec![
-            peri_acp_types::interaction::ApprovalDecision::Approve { source: None },
-        ]),
-        None,
-    )
-    .await;
-    let record = fixture.attach_record("connection-1");
-
-    let outcome = fixture
-        .service
-        .invoke(fixture.app_request(&record, serde_json::json!({"value": 1})))
-        .await
-        .expect("请求本身合法");
-    assert!(matches!(outcome, SessionInvocationOutcome::Completed(_)));
-
-    let retained = fixture
-        .service
-        .outcomes()
-        .latest()
-        .expect("outcome 必须入账");
-    let target = fixture
-        .service
-        .source_target(SESSION, &retained.invocation_id)
-        .expect("已执行调用必须能从服务端记录导出目标");
-    assert_eq!(target.server_id, SERVER);
-    assert_eq!(target.wire_tool_name, APP_TOOL, "wire 名是服务端声明名");
-    assert_eq!(
-        target.effective_tool_name,
-        super::super::tool_bridge::effective_mcp_tool_name(SERVER, APP_TOOL),
-        "effective 名是目录准入后的名字（两者不可互相代替）"
-    );
-
-    // 跨会话：本服务只导出本会话记录（ID 只定位，不授权）。
-    assert!(
-        fixture
-            .service
-            .source_target("other-session", &retained.invocation_id)
-            .is_none(),
-        "跨会话不得导出目标"
-    );
-    // 未知 / 已淘汰的执行身份：显式无目标。
-    assert!(
-        fixture
-            .service
-            .source_target(SESSION, &InvocationId::generate())
-            .is_none(),
-        "未保留的执行身份不得导出目标"
-    );
-
-    // 绑定目标**之前**被拒的调用：记录里没有目标权威，同样不可导出。
-    let (attachment_id, epoch) = fixture
-        .attachment_facts
-        .lock()
-        .get(&record.record_id)
-        .cloned()
-        .expect("夹具自检：附件事实必须记录");
-    let rejected = fixture
-        .service
-        .invoke(fixture.app_request_from(
-            &record,
-            attachment_id,
-            epoch.next(),
-            serde_json::json!({}),
-        ))
-        .await
-        .expect("请求本身合法");
-    assert_eq!(
-        rejected,
-        SessionInvocationOutcome::NotExecuted {
-            cause: NotExecutedCause::UntrustedOwner
-        },
-        "纪元不符必须显式未执行"
-    );
-    let rejected_record = fixture
-        .service
-        .outcomes()
-        .latest()
-        .expect("拒绝同样要入账（不静默）");
-    assert!(
-        rejected_record.target.is_none(),
-        "未绑定目标的调用不得伪造目标身份"
-    );
-    assert!(
-        fixture
-            .service
-            .source_target(SESSION, &rejected_record.invocation_id)
-            .is_none(),
-        "无目标的记录必须显式不可导出"
-    );
-    fixture.shutdown().await;
-}
-
-/// `map_dispatch_error` 的 typed 事实**只**来自错误本身（裁决 R9）：不再有带外
-/// 「无人可答」记录点，两种原因各自如实落账。
-#[test]
-fn map_dispatch_error_reads_typed_cause_without_side_channel() {
-    let unavailable = peri_agent::tools::EffectiveToolError::new(
-        EffectiveToolErrorCode::PermissionDenied,
-        UnansweredCause::OwnerUnmatched.reason_text(),
-    )
-    .with_unanswered_cause(UnansweredCause::OwnerUnmatched);
-    assert_eq!(
-        map_dispatch_error(unavailable, false),
-        SessionInvocationOutcome::NotExecuted {
-            cause: NotExecutedCause::ApprovalUnavailable(UnansweredCause::OwnerUnmatched)
-        },
-        "「没有人可以决定」必须落成 ApprovalUnavailable，不得折叠成用户拒绝"
-    );
-
-    let rejected = peri_agent::tools::EffectiveToolError::new(
-        EffectiveToolErrorCode::UserRejected,
-        "用户拒绝",
-    );
-    assert_eq!(
-        map_dispatch_error(rejected, false),
-        SessionInvocationOutcome::NotExecuted {
-            cause: NotExecutedCause::UserRejected
-        },
-        "已作出的拒绝决定必须落成 UserRejected"
-    );
-
-    // 本端策略拒绝（hook / 分类器 / 审批机制缺失或超时）：既不是用户拒绝，
-    // 也不是无人可答，且不得记成「目标已撤销」。
-    let policy = peri_agent::tools::EffectiveToolError::new(
-        EffectiveToolErrorCode::PermissionDenied,
-        "Hook blocked this call",
-    );
-    assert_eq!(
-        map_dispatch_error(policy, false),
-        SessionInvocationOutcome::NotExecuted {
-            cause: NotExecutedCause::PolicyDenied
-        }
-    );
-}
+include!("session_invocation_test_section_2.rs");

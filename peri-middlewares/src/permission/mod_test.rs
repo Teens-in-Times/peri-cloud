@@ -1,10 +1,28 @@
-use peri_acp_types::builtin_mcp::{
-    is_reserved_instance_name, original_tool_name_of_effective, BuiltinMcpTool,
-    BUILTIN_MCP_INSTANCES,
-};
+use peri_acp_types::builtin_mcp;
+use peri_acp_types::builtin_mcp::BuiltinMcpTool;
+use peri_acp_types::builtin_mcp::BUILTIN_MCP_INSTANCES;
 use peri_agent::agent::state::AgentState;
+use peri_agent::middleware::{Middleware as _, PromptSectionZone};
 
-use super::*;
+use super::async_trait;
+use super::default_requires_approval;
+use super::AgentError;
+use super::ApprovalDecision;
+use super::Arc;
+use super::AutoClassifier;
+use super::Classification;
+use super::InteractionContext;
+use super::InteractionResponse;
+use super::PermissionMiddleware;
+use super::PermissionMode;
+use super::SharedPermissionMode;
+use super::ToolCall;
+use super::TrustedInteractionOwner;
+use super::UserInteractionBroker;
+use super::TOOL_BASH;
+use super::TOOL_EDIT;
+use super::TOOL_FOLDER_OPS;
+use super::TOOL_WRITE;
 
 /// 自动批准 broker
 struct AutoApproveBroker;
@@ -113,65 +131,75 @@ async fn test_read_file_not_intercepted() {
 
 #[test]
 fn test_default_requires_approval() {
-    assert!(default_requires_approval("Bash"));
-    assert!(default_requires_approval("Write"));
-    assert!(default_requires_approval("Edit"));
-    assert!(default_requires_approval("folder_operations"));
-    assert!(default_requires_approval("delete_something"));
-    assert!(default_requires_approval("rm_rf"));
-    assert!(default_requires_approval("Agent"));
+    assert!(super::default_requires_approval("Bash"));
+    assert!(super::default_requires_approval("Write"));
+    assert!(super::default_requires_approval("Edit"));
+    assert!(super::default_requires_approval("folder_operations"));
+    assert!(super::default_requires_approval("delete_something"));
+    assert!(super::default_requires_approval("rm_rf"));
+    assert!(super::default_requires_approval("Agent"));
     // Workflow 启动：后台子链无 HITL，等价委派执行权（与 Agent 同规则）
-    assert!(default_requires_approval("Workflow"));
-    assert!(default_requires_approval("mcp__workflow__Workflow"));
+    assert!(super::default_requires_approval("Workflow"));
+    assert!(super::default_requires_approval("mcp__workflow__Workflow"));
     // 查询/终止/回填类 workflow 工具不拦截
-    assert!(!default_requires_approval("mcp__workflow__WorkflowStatus"));
-    assert!(!default_requires_approval("mcp__workflow__WorkflowKill"));
-    assert!(!default_requires_approval(
+    assert!(!super::default_requires_approval(
+        "mcp__workflow__WorkflowStatus"
+    ));
+    assert!(!super::default_requires_approval(
+        "mcp__workflow__WorkflowKill"
+    ));
+    assert!(!super::default_requires_approval(
         "mcp__workflow__WorkflowAgentClaim"
     ));
     // MCP 工具需审批
-    assert!(default_requires_approval("mcp__filesystem__read_file"));
-    assert!(default_requires_approval("mcp__filesystem__write_file"));
-    assert!(default_requires_approval("mcp__github__create_issue"));
-    assert!(default_requires_approval("mcp__database__query"));
-    assert!(default_requires_approval("mcp__web__fetch"));
+    assert!(super::default_requires_approval(
+        "mcp__filesystem__read_file"
+    ));
+    assert!(super::default_requires_approval(
+        "mcp__filesystem__write_file"
+    ));
+    assert!(super::default_requires_approval(
+        "mcp__github__create_issue"
+    ));
+    assert!(super::default_requires_approval("mcp__database__query"));
+    assert!(super::default_requires_approval("mcp__web__fetch"));
 
     // Web 工具需审批
-    assert!(default_requires_approval("WebFetch"));
-    assert!(default_requires_approval("WebSearch"));
+    assert!(super::default_requires_approval("WebFetch"));
+    assert!(super::default_requires_approval("WebSearch"));
 
     // cron_register 可定时触发任意 prompt，等价代理执行权，需审批
-    assert!(default_requires_approval("cron_register"));
+    assert!(super::default_requires_approval("cron_register"));
     // cron_list / cron_remove 仅查询/撤销，不拦截
-    assert!(!default_requires_approval("cron_list"));
-    assert!(!default_requires_approval("cron_remove"));
+    assert!(!super::default_requires_approval("cron_list"));
+    assert!(!super::default_requires_approval("cron_remove"));
 
-    assert!(!default_requires_approval("Read"));
-    assert!(!default_requires_approval("Glob"));
-    assert!(!default_requires_approval("Grep"));
-    assert!(!default_requires_approval("TodoWrite"));
-    assert!(!default_requires_approval("ask_user"));
+    assert!(!super::default_requires_approval("Read"));
+    assert!(!super::default_requires_approval("Glob"));
+    assert!(!super::default_requires_approval("Grep"));
+    assert!(!super::default_requires_approval("TodoWrite"));
+    assert!(!super::default_requires_approval("ask_user"));
     // mcp_read_resource 不以 mcp__（双下划线）开头，不拦截
-    assert!(!default_requires_approval("mcp_read_resource"));
+    assert!(!super::default_requires_approval("mcp_read_resource"));
 }
 
 #[test]
 fn test_mcp_prefix_edge_cases() {
     // 单下划线不匹配
-    assert!(!default_requires_approval("mcp_"));
-    assert!(!default_requires_approval("mcp_read_resource"));
+    assert!(!super::default_requires_approval("mcp_"));
+    assert!(!super::default_requires_approval("mcp_read_resource"));
     // 无下划线不匹配
-    assert!(!default_requires_approval("mcp"));
+    assert!(!super::default_requires_approval("mcp"));
     // 双下划线匹配
-    assert!(default_requires_approval("mcp__a__b"));
-    assert!(default_requires_approval("mcp__server__tool_name"));
-    assert!(default_requires_approval("mcp__x__y__z"));
+    assert!(super::default_requires_approval("mcp__a__b"));
+    assert!(super::default_requires_approval("mcp__server__tool_name"));
+    assert!(super::default_requires_approval("mcp__x__y__z"));
 }
 
 #[test]
 fn test_is_edit_tool_excludes_mcp() {
     // MCP 工具不属于编辑工具，在 AcceptEdits 模式下仍需审批
-    assert!(!is_edit_tool("mcp__filesystem__write_file"));
+    assert!(!super::is_edit_tool("mcp__filesystem__write_file"));
 }
 
 #[tokio::test]
@@ -248,14 +276,14 @@ async fn test_respond_returns_error_with_reason() {
 
 #[test]
 fn test_is_edit_tool() {
-    assert!(is_edit_tool("Write"));
-    assert!(is_edit_tool("Edit"));
-    assert!(is_edit_tool("folder_operations"));
-    assert!(!is_edit_tool("Bash"));
-    assert!(!is_edit_tool("Agent"));
-    assert!(!is_edit_tool("delete_x"));
-    assert!(!is_edit_tool("rm_x"));
-    assert!(!is_edit_tool("Read"));
+    assert!(super::is_edit_tool("Write"));
+    assert!(super::is_edit_tool("Edit"));
+    assert!(super::is_edit_tool("folder_operations"));
+    assert!(!super::is_edit_tool("Bash"));
+    assert!(!super::is_edit_tool("Agent"));
+    assert!(!super::is_edit_tool("delete_x"));
+    assert!(!super::is_edit_tool("rm_x"));
+    assert!(!super::is_edit_tool("Read"));
 }
 
 /// Mock 自动分类器
@@ -425,13 +453,16 @@ async fn test_process_batch_broker_timeout_returns_one_result_per_call() {
     let results = mw.before_tools_batch(&mut state, &calls).await;
 
     assert_eq!(results.len(), calls.len(), "批量超时结果必须与输入等长");
-    for (result, call) in results.iter().zip(calls.iter()) {
-        match result {
-            Err(AgentError::ToolRejected { tool, reason, .. }) => {
-                assert_eq!(tool, &call.name, "拒绝必须归属原调用，不串线");
-                assert!(reason.contains("超时"), "原因应说明审批超时：{reason}");
+    {
+        let paired_results = results.iter().zip(calls.iter());
+        for (result, call) in paired_results {
+            match result {
+                Err(AgentError::ToolRejected { tool, reason, .. }) => {
+                    assert_eq!(tool, &call.name, "拒绝必须归属原调用，不串线");
+                    assert!(reason.contains("超时"), "原因应说明审批超时：{reason}");
+                }
+                other => panic!("超时拒绝应为 ToolRejected，实际: {other:?}"),
             }
-            other => panic!("超时拒绝应为 ToolRejected，实际: {other:?}"),
         }
     }
 }
@@ -467,7 +498,7 @@ async fn test_cron_register_allowed_in_bypass_mode() {
 async fn test_cron_register_not_edit_tool_in_accept_edit_mode() {
     // AcceptEdit 只自动放行 Write/Edit/folder_operations；
     // cron_register 仍走审批（AutoApproveBroker 通过）
-    assert!(!is_edit_tool("cron_register"));
+    assert!(!super::is_edit_tool("cron_register"));
     let mw = make_mw_with_mode(PermissionMode::AcceptEdit, None);
     let mut state = approval_state();
     let tc = make_tool_call("cron_register");
@@ -518,99 +549,41 @@ async fn test_broker_hang_rejects_with_timeout() {
 
 // ─── 10_hitl 段落持有（波 4 演进 C3）────────────────────────────────────
 
-/// 契约（设计 §3.1.2）：sensitive 条目与 `default_requires_approval` 判定
-/// 一一对应——精确条目按名、前缀条目按前缀探测名必须判定为敏感；代表性
-/// 非敏感工具必须判定为不敏感。列表与判定函数失同步即测试失败。
-#[test]
-fn sensitive_entries_match_default_requires_approval() {
-    for entry in sensitive_tool_entries() {
-        let probe = if entry.prefix_match {
-            format!("{}some_tool", entry.name)
-        } else {
-            entry.name.to_string()
-        };
-        assert!(
-            default_requires_approval(&probe),
-            "条目 `{}`（prefix={}）应在 default_requires_approval 判定为敏感",
-            entry.name,
-            entry.prefix_match
-        );
-    }
-    // 反向抽查：常规工具不敏感（与 test_default_requires_approval 的负例一致）
-    for tool in [
-        "Read",
-        "Glob",
-        "Grep",
-        "TodoWrite",
-        "AskUserQuestion",
-        "cron_list",
-        "cron_remove",
-        "monitor_read",
-        "monitor_stop",
-        "monitor_list",
-        "mcp_read_resource",
-    ] {
-        assert!(
-            !default_requires_approval(tool),
-            "{tool} 不应判定为敏感（条目列表与判定函数失同步）"
-        );
-    }
-}
-
-/// 条目集合与判定分支数一致（精确 10 项 + 前缀 3 项 = 13 项；
-/// 变更 `default_requires_approval` 分支时必须同步条目清单）。
-#[test]
-fn sensitive_entries_cover_all_requires_approval_branches() {
-    let entries = sensitive_tool_entries();
-    assert_eq!(
-        entries.len(),
-        13,
-        "条目清单应覆盖 default_requires_approval 全部分支"
-    );
-    // 前缀条目恰好 3 项（delete_ / rm_ / mcp__）
-    let prefix_count = entries.iter().filter(|e| e.prefix_match).count();
-    assert_eq!(prefix_count, 3, "前缀匹配条目应恰好 3 项");
-}
-
-/// 10_hitl 段落声明：位置属性（Uncached order=3）与内容结构（机制说明 +
-/// 动态列表 + 模式决策尾句）。
 #[test]
 fn hitl_section_declaration_shape() {
     let sections = PermissionMiddleware::sections();
-    assert_eq!(sections.len(), 1, "10_hitl 段应唯一");
-    let section = &sections[0];
+    let [section] = sections.as_slice() else {
+        panic!("expected one approval section");
+    };
     assert_eq!(section.id, "10_hitl");
     assert_eq!(section.zone, PromptSectionZone::Uncached);
     assert_eq!(section.order, 3);
-    let content = section.content.as_str();
-    assert!(
-        content.contains("# Human-in-the-Loop (HITL) Approval Mode"),
-        "机制说明标题应保留（include_str 零拷贝）"
-    );
-    assert!(
-        content.contains("## Which tools are sensitive"),
-        "sensitive 小节引导保留"
-    );
-    assert!(
-        content.contains(&format!(
-            "- `{}` — shell command execution",
-            registry_effective_name("workspace", TOOL_BASH)
-        )),
-        "动态列表按代码事实生成（workspace 迁移后条目名是 effective name）"
-    );
-    assert!(
-        content.contains("Whether a sensitive tool actually requires approval is decided by the current `PermissionMode`"),
-        "模式决策尾句保留"
-    );
-    // 段落文件不再硬编码列表（失同步防线）
-    let file_content = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../peri-acp/prompts/sections/10_hitl.md"
+    assert!(matches!(
+        &section.content,
+        peri_agent::middleware::PromptSectionContent::Builtin(_)
     ));
-    assert!(
-        !file_content.contains("- `Bash`"),
-        "10_hitl.md 不应再硬编码 sensitive 列表（列表由代码事实生成）"
-    );
+    let content = section.content.as_str();
+    assert!(content.contains("## Which tools are sensitive"));
+    assert!(content.contains("bound target"));
+    // The approval decision and the file-edit tool share the name "Edit".
+    let edit_decision = "- **Edit** supplies replacement arguments";
+    assert!(content.contains(edit_decision));
+    let tool_policy = content.replace(edit_decision, "");
+    let policy_words: std::collections::HashSet<_> = tool_policy
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .collect();
+    for capability in builtin_mcp::BUILTIN_V5_CAPABILITIES {
+        for tool in capability.tools {
+            assert!(
+                !policy_words.contains(tool.model_name) && !policy_words.contains(tool.legacy_name),
+                "approval policy hardcodes tool name {} or {}",
+                tool.model_name,
+                tool.legacy_name
+            );
+        }
+    }
+    assert!(!content.contains("`Agent`"));
+    assert!(!content.contains("mcp__*"));
 }
 
 // ─── A4 生效名归一（IF-D6 判定型 ①② / IF-D15）─────────────────────────────
@@ -623,10 +596,7 @@ fn declared_builtin_tools() -> Vec<&'static BuiltinMcpTool> {
         .collect()
 }
 
-/// 从注册表解析 effective name 作为**期望值**。
-///
-/// 不复用生产查表助手 `builtin_tool_effective_name`：复用会让「助手退回裸名」这类
-/// 回归与断言同向变化而无法失败（同 `cron_sensitive_markdown_uses_registry_effective_name`）。
+/// 从注册表取得旧记录使用的工具别名。
 fn registry_effective_name(instance: &str, original: &str) -> &'static str {
     peri_acp_types::builtin_mcp::find(instance)
         .unwrap_or_else(|| panic!("实例 `{instance}` 应有声明"))
@@ -634,7 +604,7 @@ fn registry_effective_name(instance: &str, original: &str) -> &'static str {
         .iter()
         .find(|tool| tool.original_name == original)
         .unwrap_or_else(|| panic!("声明表应含 `{instance}` 的原始工具名 `{original}`"))
-        .effective_name
+        .legacy_name
 }
 
 /// IF-D6 判定型归一的等价性：对声明表逐项，effective name 的判定**等于**原始名。
@@ -651,20 +621,20 @@ fn builtin_effective_names_match_original_name_policy() {
     assert_eq!(tools.len(), expected, "声明表遍历必须覆盖注册表全部行");
 
     for tool in tools {
-        let (effective, original) = (tool.effective_name, tool.original_name);
+        let (effective, original) = (tool.legacy_name, tool.original_name);
         assert_eq!(
-            original_tool_name_of_effective(effective),
+            builtin_mcp::original_tool_name_of_effective(effective),
             Some(original),
             "`{effective}` 应命中归一表并返回原始名 `{original}`"
         );
         assert_eq!(
-            default_requires_approval(effective),
-            default_requires_approval(original),
+            super::default_requires_approval(effective),
+            super::default_requires_approval(original),
             "`{effective}` 的审批判定必须等于原始名 `{original}`（IF-D6）"
         );
         assert_eq!(
-            is_edit_tool(effective),
-            is_edit_tool(original),
+            super::is_edit_tool(effective),
+            super::is_edit_tool(original),
             "`{effective}` 的编辑工具判定必须等于原始名 `{original}`（IF-D6）"
         );
     }
@@ -684,13 +654,16 @@ fn builtin_effective_names_match_original_name_policy() {
             .iter()
             .find(|tool| tool.original_name == original)
             .unwrap_or_else(|| panic!("声明表应含 `{instance}` 的原始工具名 `{original}`"));
-        for name in [original, tool.effective_name] {
+        for name in [original, tool.legacy_name] {
             assert_eq!(
-                default_requires_approval(name),
+                super::default_requires_approval(name),
                 requires_approval,
                 "`{name}` 的审批判定应为 {requires_approval}（wave 2 冻结）"
             );
-            assert!(!is_edit_tool(name), "`{name}` 不是编辑工具（wave 2 冻结）");
+            assert!(
+                !super::is_edit_tool(name),
+                "`{name}` 不是编辑工具（wave 2 冻结）"
+            );
         }
     }
 }
@@ -704,15 +677,15 @@ fn builtin_effective_names_match_original_name_policy() {
 #[test]
 fn wave1_frozen_effective_name_policy() {
     // 原始名侧（迁移前行为）
-    assert!(default_requires_approval("WebSearch"));
-    assert!(default_requires_approval("WebFetch"));
-    assert!(!default_requires_approval("artifact"));
+    assert!(super::default_requires_approval("WebSearch"));
+    assert!(super::default_requires_approval("WebFetch"));
+    assert!(!super::default_requires_approval("artifact"));
 
     // effective name 侧（迁移后，必须与原始名相等）
-    assert!(default_requires_approval("mcp__web__WebSearch"));
-    assert!(default_requires_approval("mcp__web__WebFetch"));
+    assert!(super::default_requires_approval("mcp__web__WebSearch"));
+    assert!(super::default_requires_approval("mcp__web__WebFetch"));
     assert!(
-        !default_requires_approval("mcp__artifact__artifact"),
+        !super::default_requires_approval("mcp__artifact__artifact"),
         "artifact 按原始名判定 ⇒ 不审批（IF-G2 决策 1，已显式记录）"
     );
 
@@ -724,7 +697,7 @@ fn wave1_frozen_effective_name_policy() {
         "mcp__web__WebFetch",
         "mcp__artifact__artifact",
     ] {
-        assert!(!is_edit_tool(name), "`{name}` 不是编辑工具（IF-G2）");
+        assert!(!super::is_edit_tool(name), "`{name}` 不是编辑工具（IF-G2）");
     }
 }
 
@@ -741,29 +714,35 @@ fn unknown_mcp_prefix_remains_conservative() {
         "mcp__x__y__z",
     ] {
         assert_eq!(
-            original_tool_name_of_effective(unknown),
+            builtin_mcp::original_tool_name_of_effective(unknown),
             None,
             "`{unknown}` 不在归一表内（未知 / 外部 MCP 工具）"
         );
         assert!(
-            default_requires_approval(unknown),
+            super::default_requires_approval(unknown),
             "未知 `mcp__*` 必须保守敏感：{unknown}"
         );
     }
     for not_mcp in ["mcp_", "mcp", "mcp_read_resource"] {
-        assert!(!default_requires_approval(not_mcp), "{not_mcp} 不应敏感");
+        assert!(
+            !super::default_requires_approval(not_mcp),
+            "{not_mcp} 不应敏感"
+        );
     }
 
     // 两条**理由不同**的 true 必须各自成立（IF-G2 反证）：`mcp__web__fetch` 与
     // `mcp__web__WebFetch` 不是同一个名字——前者未命中归一表，靠 `mcp__` 前缀
     // （未知 MCP 工具）判定；后者命中归一表，靠原始名 `WebFetch` 判定。
-    assert_eq!(original_tool_name_of_effective("mcp__web__fetch"), None);
-    assert!(default_requires_approval("mcp__web__fetch"));
     assert_eq!(
-        original_tool_name_of_effective("mcp__web__WebFetch"),
+        builtin_mcp::original_tool_name_of_effective("mcp__web__fetch"),
+        None
+    );
+    assert!(super::default_requires_approval("mcp__web__fetch"));
+    assert_eq!(
+        builtin_mcp::original_tool_name_of_effective("mcp__web__WebFetch"),
         Some("WebFetch")
     );
-    assert!(default_requires_approval("mcp__web__WebFetch"));
+    assert!(super::default_requires_approval("mcp__web__WebFetch"));
 }
 
 /// 保留名反例（A3 / IF-D6 冻结约束 4）：外部 server 若用保留名接管，绝不能靠
@@ -775,16 +754,16 @@ fn unknown_mcp_prefix_remains_conservative() {
 /// ② 预留但未实现的实例名不进归一表 ⇒ 其 effective name 仍是未知 MCP 工具，保守敏感。
 #[test]
 fn builtin_reserved_name_is_not_parity_hijackable() {
-    for instance in BUILTIN_MCP_INSTANCES {
+    for instance in BUILTIN_MCP_INSTANCES.iter() {
         assert!(
-            is_reserved_instance_name(instance.name),
+            builtin_mcp::is_reserved_instance_name(instance.name),
             "归一表只允许以保留实例名为键（保留名由加载期 typed error 保护，A3）：{}",
             instance.name
         );
     }
     for reserved in ["web", "artifact", "cron", "workspace"] {
         assert!(
-            is_reserved_instance_name(reserved),
+            builtin_mcp::is_reserved_instance_name(reserved),
             "{reserved} 应为保留实例名"
         );
     }
@@ -793,140 +772,65 @@ fn builtin_reserved_name_is_not_parity_hijackable() {
     // （`Read` 不敏感）；**未声明**的工具名（下例 `NotATool`）不进归一表 ⇒ 仍是
     // 未知 MCP 工具、保守敏感——原「未声明 ⇒ 保守」的强度由后两条断言保留。
     assert_eq!(
-        original_tool_name_of_effective("mcp__workspace__Read"),
+        builtin_mcp::original_tool_name_of_effective("mcp__workspace__Read"),
         Some("Read")
     );
-    assert!(!default_requires_approval("mcp__workspace__Read"));
+    assert!(!super::default_requires_approval("mcp__workspace__Read"));
     assert_eq!(
-        original_tool_name_of_effective("mcp__workspace__NotATool"),
+        builtin_mcp::original_tool_name_of_effective("mcp__workspace__NotATool"),
         None
     );
-    assert!(default_requires_approval("mcp__workspace__NotATool"));
+    assert!(super::default_requires_approval("mcp__workspace__NotATool"));
 
     // 「外部 server 名 `artifact` + 工具 `artifact`」的判定跟原始名走（另一结果
     // = 加载期 typed error，见配置侧断言）；两者都必须成立其一，不得是第三种。
     assert_eq!(
-        default_requires_approval("mcp__artifact__artifact"),
-        default_requires_approval("artifact")
+        super::default_requires_approval("mcp__artifact__artifact"),
+        super::default_requires_approval("artifact")
     );
 }
 
-/// A19 / IF-G3：已迁移条目的 `name` 为 effective name；`mcp__` 前缀条目的
-/// description 不再宣称「所有 `mcp__*` 一律敏感」（对 builtin 一等工具已不充分）。
 #[test]
-fn sensitive_entries_use_model_names_and_parity_description() {
-    let entries = sensitive_tool_entries();
-    let names: Vec<&str> = entries.iter().map(|entry| entry.name).collect();
-
-    // system MCP 原名就是模型面名字。
-    assert!(
-        names.contains(&TOOL_WEBFETCH),
-        "条目名应为原名 `{TOOL_WEBFETCH}`"
-    );
-    assert!(
-        names.contains(&TOOL_WEBSEARCH),
-        "条目名应为原名 `{TOOL_WEBSEARCH}`"
-    );
-
-    // 两个 Web 工具以 effective name 精确条目出现
-    let web = peri_acp_types::builtin_mcp::find("web").expect("web 实例应有声明");
-    for tool in web.tools {
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.name == tool.effective_name && !entry.prefix_match),
-            "`{}` 应以 effective name 的精确条目出现",
-            tool.effective_name
-        );
-    }
-
-    // artifact 不在敏感清单（IF-G2 决策 1）——条目表与判定同源
-    let artifact = peri_acp_types::builtin_mcp::find("artifact").expect("artifact 实例应有声明");
-    for tool in artifact.tools {
-        assert!(
-            !names.contains(&tool.effective_name),
-            "`{}` 不应在敏感清单（artifact 不审批）",
-            tool.effective_name
-        );
-    }
-
-    // 前缀条目条文与归一后的判定一致
-    let prefix_entry = entries
-        .iter()
-        .find(|entry| entry.prefix_match && entry.name == "mcp__")
-        .expect("`mcp__` 前缀条目应存在");
-    assert!(
-        prefix_entry
-            .description
-            .contains("follow their original tool's rule"),
-        "`mcp__` 条目条文必须说明 builtin 一等工具按原始名规则，实际：{}",
-        prefix_entry.description
-    );
-}
-
-/// N8：workspace 四个需审批条目以模型面 effective name 出现（裸名不得残留——
-/// 迁移后模型面已不存在裸名），免审批的 Read/Glob/Grep 不得进清单，判定与
-/// 条目同源。
-#[test]
-fn workspace_sensitive_entries_use_model_names() {
-    let entries = sensitive_tool_entries();
-    let names: Vec<&str> = entries.iter().map(|entry| entry.name).collect();
-
+fn workspace_approval_uses_direct_and_legacy_names() {
     let gated = [TOOL_BASH, TOOL_FOLDER_OPS, TOOL_WRITE, TOOL_EDIT];
 
-    // 原名作为模型面条目名出现。
-    for bare in gated {
-        assert!(names.contains(&bare), "条目名应为原名 `{bare}`");
-    }
-
-    // 四个需审批工具以 effective name 的精确条目出现
+    // Direct model names and legacy transcript aliases preserve the same policy.
     for original in gated {
         let effective = registry_effective_name("workspace", original);
         assert!(
-            entries
-                .iter()
-                .any(|entry| entry.name == effective && !entry.prefix_match),
-            "`{effective}` 应以 effective name 的精确条目出现"
-        );
-    }
-
-    // 免审批的 workspace 工具不得进清单
-    for original in ["Read", "Glob", "Grep"] {
-        let effective = registry_effective_name("workspace", original);
-        assert!(
-            !names.contains(&effective),
-            "`{effective}` 归一后走免审批分支，不得进敏感清单"
-        );
-    }
-
-    // 判定与条目同源（两种名字形态逐项）
-    for original in gated {
-        let effective = registry_effective_name("workspace", original);
-        assert!(
-            default_requires_approval(effective),
+            super::default_requires_approval(effective),
             "`{effective}` 必须判定为需审批"
         );
         assert!(
-            default_requires_approval(original),
+            super::default_requires_approval(original),
             "裸名 `{original}` 必须判定为需审批"
         );
     }
     for original in ["Read", "Glob", "Grep"] {
         let effective = registry_effective_name("workspace", original);
         assert!(
-            !default_requires_approval(effective),
+            !super::default_requires_approval(effective),
             "`{effective}` 必须判定为免审批"
         );
     }
 
     // AcceptEdits 模式的编辑工具判定（Write / Edit / folder_operations 为真）
-    assert!(is_edit_tool(registry_effective_name("workspace", "Write")));
-    assert!(is_edit_tool(registry_effective_name("workspace", "Edit")));
-    assert!(is_edit_tool(registry_effective_name(
+    assert!(super::is_edit_tool(registry_effective_name(
+        "workspace",
+        "Write"
+    )));
+    assert!(super::is_edit_tool(registry_effective_name(
+        "workspace",
+        "Edit"
+    )));
+    assert!(super::is_edit_tool(registry_effective_name(
         "workspace",
         "folder_operations"
     )));
-    assert!(!is_edit_tool(registry_effective_name("workspace", "Bash")));
+    assert!(!super::is_edit_tool(registry_effective_name(
+        "workspace",
+        "Bash"
+    )));
 }
 
 #[path = "mod_workflow_test.rs"]

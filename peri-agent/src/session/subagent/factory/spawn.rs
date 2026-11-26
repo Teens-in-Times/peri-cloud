@@ -4,20 +4,11 @@ use std::sync::Arc;
 
 use peri_acp_types::store::{InheritedContext, PersistedPayload};
 
-use super::super::background::spawn_background_subagent;
-use super::super::directives::{build_bg_fork_directive, build_fork_directive};
-use super::super::run_sync::{
-    handoff_event_handler, new_sync_task_id, run_sync_subagent, run_sync_with_registered_handoff,
-    SyncCompletion,
-};
-use super::super::types::{
-    ChildRunOutcome, ForkDirectiveKind, SubagentFailure, SubagentRunMode, SubagentSpawnConfig,
-    SubagentSpawned,
-};
-use super::super::v2_bridge::agent_id_from_child_thread;
-use super::context::{build_subagent_session_v2, derive_cancel_token, inherited_frozen_context};
 use crate::messages::BaseMessage;
 use crate::session::queue::{MessageKind, MessageSource, QueuedMessage};
+
+use crate::session::subagent::types::{ForkDirectiveKind, SubagentSpawnConfig, SubagentSpawned};
+
 use crate::session::Session;
 
 /// 父线程 ID 解析——spawn 写盘的**唯一取值点**（挂父子链）：
@@ -46,7 +37,7 @@ pub(super) fn parent_thread_id_of(parent: Option<&Arc<Session>>) -> Option<Strin
 /// 4. 构造子 session（frozen copy + transcript with_persistence 绑定存储）
 /// 5. 注入 parent_messages / system_prompt 到 transcript，push prompt 到 queue
 /// 6. 经 chain_assembler 装配子链（frozen 注入链上下文），构造 StageContext
-/// 7. Sync：直接 run_react_loop；Background：tokio::spawn + TaskManager 注册
+/// 7. Background：tokio::spawn + TaskManager 注册（无同步执行路径，Issue #450）
 /// 8. 收尾：update_thread_status（done/cancelled/error）+ 事件 + hook 闭包
 ///
 /// 并发限制：Agent 类后台任务不设上限（shell/workflow 的 kind 上限无关本路径），
@@ -70,7 +61,6 @@ pub(super) async fn spawn_subagent_impl(
         cancel_policy,
         max_iterations,
         fork_directive_kind,
-        run_mode,
         skill_names,
         llm,
         chain_assembler,
@@ -82,7 +72,7 @@ pub(super) async fn spawn_subagent_impl(
         context_budget,
         compact_llm,
         session_resources,
-        event_handler,
+        event_handler: _,
         bg_event_sender,
         task_manager,
         on_bg_complete,
@@ -116,8 +106,11 @@ pub(super) async fn spawn_subagent_impl(
         .or(cwd_cfg)
         .ok_or("spawn_subagent: cwd 未提供（parent 缺失且 config.cwd 为 None）")?;
     let parent_thread_id = parent_thread_id_of(parent).or(parent_thread_id_cfg);
-    let completion_target =
-        super::completion_target(parent, on_bg_complete.as_ref(), parent_thread_id.clone());
+    let completion_target = crate::session::subagent::factory::completion_target(
+        parent,
+        on_bg_complete.as_ref(),
+        parent_thread_id.clone(),
+    );
     let frozen_claude_md = parent
         .map(|p| p.store().frozen.claude_md.to_string())
         .or(frozen_claude_md_cfg);
@@ -166,7 +159,11 @@ pub(super) async fn spawn_subagent_impl(
     // cancel token：Cascade = 父 cancel 传播（parent 优先，回退 config 注入的
     // 父 token；均缺失时新建），Independent = 新建（与迁移前语义一致）
     let cancel_policy = cancel_policy.as_cancel_policy();
-    let cancel_token = derive_cancel_token(parent, cancel_token_cfg, cancel_policy);
+    let cancel_token = crate::session::subagent::factory::context::derive_cancel_token(
+        parent,
+        cancel_token_cfg,
+        cancel_policy,
+    );
 
     // 父历史在本函数内只被继承区消费一次：先固定 snapshot 位于父消息尾，再把
     // Vec 直接交给 PersistedPayload，避免同时持有原 Vec 与逐条 clone 的副本。
@@ -234,7 +231,7 @@ pub(super) async fn spawn_subagent_impl(
                 .iter()
                 .filter_map(|payload| {
                     transcript
-                        .get_flags(payload.id())
+                        .message_flags(payload.id())
                         .map(|flags| (payload.id(), flags))
                 })
                 .collect();
@@ -278,7 +275,8 @@ pub(super) async fn spawn_subagent_impl(
         ) {
             return Err(peri_acp_types::workspace::WorkspaceError::ExecutionBindingMismatch.into());
         }
-        let root_id = super::execution_root(store.as_ref(), &parent_id).await?;
+        let root_id =
+            crate::session::subagent::factory::execution_root(store.as_ref(), &parent_id).await?;
         let child = peri_acp_types::session_resources::ChildSnapshot {
             target: peri_acp_types::session_resources::NewSession {
                 thread_id: child_thread_id.clone(),
@@ -299,7 +297,7 @@ pub(super) async fn spawn_subagent_impl(
             inherited: inherited.clone(),
         };
         store.save_child(&child).await?;
-        super::persist_completion_target(
+        crate::session::subagent::factory::persist_completion_target(
             store.as_ref(),
             &child_thread_id,
             completion_target.as_deref(),
@@ -312,43 +310,43 @@ pub(super) async fn spawn_subagent_impl(
     //    身份（H1/M3）：子 `FrozenContext.system_prompt` = system_builder 的子能力
     //    投影字节（定义型带 overrides / fork 无 overrides）——不复制父字节；
     //    注入 prompt 留在本函数，不进 helper（D1）
-    let frozen = inherited_frozen_context(
+    let frozen = crate::session::subagent::factory::context::inherited_frozen_context(
         parent,
         system_prompt.as_deref(),
-        &frozen_claude_md,
-        &frozen_skill_summary,
-        &frozen_date,
+        frozen_claude_md.as_deref(),
+        frozen_skill_summary.as_deref(),
+        frozen_date.as_deref(),
     );
-    let (session, mut v2_ctx) = build_subagent_session_v2(
-        cwd.clone(),
-        frozen,
-        cancel_token.clone(),
-        child_thread_id.clone(),
-        parent.and_then(|session| session.subagent_host()),
-        session_resources.clone(),
-        inherited,
-        Vec::new(), // 新 child 没有 own history
-        llm,
-        chain_assembler,
-        tools,
-        tool_filter,
-        parent
-            .and_then(|session| session.subagent_host())
-            .and_then(|host| host.session_mcp_catalog.clone()),
-        skill_names,
-        frozen_claude_md,
-        frozen_claude_local_md,
-        frozen_skill_summary,
-        tool_invocation_resolver,
-        compact_config,
-        context_budget,
-        compact_llm,
-        Some(agent_id_from_child_thread(&child_thread_id)),
-        // 身份随 transcript 持久化（见 6b），故开启定向吸收：请求投影按内容相等
-        // 丢弃该条，身份在请求面只由 bridge base system 出现一次。
-        true,
-    )
-    .await?;
+    let identity_message = system_prompt.as_deref().map(BaseMessage::system);
+    let (session, mut v2_ctx) =
+        crate::session::subagent::factory::context::build_subagent_session_v2(
+            cwd.clone(),
+            frozen,
+            cancel_token.clone(),
+            child_thread_id.clone(),
+            parent.and_then(|session| session.subagent_host()),
+            session_resources.clone(),
+            inherited,
+            Vec::new(), // 新 child 没有 own history
+            llm,
+            chain_assembler,
+            tools,
+            tool_filter,
+            parent
+                .and_then(|session| session.subagent_host())
+                .and_then(|host| host.session_mcp_catalog.clone()),
+            skill_names,
+            frozen_claude_md,
+            frozen_claude_local_md,
+            frozen_skill_summary,
+            tool_invocation_resolver,
+            compact_config,
+            context_budget,
+            compact_llm,
+            Some(crate::session::subagent::v2_bridge::agent_id_from_child_thread(&child_thread_id)),
+            identity_message.as_ref().map(BaseMessage::id),
+        )
+        .await?;
     v2_ctx.context.session.model_parent =
         crate::agent::model_call::capture_tool_parent(parent_tool_call_id.as_deref())
             .filter(|parent| Some(parent.owner.as_str()) == parent_thread_id.as_deref());
@@ -360,19 +358,32 @@ pub(super) async fn spawn_subagent_impl(
     // - transcript 起始处的 System 消息：负责**持久化**。执行恢复 metadata 通道
     //   已随 recovery 移除，transcript 是本分支上身份唯一的持久事实；恢复路径
     //   （见 `resume.rs`）不再注入身份，而是读回这条历史，避免重注入。
-    //   归一化吸收（上方 `normalize_persisted_identity`）保证请求面仍恰一次，
-    //   transcript 本体不被改写、历史保持可读。
+    //   请求投影按消息身份吸收该条，保证模型只收到一份会话身份。
     // - fork 路径：位于 parent_messages/ancestor 之后（身份在对话上下文之后）。
-    if let Some(identity) = system_prompt.as_deref() {
-        let transcript = session.transcript();
-        let mut guard = transcript.write();
-        guard.append(BaseMessage::system(identity));
+    if let Some(identity) = identity_message {
+        let access = peri_acp_types::skills::SkillToolAccess::from_tools(
+            v2_ctx
+                .context
+                .runtime
+                .tools
+                .read()
+                .values()
+                .map(Arc::as_ref),
+        );
+        session
+            .transcript()
+            .write()
+            .append(identity.with_child_skill_ceiling(access));
     }
 
     // 6c. push prompt 到 queue（fork 路径套 fork directive 模板）
     let prompt_message = match fork_directive_kind {
-        Some(ForkDirectiveKind::Fork) => build_fork_directive(&prompt),
-        Some(ForkDirectiveKind::Bg) => build_bg_fork_directive(&prompt),
+        Some(ForkDirectiveKind::Fork) => {
+            crate::session::subagent::directives::build_fork_directive(&prompt)
+        }
+        Some(ForkDirectiveKind::Bg) => {
+            crate::session::subagent::directives::build_bg_fork_directive(&prompt)
+        }
         None => prompt.clone(),
     };
     let queued = QueuedMessage::new(
@@ -400,138 +411,60 @@ pub(super) async fn spawn_subagent_impl(
 
     // 终态结果投递到父会话的 MQ（无父 thread 时不做跨会话投递）。
     let terminal_route = match (&session_resources, completion_target.clone()) {
-        (Some(store), Some(target)) => Some(super::super::terminal_settlement::TerminalMqRoute {
-            store: Arc::clone(store),
-            target: peri_acp_types::thread::ThreadId::from(target.as_str()),
-            mailbox: parent
-                .filter(|_| parent_thread_id.as_ref() == Some(&target))
-                .map(|parent| parent.async_result_mailbox()),
-        }),
+        (Some(store), Some(target)) => Some(
+            crate::session::subagent::terminal_settlement::TerminalMqRoute {
+                store: Arc::clone(store),
+                target: peri_acp_types::thread::ThreadId::from(target.as_str()),
+            },
+        ),
         _ => None,
     };
-    match run_mode {
-        SubagentRunMode::Sync => {
-            let run_thread_id = child_thread_id.clone();
-            let run_agent_name = agent_name.clone();
-            let run_cwd = cwd.clone();
-            let run_session = session.clone();
-            let sync_task_id = new_sync_task_id();
-            let completion = run_sync_with_registered_handoff(
-                session.clone(),
-                child_thread_id.clone(),
-                agent_name.clone(),
-                parent
-                    .and_then(|session| session.subagent_host())
-                    .and_then(|host| host.task_manager.clone()),
-                Some(sync_task_id.clone()),
-                super::completion_delivery(parent, on_bg_complete),
-                terminal_route,
-                move |handoff_start, handed_off| async move {
-                    run_sync_subagent(
-                        &run_thread_id,
-                        &run_agent_name,
-                        &run_cwd,
-                        max_iterations,
-                        handoff_event_handler(event_handler, bg_event_sender, handed_off),
-                        on_subagent_start,
-                        on_subagent_stop,
-                        session_resources,
-                        register_runtime,
-                        deregister_runtime,
-                        langfuse_bridge,
-                        parent_agent_id,
-                        parent_tool_call_id,
-                        v2_ctx,
-                        run_session,
-                        None,
-                        Some(handoff_start),
-                    )
-                    .await
-                },
-            )
-            .await?;
-            let (interrupted, pending_tasks, pending_task_id, handoff) = match completion {
-                SyncCompletion::Finished(ChildRunOutcome::Settled) => {
-                    (false, Vec::new(), None, None)
-                }
-                SyncCompletion::Finished(ChildRunOutcome::Interrupted) => {
-                    (true, Vec::new(), None, None)
-                }
-                SyncCompletion::Finished(ChildRunOutcome::HandedOff { receipt }) => {
-                    let tasks = receipt
-                        .tasks
-                        .iter()
-                        .map(|task| task.task_id.clone())
-                        .collect();
-                    (false, tasks, None, Some(receipt))
-                }
-                SyncCompletion::Finished(ChildRunOutcome::Failed { error, .. }) => {
-                    return Err(Box::new(SubagentFailure::new(
-                        child_thread_id.clone(),
-                        agent_name.clone(),
-                        error,
-                    )))
-                }
-                SyncCompletion::Finished(ChildRunOutcome::HandoffFailed { cause, failure }) => {
-                    return Err(Box::new(SubagentFailure::handoff_failed(
-                        child_thread_id.clone(),
-                        agent_name.clone(),
-                        cause,
-                        &failure,
-                    )))
-                }
-                SyncCompletion::Pending(pending) => (
-                    false,
-                    pending.pending_tasks,
-                    Some(sync_task_id),
-                    Some(pending.receipt),
-                ),
+    let task_id_clone = task_id.clone();
+    // dispatch 失败时 child 不会运行；保留存储句柄把已持久化的记录标为 Error，
+    // 避免留下 hidden/Active 且没有任务支撑的悬挂行。
+    let dispatch_store = session_resources.clone();
+    if let Err(error) = crate::session::subagent::background::spawn_background_subagent(
+        task_id,
+        child_thread_id.clone(),
+        agent_name.clone(),
+        prompt,
+        cwd.clone(),
+        max_iterations,
+        bg_event_sender,
+        task_manager,
+        crate::session::subagent::factory::completion_delivery(parent, on_bg_complete),
+        langfuse_bridge,
+        session_resources,
+        terminal_route,
+        deregister_runtime,
+        on_subagent_start,
+        on_subagent_stop,
+        register_runtime,
+        parent_agent_id,
+        parent_tool_call_id,
+        cancel_token.clone(),
+        v2_ctx,
+        None,
+    )
+    .await
+    {
+        if let Some(store) = dispatch_store.as_ref() {
+            let patch = peri_acp_types::session_resources::SessionMetaPatch {
+                status: Some(peri_acp_types::thread::AgentStatus::Error),
+                ..Default::default()
             };
-            Ok(SubagentSpawned {
-                child_thread_id,
-                task_id: pending_task_id,
-                session,
-                cancel_token,
-                interrupted,
-                pending_tasks,
-                handoff,
-            })
+            if let Err(mark) = store.update_session_meta(&child_thread_id, &patch).await {
+                return Err(
+                    format!("{error}; child error status could not be recorded: {mark}").into(),
+                );
+            }
         }
-        SubagentRunMode::Background => {
-            let task_id_clone = task_id.clone();
-            spawn_background_subagent(
-                task_id.clone(),
-                child_thread_id.clone(),
-                agent_name.clone(),
-                prompt,
-                cwd.clone(),
-                max_iterations,
-                bg_event_sender,
-                task_manager,
-                super::completion_delivery(parent, on_bg_complete),
-                langfuse_bridge,
-                session_resources,
-                terminal_route,
-                deregister_runtime,
-                on_subagent_start,
-                on_subagent_stop,
-                register_runtime,
-                parent_agent_id,
-                parent_tool_call_id,
-                cancel_token.clone(),
-                v2_ctx,
-                None,
-            )
-            .await?;
-            Ok(SubagentSpawned {
-                child_thread_id,
-                task_id: Some(task_id_clone),
-                session,
-                cancel_token,
-                interrupted: false,
-                pending_tasks: Vec::new(),
-                handoff: None,
-            })
-        }
+        return Err(error);
     }
+    Ok(SubagentSpawned {
+        child_thread_id,
+        task_id: task_id_clone,
+        session,
+        cancel_token,
+    })
 }

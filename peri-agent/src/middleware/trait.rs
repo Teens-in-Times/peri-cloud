@@ -1,13 +1,15 @@
 use crate::middleware::capabilities as hook_state;
 use async_trait::async_trait;
 
-use crate::{
-    agent::react::{AgentOutput, Reasoning, ToolCall, ToolResult},
-    error::{AgentError, AgentResult},
-    hitl::BatchItem,
-    middleware::prompt_sections::PromptSection,
-    tools::BaseTool,
-};
+use crate::agent::react::AgentOutput;
+use crate::agent::react::Reasoning;
+use crate::agent::react::ToolCall;
+use crate::agent::react::ToolResult;
+use crate::error::AgentError;
+use crate::error::AgentResult;
+use crate::hitl::BatchItem;
+use crate::middleware::prompt_sections::PromptSection;
+use crate::tools::BaseTool;
 
 /// 中间件 trait - 与 TypeScript AgentMiddleware 对齐（v2 扩展）
 ///
@@ -33,6 +35,7 @@ use crate::{
 /// 6.  before_tools_batch     - 批量工具调用前
 /// 7.  before_tool            - 每次工具调用前
 /// 8.  after_tool             - 每次工具调用后
+///     on_tool_rejected       - 审批阶段被拒绝的调用（不执行，不触发 after_tool）
 /// 9.  after_tools_batch      - 批量结果写入后
 /// ── 每轮 ReAct 迭代 ──
 ///
@@ -54,12 +57,14 @@ use crate::{
 #[async_trait]
 pub trait Middleware: Send + Sync {
     /// 中间件名称（用于日志和调试）
+    #[must_use]
     fn name(&self) -> &str;
 
     /// 声明此中间件提供的工具列表（根据工作目录动态生成）
     ///
     /// 默认返回空列表（无工具的中间件无需实现）。
     /// v2 stages 在 `build_stage_context` 入口自动收集所有中间件的工具并合并到 `shared_tools`。
+    #[must_use]
     fn collect_tools(&self, _cwd: &str) -> Vec<Box<dyn BaseTool>> {
         vec![]
     }
@@ -145,6 +150,19 @@ pub trait Middleware: Send + Sync {
         _state: &mut dyn hook_state::AfterToolState,
         _tool_call: &ToolCall,
         _result: &ToolResult,
+    ) -> AgentResult<()> {
+        Ok(())
+    }
+
+    /// 工具调用在审批阶段被拒绝时调用：该调用不会执行，也不会触发 `after_tool`。
+    ///
+    /// `before_tool` 可能已为该调用暂存执行前状态（例如归因用的旧文件正文）；
+    /// 中间件必须在这里按调用结算，不得把未发生的副作用计入结果。
+    /// 同批其他调用的暂存与后续结算不受影响。
+    async fn on_tool_rejected(
+        &self,
+        _state: &mut dyn hook_state::StateView,
+        _tool_call: &ToolCall,
     ) -> AgentResult<()> {
         Ok(())
     }
@@ -238,6 +256,7 @@ pub trait Middleware: Send + Sync {
     /// 契约 4（运行时缺失防御）：未提供段落（默认空列表）或提供空内容 =
     /// 跳过渲染不 fail；DefaultSystemPromptMiddleware / LangMiddleware
     /// 演进后默认总是装配，除非显式关闭。
+    #[must_use]
     fn prompt_sections(&self) -> Vec<PromptSection> {
         Vec::new()
     }
@@ -350,11 +369,13 @@ pub trait Middleware: Send + Sync {
 }
 
 /// 空中间件 - 所有钩子均为 no-op，用于测试或占位
+#[derive(Debug)]
 pub struct NoopMiddleware {
     name: String,
 }
 
 impl NoopMiddleware {
+    #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }

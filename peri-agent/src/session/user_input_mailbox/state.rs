@@ -5,13 +5,21 @@
 
 use std::hash::{Hash, Hasher};
 
-use peri_acp_types::{
-    messages::{BaseMessage, MessageContent, MessageId},
-    session::{MqEntry, UserInput, UserInputItemResult, UserInputState},
-    store::PersistedPayload,
-};
+use peri_acp_types::messages::BaseMessage;
+use peri_acp_types::messages::MessageContent;
+use peri_acp_types::messages::MessageId;
+use peri_acp_types::session::MqEntry;
+use peri_acp_types::session::PluginSelection;
+use peri_acp_types::session::UserInput;
+use peri_acp_types::session::UserInputItemResult;
+use peri_acp_types::session::UserInputState;
+use peri_acp_types::store::PersistedPayload;
 
-use super::{CommandReceipt, InputRecord, MailboxState, UserInputQueueError, UserInputRunTicket};
+use crate::session::user_input_mailbox::CommandReceipt;
+use crate::session::user_input_mailbox::InputRecord;
+use crate::session::user_input_mailbox::MailboxState;
+use crate::session::user_input_mailbox::UserInputQueueError;
+use crate::session::user_input_mailbox::UserInputRunTicket;
 
 impl MailboxState {
     pub(super) fn next_record_seq(&mut self) -> u64 {
@@ -28,13 +36,16 @@ impl InputRecord {
         seq: u64,
         content: MessageContent,
         original_draft: String,
+        plugin_selections: Vec<PluginSelection>,
     ) -> Self {
         Self {
             input_id,
+            boundary_attempt: None,
             fingerprint,
             seq,
             content,
             original_draft,
+            plugin_selections,
             state: UserInputState::Queued,
             handed_off: false,
             delivery_reserved: true,
@@ -156,12 +167,16 @@ pub(super) fn user_input_payload(entry: &MqEntry) -> Option<(MessageContent, Str
     }
 }
 
-pub(super) fn user_input_from_entry(entry: &MqEntry) -> Option<UserInput> {
+pub(super) fn user_input_from_entry(
+    entry: &MqEntry,
+    plugin_selections: Vec<PluginSelection>,
+) -> Option<UserInput> {
     let (content, original_draft) = user_input_payload(entry)?;
     Some(UserInput {
         input_id: entry.id.as_uuid().to_string(),
         content,
         original_draft,
+        plugin_selections,
     })
 }
 
@@ -169,8 +184,15 @@ pub(super) fn fingerprint_for(
     input_id: &str,
     content: &MessageContent,
     original_draft: &str,
+    plugin_selections: &[PluginSelection],
 ) -> u64 {
-    compute_fingerprint(("user_input", input_id, content, original_draft))
+    compute_fingerprint((
+        "user_input",
+        input_id,
+        content,
+        original_draft,
+        plugin_selections,
+    ))
 }
 
 pub(super) fn compute_fingerprint<T: serde::Serialize>(value: T) -> u64 {

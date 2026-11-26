@@ -344,10 +344,10 @@ pub(crate) async fn run_before_bound_tools_batch(
 }
 
 /// 调用期只读视图：会话快照 + turn 事实（可缺），外加队列与 hook 输出端口。
-struct InvocationState<'a> {
-    context: &'a InvocationContext,
+struct InvocationState<'invocation> {
+    context: &'invocation InvocationContext,
     /// `None` = 无活跃 turn（idle 执行）：规则显式看到缺 turn，不伪造 step。
-    turn: Option<&'a ModelTurnFacts>,
+    turn: Option<&'invocation ModelTurnFacts>,
 }
 
 impl hook_state::StateView for InvocationState<'_> {
@@ -418,9 +418,10 @@ impl hook_state::HookOutputState for InvocationState<'_> {
 }
 
 /// 工具审批状态：调用期只读视图 + 已绑定目标身份。
-struct BoundApprovalState<'a> {
-    view: InvocationState<'a>,
-    targets: &'a std::collections::HashMap<String, std::sync::Arc<dyn crate::tools::BaseTool>>,
+struct BoundApprovalState<'invocation> {
+    view: InvocationState<'invocation>,
+    targets:
+        &'invocation std::collections::HashMap<String, std::sync::Arc<dyn crate::tools::BaseTool>>,
 }
 
 impl hook_state::StateView for BoundApprovalState<'_> {
@@ -508,6 +509,21 @@ pub(crate) async fn run_after_tool(
             .run_after_tool(&mut state, call, result),
     )
     .await
+}
+
+/// 通知 middleware chain：该调用在审批阶段被拒绝，不会执行。
+///
+/// 这是 `before_tool` 暂存状态的结算点（`after_tool` 不会为被拒调用触发）。
+/// 不使用取消令牌：清理不得因子句被取消而跳过。
+pub(crate) async fn run_tool_rejected(
+    ctx: &InvocationContext,
+    turn: Option<&ModelTurnFacts>,
+    call: &crate::agent::react::ToolCall,
+) -> crate::error::AgentResult<()> {
+    let mut state = InvocationState { context: ctx, turn };
+    ctx.middleware_chain()
+        .run_tool_rejected(&mut state, call)
+        .await
 }
 
 /// 调用 middleware chain 的 `on_error` 钩子（调用级）。

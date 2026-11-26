@@ -5,17 +5,19 @@
 
 use std::collections::HashSet;
 
-use peri_acp_types::{
-    event_v2::StateEvent,
-    session::{
-        MqEntry, MqFilter, UserInputQueueItem, UserInputQueueSnapshot, UserInputQueueTerminalItem,
-        UserInputState,
-    },
-};
+use peri_acp_types::event_v2::StateEvent;
+use peri_acp_types::session::MqEntry;
+use peri_acp_types::session::MqFilter;
+use peri_acp_types::session::UserInputQueueItem;
+use peri_acp_types::session::UserInputQueueSnapshot;
+use peri_acp_types::session::UserInputQueueTerminalItem;
+use peri_acp_types::session::UserInputState;
 
-use super::state::{fingerprint_for, user_input_payload};
-use super::window::prune_terminal_records;
-use super::{InputRecord, MailboxState, SnapshotSeed, UserInputMailbox, UserInputQueueError};
+use crate::session::user_input_mailbox::InputRecord;
+use crate::session::user_input_mailbox::MailboxState;
+use crate::session::user_input_mailbox::SnapshotSeed;
+use crate::session::user_input_mailbox::UserInputMailbox;
+use crate::session::user_input_mailbox::UserInputQueueError;
 
 /// 对账重试上限：并发变更持续时宁可跳过本轮，也不把旧查询内容配给新 revision。
 const REFRESH_ATTEMPTS: usize = 3;
@@ -59,6 +61,7 @@ impl UserInputMailbox {
     }
 
     /// 纯内存投影：revision 与条目在同一把锁内取得。
+    #[must_use]
     pub async fn snapshot(&self) -> UserInputQueueSnapshot {
         let state = self.state.lock();
         let items = state
@@ -69,6 +72,7 @@ impl UserInputMailbox {
                 input_id: record.input_id.clone(),
                 content: record.content.clone(),
                 original_draft: record.original_draft.clone(),
+                plugin_selections: record.plugin_selections.clone(),
                 state: record.state,
             })
             .collect();
@@ -107,7 +111,7 @@ impl UserInputMailbox {
                 item.published = true;
             }
         }
-        prune_terminal_records(&mut state);
+        crate::session::user_input_mailbox::window::prune_terminal_records(&mut state);
     }
 }
 
@@ -128,7 +132,9 @@ fn merge_store_entries(
     for entry in entries {
         let input_id = entry.id.as_uuid().to_string();
         known.insert(input_id.clone());
-        let Some((content, original_draft)) = user_input_payload(entry) else {
+        let Some((content, original_draft)) =
+            crate::session::user_input_mailbox::state::user_input_payload(entry)
+        else {
             tracing::warn!(
                 input_id = %entry.id.as_uuid(),
                 "MQ user input row has a non-human payload; skipped during reconcile"
@@ -144,13 +150,21 @@ fn merge_store_entries(
             continue;
         }
         let seq = state.next_record_seq();
-        let fingerprint = fingerprint_for(&input_id, &content, &original_draft);
+        // 选择随 payload JSON 持久化；重启后从这里恢复到运行期记录与快照标签。
+        let plugin_selections = entry.plugin_selections.clone();
+        let fingerprint = crate::session::user_input_mailbox::state::fingerprint_for(
+            &input_id,
+            &content,
+            &original_draft,
+            &plugin_selections,
+        );
         state.records.push(InputRecord::new(
             input_id,
             fingerprint,
             seq,
             content,
             original_draft,
+            plugin_selections,
         ));
         changed = true;
     }

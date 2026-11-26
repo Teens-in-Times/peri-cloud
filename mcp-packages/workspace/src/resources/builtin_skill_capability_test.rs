@@ -14,10 +14,13 @@
 //! `WorkflowAgentDefinition` 的运行时裁剪；「有效工具集为空」在 subagent 与
 //! workflow 两条派发路径上都不报错（现状），所以预检只能由派发方在 brief 里完成。
 
-use super::*;
+use crate::resources::builtin::BUILTIN_AGENTS;
+use crate::resources::builtin::BUILTIN_SKILLS;
 
 use peri_acp_types::builtin_mcp::BUILTIN_MCP_INSTANCES;
-use peri_acp_types::workspace_resources::{agent_uri, ResourceScope, AGENT_ENTRY_FILE};
+use peri_acp_types::workspace_resources;
+use peri_acp_types::workspace_resources::ResourceScope;
+use peri_acp_types::workspace_resources::AGENT_ENTRY_FILE;
 use peri_mcp_web::BUILTIN_AGENTS as WEB_BUILTIN_AGENTS;
 use serde_json::Value;
 
@@ -266,13 +269,13 @@ fn capability_table_check_rejects_tampered_rows() {
             "`plan`",
         ),
         (
-            "把 explorer 的只读能力改错",
-            replace_once(&body, "| `explorer` | no |", "| `explorer` | yes |"),
+            "把 explorer 的运行命令能力改错",
+            replace_once(&body, "| `explorer` | yes |", "| `explorer` | no |"),
             "`explorer`",
         ),
         (
             "少一行目标",
-            replace_once(&body, "| `explorer` | no |", "| explorer | no |"),
+            replace_once(&body, "| `explorer` | yes |", "| explorer | yes |"),
             "explorer",
         ),
         (
@@ -305,7 +308,7 @@ fn capability_table_check_rejects_tampered_rows() {
 }
 
 #[test]
-fn explorer_definition_is_tool_level_read_only() {
+fn explorer_definition_relies_on_prompt_not_tool_allowlist() {
     let agent = BUILTIN_AGENTS
         .iter()
         .find(|agent| agent.id == "explorer")
@@ -313,28 +316,25 @@ fn explorer_definition_is_tool_level_read_only() {
     let frontmatter =
         peri_mcp_common::agent_definition::frontmatter::frontmatter_json(agent.content)
             .expect("explorer frontmatter 必须可解析");
-    match tool_boundary(&frontmatter) {
-        ToolBoundary::Allow(tools) => assert!(
-            !tools.is_empty(),
-            "explorer 必须声明非空 tools 白名单，否则会退化为继承父工具"
-        ),
-        other => panic!("explorer 必须使用显式只读白名单，实际 {other:?}"),
-    }
+    assert_eq!(
+        tool_boundary(&frontmatter),
+        ToolBoundary::Inherit,
+        "explorer 不声明 tools：工具面继承父 Agent，只读只能由提示词约束"
+    );
 
     let target = capability_of("explorer", agent.content);
-    for tool in [
-        "Bash",
-        "Write",
-        "Edit",
-        "folder_operations",
-        "cron_register",
-        "ExecuteExtraTool",
-    ] {
-        assert!(!target.permits(tool), "explorer 不得声明写能力工具 {tool}");
-    }
-    for tool in ["Read", "Grep", "Glob"] {
-        assert!(target.permits(tool), "explorer 必须保留只读工具 {tool}");
-    }
+    assert!(
+        !target.permits("Agent"),
+        "disallowedTools 必须继续禁止 explorer 再派发子 Agent"
+    );
+
+    let (_, body) =
+        peri_mcp_common::agent_definition::frontmatter::split_frontmatter(agent.content)
+            .expect("explorer 必须有 frontmatter");
+    assert!(
+        body.contains("READ-ONLY"),
+        "工具白名单已移除，提示词必须保留只读约束"
+    );
 }
 
 #[test]
@@ -444,8 +444,8 @@ fn dispatch_guidance_wires_real_tools_and_agent_resources() {
     );
 
     // 正向：指导文本给出的 agent 定义读取路径必须是生产 `agent_uri` 的真实输出。
-    let plan_uri =
-        agent_uri(ResourceScope::Builtin, None, "plan").expect("builtin plan 必须可寻址");
+    let plan_uri = workspace_resources::agent_uri(ResourceScope::Builtin, None, "plan")
+        .expect("builtin plan 必须可寻址");
     assert_eq!(plan_uri, format!("agent://builtin/plan/{AGENT_ENTRY_FILE}"));
     assert!(
         body.contains(&plan_uri),
@@ -453,7 +453,7 @@ fn dispatch_guidance_wires_real_tools_and_agent_resources() {
     );
     for target in builtin_targets() {
         assert!(
-            agent_uri(ResourceScope::Builtin, None, &target.id).is_some(),
+            workspace_resources::agent_uri(ResourceScope::Builtin, None, &target.id).is_some(),
             "builtin 目标 {} 必须可经 agent:// 寻址",
             target.id
         );

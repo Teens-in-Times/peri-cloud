@@ -118,7 +118,7 @@ pub(crate) async fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut tree = ProcessTree::new()?;
+    let mut tree = ProcessTree::try_new()?;
     tree.prepare(&mut shell);
     let mut child = match shell.spawn() {
         Ok(child) => child,

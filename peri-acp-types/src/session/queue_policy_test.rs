@@ -1,6 +1,11 @@
-use super::*;
 use crate::identity::AttemptId;
 use crate::messages::BaseMessage;
+use crate::session::message_policy::ExecutionBinding;
+use crate::session::message_policy::MessageDisposition;
+use crate::session::message_policy::MessagePolicy;
+use crate::session::message_queue::MessageQueue;
+use crate::session::message_queue::MessageSource;
+use crate::session::message_queue::QueuedMessage;
 use crate::session::{MqReceiveDisposition, MqReceivePurpose, TurnId};
 
 fn execution() -> ExecutionBinding {
@@ -57,6 +62,25 @@ fn stop_intent_is_bound_to_its_own_execution() {
     );
     assert!(!stop.policy.ensures_processing());
     assert!(!stop.policy.notifies_execution());
+}
+
+/// 非唤醒的执行绑定通知：同一执行正常投影，其他执行被 Suppress。
+#[test]
+fn execution_scoped_notification_is_non_waking_and_suppressed_elsewhere() {
+    let origin = execution();
+    let policy = MessagePolicy::execution_scoped(origin.clone());
+    assert_eq!(
+        policy.disposition(&origin),
+        MessageDisposition::ProjectOnly,
+        "同一执行仍必须提交自己的通知"
+    );
+    assert_eq!(
+        policy.disposition(&execution()),
+        MessageDisposition::Suppressed,
+        "其他执行不得消费该通知"
+    );
+    assert!(!policy.notifies_execution(), "通知不得单独唤醒新执行");
+    assert!(!policy.ensures_processing());
 }
 
 /// 旧执行绑定的 guidance 在 Receive 中被显式标记为 `Suppress`：删行、不写历史。

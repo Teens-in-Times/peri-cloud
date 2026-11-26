@@ -3,7 +3,8 @@
 use super::{ClientStatus, McpClientHandle, McpClientPool, OAuthStatus, ServerInfo};
 use peri_acp_types::plugin::ConfigSource;
 use peri_acp_types::ports::{McpResourceInfo, McpToolInfo};
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 /// 传输形态三分类（IF-D11）：builtin 身份来自运行时标记 `source`，其余保持既有推断。
 ///
@@ -96,7 +97,13 @@ impl McpClientPool {
     pub(crate) fn insert_failed(pool: &Arc<Self>, name: &str, reason: String) {
         let old_status = {
             let _admission = pool.lifecycle_registration.lock();
-            if !pool.is_open() {
+            // 停止后的迟到失败不得覆盖停止态（迟到结果不能复活 server）。
+            if !pool.is_open()
+                || pool
+                    .server_slot(name)
+                    .stopped
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
                 return;
             }
             let (source, url) = pool
@@ -147,7 +154,13 @@ impl McpClientPool {
         tracing::info!(server = %name, "HTTP 服务器需要 OAuth 授权，可在 MCP 面板按 r 键触发");
         let old_status = {
             let _admission = pool.lifecycle_registration.lock();
-            if !pool.is_open() {
+            // 停止后的迟到授权要求同样不得覆盖停止态。
+            if !pool.is_open()
+                || pool
+                    .server_slot(name)
+                    .stopped
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
                 return;
             }
             let (source, url) = pool
@@ -188,6 +201,7 @@ impl McpClientPool {
         transport_is_http && (error.contains("Auth required") || error.contains("AuthRequired"))
     }
 
+    #[must_use]
     pub fn server_infos(&self) -> Vec<ServerInfo> {
         let clients = self.clients.read();
         // 订阅项来自配置：与 clients 一样只持一次读锁，避免逐项重复加锁。
@@ -223,6 +237,7 @@ impl McpClientPool {
     /// 返回所有 MCP 服务器信息（合并 configs + clients）
     ///
     /// 尚无连接句柄的配置按控制槽投影：已停止为 Disconnected，其余为 Uninitialized。
+    #[must_use]
     pub fn all_server_infos(&self) -> Vec<ServerInfo> {
         let clients = self.clients.read();
         let configs = self.configs.read();
@@ -297,6 +312,7 @@ impl McpClientPool {
     ///
     /// 会话内概览 / 发现面必须用它：ACP 连接属于声明它的会话，别的会话既不该
     /// 看见它的工具，也不该看见它的名字与状态。
+    #[must_use]
     pub fn all_server_infos_visible_to(&self, session_id: Option<&str>) -> Vec<ServerInfo> {
         let mut infos = self.all_server_infos();
         if let Some(session_id) = session_id {

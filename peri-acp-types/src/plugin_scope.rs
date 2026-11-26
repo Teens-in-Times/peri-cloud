@@ -14,6 +14,7 @@ use crate::plugin::{InstallScope, PluginOrigin};
 
 impl PluginOrigin {
     /// 是否由外部工具（Claude Code）安装，非 Peri 管理
+    #[must_use]
     pub fn is_external(&self) -> bool {
         matches!(
             self,
@@ -103,6 +104,7 @@ mod tests {
             headers: None,
             oauth: None,
             disabled: None,
+            dynamic: false,
             subscriptions: None,
             system_mcp: None,
             system_mcp_tools: None,

@@ -1,11 +1,12 @@
 //! Lifecycle adapters and creation/resume intent for the Agent-owned factory.
 use crate::tool_search::ExecuteExtraToolResolver;
 use peri_acp_types::session_resources::SessionResources;
+use peri_agent::messages::BaseMessage;
 use peri_agent::session::subagent::{
     SessionFactory, SubagentLifecycleStart, SubagentLifecycleStop, SubagentLlmSource,
-    SubagentResumeConfig, SubagentRunMode, SubagentSpawnConfig, SubagentSpawned,
+    SubagentResumeConfig, SubagentSpawnConfig, SubagentSpawned,
 };
-use peri_agent::{messages::BaseMessage, tools::BaseTool};
+use peri_agent::tools::BaseTool;
 use std::sync::Arc;
 
 /// 生命周期 hook 默认非阻断：非 Allow action 只做无正文诊断，不影响子 agent。
@@ -136,7 +137,6 @@ impl super::SubAgentTool {
         cancel_policy: peri_agent::session::subagent::SubagentCancelPolicy,
         max_iterations: usize,
         fork_directive_kind: Option<peri_agent::session::subagent::ForkDirectiveKind>,
-        run_mode: peri_agent::session::subagent::SubagentRunMode,
         llm: SubagentLlmSource,
         tools: Vec<Arc<dyn BaseTool>>,
         tool_filter: peri_agent::session::tool_catalog::ToolFilter,
@@ -157,7 +157,6 @@ impl super::SubAgentTool {
             cancel_policy,
             max_iterations,
             fork_directive_kind,
-            run_mode,
             skill_names,
             llm,
             chain_assembler: Arc::new(super::session_binding::SessionBoundAssembler::new(self)),
@@ -214,7 +213,6 @@ impl super::SubAgentTool {
         &self,
         thread_id: String,
         prompt: Option<String>,
-        run_mode: SubagentRunMode,
         max_iterations: usize,
         llm: SubagentLlmSource,
         tools: Vec<Arc<dyn BaseTool>>,
@@ -232,7 +230,6 @@ impl super::SubAgentTool {
             thread_id,
             prompt,
             agent_name: None,
-            run_mode,
             max_iterations,
             llm,
             chain_assembler: Arc::new(super::session_binding::SessionBoundAssembler::new(self)),

@@ -1,9 +1,9 @@
-use std::{
-    collections::HashMap,
-    io,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-};
+use std::collections::HashMap;
+use std::io;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use peri_acp_types::plugin::{ConfigSource, McpServerConfig};
 use serde_json::{json, Value};
@@ -12,7 +12,9 @@ use super::{
     ConfigurationError, ConfigurationField, ConfigurationInputs, ConfigurationScope,
     ConfigurationSnapshot, ConfigurationSystem, SourceIdentity,
 };
-use crate::{app::PeriConfig, mcp::McpConfigFile, source::ConfigurationSource};
+use crate::app::PeriConfig;
+use crate::mcp::McpConfigFile;
+use crate::source::ConfigurationSource;
 
 #[derive(Default)]
 struct FakeState {
@@ -141,7 +143,7 @@ impl ConfigurationSource for FakeSource {
 }
 
 fn make_scope(root: &Path, cwd_name: &str) -> ConfigurationScope {
-    ConfigurationScope::new(root.join(cwd_name), root.join("global/settings.json")).unwrap()
+    ConfigurationScope::try_new(root.join(cwd_name), root.join("global/settings.json")).unwrap()
 }
 
 fn make_inputs(
@@ -176,6 +178,7 @@ fn make_default_mcp_server() -> McpServerConfig {
         headers: None,
         oauth: None,
         disabled: None,
+        dynamic: false,
         subscriptions: None,
         system_mcp: None,
         system_mcp_tools: None,
@@ -588,4 +591,335 @@ fn mcp_with_plugins_uses_frozen_sources_without_io() {
     assert!(Arc::ptr_eq(&snapshot, &system.current(&scope).unwrap()));
 }
 
-include!("system_settings_test.rs");
+#[test]
+fn settings_update_preserves_root_siblings_and_schema() {
+    let temp = tempfile::tempdir().unwrap();
+    let scope = make_scope(temp.path(), "project");
+    let global = r#"{"$schema":"https://example.test/schema","config":{"active_alias":"sonnet"},"mcpServers":{"root":{"command":"echo"}},"langfuse":{"trace_sampling":0.4},"extension":{"keep":true}}"#;
+    let (source, system) = make_system(&scope, make_inputs(Some(global), None, None));
+    let current = system.resolve(scope.clone()).unwrap();
+    let mut updated = current.settings().clone();
+    updated.config.active_alias = "haiku".into();
+    let next = system.update(&scope, current.revision(), &updated).unwrap();
+    let (_, _, content) = source.writes().pop().unwrap();
+    let document: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(document["$schema"], "https://example.test/schema");
+    assert_eq!(document["mcpServers"]["root"]["command"], "echo");
+    assert_eq!(document["langfuse"]["trace_sampling"], 0.4);
+    assert_eq!(document["extension"]["keep"], true);
+    assert_eq!(next.settings().config.active_alias, "haiku");
+}
+
+#[test]
+fn workspace_settings_write_only_relative_diff_without_global_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let scope = make_scope(temp.path(), "project");
+    let global = r#"{"config":{"active_alias":"sonnet","providers":[{"id":"global","type":"openai","apiKey":"sk-global-secret"}],"language":"en"}}"#;
+    let workspace =
+        r#"{"$schema":"workspace-schema","config":{"active_alias":"haiku"},"extension":"keep"}"#;
+    let (source, system) = make_system(&scope, make_inputs(Some(global), Some(workspace), None));
+    let current = system.resolve(scope.clone()).unwrap();
+    let mut updated = current.settings().clone();
+    updated.config.active_alias = "opus".into();
+    let next = system.update(&scope, current.revision(), &updated).unwrap();
+    let (path, _, content) = source.writes().pop().unwrap();
+    assert_eq!(path, scope.cwd.join(".peri/settings.json"));
+    assert!(!content.contains("sk-global-secret"));
+    let document: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(document["$schema"], "workspace-schema");
+    assert_eq!(document["extension"], "keep");
+    assert_eq!(document["config"]["active_alias"], "opus");
+    assert!(document["config"].get("providers").is_none());
+    assert_eq!(next.settings().config.providers.len(), 1);
+}
+
+#[test]
+fn workspace_provider_edit_does_not_copy_global_api_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    let scope = make_scope(temp.path(), "project");
+    let global = r#"{"config":{"active_alias":"sonnet","providers":[{"id":"global","type":"openai","apiKey":"sk-global-secret"}]}}"#;
+    let workspace = r#"{"config":{"active_alias":"haiku"}}"#;
+    let (source, system) = make_system(&scope, make_inputs(Some(global), Some(workspace), None));
+    let current = system.resolve(scope.clone()).unwrap();
+    let mut updated = current.settings().clone();
+    // setup wizard：编辑 global provider 的非凭据字段，并新增一个带自有密钥的 provider。
+    updated.config.providers[0].base_url = "https://proxy.example.test/v1".into();
+    updated.config.providers.push(
+        serde_json::from_value(json!({
+            "id": "workspace",
+            "type": "anthropic",
+            "apiKey": "sk-workspace-owned"
+        }))
+        .unwrap(),
+    );
+    let next = system.update(&scope, current.revision(), &updated).unwrap();
+    let (_, _, content) = source.writes().pop().unwrap();
+    assert!(
+        !content.contains("sk-global-secret"),
+        "workspace 写回不得复制全局凭据: {content}"
+    );
+    assert!(content.contains("sk-workspace-owned"));
+    let document: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(document["config"]["active_alias"], "haiku");
+    let providers = document["config"]["providers"].as_array().unwrap();
+    assert_eq!(providers.len(), 2);
+    let inherited = providers
+        .iter()
+        .find(|provider| provider["id"] == "global")
+        .unwrap();
+    assert_eq!(inherited["apiKey"], "");
+    assert_eq!(inherited["baseUrl"], "https://proxy.example.test/v1");
+    // endpoint 已改写，凭据绑定上下文不再一致：保存后不得回填全局密钥，
+    // 也不得把它发往新 endpoint。
+    assert!(
+        next.settings().config.providers[0].api_key.is_empty(),
+        "endpoint 改写后不得回填全局密钥"
+    );
+    let reloaded = system.resolve(scope.clone()).unwrap();
+    assert!(
+        reloaded.settings().config.providers[0].api_key.is_empty(),
+        "重新 resolve 不得回填全局密钥"
+    );
+}
+
+#[test]
+fn mcp_update_preserves_top_level_siblings() {
+    let temp = tempfile::tempdir().unwrap();
+    let scope = make_scope(temp.path(), "project");
+    let project = r#"{"$schema":"mcp-schema","mcpServers":{"old":{"command":"old"}},"extension":{"keep":true},"owner":"team"}"#;
+    let (source, system) = make_system(&scope, make_inputs(None, None, Some(project)));
+    let current = system.resolve(scope.clone()).unwrap();
+    let config: McpConfigFile = serde_json::from_value(json!({
+        "mcpServers": {"new": {"command": "new"}},
+        "mcpCache": false
+    }))
+    .unwrap();
+    system
+        .update_mcp(&scope, current.revision(), &config)
+        .unwrap();
+    let document: Value = serde_json::from_str(&source.writes().pop().unwrap().2).unwrap();
+    assert_eq!(document["$schema"], "mcp-schema");
+    assert_eq!(document["extension"]["keep"], true);
+    assert_eq!(document["owner"], "team");
+    assert_eq!(document["mcpServers"]["new"]["command"], "new");
+    assert!(document["mcpServers"].get("old").is_none());
+    assert_eq!(document["mcpCache"], false);
+}
+
+#[test]
+fn global_update_invalidates_other_scopes_sharing_global_settings() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_scope = make_scope(temp.path(), "project-a");
+    let second_scope = make_scope(temp.path(), "project-b");
+    let source = Arc::new(FakeSource::default());
+    for scope in [&first_scope, &second_scope] {
+        source.set_inputs(scope, make_inputs(None, None, None));
+    }
+    let system = ConfigurationSystem::new(source);
+    let first = system.resolve(first_scope.clone()).unwrap();
+    system.resolve(second_scope.clone()).unwrap();
+    let mut settings = first.settings().clone();
+    settings.config.language = Some("en".into());
+    let next = system
+        .update(&first_scope, first.revision(), &settings)
+        .unwrap();
+    assert!(system.current(&second_scope).is_none());
+    assert!(Arc::ptr_eq(&next, &system.current(&first_scope).unwrap()));
+    assert_ne!(first.revision(), next.revision());
+}
+
+#[test]
+fn settings_update_preserves_nested_mcp_domain_when_request_only_has_provider() {
+    let temp = tempfile::tempdir().unwrap();
+    let scope = make_scope(temp.path(), "project");
+    let global = json!({
+        "config": {
+            "mcpServers": {"nested": {"command": "original"}},
+            "mcpCache": false
+        }
+    });
+    let (source, system) = make_system(&scope, make_inputs(Some(&global.to_string()), None, None));
+    let current = system.resolve(scope.clone()).unwrap();
+    let request: PeriConfig = serde_json::from_value(json!({
+        "config": {"providers": [{"id": "new", "type": "openai", "apiKey": "new-key"}]}
+    }))
+    .unwrap();
+    let next = system.update(&scope, current.revision(), &request).unwrap();
+    let writes = source.writes();
+    assert_eq!(writes.len(), 1);
+    let document: Value = serde_json::from_str(&writes[0].2).unwrap();
+    assert_eq!(
+        document["config"]["mcpServers"],
+        global["config"]["mcpServers"]
+    );
+    assert_eq!(document["config"]["mcpCache"], false);
+    assert_eq!(
+        next.mcp().mcp_servers["nested"].command.as_deref(),
+        Some("original")
+    );
+    assert_eq!(next.mcp().mcp_cache, Some(false));
+    assert_eq!(next.settings().config.providers[0].id, "new");
+}
+
+#[test]
+fn workspace_settings_update_preserves_local_mcp_fields_and_schema() {
+    let temp = tempfile::tempdir().unwrap();
+    let scope = make_scope(temp.path(), "project");
+    let global = r#"{"$schema":"global-schema","config":{}}"#;
+    let workspace = json!({
+        "$schema": "local-schema",
+        "config": {
+            "mcpServers": {"local": {"command": "local-command"}},
+            "mcpCache": false
+        },
+        "extension": "keep"
+    });
+    let (source, system) = make_system(
+        &scope,
+        make_inputs(Some(global), Some(&workspace.to_string()), None),
+    );
+    let current = system.resolve(scope.clone()).unwrap();
+    let request: PeriConfig = serde_json::from_value(json!({
+        "$schema": "global-schema",
+        "config": {"providers": [{"id": "new", "type": "openai", "apiKey": "new-key"}]}
+    }))
+    .unwrap();
+    system.update(&scope, current.revision(), &request).unwrap();
+    let writes = source.writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].0, scope.cwd.join(".peri/settings.json"));
+    let document: Value = serde_json::from_str(&writes[0].2).unwrap();
+    assert_eq!(document["$schema"], "local-schema");
+    assert_eq!(
+        document["config"]["mcpServers"],
+        workspace["config"]["mcpServers"]
+    );
+    assert_eq!(document["config"]["mcpCache"], false);
+    assert_eq!(document["extension"], "keep");
+}
+
+#[test]
+fn workspace_settings_update_cannot_import_global_mcp_fields_or_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let scope = make_scope(temp.path(), "project");
+    let global = r#"{"config":{"providers":[{"id":"global","type":"openai","apiKey":"global-provider-secret"}],"mcpServers":{"global":{"command":"global-command","env":{"TOKEN":"global-mcp-secret"}}},"mcpCache":false}}"#;
+    let (source, system) = make_system(
+        &scope,
+        make_inputs(Some(global), Some(r#"{"config":{}}"#), None),
+    );
+    let current = system.resolve(scope.clone()).unwrap();
+    let mut request = current.settings().clone();
+    request.config.language = Some("fr".into());
+    request.config.extra.insert("mcpCache".into(), json!(true));
+    request.config.extra.insert(
+        "mcpServers".into(),
+        json!({
+            "imported": {"command": "imported-command", "env": {"TOKEN": "global-mcp-secret"}}
+        }),
+    );
+    let next = system.update(&scope, current.revision(), &request).unwrap();
+    let writes = source.writes();
+    assert_eq!(writes.len(), 1);
+    let document: Value = serde_json::from_str(&writes[0].2).unwrap();
+    assert!(document["config"].get("mcpServers").is_none());
+    assert!(document["config"].get("mcpCache").is_none());
+    assert!(document["config"].get("providers").is_none());
+    assert!(!writes[0].2.contains("global-provider-secret"));
+    assert!(!writes[0].2.contains("global-mcp-secret"));
+    assert_eq!(next.mcp().mcp_cache, Some(false));
+    assert!(next.mcp().mcp_servers.contains_key("global"));
+    assert!(!next.mcp().mcp_servers.contains_key("imported"));
+}
+
+#[test]
+fn mcp_update_rejects_foreign_server_sources_without_writing_or_publishing() {
+    let temp = tempfile::tempdir().unwrap();
+    let scope = make_scope(temp.path(), "project");
+    let (source, system) = make_system(&scope, make_inputs(None, None, None));
+    let current = system.resolve(scope.clone()).unwrap();
+    let foreign_sources = [
+        ConfigSource::Global(scope.global_settings.clone()),
+        ConfigSource::Plugin,
+        ConfigSource::Builtin {
+            instance: "workspace".into(),
+        },
+        ConfigSource::Acp,
+        ConfigSource::Project(temp.path().join("other-project/.mcp.json")),
+    ];
+    for foreign_source in foreign_sources {
+        let mut server = make_default_mcp_server();
+        server.command = Some("foreign-command".into());
+        server.env = Some(HashMap::from([("TOKEN".into(), "foreign-secret".into())]));
+        server.source = Some(foreign_source);
+        let config = McpConfigFile {
+            mcp_servers: HashMap::from([("foreign".into(), server)]),
+            mcp_cache: None,
+        };
+        assert!(matches!(
+            system.update_mcp(&scope, current.revision(), &config),
+            Err(ConfigurationError::InvalidInput { .. })
+        ));
+        assert_eq!(source.io_counts().1, 0);
+        assert!(source.writes().is_empty());
+        assert!(Arc::ptr_eq(&current, &system.current(&scope).unwrap()));
+    }
+}
+
+#[test]
+fn mcp_update_accepts_unattributed_and_current_project_servers() {
+    let temp = tempfile::tempdir().unwrap();
+    let scope = make_scope(temp.path(), "project");
+    let (source, system) = make_system(&scope, make_inputs(None, None, None));
+    let current = system.resolve(scope.clone()).unwrap();
+    let mut unattributed = make_default_mcp_server();
+    unattributed.command = Some("unattributed-command".into());
+    let mut local = make_default_mcp_server();
+    local.command = Some("local-command".into());
+    local.source = Some(ConfigSource::Project(scope.cwd.join(".mcp.json")));
+    let config = McpConfigFile {
+        mcp_servers: HashMap::from([("new".into(), unattributed), ("local".into(), local)]),
+        mcp_cache: None,
+    };
+    let next = system
+        .update_mcp(&scope, current.revision(), &config)
+        .unwrap();
+    let writes = source.writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].0, scope.cwd.join(".mcp.json"));
+    let document: Value = serde_json::from_str(&writes[0].2).unwrap();
+    assert_eq!(
+        document["mcpServers"]["new"]["command"],
+        "unattributed-command"
+    );
+    assert_eq!(document["mcpServers"]["local"]["command"], "local-command");
+    for server in next.mcp().mcp_servers.values() {
+        assert_eq!(
+            server.source,
+            Some(ConfigSource::Project(scope.cwd.join(".mcp.json")))
+        );
+    }
+}
+
+#[test]
+fn explanations_omit_environment_secrets_while_debug_preserves_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let scope = make_scope(temp.path(), "project");
+    let mut inputs = make_inputs(None, None, None);
+    inputs
+        .environment
+        .insert("LANGFUSE_PUBLIC_KEY".into(), "pk-visible-secret".into());
+    inputs
+        .environment
+        .insert("LANGFUSE_SECRET_KEY".into(), "sk-hidden-secret".into());
+    let snapshot = ConfigurationSnapshot::resolve(scope, inputs.clone()).unwrap();
+    let explanation = snapshot.explain(ConfigurationField::Observability);
+    let explanation_rendered = format!("{explanation:?}");
+    assert!(!explanation_rendered.contains("pk-visible-secret"));
+    assert!(!explanation_rendered.contains("sk-hidden-secret"));
+    let debug = format!("{snapshot:?} {inputs:?} {:?}", snapshot.observability());
+    assert!(debug.contains("pk-visible-secret"));
+    assert!(debug.contains("sk-hidden-secret"));
+}
+
+include!("system_test/beta_configuration.rs");
+include!("system_test/concurrency.rs");

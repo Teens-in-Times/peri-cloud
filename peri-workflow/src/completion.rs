@@ -1,17 +1,20 @@
 //! A registered run owns execution and completion publication; callers only observe it.
-use crate::{
-    journal::WorkflowJournalStore,
-    progress::WorkflowProgressStore,
-    registry::{WorkflowRunStatus, WorkflowTaskRegistry, WorkflowTaskResult},
-    runner::{WorkflowInput, WorkflowResult, WorkflowRunner},
-};
+use crate::journal::WorkflowJournalStore;
+use crate::progress::WorkflowProgressStore;
+use crate::registry::WorkflowRunStatus;
+use crate::registry::WorkflowTaskRegistry;
+use crate::registry::WorkflowTaskResult;
+use crate::runner::WorkflowInput;
+use crate::runner::WorkflowResult;
+use crate::runner::WorkflowRunner;
 use futures::FutureExt;
 use peri_acp_types::tasks::{ExternalExecutionGuard, TaskManager, TaskRegistrationTicket};
 use std::sync::{Arc, Weak};
-use tokio::{
-    sync::{oneshot, watch},
-    task::JoinHandle,
-};
+use tokio::sync::oneshot;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+
+mod preview;
 
 /// An unpolled admission has no process to drain. Once execution starts, only
 /// an explicit cleanup result can release the session's external owner.
@@ -134,6 +137,7 @@ impl RunCompletion {
                     post_processing_status: peri_acp_types::workflow::PostProcessingStatus::Failed,
                     delivery_status: peri_acp_types::workflow::DeliveryStatus::Blocked,
                     stderr_tail: None,
+                    unknown_side_effects: false,
                 })
             };
             let stderr_tail = raw.stderr_tail.clone();
@@ -178,12 +182,18 @@ impl RunCompletion {
     fn settle_failed_terminal_state(&self, error: &str) -> WorkflowResult {
         use peri_acp_types::workflow::{DeliveryStatus, ExecutionStatus, PostProcessingStatus};
 
-        match self.journal.read_state(&self.run_id) {
+        let unknown_side_effects = match self.journal.read_state(&self.run_id) {
             Ok(mut state) => {
+                // 后到的清理失败不改写「存在不可确认副作用」这一观测事实。
+                let unknown_side_effects = state.unknown_side_effects;
                 state.status = "failed".into();
                 state.execution_status = ExecutionStatus::Failed;
                 state.post_processing_status = PostProcessingStatus::Failed;
                 state.delivery_status = DeliveryStatus::Blocked;
+                // 后到的清理失败改写了执行结论：旧的交付原因（如 not_requested）
+                // 不再解释本次 failed 终态。
+                state.delivery_reason = None;
+                state.outcome = peri_acp_types::workflow::WorkflowOutcome::Failed;
                 state.error = Some(error.to_string());
                 if let Err(write_error) = self.journal.write_state(&self.run_id, &state) {
                     tracing::warn!(
@@ -193,16 +203,24 @@ impl RunCompletion {
                         "failed to persist failed terminal state; the on-disk state still reports the previous terminal status while this run is reported as failed"
                     );
                 }
+                unknown_side_effects
             }
             Err(read_error) => {
+                // journal 不可读时回落到内存投影：后到的清理失败不得抹掉已经
+                // 观测到的「存在不可确认副作用」事实。
+                let unknown_side_effects = self
+                    .progress
+                    .run_snapshot(&self.run_id)
+                    .is_some_and(|run| run.unknown_side_effects);
                 tracing::warn!(
                     target: "workflow",
                     run_id = %self.run_id,
                     error = %read_error,
                     "failed to read workflow state; the on-disk terminal state is left unchanged and may still report success while this run is reported as failed"
                 );
+                unknown_side_effects
             }
-        }
+        };
         // 投影与返回值同口径（Failed / Blocked），且与 RunDone 同一次提交：
         // 订阅方按通知补读即得完整终态。
         self.progress.apply_run_done(
@@ -212,6 +230,7 @@ impl RunCompletion {
             Some(error.to_string()),
             PostProcessingStatus::Failed,
             DeliveryStatus::Blocked,
+            unknown_side_effects,
         );
         WorkflowResult {
             run_id: self.run_id.clone(),
@@ -221,24 +240,27 @@ impl RunCompletion {
             post_processing_status: PostProcessingStatus::Failed,
             delivery_status: DeliveryStatus::Blocked,
             stderr_tail: None,
+            unknown_side_effects,
         }
     }
 
     fn project(&self, result: WorkflowResult) -> WorkflowTaskResult {
+        let result_preview = result
+            .return_value
+            .as_ref()
+            .map(|value| preview::result_preview(value, &self.journal, &self.run_id));
         // 从 progress_store 获取真实 agent 数量与 tool count
         // 必须在 done_rx 之后读取——此时 workflow 已执行完毕，
         // progress_store 已被所有 progress/event RPC 填充。
         let (agent_count, tool_calls_count) =
-            self.progress.get_run_stats(&self.run_id).unwrap_or((0, 0));
-        let phase_summaries = self.progress.get_phase_summaries(&self.run_id);
+            self.progress.run_stats(&self.run_id).unwrap_or((0, 0));
+        let phase_summaries = self.progress.phase_summaries(&self.run_id);
         let acceptance_status = self
             .journal
             .read_state(&self.run_id)
             .map(|state| state.acceptance_status)
             .unwrap_or_default();
         let delivery_status = result.delivery_status;
-        let success = result.status == "completed"
-            && delivery_status != peri_acp_types::workflow::DeliveryStatus::Blocked;
         let status = match result.status.as_str() {
             "completed" => WorkflowRunStatus::Completed,
             "killed" => WorkflowRunStatus::Killed,
@@ -249,6 +271,12 @@ impl RunCompletion {
             "killed" => peri_acp_types::workflow::ExecutionStatus::Killed,
             _ => peri_acp_types::workflow::ExecutionStatus::Failed,
         };
+        let outcome = peri_acp_types::workflow::WorkflowOutcome::project(
+            execution_status,
+            acceptance_status,
+            delivery_status,
+        );
+        let success = outcome == peri_acp_types::workflow::WorkflowOutcome::Completed;
         WorkflowTaskResult {
             run_id: self.run_id.clone(),
             workflow_name: self.name.clone(),
@@ -258,6 +286,7 @@ impl RunCompletion {
             acceptance_status,
             post_processing_status: result.post_processing_status,
             delivery_status: result.delivery_status,
+            outcome,
             state_artifact_exists: self
                 .journal
                 .run_dir(&self.run_id)
@@ -267,8 +296,10 @@ impl RunCompletion {
             agent_count,
             tool_calls_count,
             error: result.error,
+            result_preview,
             phase_summaries,
             attempts: self.journal.read_attempts(&self.run_id).unwrap_or_default(),
+            unknown_side_effects: result.unknown_side_effects,
         }
     }
 }

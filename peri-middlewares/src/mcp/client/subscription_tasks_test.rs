@@ -1,54 +1,69 @@
-use super::{lost_owner_retry_due, McpClientPool, LOST_ABANDON_ATTEMPTS};
-use peri_acp_types::{
-    event::{BackgroundTaskResult, ShellOutput},
-    mcp::McpSubscriptionPort,
-    messages::MessageId,
-    monitor::{monitor_alert_delivery_id, MONITOR_META_KEY},
-    plugin::ConfigSource,
-    session::{
-        MessageKind, MessageQueue, MessageSource, QueuedMessage, QueuedPayload, SessionInbox,
-    },
-    system_reminder::TrustedSystemReminder,
-    tasks::{
-        BgRegistryEvent, BgShellHandle, BgTaskKind, BgTaskRegistration, ExternalTaskRegistration,
-        OnBgCompleteFn, TaskManager, TaskRegistrationTicket, TaskSnapshot, TaskTerminalDelivery,
-    },
-};
-use rmcp::{
-    model::{
-        DetailedTask, GetTaskParams, GetTaskResult, JsonObject, MetaObject, ServerCapabilities,
-        ServerConfig, Task, TaskPayload, TaskStatus,
-    },
-    service::{RequestContext, RoleServer},
-    ServerHandler,
-};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use super::McpClientPool;
+use super::LOST_ABANDON_ATTEMPTS;
+use peri_acp_types::event::BackgroundTaskResult;
+use peri_acp_types::event::ShellOutput;
+use peri_acp_types::mcp::McpSubscriptionPort;
+use peri_acp_types::messages::MessageId;
+use peri_acp_types::monitor;
+use peri_acp_types::monitor::MONITOR_META_KEY;
+use peri_acp_types::plugin::ConfigSource;
+use peri_acp_types::session::MessageKind;
+use peri_acp_types::session::MessageQueue;
+use peri_acp_types::session::MessageSource;
+use peri_acp_types::session::QueuedMessage;
+use peri_acp_types::session::QueuedPayload;
+use peri_acp_types::session::SessionInbox;
+use peri_acp_types::system_reminder::TrustedSystemReminder;
+use peri_acp_types::tasks::BgRegistryEvent;
+use peri_acp_types::tasks::BgShellHandle;
+use peri_acp_types::tasks::BgTaskKind;
+use peri_acp_types::tasks::BgTaskRegistration;
+use peri_acp_types::tasks::ExternalTaskRegistration;
+use peri_acp_types::tasks::OnBgCompleteFn;
+use peri_acp_types::tasks::TaskManager;
+use peri_acp_types::tasks::TaskRegistrationTicket;
+use peri_acp_types::tasks::TaskSnapshot;
+use peri_acp_types::tasks::TaskTerminalDelivery;
+use rmcp::model::DetailedTask;
+use rmcp::model::GetTaskParams;
+use rmcp::model::GetTaskResult;
+use rmcp::model::JsonObject;
+use rmcp::model::MetaObject;
+use rmcp::model::ServerCapabilities;
+use rmcp::model::ServerConfig;
+use rmcp::model::Task;
+use rmcp::model::TaskPayload;
+use rmcp::model::TaskStatus;
+use rmcp::service::RequestContext;
+use rmcp::service::RoleServer;
+use rmcp::ServerHandler;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::mcp::client::output_store::tests::Wire;
 use crate::mcp::McpTaskOwner;
+use peri_acp_types::tasks::ExternalTaskOwner;
 
 #[test]
 fn unobservable_owner_reaches_retry_limit_and_resets_after_recovery() {
     let mut attempts = 0;
     for _ in 1..LOST_ABANDON_ATTEMPTS {
-        assert!(!lost_owner_retry_due(&mut attempts));
+        assert!(!super::lost_owner_retry_due(&mut attempts));
     }
-    assert!(lost_owner_retry_due(&mut attempts));
+    assert!(super::lost_owner_retry_due(&mut attempts));
     assert_eq!(attempts, LOST_ABANDON_ATTEMPTS);
 
     attempts = 0;
-    assert!(!lost_owner_retry_due(&mut attempts));
+    assert!(!super::lost_owner_retry_due(&mut attempts));
     assert_eq!(attempts, 1);
 }
 
 #[test]
 fn unobservable_owner_retry_counter_saturates() {
     let mut attempts = usize::MAX;
-    assert!(lost_owner_retry_due(&mut attempts));
+    assert!(super::lost_owner_retry_due(&mut attempts));
     assert_eq!(attempts, usize::MAX);
 }
 
@@ -469,7 +484,7 @@ async fn cancel_session_external_tasks_uses_one_total_deadline() {
             session_id: "session".into(),
             initiator_session_id: Some("session".into()),
             owner_identity: "fixture".into(),
-            owner_task_id: owner_task_id.into(),
+            owner: ExternalTaskOwner::mcp("fixture", owner_task_id),
             kind: BgTaskKind::Mcp,
             summary: "pending cancel".into(),
             started_at: Some("2026-10-24T00:00:00Z".into()),
@@ -532,7 +547,7 @@ async fn task_subscription_confirms_terminal_after_snapshot_eviction() {
             session_id: "session".into(),
             initiator_session_id: Some("session".into()),
             owner_identity: "server".into(),
-            owner_task_id: "remote".into(),
+            owner: ExternalTaskOwner::mcp("fixture", "remote"),
             kind: BgTaskKind::Mcp,
             summary: "remote".into(),
             started_at: Some("2026-01-01T00:00:00Z".into()),
@@ -661,4 +676,84 @@ async fn settle_registered_task(
     (inbox.queue_for_test().drain_all_sync(), status)
 }
 
-include!("subscription_monitor_tasks_test.rs");
+/// monitor 的终态（成功/失败）各向发起会话投递恰好一条终态提醒。
+#[tokio::test]
+async fn monitor_terminal_settlement_wakes_the_owner_once() {
+    for success in [true, false] {
+        let (messages, status) = settle_registered_task(
+            "monitor",
+            Some(ConfigSource::Builtin {
+                instance: "monitor".into(),
+            }),
+            true,
+            success,
+        )
+        .await;
+        assert_eq!(
+            messages.len(),
+            1,
+            "monitor terminal settlement must queue exactly one reminder (success={success}): \
+             {messages:?}"
+        );
+        assert_eq!(messages[0].kind, MessageKind::Defer);
+        assert_eq!(messages[0].source, MessageSource::McpNotification);
+        assert!(
+            messages[0].delivery_id.is_some(),
+            "the terminal reminder keeps the settlement delivery id"
+        );
+        let QueuedPayload::SystemReminder(reminder) = &messages[0].payload else {
+            panic!(
+                "expected a canonical reminder, got {:?}",
+                messages[0].payload
+            )
+        };
+        assert_eq!(
+            reminder.as_reminder().summary.as_deref(),
+            Some(if success {
+                "Monitor task succeeded"
+            } else {
+                "Monitor task failed"
+            })
+        );
+        assert_eq!(
+            status,
+            if success { "completed" } else { "failed" },
+            "terminal projection must still be observable through the task manager"
+        );
+    }
+}
+
+/// B9 回归：非 monitor 实例的终态投递保持不变。
+#[tokio::test]
+async fn non_monitor_terminal_settlement_still_wakes_the_owner() {
+    let (messages, status) = settle_registered_task("workflow", None, false, true).await;
+    assert_eq!(status, "completed");
+    assert_eq!(
+        messages.len(),
+        1,
+        "non-monitor terminal delivery must be unchanged"
+    );
+    assert_eq!(messages[0].kind, MessageKind::Defer);
+    assert_eq!(messages[0].source, MessageSource::McpNotification);
+}
+
+/// B9：身份以 `ConfigSource::Builtin { instance }` 为准，不依赖 server key 字面量。
+#[tokio::test]
+async fn monitor_instance_alias_terminal_settlement_wakes_the_owner_once() {
+    let (messages, status) = settle_registered_task(
+        "monitor-alias",
+        Some(ConfigSource::Builtin {
+            instance: "monitor".into(),
+        }),
+        true,
+        true,
+    )
+    .await;
+    assert_eq!(
+        messages.len(),
+        1,
+        "monitor instance identity must deliver one terminal reminder regardless of server key"
+    );
+    assert_eq!(status, "completed");
+}
+include!("subscription_tasks_test/terminal_monitor.rs");

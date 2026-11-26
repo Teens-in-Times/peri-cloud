@@ -1,4 +1,103 @@
-use super::*;
+use super::Arc;
+use super::McpClientPool;
+use super::OAuthFlowEvent;
+use super::OAuthStartDisposition;
+use super::TestDropSignal;
+use crate::mcp::client::SHUTDOWN_TIMEOUT;
+use peri_acp_types::ports::McpPoolShutdownReport;
+
+#[tokio::test]
+async fn test_service_close_runs_in_parallel_across_services() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let pool = Arc::new(McpClientPool::new_empty());
+    let close_count = Arc::new(AtomicUsize::new(0));
+    let mut entered = Vec::new();
+    let mut releases = Vec::new();
+    for index in 0..3 {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        pool.services.lock().insert(
+            format!("service-{index}"),
+            super::controlled_service(entered_tx, Arc::clone(&release), Arc::clone(&close_count)),
+        );
+        entered.push(entered_rx);
+        releases.push(release);
+    }
+
+    // Controlled service 的 close 没有超时：串行实现会卡死在第一个 service 上，
+    // 后续 entered 永远不会到达。并行实现三项先后进入等待，测试即可统一放行。
+    let shutdown = tokio::spawn(async move { pool.shutdown().await });
+    for (index, entered_rx) in entered.into_iter().enumerate() {
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap_or_else(|_| panic!("service {index} close did not start in parallel"))
+            .expect("controlled service must signal entry");
+    }
+    for release in releases {
+        release.notify_one();
+    }
+    let report = tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("parallel close must converge")
+        .expect("shutdown task must not panic");
+
+    assert_eq!(close_count.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        report,
+        McpPoolShutdownReport::Complete {
+            settled_services: 3,
+            failed_services: 0,
+        }
+    );
+}
+
+#[tokio::test]
+async fn test_abandoned_builtin_close_still_aborts_server_task() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let pool = Arc::new(McpClientPool::new_empty());
+    let dropped = Arc::new(AtomicBool::new(false));
+    struct Probe(Arc<AtomicBool>);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let probe = Probe(Arc::clone(&dropped));
+    let handle = tokio::spawn(async move {
+        let _probe = probe;
+        std::future::pending::<()>().await;
+        crate::mcp::builtin::runtime::BuiltinServerExit::NotStarted("unreachable".into())
+    });
+    pool.builtin_server_tasks.lock().insert(
+        "cron".to_string(),
+        crate::mcp::builtin::runtime::BuiltinInstanceSupervisor::new_for_test(
+            "cron".to_string(),
+            handle,
+        ),
+    );
+
+    // 宿主预算到期：关闭 future 被丢弃，此时 supervisor 已从表里摘除。
+    tokio::time::timeout(Duration::from_millis(20), pool.close_builtin_tasks())
+        .await
+        .expect_err("server task 不会自行收敛，关闭 future 必须还在等");
+    assert!(
+        !dropped.load(Ordering::SeqCst),
+        "关闭 future 被丢弃时 server task 仍应存活（收尾交给独立 task）"
+    );
+
+    // 独立收尾任务必须仍走完「有界等待 → abort」，不能把 task 留在 detach 状态。
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !dropped.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("丢弃的关闭 future 不得让 builtin server task 变成无人 abort 的 orphan");
+}
 
 #[tokio::test]
 async fn test_shutdown_drops_pending_oauth_callbacks() {
@@ -44,7 +143,7 @@ async fn test_cancelled_shutdown_waiter_keeps_single_service_transaction_owned()
     let (second_entered_tx, mut second_entered_rx) = tokio::sync::oneshot::channel();
     pool.services.lock().insert(
         "first".to_string(),
-        controlled_service(
+        super::controlled_service(
             first_entered_tx,
             Arc::clone(&first_release),
             Arc::clone(&first_count),
@@ -52,7 +151,7 @@ async fn test_cancelled_shutdown_waiter_keeps_single_service_transaction_owned()
     );
     pool.services.lock().insert(
         "second".to_string(),
-        controlled_service(
+        super::controlled_service(
             second_entered_tx,
             Arc::clone(&second_release),
             Arc::clone(&second_count),
@@ -137,7 +236,7 @@ async fn test_concurrent_and_repeated_shutdown_share_one_service_transaction() {
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     pool.services.lock().insert(
         "only".to_string(),
-        controlled_service(entered_tx, Arc::clone(&release), Arc::clone(&close_count)),
+        super::controlled_service(entered_tx, Arc::clone(&release), Arc::clone(&close_count)),
     );
 
     let first_pool = Arc::clone(&pool);
@@ -164,7 +263,7 @@ async fn test_timed_out_service_is_recorded_incomplete_and_never_publishes_close
     let close_count = Arc::new(AtomicUsize::new(0));
     pool.services.lock().insert(
         "unfinished".to_string(),
-        timing_out_service(Arc::clone(&close_count)),
+        super::timing_out_service(Arc::clone(&close_count)),
     );
 
     let first = pool.shutdown().await;
@@ -277,7 +376,7 @@ async fn test_blocked_oauth_task_crossing_shutdown_cannot_commit_callback_or_ser
     close_release.notify_one();
     let close_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (close_entered_tx, _close_entered_rx) = tokio::sync::oneshot::channel();
-    let service = controlled_service(close_entered_tx, close_release, close_count);
+    let service = super::controlled_service(close_entered_tx, close_release, close_count);
     pool.spawn_background(McpTaskKey::OAuth("flow-blocked".into()), async move {
         let _ = started_tx.send(());
         let _ = release_rx.await;
@@ -289,7 +388,7 @@ async fn test_blocked_oauth_task_crossing_shutdown_cannot_commit_callback_or_ser
         });
         let committed = match task_pool.try_commit_connection(
             "docs".to_string(),
-            connected_test_handle("docs"),
+            super::connected_test_handle("docs"),
             service,
         ) {
             Ok(()) => true,
@@ -358,7 +457,7 @@ async fn test_concurrent_terminal_shutdown_settles_pending_task_subscription_and
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     pool.services.lock().insert(
         "docs".to_string(),
-        controlled_service(entered_tx, Arc::clone(&release), Arc::clone(&close_count)),
+        super::controlled_service(entered_tx, Arc::clone(&release), Arc::clone(&close_count)),
     );
 
     pool.begin_shutdown();

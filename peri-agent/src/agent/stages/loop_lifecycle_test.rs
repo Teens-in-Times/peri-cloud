@@ -1,9 +1,20 @@
 //! 循环完成、取消及 idle 用户消息交接。
-use super::super::*;
+use crate::agent::events::Stage;
+use crate::agent::events::StageStatus;
+
+use crate::agent::events_v2::ObserveEvent;
+use crate::agent::react::ReactLLM;
+
+use crate::agent::stages::context::StageContext;
+use crate::agent::stages::LoopResult;
+use crate::messages::BaseMessage;
 use crate::messages::MessageContent;
 use crate::session::queue::MessageSource;
 use crate::session::store::FrozenContext;
+use crate::session::QueuedMessage;
 use crate::session::Session;
+
+use std::sync::Arc;
 
 /// 构造测试用 StageContext
 fn make_stage_context() -> StageContext {
@@ -51,7 +62,12 @@ impl ReactLLM for InterruptibleReasonLLM {
         _tools: &[&dyn crate::tools::BaseTool],
         _streaming: Option<crate::agent::react::StreamingContext>,
     ) -> crate::error::AgentResult<crate::agent::react::Reasoning> {
-        if let Some(entered) = self.entered.lock().unwrap().take() {
+        if let Some(entered) = self
+            .entered
+            .lock()
+            .expect("self entered mutex must remain unpoisoned throughout the test")
+            .take()
+        {
             let _ = entered.send(());
         }
         std::future::pending().await
@@ -77,7 +93,7 @@ async fn test_e2e_final_answer_no_tools() {
         BaseMessage::human(MessageContent::text("do the task")),
     ));
 
-    let result = run_react_loop(ctx.clone(), 10).await;
+    let result = crate::agent::stages::run_react_loop(ctx.clone(), 10).await;
     assert!(
         matches!(result, LoopResult::Completed),
         "expected Completed, got {:?}",
@@ -124,7 +140,9 @@ async fn test_run_react_loop_idle_dispatches_queued_prompts_one_at_a_time() {
             );
             let entered = self.entered.lock().take();
             if let Some(entered) = entered {
-                entered.send(()).unwrap();
+                entered
+                    .send(())
+                    .expect("entered send test receiver must remain available for this delivery");
                 self.resume.notified().await;
             }
             Ok(crate::agent::react::Reasoning::with_answer("", "完成"))
@@ -135,7 +153,7 @@ async fn test_run_react_loop_idle_dispatches_queued_prompts_one_at_a_time() {
     let mailbox = UserInputMailbox::new("session".into(), inbox.clone(), Arc::new(|_| {}));
     mailbox
         .attach_external_attempt_sync(context.session.turn.cancel_token.as_ref().clone(), false)
-        .unwrap();
+        .expect("the attach external attempt sync fixture result is required for this assertion");
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let resume = Arc::new(tokio::sync::Notify::new());
     let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -156,11 +174,11 @@ async fn test_run_react_loop_idle_dispatches_queued_prompts_one_at_a_time() {
         MessageSource::UserInput,
         BaseMessage::human("初始任务"),
     ));
-    let task = tokio::spawn(run_react_loop(context, 3));
+    let task = tokio::spawn(crate::agent::stages::run_react_loop(context, 3));
     tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
         .await
         .expect("初始模型调用必须开始")
-        .unwrap();
+        .expect("the expect fixture result is required for this assertion");
     let mut input_ids = Vec::new();
     for text in ["A", "B"] {
         let input_id = uuid::Uuid::now_v7().to_string();
@@ -172,8 +190,9 @@ async fn test_run_react_loop_idle_dispatches_queued_prompts_one_at_a_time() {
                 input_id: input_id.clone(),
                 content: MessageContent::text(text),
                 original_draft: text.into(),
+                plugin_selections: Vec::new(),
             })
-            .unwrap();
+            .expect("the enqueue sync fixture result is required for this assertion");
         assert_eq!(receipt.results[0].state, UserInputState::Queued);
         input_ids.push(input_id);
     }
@@ -185,7 +204,7 @@ async fn test_run_react_loop_idle_dispatches_queued_prompts_one_at_a_time() {
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
         .await
         .expect("已有队列必须在 idle 自动继续，无需再次提交或等待后台结果")
-        .unwrap();
+        .expect("the expect fixture result is required for this assertion");
     assert!(matches!(result, LoopResult::Completed));
     assert_eq!(
         *seen.lock(),
@@ -216,6 +235,303 @@ async fn test_run_react_loop_idle_dispatches_queued_prompts_one_at_a_time() {
     );
 }
 
+/// [回归测试] Act 工具批次中放行的立即发送不取消执行；下一次 Receive 在
+/// 同一 attempt 内摄取，工具结果在前、steer 输入按 MQ 顺序在后。
+#[tokio::test]
+async fn test_run_react_loop_steer_during_tool_batch_is_received_next_iteration() {
+    assert_tool_boundary_steer(0, false, false).await;
+}
+
+#[tokio::test]
+async fn test_tool_boundary_steer_behind_two_pages_reaches_next_model_request() {
+    assert_tool_boundary_steer(130, false, false).await;
+}
+
+#[tokio::test]
+async fn test_tool_boundary_steer_during_request_preparation_reaches_next_model_request() {
+    assert_tool_boundary_steer(0, true, false).await;
+}
+
+#[tokio::test]
+async fn test_enter_during_tool_batch_reaches_next_model_request_without_dispatch() {
+    assert_tool_boundary_steer(130, false, true).await;
+}
+
+#[tokio::test]
+async fn test_enter_during_request_preparation_reaches_next_model_request_without_dispatch() {
+    assert_tool_boundary_steer(0, true, true).await;
+}
+
+async fn assert_tool_boundary_steer(backlog: usize, dispatch_in_preparation: bool, enter: bool) {
+    use crate::agent::react::{Reasoning, ToolCall};
+    use crate::middleware::{capabilities::BeforeModelState, Middleware, MiddlewareChain};
+    use crate::session::tool_catalog::SessionToolCatalog;
+    use crate::session::user_input_mailbox::UserInputMailbox;
+    use crate::tools::BaseTool;
+    use peri_acp_types::session::{
+        DispatchUserInputsRequest, EnqueueUserInputRequest, SessionInbox, UserInputState,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    struct PauseSecondRequest {
+        hooks: AtomicUsize,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Middleware for PauseSecondRequest {
+        fn name(&self) -> &str {
+            "pause-second-request"
+        }
+        async fn before_model(
+            &self,
+            _: &mut dyn BeforeModelState,
+        ) -> crate::error::AgentResult<()> {
+            if self.hooks.fetch_add(1, Ordering::SeqCst) == 1 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    struct ToolBatchLlm {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        requests: Arc<parking_lot::Mutex<Vec<Vec<BaseMessage>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReactLLM for ToolBatchLlm {
+        async fn generate_reasoning(
+            &self,
+            messages: &[BaseMessage],
+            _tools: &[&dyn BaseTool],
+            _streaming: Option<crate::agent::react::StreamingContext>,
+        ) -> crate::error::AgentResult<Reasoning> {
+            self.requests.lock().push(messages.to_vec());
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(Reasoning::with_tools(
+                    "need the blocking tool",
+                    vec![ToolCall::new(
+                        "call-block",
+                        "Blocking",
+                        serde_json::json!({}),
+                    )],
+                ));
+            }
+            Ok(Reasoning::with_answer("", "done"))
+        }
+        fn model_name(&self) -> String {
+            "mock-tool-batch".to_string()
+        }
+    }
+
+    struct BlockingTool {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl BaseTool for BlockingTool {
+        fn name(&self) -> &str {
+            "Blocking"
+        }
+        fn description(&self) -> &str {
+            "blocks the Act batch"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn is_direct(&self) -> bool {
+            true
+        }
+        async fn invoke(
+            &self,
+            _input: serde_json::Value,
+            _ctx: crate::tools::ToolContext<'_>,
+        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok("tool finished".to_string())
+        }
+    }
+
+    let session = Session::new(
+        Arc::from("/tmp/steer-during-tool-batch"),
+        FrozenContext::builder().build(),
+        None,
+    );
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut tools: BTreeMap<String, Arc<dyn BaseTool>> = BTreeMap::new();
+    tools.insert(
+        "Blocking".to_string(),
+        Arc::new(BlockingTool {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+    );
+    let shared_tools = Arc::new(parking_lot::RwLock::new(tools.clone()));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let mut chain = MiddlewareChain::new();
+    let preparing = Arc::new(tokio::sync::Notify::new());
+    let resume_preparation = Arc::new(tokio::sync::Notify::new());
+    if dispatch_in_preparation {
+        chain.add(Box::new(PauseSecondRequest {
+            hooks: AtomicUsize::new(0),
+            entered: preparing.clone(),
+            release: resume_preparation.clone(),
+        }));
+    }
+    let mut context = StageContext::builder(
+        session.start_turn(),
+        session.transcript(),
+        session.queue().clone(),
+    )
+    .with_llm(Arc::new(ToolBatchLlm {
+        calls: Arc::clone(&calls),
+        requests: Arc::clone(&requests),
+    }))
+    .with_middleware_chain(Arc::new(chain))
+    .with_tools(shared_tools)
+    .with_tool_catalog(Arc::new(SessionToolCatalog::new(tools, None)))
+    .build();
+    let inbox = Arc::new(SessionInbox::new(Arc::new(context.session.queue.clone())));
+    let mailbox = UserInputMailbox::new("session".into(), inbox.clone(), Arc::new(|_| {}));
+    let cancel = context.session.turn.cancel_token.as_ref().clone();
+    let ticket = mailbox
+        .attach_external_attempt_sync(cancel.clone(), false)
+        .expect("the attach external attempt sync fixture result is required for this assertion");
+    context.session.user_input_mailbox = Some(mailbox.clone());
+    context.session.queue.push_sync(QueuedMessage::prompt(
+        MessageSource::UserInput,
+        BaseMessage::human("初始任务"),
+    ));
+
+    let task = tokio::spawn(crate::agent::stages::run_react_loop(context, 2));
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("工具批次必须开始执行");
+
+    // 后台进度先于用户显式发送入队，不能耗掉一次模型调用。
+    for index in 0..backlog {
+        session.queue().push_sync(QueuedMessage::info(
+            MessageSource::SystemInjected,
+            BaseMessage::human(format!("background progress {index}")),
+        ));
+    }
+
+    if dispatch_in_preparation {
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), preparing.notified())
+            .await
+            .expect("the tool result must have passed Receive before dispatch");
+    }
+    let mut input_ids = Vec::new();
+    for text in ["idle-only", "steer-1", "steer-2"] {
+        let input_id = uuid::Uuid::now_v7().to_string();
+        let request = EnqueueUserInputRequest {
+            session_id: "session".into(),
+            generation: mailbox.generation().into(),
+            command_id: format!("enqueue-{text}"),
+            input_id: input_id.clone(),
+            content: MessageContent::text(text),
+            original_draft: text.into(),
+            plugin_selections: Vec::new(),
+        };
+        let soft_submit = enter && text != "idle-only";
+        let receipt = if soft_submit {
+            mailbox.enqueue_at_tool_boundary(&request).await
+        } else {
+            mailbox.enqueue(&request).await
+        }
+        .expect("enqueue");
+        assert_eq!(receipt.results[0].state, UserInputState::Queued);
+        if text != "idle-only" {
+            input_ids.push(input_id);
+        }
+    }
+    if !enter {
+        mailbox
+            .dispatch(&DispatchUserInputsRequest {
+                session_id: "session".into(),
+                generation: mailbox.generation().into(),
+                command_id: "dispatch-during-tool-batch".into(),
+                input_ids: input_ids.clone(),
+            })
+            .await
+            .expect("the dispatch fixture result is required for this assertion");
+    }
+    assert!(!cancel.is_cancelled(), "工具批次执行中不得取消当前 attempt");
+
+    if dispatch_in_preparation {
+        resume_preparation.notify_one();
+    } else {
+        release.notify_one();
+    }
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("工具完成后 loop 必须继续")
+        .expect("loop task 不得 panic");
+    assert!(
+        matches!(result, LoopResult::Completed),
+        "软注入必须完成同一 attempt，不得返回 Interrupted: {result:?}"
+    );
+    assert!(!cancel.is_cancelled(), "整个过程中不应触发取消");
+    assert!(
+        mailbox.is_active_ticket(&ticket),
+        "软注入不得结束当前 attempt"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "工具后必须再走一轮 Reason");
+    let pending = mailbox.snapshot_sync().items;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].original_draft, "idle-only");
+    assert_eq!(pending[0].state, UserInputState::Queued);
+
+    let requests = requests.lock();
+    let second = requests.get(1).expect("第二轮 Reason 请求必须存在");
+    for text in ["steer-1", "steer-2"] {
+        assert_eq!(
+            second
+                .iter()
+                .filter(|message| message.content() == text)
+                .count(),
+            1
+        );
+    }
+    assert!(!second
+        .iter()
+        .any(|message| message.content() == "idle-only"));
+    let tool_position = second
+        .iter()
+        .position(|message| {
+            matches!(
+                message,
+                BaseMessage::Tool { tool_call_id, .. } if tool_call_id == "call-block"
+            )
+        })
+        .expect("第二轮请求必须包含工具结果");
+    let steer_positions: Vec<_> = ["steer-1", "steer-2"]
+        .iter()
+        .map(|text| {
+            second
+                .iter()
+                .position(|message| {
+                    matches!(message, BaseMessage::Human { .. }) && message.content() == *text
+                })
+                .unwrap_or_else(|| panic!("第二轮请求缺少 {text}"))
+        })
+        .collect();
+    assert!(
+        tool_position < steer_positions[0] && steer_positions[0] < steer_positions[1],
+        "同一批 steer 必须按 MQ 顺序排在工具结果之后: {steer_positions:?}, tool={tool_position}"
+    );
+}
+
 #[tokio::test]
 async fn test_e2e_cancel_before_loop() {
     // e2e：cancel_token 在 run_react_loop 之前触发 → Interrupted
@@ -232,7 +548,7 @@ async fn test_e2e_cancel_before_loop() {
     // 立即 cancel
     ctx.session.turn.cancel_token.cancel();
 
-    let result = run_react_loop(ctx, 10).await;
+    let result = crate::agent::stages::run_react_loop(ctx, 10).await;
     assert!(
         matches!(result, LoopResult::Interrupted),
         "expected Interrupted, got {:?}",
@@ -263,7 +579,8 @@ async fn test_run_react_loop_cancel_during_reason_is_interrupted() {
         BaseMessage::human("cancel while reasoning"),
     ));
     let loop_ctx = ctx.clone();
-    let task = tokio::spawn(async move { run_react_loop(loop_ctx, 10).await });
+    let task =
+        tokio::spawn(async move { crate::agent::stages::run_react_loop(loop_ctx, 10).await });
     entered_rx.await.expect("Reason LLM 必须进入调用");
 
     ctx.session.turn.cancel_token.cancel();
@@ -306,7 +623,7 @@ async fn test_e2e_empty_queue_completes_immediately() {
         .build();
 
     // 不推入 Prompt，直接跑循环（首轮 Receive consumed=0 → 直接退出）
-    let result = run_react_loop(ctx.clone(), 0).await;
+    let result = crate::agent::stages::run_react_loop(ctx.clone(), 0).await;
     assert!(
         matches!(result, LoopResult::Completed),
         "expected Completed, got {:?}",
@@ -338,7 +655,7 @@ async fn idle_suspension_waits_for_render_capacity() {
         turn_id: context.turn_id(),
         agent_id: context.session.agent_id,
     });
-    let running = run_react_loop(context, 1);
+    let running = crate::agent::stages::run_react_loop(context, 1);
     tokio::pin!(running);
     assert!(
         std::future::poll_fn(|cx| {
@@ -347,7 +664,11 @@ async fn idle_suspension_waits_for_render_capacity() {
         .await
     );
     assert!(!bus.health().dirty);
-    handles.render_rx.recv().await.unwrap();
+    handles
+        .render_rx
+        .recv()
+        .await
+        .expect("handles render rx producer must deliver the expected test event before closing");
     assert!(
         std::future::poll_fn(|cx| {
             std::task::Poll::Ready(std::future::Future::poll(running.as_mut(), cx).is_pending())
@@ -362,6 +683,6 @@ async fn idle_suspension_waits_for_render_capacity() {
     cancel.cancel();
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), running)
         .await
-        .unwrap();
+        .expect("the timeout fixture result is required for this assertion");
     assert!(matches!(result, LoopResult::Interrupted));
 }

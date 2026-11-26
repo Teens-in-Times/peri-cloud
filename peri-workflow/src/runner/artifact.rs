@@ -4,47 +4,38 @@
 //! 常量与身份契约，JS 产物始终以文件系统路径消费：随包 sidecar
 //! （`<可执行文件目录>/peri-resources/workflow/<内容身份>/`）、本机缓存
 //! （`~/.peri/workflow/<version>/<内容身份>/`）或显式注入的部署目录。
-//! 网络获取仅显式 opt-in，且获取内容必须通过同一摘要校验后才可能被执行。
+//! 运行时不访问 npm/registry：缺少已校验来源即 fail closed。
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
 
-use peri_process::ProcessTree;
 use sha2::{Digest, Sha256};
-use tokio::process::{Child, Command};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::error::WorkflowError;
 
-/// 本地固定 Workflow engine 版本（与 npm 发布版本保持一致）。
+/// 本地随包 Workflow engine 版本（与仓库 `npm-packages/@peri-workflow/package.json` 一致）。
+///
+/// 版本只用于本机缓存路径与包身份校验；运行时只消费随包 sidecar，不访问 npm。
 const WORKFLOW_NPM_VERSION: &str = "0.3.0";
 const WORKFLOW_PACKAGE_NAME: &str = "@peri-code/workflow";
 const WORKFLOW_ENTRY: &str = "dist/peri-workflow.js";
-/// 网络获取的超时（仅显式 opt-in 路径使用）。
-const INSTALL_TIMEOUT: Duration = Duration::from_secs(90);
-pub(super) const WORKFLOW_PROTOCOL_VERSION: u32 = 2;
+pub(super) const WORKFLOW_PROTOCOL_VERSION: u32 = 3;
 pub(super) const WORKFLOW_BUILD_ID: &str = "@peri-code/workflow@0.3.0";
 
-/// pin 的入口内容摘要（sha256 十六进制小写），不是 JS 内容本身。
+/// 随包 pin 的入口内容摘要（sha256 十六进制小写），不是 JS 内容本身。
 ///
-/// 与发布产物（`bun run build` 的构建产出，不入库）一致：bundle 变化时必须重新发布并
-/// 同步本常量；仓库内不保存该产物，任何代码/测试都不读取工作树 dist。
+/// 与本地构建产物（`bun run build` 的构建产出，不入库）一致：bundle 变化时必须重新
+/// 发布并同步本常量；仓库内不保存该产物，任何代码/测试都不读取工作树 dist。
 const WORKFLOW_ENTRY_SHA256: &str =
-    "bd746ad747e9056bd5cb4a7c24964278a421bd46929edd9a9bc86775519514ba";
+    "ae03ca29c07dae162e4f15280f1b34b874480b02ca2251e3f3c687e3534ecbd1";
 
 /// 随包 sidecar 目录（相对可执行文件所在目录）。
 const SIDECAR_RELATIVE_DIR: &str = "peri-resources/workflow";
-/// 显式注入的包目录（部署或测试）：包含 `package.json` 与 `dist/` 的 npm 包目录。
+/// 显式注入的包目录（部署或测试）：包含 `package.json` 与 `dist/` 的包目录。
 const ARTIFACT_DIR_ENV: &str = "PERI_WORKFLOW_ARTIFACT_DIR";
-/// 显式 opt-in 的网络获取开关（值必须恰为 `1`）。
-///
-/// 获取内容写入 staging 后仍须通过同一摘要校验；任一步失败都以 [`WorkflowError`]
-/// 结束，不存在「未校验即执行」的网络路径。
-const NETWORK_FETCH_ENV: &str = "PERI_WORKFLOW_ALLOW_NPX_FALLBACK";
 
 /// 串行化本机缓存的发布（避免并发 workflow 同时写入同一内容身份目录）。
-static INSTALL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+static CACHE_PUBLISH_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +60,36 @@ struct WorkflowPackageMetadata {
 /// 发行包 sidecar 目录名与本机缓存内容目录共用该身份；同一版本号下旧内容因摘要
 /// 不同而位于不同目录并校验失败，不会被混用。
 pub(crate) fn artifact_id() -> &'static str {
-    &WORKFLOW_ENTRY_SHA256[..12]
+    content_id(WORKFLOW_ENTRY_SHA256)
+}
+
+/// 摘要对应的内容身份；malformed pin 原样返回，后续摘要校验会 fail closed。
+fn content_id(sha256: &str) -> &str {
+    sha256.get(..12).unwrap_or(sha256)
+}
+
+#[cfg(test)]
+fn build_id_for(version: &str) -> String {
+    format!("{WORKFLOW_PACKAGE_NAME}@{version}")
+}
+
+/// 单个来源期望的包身份（版本、构建标识与入口摘要）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PackageIdentity<'a> {
+    version: &'a str,
+    build_id: &'a str,
+    sha256: &'a str,
+}
+
+impl<'a> PackageIdentity<'a> {
+    /// 随包来源：版本与构建标识取编译期常量，摘要可注入（测试夹具）。
+    fn bundled(sha256: &'a str) -> Self {
+        Self {
+            version: WORKFLOW_NPM_VERSION,
+            build_id: WORKFLOW_BUILD_ID,
+            sha256,
+        }
+    }
 }
 
 /// artifact 来源：决定是否在运行前发布到本机缓存。
@@ -134,13 +154,13 @@ impl ArtifactSources {
     }
 }
 
-/// 按「显式注入 → 本机缓存 → 随包 sidecar」顺序解析并校验入口。
+/// 按「显式注入 → 随包缓存 → 随包 sidecar」顺序解析并校验入口。
 ///
-/// 显式注入无效时继续尝试其余来源（三者校验口径一致，接受的必为同一内容）。
+/// 三者都校验随包 pin；显式注入无效时继续尝试其余来源。
 pub(crate) fn resolve_artifact(sources: &ArtifactSources) -> Option<ResolvedArtifact> {
     let expected = sources.entry_pin.0.as_str();
     if let Some(dir) = sources.override_dir.as_deref() {
-        if let Some(entry) = validate_workflow_package(dir, expected) {
+        if let Some(entry) = validate_workflow_package(dir, PackageIdentity::bundled(expected)) {
             return Some(ResolvedArtifact {
                 package_dir: dir.to_path_buf(),
                 entry,
@@ -154,8 +174,8 @@ pub(crate) fn resolve_artifact(sources: &ArtifactSources) -> Option<ResolvedArti
         );
     }
     if let Some(prefix) = sources.cache_prefix.as_deref() {
-        let dir = prefix.join(artifact_id());
-        if let Some(entry) = validate_workflow_package(&dir, expected) {
+        let dir = prefix.join(content_id(expected));
+        if let Some(entry) = validate_workflow_package(&dir, PackageIdentity::bundled(expected)) {
             return Some(ResolvedArtifact {
                 package_dir: dir,
                 entry,
@@ -164,7 +184,7 @@ pub(crate) fn resolve_artifact(sources: &ArtifactSources) -> Option<ResolvedArti
         }
     }
     for dir in &sources.sidecar_dirs {
-        if let Some(entry) = validate_workflow_package(dir, expected) {
+        if let Some(entry) = validate_workflow_package(dir, PackageIdentity::bundled(expected)) {
             return Some(ResolvedArtifact {
                 package_dir: dir.clone(),
                 entry,
@@ -175,17 +195,17 @@ pub(crate) fn resolve_artifact(sources: &ArtifactSources) -> Option<ResolvedArti
     None
 }
 
-/// 校验 npm 包目录的身份、入口契约与入口内容摘要。
+/// 校验包目录的身份、入口契约与入口内容摘要。
 ///
 /// 返回入口路径；身份、越界路径或摘要任一不符返回 `None`（fail closed）。
-fn validate_workflow_package(package_dir: &Path, expected_sha256: &str) -> Option<PathBuf> {
+fn validate_workflow_package(package_dir: &Path, expected: PackageIdentity<'_>) -> Option<PathBuf> {
     let metadata: WorkflowPackageMetadata =
         serde_json::from_slice(&std::fs::read(package_dir.join("package.json")).ok()?).ok()?;
     if metadata.name != WORKFLOW_PACKAGE_NAME
-        || metadata.version != WORKFLOW_NPM_VERSION
+        || metadata.version != expected.version
         || metadata.main != WORKFLOW_ENTRY
         || metadata.protocol_version != WORKFLOW_PROTOCOL_VERSION
-        || metadata.build_id != WORKFLOW_BUILD_ID
+        || metadata.build_id != expected.build_id
     {
         return None;
     }
@@ -197,7 +217,7 @@ fn validate_workflow_package(package_dir: &Path, expected_sha256: &str) -> Optio
     {
         return None;
     }
-    if !digest_matches(&std::fs::read(&canonical_entry).ok()?, expected_sha256) {
+    if !digest_matches(&std::fs::read(&canonical_entry).ok()?, expected.sha256) {
         return None;
     }
     Some(entry)
@@ -263,8 +283,7 @@ fn node_command(entry: PathBuf) -> WorkflowCommand {
 
 /// 准备运行入口：解析已校验 artifact；随包 sidecar 先 best-effort 发布到本机缓存。
 ///
-/// 没有任何已校验来源时 fail closed；仅在显式 opt-in 时尝试网络获取，且获取内容
-/// 必须通过同一摘要校验。
+/// 没有任何已校验来源时 fail closed，不访问 npm/registry。
 pub(crate) async fn prepare_workflow_command() -> Result<WorkflowCommand, WorkflowError> {
     prepare_workflow_command_with(&ArtifactSources::from_process()).await
 }
@@ -281,7 +300,7 @@ pub(crate) async fn prepare_workflow_command_with(
                         prefix,
                         &resolved.package_dir,
                         &resolved.entry,
-                        sources.entry_pin.0.as_str(),
+                        PackageIdentity::bundled(sources.entry_pin.0.as_str()),
                     )
                     .await
                     {
@@ -303,11 +322,8 @@ pub(crate) async fn prepare_workflow_command_with(
         };
         return Ok(node_command(entry));
     }
-    if network_fetch_allowed() {
-        return fetch_and_publish_from_registry().await.map(node_command);
-    }
     Err(WorkflowError::SpawnFailed(format!(
-        "validated workflow artifact {WORKFLOW_NPM_VERSION} is unavailable: no sidecar at `{SIDECAR_RELATIVE_DIR}/{id}` next to the peri executable and no valid local cache; reinstall peri with the bundled resources, set {ARTIFACT_DIR_ENV}, or set {NETWORK_FETCH_ENV}=1 to allow a validated registry fetch",
+        "validated workflow artifact {WORKFLOW_NPM_VERSION} is unavailable: no sidecar at `{SIDECAR_RELATIVE_DIR}/{id}` next to the peri executable and no valid local cache; reinstall peri with the bundled resources or set {ARTIFACT_DIR_ENV} to a validated package directory",
         id = artifact_id()
     )))
 }
@@ -318,15 +334,15 @@ pub(crate) async fn publish_to_cache_in(
     prefix: &Path,
     package_dir: &Path,
     entry: &Path,
-    expected_sha256: &str,
+    expected: PackageIdentity<'_>,
 ) -> Result<PathBuf, WorkflowError> {
-    let target = prefix.join(artifact_id());
-    if let Some(entry) = validate_workflow_package(&target, expected_sha256) {
+    let target = prefix.join(content_id(expected.sha256));
+    if let Some(entry) = validate_workflow_package(&target, expected) {
         return Ok(entry);
     }
 
-    let _guard = INSTALL_LOCK.lock().await;
-    if let Some(entry) = validate_workflow_package(&target, expected_sha256) {
+    let _guard = CACHE_PUBLISH_LOCK.lock().await;
+    if let Some(entry) = validate_workflow_package(&target, expected) {
         return Ok(entry);
     }
 
@@ -337,7 +353,7 @@ pub(crate) async fn publish_to_cache_in(
         let _ = tokio::fs::remove_dir_all(&staging).await;
         return Err(error);
     }
-    if validate_workflow_package(&staging, expected_sha256).is_none() {
+    if validate_workflow_package(&staging, expected).is_none() {
         let _ = tokio::fs::remove_dir_all(&staging).await;
         return Err(WorkflowError::SpawnFailed(
             "staged workflow artifact failed validation".into(),
@@ -346,7 +362,7 @@ pub(crate) async fn publish_to_cache_in(
 
     match tokio::fs::rename(&staging, &target).await {
         Ok(()) => {}
-        Err(error) if validate_workflow_package(&target, expected_sha256).is_some() => {
+        Err(error) if validate_workflow_package(&target, expected).is_some() => {
             let _ = tokio::fs::remove_dir_all(&staging).await;
             debug!(target: "workflow", error_kind = ?error.kind(), "another publisher created the workflow artifact cache entry");
         }
@@ -355,7 +371,7 @@ pub(crate) async fn publish_to_cache_in(
             return Err(WorkflowError::Io(error));
         }
     }
-    validate_workflow_package(&target, expected_sha256).ok_or_else(|| {
+    validate_workflow_package(&target, expected).ok_or_else(|| {
         WorkflowError::SpawnFailed("published workflow artifact failed validation".into())
     })
 }
@@ -374,104 +390,6 @@ async fn write_staged_package(
     .await?;
     tokio::fs::copy(entry, staging.join(WORKFLOW_ENTRY)).await?;
     Ok(())
-}
-
-fn network_fetch_allowed() -> bool {
-    network_fetch_allowed_from(std::env::var_os(NETWORK_FETCH_ENV).as_deref())
-}
-
-/// 网络获取的准入判定：值必须恰为 `1`；不因测试构建放开。
-fn network_fetch_allowed_from(value: Option<&std::ffi::OsStr>) -> bool {
-    value == Some(std::ffi::OsStr::new("1"))
-}
-
-async fn stop_fetch_child(child: &mut Child, tree: &ProcessTree) {
-    tree.terminate();
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-    tree.wait_for_exit().await;
-}
-
-async fn run_fetch_with_timeout(
-    child: &mut Child,
-    tree: &ProcessTree,
-    timeout: Duration,
-) -> std::io::Result<bool> {
-    match peri_time::timeout(timeout, child.wait()).await {
-        Ok(status) => {
-            let status = status?;
-            tree.wait_for_exit().await;
-            Ok(status.success())
-        }
-        Err(_) => {
-            stop_fetch_child(child, tree).await;
-            Ok(false)
-        }
-    }
-}
-
-/// 显式 opt-in 的 registry 获取：安装到 staging → 同一摘要校验 → 发布到本机缓存。
-///
-/// 未通过校验的获取内容一律丢弃并以错误结束；不存在直接执行网络内容的路径。
-async fn fetch_and_publish_from_registry() -> Result<PathBuf, WorkflowError> {
-    let prefix = workflow_prefix().ok_or_else(|| {
-        WorkflowError::SpawnFailed("HOME is unavailable for the workflow artifact cache".into())
-    })?;
-    let parent = prefix.parent().ok_or_else(|| {
-        WorkflowError::SpawnFailed("workflow artifact cache prefix has no parent".into())
-    })?;
-    tokio::fs::create_dir_all(parent).await?;
-    let staging = parent.join(format!(
-        ".{WORKFLOW_NPM_VERSION}.fetch-{}",
-        uuid::Uuid::now_v7()
-    ));
-    tokio::fs::create_dir(&staging).await?;
-
-    let package = format!("{WORKFLOW_PACKAGE_NAME}@{WORKFLOW_NPM_VERSION}");
-    let mut command = Command::new("npm");
-    command
-        .args(["install", "--prefix"])
-        .arg(&staging)
-        .arg(&package)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let (mut child, tree) = match crate::process::spawn(command) {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = tokio::fs::remove_dir_all(&staging).await;
-            return Err(WorkflowError::Io(error));
-        }
-    };
-
-    let installed = run_fetch_with_timeout(&mut child, &tree, INSTALL_TIMEOUT).await?;
-    let package_dir = staging
-        .join("node_modules")
-        .join("@peri-code")
-        .join("workflow");
-    let entry = if installed {
-        validate_workflow_package(&package_dir, WORKFLOW_ENTRY_SHA256)
-    } else {
-        None
-    };
-    let Some(entry) = entry else {
-        stop_fetch_child(&mut child, &tree).await;
-        let _ = tokio::fs::remove_dir_all(&staging).await;
-        return Err(WorkflowError::SpawnFailed(format!(
-            "workflow artifact fetched from the registry failed validation against pinned sha256 {WORKFLOW_ENTRY_SHA256}"
-        )));
-    };
-
-    let published = publish_to_cache_in(&prefix, &package_dir, &entry, WORKFLOW_ENTRY_SHA256).await;
-    let _ = tokio::fs::remove_dir_all(&staging).await;
-    let published = published?;
-    info!(
-        target: "workflow",
-        version = WORKFLOW_NPM_VERSION,
-        "fetched and validated workflow artifact from the registry"
-    );
-    Ok(published)
 }
 
 #[cfg(test)]

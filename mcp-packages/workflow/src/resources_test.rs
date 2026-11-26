@@ -4,11 +4,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use peri_acp_types::workflow::{AgentExecutor, AgentRunParams, AgentRunResult, Usage};
+use peri_acp_types::workflow::{
+    AgentExecutor, AgentRunParams, AgentRunResult, Usage, WorkflowOutcome,
+};
 use peri_workflow::protocol::ProgressEvent;
 use peri_workflow::runtime::{SettleAdmission, WorkflowRuntime, WorkflowTaskState};
 
-use super::*;
+use crate::resources::WorkflowResource;
+use crate::resources::DEFAULT_PAGE_LIMIT;
+use crate::resources::MAX_PAGE_LIMIT;
+use peri_workflow::runtime::WorkflowResourceUpdate;
 
 struct NoopExecutor;
 
@@ -63,13 +68,16 @@ fn completed_workflow(run_id: &str) -> peri_workflow::registry::WorkflowTaskResu
         acceptance_status: Default::default(),
         post_processing_status: Default::default(),
         delivery_status: Default::default(),
+        outcome: WorkflowOutcome::Completed,
         state_artifact_exists: false,
         duration_ms: 1,
         agent_count: 0,
         tool_calls_count: 0,
         error: None,
+        result_preview: None,
         phase_summaries: vec![],
         attempts: vec![],
+        unknown_side_effects: false,
     }
 }
 
@@ -137,7 +145,7 @@ async fn unacknowledged_completions_keep_source_records_after_display_eviction()
         .iter()
         .all(|record| record.task_id != "unacked-0"));
 
-    let payload = read_payload(&runtime, "workflow://background-tasks").unwrap();
+    let payload = crate::resources::read_payload(&runtime, "workflow://background-tasks").unwrap();
     assert_eq!(payload["completions"].as_array().unwrap().len(), 600);
     let source_records = payload["snapshot"]["tasks"].as_array().unwrap();
     assert_eq!(source_records.len(), 600);
@@ -153,7 +161,7 @@ async fn unacknowledged_completions_keep_source_records_after_display_eviction()
             .registry()
             .acknowledge_completion(&format!("unacked-{index}"));
     }
-    let payload = read_payload(&runtime, "workflow://background-tasks").unwrap();
+    let payload = crate::resources::read_payload(&runtime, "workflow://background-tasks").unwrap();
     assert!(payload["completions"].as_array().unwrap().is_empty());
     assert!(runtime.registry().list_runs().is_empty());
     assert!(payload["snapshot"]["tasks"]
@@ -204,7 +212,7 @@ async fn source_ack_before_owner_settlement_cannot_republish_a_running_task() {
         "running",
         "reproduce the window before owner settlement"
     );
-    let payload = read_payload(&runtime, "workflow://background-tasks").unwrap();
+    let payload = crate::resources::read_payload(&runtime, "workflow://background-tasks").unwrap();
     assert!(payload["completions"].as_array().unwrap().is_empty());
     assert!(
         payload["snapshot"]["tasks"].as_array().unwrap().is_empty(),
@@ -222,6 +230,53 @@ async fn source_ack_before_owner_settlement_cannot_republish_a_running_task() {
     assert_eq!(owner.shutdown().await, TaskShutdownReport::Complete);
 }
 
+/// issue #407：tool 任务与 agent 任务同表投影（`params.kind` 标种类，tool 无
+/// `agentId`，终态结果在 `toolOutcome`）。
+#[test]
+fn tool_tasks_are_visible_in_the_task_projection_with_kind() {
+    let runtime = make_runtime();
+    runtime
+        .progress_store()
+        .apply_event(&ProgressEvent::RunStarted {
+            run_id: "run-tool".into(),
+            workflow_name: "t".into(),
+            meta: None,
+        });
+    let _ = runtime
+        .tasks()
+        .publish("agent-1".to_string(), published_params("run-tool", 1));
+    let _ = runtime.tasks().publish_tool(
+        "tool-1".to_string(),
+        "run-tool",
+        "Read".to_string(),
+        serde_json::Map::new(),
+        0,
+        0,
+    );
+
+    let payload =
+        crate::resources::read_payload(&runtime, "workflow://tasks").expect("任务流必须可读");
+    let active = payload["activeTasks"]
+        .as_array()
+        .expect("任务资源必须随页返回活跃任务基线");
+    let tool = active
+        .iter()
+        .find(|record| record["taskId"].as_str() == Some("tool-1"))
+        .expect("tool 任务必须在同一任务投影中可见");
+    assert_eq!(tool["params"]["kind"], "tool", "任务种类必须标在投影里");
+    assert_eq!(tool["params"]["toolName"], "Read");
+    assert!(
+        tool.get("agentId").is_none(),
+        "tool 任务没有 agent 槽位，不得伪造 agentId: {tool}"
+    );
+    let agent = active
+        .iter()
+        .find(|record| record["taskId"].as_str() == Some("agent-1"))
+        .expect("agent 任务仍在同一投影中");
+    assert_eq!(agent["params"]["kind"], "agent");
+    assert_eq!(agent["agentId"], 1);
+}
+
 /// F3 回归：长寿命活跃任务的发布事件被事件日志淘汰后，读取方必须仍能从
 /// 任务资源返回的基线快照找回未终态任务（不能只依赖事件页）。
 #[test]
@@ -236,16 +291,16 @@ fn tasks_baseline_survives_event_log_eviction() {
             meta: None,
         });
     // 长寿命活跃任务：published 后一直未被消费者 claim（其后没有它的事件）。
-    runtime
+    let _ = runtime
         .tasks()
         .publish("t-long".to_string(), published_params("run-1", 1));
     // 其他任务产生超过任务事件日志容量（512）的事件，淘汰 t-long 的发布事件。
     for index in 0..600u64 {
         let task_id = format!("t-filler-{index}");
-        runtime
+        let _ = runtime
             .tasks()
             .publish(task_id.clone(), published_params("run-2", index));
-        runtime.tasks().settle(
+        let _ = runtime.tasks().settle(
             "run-2",
             &task_id,
             SettleAdmission::AnyActive,
@@ -255,7 +310,8 @@ fn tasks_baseline_survives_event_log_eviction() {
         );
     }
 
-    let payload = read_payload(&runtime, "workflow://tasks").expect("任务流必须可读");
+    let payload =
+        crate::resources::read_payload(&runtime, "workflow://tasks").expect("任务流必须可读");
     assert!(
         payload["truncatedBefore"].as_u64().unwrap_or(0) > 1,
         "前提：保留边界已前进"
@@ -278,8 +334,8 @@ fn tasks_baseline_survives_event_log_eviction() {
     );
 
     // run 级任务视图同样携带基线（同一 run 的活跃任务）。
-    let run_payload =
-        read_payload(&runtime, "workflow://runs/run-1/tasks").expect("run 任务视图必须可读");
+    let run_payload = crate::resources::read_payload(&runtime, "workflow://runs/run-1/tasks")
+        .expect("run 任务视图必须可读");
     let run_active = run_payload["activeTasks"]
         .as_array()
         .expect("run 任务视图必须随页返回活跃任务基线");
@@ -311,7 +367,8 @@ fn run_snapshot_watermark_does_not_regress_after_eviction() {
         });
     }
 
-    let payload = read_payload(&runtime, "workflow://runs/run-wm").expect("已登记 run 必须可读");
+    let payload = crate::resources::read_payload(&runtime, "workflow://runs/run-wm")
+        .expect("已登记 run 必须可读");
     assert!(
         payload["status"].as_str() == Some("running"),
         "前提：run 快照仍在"
@@ -325,29 +382,35 @@ fn run_snapshot_watermark_does_not_regress_after_eviction() {
 
 #[test]
 fn parses_registered_uri_shapes() {
-    assert_eq!(parse_uri("workflow://runs"), Some(WorkflowResource::Runs));
-    assert_eq!(parse_uri("workflow://tasks"), Some(WorkflowResource::Tasks));
     assert_eq!(
-        parse_uri("workflow://runs/0199-a"),
+        crate::resources::parse_uri("workflow://runs"),
+        Some(WorkflowResource::Runs)
+    );
+    assert_eq!(
+        crate::resources::parse_uri("workflow://tasks"),
+        Some(WorkflowResource::Tasks)
+    );
+    assert_eq!(
+        crate::resources::parse_uri("workflow://runs/0199-a"),
         Some(WorkflowResource::Run {
             run_id: "0199-a".to_string()
         })
     );
     assert_eq!(
-        parse_uri("workflow://runs/0199-a/events"),
+        crate::resources::parse_uri("workflow://runs/0199-a/events"),
         Some(WorkflowResource::RunEvents {
             run_id: "0199-a".to_string()
         })
     );
     assert_eq!(
-        parse_uri("workflow://runs/0199-a/tasks"),
+        crate::resources::parse_uri("workflow://runs/0199-a/tasks"),
         Some(WorkflowResource::RunTasks {
             run_id: "0199-a".to_string()
         })
     );
     // query 串不影响形状解析。
     assert_eq!(
-        parse_uri("workflow://tasks?after=3&limit=2"),
+        crate::resources::parse_uri("workflow://tasks?after=3&limit=2"),
         Some(WorkflowResource::Tasks)
     );
 }
@@ -362,59 +425,72 @@ fn rejects_unregistered_uri_shapes() {
         "workspace://git/ref",
         "https://example.com",
     ] {
-        assert!(parse_uri(uri).is_none(), "{uri} 不得被解析为资源");
+        assert!(
+            crate::resources::parse_uri(uri).is_none(),
+            "{uri} 不得被解析为资源"
+        );
     }
 }
 
 #[test]
 fn parses_page_query_with_bounds() {
-    let default = parse_page_query("workflow://tasks");
+    let default = crate::resources::parse_page_query("workflow://tasks");
     assert_eq!(default.after, None);
     assert_eq!(default.limit, DEFAULT_PAGE_LIMIT);
 
-    let parsed = parse_page_query("workflow://tasks?after=7&limit=3");
+    let parsed = crate::resources::parse_page_query("workflow://tasks?after=7&limit=3");
     assert_eq!(parsed.after, Some(7));
     assert_eq!(parsed.limit, 3);
 
     // limit 收窄到 [1, MAX_PAGE_LIMIT]；非法值回落缺省。
-    assert_eq!(parse_page_query("workflow://tasks?limit=0").limit, 1);
     assert_eq!(
-        parse_page_query(&format!("workflow://tasks?limit={}", MAX_PAGE_LIMIT + 50)).limit,
+        crate::resources::parse_page_query("workflow://tasks?limit=0").limit,
+        1
+    );
+    assert_eq!(
+        crate::resources::parse_page_query(&format!(
+            "workflow://tasks?limit={}",
+            MAX_PAGE_LIMIT + 50
+        ))
+        .limit,
         MAX_PAGE_LIMIT
     );
     assert_eq!(
-        parse_page_query("workflow://tasks?limit=abc").limit,
+        crate::resources::parse_page_query("workflow://tasks?limit=abc").limit,
         DEFAULT_PAGE_LIMIT
     );
-    assert_eq!(parse_page_query("workflow://tasks?after=abc").after, None);
+    assert_eq!(
+        crate::resources::parse_page_query("workflow://tasks?after=abc").after,
+        None
+    );
 }
 
 #[test]
 fn maps_updates_to_canonical_uris() {
     assert_eq!(
-        update_uri(&WorkflowResourceUpdate::RunsIndex),
+        crate::resources::update_uri(&WorkflowResourceUpdate::RunsIndex),
         "workflow://runs"
     );
     assert_eq!(
-        update_uri(&WorkflowResourceUpdate::Run {
+        crate::resources::update_uri(&WorkflowResourceUpdate::Run {
             run_id: "r1".to_string()
         }),
         "workflow://runs/r1"
     );
     assert_eq!(
-        update_uri(&WorkflowResourceUpdate::RunEvents {
+        crate::resources::update_uri(&WorkflowResourceUpdate::RunEvents {
             run_id: "r1".to_string()
         }),
         "workflow://runs/r1/events"
     );
     assert_eq!(
-        update_uri(&WorkflowResourceUpdate::RunTasks {
+        crate::resources::update_uri(&WorkflowResourceUpdate::RunTasks {
             run_id: "r1".to_string()
         }),
         "workflow://runs/r1/tasks"
     );
     assert_eq!(
-        update_uri(&WorkflowResourceUpdate::Tasks),
+        crate::resources::update_uri(&WorkflowResourceUpdate::Tasks),
         "workflow://tasks"
     );
 }

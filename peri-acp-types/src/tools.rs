@@ -130,11 +130,12 @@ impl ToolExecutionEvidence {
 /// - [`ToolOutcome`]：工具/远端 MCP 自身报告的结果（真实 `isError` + raw 载荷）；
 /// - [`ToolExecutionEvidence`]：本进程侧的执行状态（进程存活、退出码、落盘引用）；
 /// - [`EffectiveToolError`]：transport/权限/取消等协议层失败。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolOutcome {
     /// 未报告：工具没有提供结构化结果（legacy `BaseTool::invoke` 路径）。调用方
     /// 必须保留这份不确定性，不得读作成功、失败或完成。
+    #[default]
     Unreported,
     /// 已报告工具自身的结果。
     Reported {
@@ -147,13 +148,6 @@ pub enum ToolOutcome {
     },
 }
 
-impl Default for ToolOutcome {
-    /// 缺省即「未报告」：反序列化旧数据或缺失字段时不引入成功/失败的假设。
-    fn default() -> Self {
-        Self::Unreported
-    }
-}
-
 impl ToolOutcome {
     /// 从无损 raw 结果构造；`is_error` 取 raw 的 `isError`，不额外推断。
     pub fn from_raw(raw: RawToolResult) -> Self {
@@ -164,6 +158,7 @@ impl ToolOutcome {
     }
 
     /// 工具如实报告结果但没有 raw 载荷（本地工具）。
+    #[must_use]
     pub fn reported(is_error: bool) -> Self {
         Self::Reported {
             is_error,
@@ -172,6 +167,7 @@ impl ToolOutcome {
     }
 
     /// 是否为 legacy 未报告状态。
+    #[must_use]
     pub fn is_unreported(&self) -> bool {
         matches!(self, Self::Unreported)
     }
@@ -207,6 +203,7 @@ pub struct ToolOutput {
 
 impl ToolOutput {
     /// Legacy 契约：只有文本，执行状态与结果事实都未报告。
+    #[must_use]
     pub fn from_legacy(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -218,6 +215,7 @@ impl ToolOutput {
     /// 携带本进程执行证据构造。执行证据不是工具结果：`outcome` 仍为
     /// [`ToolOutcome::Unreported`]，需要报告结果的工具请用
     /// [`ToolOutput::with_outcome`] / [`ToolOutput::from_raw_result`]。
+    #[must_use]
     pub fn with_execution(text: impl Into<String>, execution: ToolExecutionEvidence) -> Self {
         Self {
             text: text.into(),
@@ -236,6 +234,7 @@ impl ToolOutput {
     }
 
     /// 携带显式 typed outcome 构造（可与执行证据组合）。
+    #[must_use]
     pub fn with_outcome(text: impl Into<String>, outcome: ToolOutcome) -> Self {
         Self {
             text: text.into(),
@@ -245,6 +244,7 @@ impl ToolOutput {
     }
 
     /// 工具结果事实；[`ToolOutcome::Unreported`] = legacy 契约未报告。
+    #[must_use]
     pub fn outcome(&self) -> &ToolOutcome {
         &self.outcome
     }
@@ -539,6 +539,7 @@ pub struct EffectiveToolError {
 }
 
 impl EffectiveToolError {
+    #[must_use]
     pub fn new(code: EffectiveToolErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -627,11 +628,11 @@ impl ContextUsage {
 ///
 /// 通过 `BaseTool::invoke` 的第二个参数传入。工具可读取 messages 和 cwd，
 /// 但不能修改 state（避免绕过 dispatch_tools 统一写入语义）。
-pub struct ToolContext<'a> {
+pub struct ToolContext<'context> {
     /// 当前对话历史（只读引用，借用 state.messages）
-    pub messages: &'a [BaseMessage],
+    pub messages: &'context [BaseMessage],
     /// 当前工作目录
-    pub cwd: &'a str,
+    pub cwd: &'context str,
     /// 当前 canonical dispatch 能力；仅 dispatch 中调用工具时存在。
     pub effective_tool_dispatcher: Option<std::sync::Arc<dyn EffectiveToolDispatcher>>,
     /// 当前 canonical 执行身份；`None` = 不在 canonical dispatch 中。
@@ -657,12 +658,17 @@ pub struct ToolContext<'a> {
     /// 当前 turn generation；用于撤销跨 turn 的宿主调用租约。
     pub turn_generation: Option<String>,
     pub session_resources: Option<std::sync::Arc<dyn crate::session_resources::SessionResources>>,
+    /// 当前会话下一轮目录的只读准备端口；canonical 执行中由会话目录投影。
+    ///
+    /// 工具只能用它验证候选目录，不能替换当前 Act 固定的工具视图。
+    pub session_tool_catalog:
+        Option<std::sync::Arc<dyn crate::mcp_control::SessionToolCatalogPreparationPort>>,
     /// 当前会话上下文用量快照；`None` = 无预算或无估算，工具无法评估。
     pub context_usage: Option<ContextUsage>,
 }
 
-impl<'a> ToolContext<'a> {
-    pub fn new(messages: &'a [BaseMessage], cwd: &'a str) -> Self {
+impl<'context> ToolContext<'context> {
+    pub fn new(messages: &'context [BaseMessage], cwd: &'context str) -> Self {
         Self {
             messages,
             cwd,
@@ -676,6 +682,7 @@ impl<'a> ToolContext<'a> {
             task_terminal_delivery: None,
             turn_generation: None,
             session_resources: None,
+            session_tool_catalog: None,
             context_usage: None,
         }
     }
@@ -683,6 +690,15 @@ impl<'a> ToolContext<'a> {
     /// 绑定 dispatch 时刻的会话上下文用量快照。
     pub fn with_context_usage(mut self, usage: Option<ContextUsage>) -> Self {
         self.context_usage = usage;
+        self
+    }
+
+    /// 绑定当前会话的下一轮目录准备端口（执行期持有，不跨执行常驻）。
+    pub fn with_session_tool_catalog(
+        mut self,
+        port: std::sync::Arc<dyn crate::mcp_control::SessionToolCatalogPreparationPort>,
+    ) -> Self {
+        self.session_tool_catalog = Some(port);
         self
     }
 
@@ -809,8 +825,9 @@ pub trait BaseTool: Send + Sync {
         Ok(None)
     }
 
-    /// Static MCP source identity used by session catalog shadowing and collision
-    /// checks. Non-MCP tools return `None`; wrappers must forward this value.
+    /// MCP source binding used by session catalog ownership, shadowing and
+    /// revocation. It is **not** a remote `tools/call` target: entries that need
+    /// wire identity must also validate [`BaseTool::mcp_tool_name`].
     fn mcp_server_name(&self) -> Option<&str> {
         None
     }

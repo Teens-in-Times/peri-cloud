@@ -1,13 +1,41 @@
-use super::*;
+use crate::session::subagent::factory::claim::ResumeClaim;
 use crate::session::test_resources::mock::MockSessionResources;
+use crate::tools::EffectiveToolError;
+use crate::tools::EffectiveToolErrorCode;
 use peri_acp_types::messages::MessageId;
-use peri_acp_types::session_resources::*;
+
+use peri_acp_types::session_resources::BindingRecheck;
+use peri_acp_types::session_resources::BindingState;
+use peri_acp_types::session_resources::ChildResumeClaim;
+use peri_acp_types::session_resources::ChildSnapshot;
+use peri_acp_types::session_resources::CloseSettlement;
+use peri_acp_types::session_resources::ForkSnapshot;
+use peri_acp_types::session_resources::FrozenSnapshotBytes;
+use peri_acp_types::session_resources::MutationOutcome;
+use peri_acp_types::session_resources::NewSession;
+use peri_acp_types::session_resources::NewSessionDraft;
+use peri_acp_types::session_resources::PersistenceRecovery;
+use peri_acp_types::session_resources::RewindBoundary;
+use peri_acp_types::session_resources::RewindOutcome;
+use peri_acp_types::session_resources::SessionAvailability;
+use peri_acp_types::session_resources::SessionInitialization;
+use peri_acp_types::session_resources::SessionMetaPatch;
+use peri_acp_types::session_resources::SessionResourceError;
+use peri_acp_types::session_resources::SessionResourceErrorKind;
+use peri_acp_types::session_resources::SessionResourceResult;
+use peri_acp_types::session_resources::SessionResources;
+use peri_acp_types::session_resources::SessionSnapshot;
+
 use peri_acp_types::store::{CompactionChange, MessageFlags, PersistedPayload};
 use peri_acp_types::system_reminder::TrustedSystemReminder;
 use peri_acp_types::tasks::TaskManager as _;
+use peri_acp_types::thread::AgentStatus;
+use peri_acp_types::thread::ThreadId;
+use peri_acp_types::thread::ThreadMeta;
 use peri_acp_types::workspace::{ResolvedWorkspace, ScopedThreadPage, ScopedThreadQuery};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 /// 可控 gate：让 Working 写停在「已进入、尚未提交」，或按需失败；
@@ -63,7 +91,11 @@ impl ChildResumeClaim for ReplayClaim {
     async fn mark_failed(&self) -> SessionResourceResult<()> {
         if let Some(gate) = &self.0.rollback_gate {
             gate.entered.notify_one();
-            gate.release.acquire().await.unwrap().forget();
+            gate.release
+                .acquire()
+                .await
+                .expect("the acquire fixture result is required for this assertion")
+                .forget();
             gate.committed.notify_one();
         }
         self.0.inner.mark_failed().await
@@ -109,7 +141,7 @@ impl ClaimResources {
     pub(super) fn last_claim(&self) -> ReplayClaim {
         self.replays
             .lock()
-            .unwrap()
+            .expect("self replays mutex must remain unpoisoned throughout the test")
             .last()
             .expect("no resume claim recorded")
             .clone()
@@ -119,7 +151,12 @@ impl ClaimResources {
 #[async_trait::async_trait]
 impl SessionResources for ClaimResources {
     async fn load_session_meta(&self, id: &ThreadId) -> SessionResourceResult<ThreadMeta> {
-        if let Some(error) = self.read_error.lock().unwrap().take() {
+        if let Some(error) = self
+            .read_error
+            .lock()
+            .expect("self read error mutex must remain unpoisoned throughout the test")
+            .take()
+        {
             return Err(error);
         }
         self.inner.load_session_meta(id).await
@@ -134,7 +171,12 @@ impl SessionResources for ClaimResources {
         if self.commit_before_error {
             let _handle = self.inner.claim_child_resume(child, root).await?;
         }
-        if let Some(error) = self.claim_error.lock().unwrap().take() {
+        if let Some(error) = self
+            .claim_error
+            .lock()
+            .expect("self claim error mutex must remain unpoisoned throughout the test")
+            .take()
+        {
             return Err(error);
         }
         let inner = self.inner.claim_child_resume(child, root).await?;
@@ -150,7 +192,10 @@ impl SessionResources for ClaimResources {
             inner,
             rollback_gate: self.rollback_gate.clone(),
         }));
-        self.replays.lock().unwrap().push(replay.clone());
+        self.replays
+            .lock()
+            .expect("self replays mutex must remain unpoisoned throughout the test")
+            .push(replay.clone());
         Ok(Box::new(replay))
     }
     async fn inspect_availability(
@@ -365,7 +410,11 @@ impl SessionResources for ClaimResources {
             if let Some(gate) = &self.work_state_gate {
                 gate.writes.fetch_add(1, Ordering::SeqCst);
                 gate.entered.notify_one();
-                gate.release.acquire().await.unwrap().forget();
+                gate.release
+                    .acquire()
+                    .await
+                    .expect("the acquire fixture result is required for this assertion")
+                    .forget();
                 if gate.fail {
                     return Err(SessionResourceError::new(
                         SessionResourceErrorKind::Unavailable {
@@ -381,7 +430,11 @@ impl SessionResources for ClaimResources {
             if let Some(gate) = &self.work_state_gate {
                 if gate.pause_after_commit.load(Ordering::SeqCst) {
                     gate.committed.notify_one();
-                    gate.post_release.acquire().await.unwrap().forget();
+                    gate.post_release
+                        .acquire()
+                        .await
+                        .expect("the acquire fixture result is required for this assertion")
+                        .forget();
                 }
             }
         }
@@ -415,100 +468,15 @@ async fn acquire_error(
     }
 }
 
-#[tokio::test]
-async fn cancel_running_claim_finalizes_only_after_resource_close_is_confirmed() {
-    use crate::session::subagent::{ParkedChildOwner, SubagentHost};
-    use crate::session::{FrozenContext, MessageTranscript, Session};
-
-    for persistence_failure in [true, false] {
-        let store = MockSessionResources::new();
-        store
-            .update_thread_status(&CHILD.into(), "done")
-            .await
-            .unwrap();
-        let (_, mut claim) = ResumeClaim::acquire(store.clone(), CHILD.into(), CHILD.into(), None)
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .load_session_meta(&CHILD.into())
-                .await
-                .unwrap()
-                .agent_status,
-            AgentStatus::Active
-        );
-        let session = Session::new(
-            Arc::from("/tmp"),
-            FrozenContext::builder().build(),
-            Some(CHILD.into()),
-        );
-        let history = MockSessionResources::new();
-        *session.transcript().write() =
-            MessageTranscript::new().with_persistence(history.clone(), CHILD.into());
-        let manager = Arc::new(crate::agent::async_tasks::TaskManager::new());
-        let owner = ParkedChildOwner::new(
-            CHILD.into(),
-            CHILD.into(),
-            manager.clone(),
-            session.queue().clone(),
-            Some(history.clone()),
-            None,
-        );
-        owner.set_writer(session.transcript().read().persist_tx_handle());
-        session.set_subagent_host(SubagentHost {
-            task_manager: Some(manager),
-            child_owner: Some(owner.clone()),
-            ..Default::default()
-        });
-        if persistence_failure {
-            // 只令 transcript 写失败；meta 仍可写，避免把 Active 误归因于状态写失败。
-            history.restrict_to_history_read_only();
-            session
-                .transcript()
-                .write()
-                .append(crate::messages::BaseMessage::human("未确认历史"));
-        } else {
-            let permit = owner
-                .acquire(session.start_turn().execution_binding())
-                .unwrap();
-            permit.finish(Err("执行结算未确认".into()));
-        }
-        claim.mark_running(session.clone());
-        claim.decide(ClaimDecision::CancelRunning(session.clone()));
-        let error = (&mut claim.worker).await.unwrap().unwrap_err();
-        assert!(session.subagent_host().unwrap().close_state.is_closing());
-        assert!(owner.failure().is_some());
-        let expected = if persistence_failure {
-            assert!(
-                error.starts_with("Incomplete: child history persistence unconfirmed"),
-                "{error}"
-            );
-            AgentStatus::Active
-        } else {
-            assert!(
-                error.starts_with("Incomplete: child settlement is unconfirmed"),
-                "{error}"
-            );
-            AgentStatus::Cancelled
-        };
-        assert_eq!(
-            store
-                .load_session_meta(&CHILD.into())
-                .await
-                .unwrap()
-                .agent_status,
-            expected
-        );
-    }
-}
-
 const CHILD: &str = "00000000-0000-0000-0000-000000000000";
 
 #[tokio::test]
 async fn missing_thread_survives_worker_channel_as_invalid_input() {
     let store = ClaimResources::new();
     let error = acquire_error(store.clone(), CHILD).await;
-    let typed = error.downcast_ref::<EffectiveToolError>().unwrap();
+    let typed = error
+        .downcast_ref::<EffectiveToolError>()
+        .expect("the <EffectiveToolError> fixture result is required for this assertion");
     assert_eq!(typed.code, EffectiveToolErrorCode::InvalidInput);
     assert_eq!(
         typed.message,
@@ -523,7 +491,10 @@ async fn invalid_identity_survives_worker_channel_without_claiming() {
     let store = ClaimResources::new();
     let error = acquire_error(store.clone(), "invalid-id").await;
     assert_eq!(
-        error.downcast_ref::<EffectiveToolError>().unwrap().code,
+        error
+            .downcast_ref::<EffectiveToolError>()
+            .expect("the EffectiveToolError fixture result is required for this assertion")
+            .code,
         EffectiveToolErrorCode::InvalidInput
     );
     assert_eq!(store.claims.load(Ordering::SeqCst), 0);
@@ -536,10 +507,12 @@ async fn active_thread_is_typed_application_failure_without_claiming() {
         .inner
         .update_thread_status(&CHILD.into(), "active")
         .await
-        .unwrap();
+        .expect("the update thread status fixture result is required for this assertion");
     let before = store.inner.statuses();
     let error = acquire_error(store.clone(), CHILD).await;
-    let typed = error.downcast_ref::<EffectiveToolError>().unwrap();
+    let typed = error
+        .downcast_ref::<EffectiveToolError>()
+        .expect("the <EffectiveToolError> fixture result is required for this assertion");
     assert_eq!(typed.code, EffectiveToolErrorCode::ApplicationFailed);
     assert!(typed.message.contains("still active"));
     assert_eq!(store.claims.load(Ordering::SeqCst), 0);
@@ -548,7 +521,7 @@ async fn active_thread_is_typed_application_failure_without_claiming() {
 
 #[tokio::test]
 async fn metadata_read_errors_keep_resource_kind_and_effect() {
-    for kind in [
+    let kind_items = [
         SessionResourceErrorKind::ReadOnlyStore,
         SessionResourceErrorKind::Corrupt {
             detail: "unreadable metadata".into(),
@@ -560,15 +533,22 @@ async fn metadata_read_errors_keep_resource_kind_and_effect() {
         SessionResourceErrorKind::PersistenceUncertain {
             thread_id: Some(CHILD.into()),
         },
-    ] {
+    ];
+    for kind in kind_items {
         let store = ClaimResources::new();
         let expected = SessionResourceError::new(kind);
         let expected_kind = format!("{:?}", expected.kind());
         let expected_effect = expected.effect();
-        *store.read_error.lock().unwrap() = Some(expected);
+        *store
+            .read_error
+            .lock()
+            .expect("store read error mutex must remain unpoisoned throughout the test") =
+            Some(expected);
         let error = acquire_error(store.clone(), CHILD).await;
         assert!(error.downcast_ref::<EffectiveToolError>().is_none());
-        let typed = error.downcast_ref::<SessionResourceError>().unwrap();
+        let typed = error
+            .downcast_ref::<SessionResourceError>()
+            .expect("the <SessionResourceError> fixture result is required for this assertion");
         assert_eq!(format!("{:?}", typed.kind()), expected_kind);
         assert_eq!(typed.effect(), expected_effect);
         assert!(!error.to_string().contains("thread not found"));
@@ -591,21 +571,29 @@ async fn claim_rejections_keep_resource_kind_without_application_failure() {
             .inner
             .update_thread_status(&CHILD.into(), "done")
             .await
-            .unwrap();
+            .expect("the update thread status fixture result is required for this assertion");
         let before = store.inner.statuses();
         let expected = SessionResourceError::new(kind);
         let expected_kind = format!("{:?}", expected.kind());
-        *store.claim_error.lock().unwrap() = Some(expected);
+        *store
+            .claim_error
+            .lock()
+            .expect("store claim error mutex must remain unpoisoned throughout the test") =
+            Some(expected);
         let manager = crate::agent::async_tasks::TaskManager::new();
         let guard =
             peri_acp_types::tasks::TaskManager::begin_external_execution(&manager, "resume")
-                .unwrap();
+                .expect(
+                    "the begin external execution fixture result is required for this assertion",
+                );
         let error = ResumeClaim::acquire(store.clone(), CHILD.into(), CHILD.into(), Some(guard))
             .await
             .err()
             .expect("claim must reject");
         assert!(error.downcast_ref::<EffectiveToolError>().is_none());
-        let typed = error.downcast_ref::<SessionResourceError>().unwrap();
+        let typed = error
+            .downcast_ref::<SessionResourceError>()
+            .expect("the <SessionResourceError> fixture result is required for this assertion");
         assert_eq!(format!("{:?}", typed.kind()), expected_kind);
         assert_eq!(typed.effect(), MutationOutcome::NotApplied);
         assert_eq!(store.claims.load(Ordering::SeqCst), 1);
@@ -617,24 +605,31 @@ async fn claim_rejections_keep_resource_kind_without_application_failure() {
 #[tokio::test]
 async fn committed_claim_with_unknown_ack_stays_unknown_and_active() {
     let mut store = ClaimResources::new();
-    Arc::get_mut(&mut store).unwrap().commit_before_error = true;
+    Arc::get_mut(&mut store)
+        .expect("Arc get mut fixture must contain the requested entry")
+        .commit_before_error = true;
     store
         .inner
         .update_thread_status(&CHILD.into(), "done")
         .await
-        .unwrap();
-    *store.claim_error.lock().unwrap() = Some(SessionResourceError::persistence_uncertain(Some(
-        CHILD.into(),
-    )));
+        .expect("the update thread status fixture result is required for this assertion");
+    *store
+        .claim_error
+        .lock()
+        .expect("store claim error mutex must remain unpoisoned throughout the test") = Some(
+        SessionResourceError::persistence_uncertain(Some(CHILD.into())),
+    );
     let manager = crate::agent::async_tasks::TaskManager::new();
-    let guard =
-        peri_acp_types::tasks::TaskManager::begin_external_execution(&manager, "resume").unwrap();
+    let guard = peri_acp_types::tasks::TaskManager::begin_external_execution(&manager, "resume")
+        .expect("the begin external execution fixture result is required for this assertion");
     let error = ResumeClaim::acquire(store.clone(), CHILD.into(), CHILD.into(), Some(guard))
         .await
         .err()
         .expect("claim ACK must remain unknown");
     assert!(error.downcast_ref::<EffectiveToolError>().is_none());
-    let typed = error.downcast_ref::<SessionResourceError>().unwrap();
+    let typed = error
+        .downcast_ref::<SessionResourceError>()
+        .expect("the <SessionResourceError> fixture result is required for this assertion");
     assert!(
         matches!(typed.kind(), SessionResourceErrorKind::PersistenceUncertain { thread_id: Some(thread_id) } if thread_id == CHILD)
     );
@@ -644,78 +639,8 @@ async fn committed_claim_with_unknown_ack_stays_unknown_and_active() {
         .inner
         .load_session_meta(&CHILD.into())
         .await
-        .unwrap()
+        .expect("the into fixture result is required for this assertion")
         .agent_status
         .is_active());
     assert!(!manager.is_execution_idle());
-}
-
-async fn resumable_child(store: &ClaimResources) {
-    let mut meta = ThreadMeta::new_at("/tmp/work", peri_time::now_wall());
-    meta.id = CHILD.into();
-    meta.agent_status = AgentStatus::Done;
-    meta.work_state = peri_acp_types::thread::WorkState::Stopped;
-    store.inner.create_resumable_thread(meta).await.unwrap();
-}
-
-/// 正常 Finish：终态由认领在归属校验内提交，并恢复认领前的工作意图。
-#[tokio::test]
-async fn finish_writes_terminal_status_for_owned_claim() {
-    use peri_acp_types::thread::WorkState;
-    let store = ClaimResources::new();
-    resumable_child(&store).await;
-    let (_, claim) = ResumeClaim::acquire(store.clone(), CHILD.into(), CHILD.into(), None)
-        .await
-        .unwrap();
-    store
-        .inner
-        .set_work_state(&CHILD.into(), WorkState::Working)
-        .await
-        .unwrap();
-
-    claim.finish(AgentStatus::Error).await.unwrap();
-    let meta = store.inner.load_session_meta(&CHILD.into()).await.unwrap();
-    assert_eq!(meta.agent_status, AgentStatus::Error);
-    assert_eq!(meta.work_state, WorkState::Stopped);
-}
-
-/// [回归] 旧认领结清后新 run 认领成功；迟到的 Finish 终态不得覆盖新的 Active。
-///
-/// 复现原缺陷窗口：旧认领的结清已提交、终态尚未写入时，新 run 完成认领；
-/// 旧认领随后提交终态会把新认领的 `Active` 覆盖掉。
-#[tokio::test]
-async fn stale_claim_finish_does_not_override_new_claim() {
-    let store = ClaimResources::new();
-    resumable_child(&store).await;
-    let (_, old) = ResumeClaim::acquire(store.clone(), CHILD.into(), CHILD.into(), None)
-        .await
-        .unwrap();
-    store.last_claim().mark_terminated().await.unwrap();
-    let new_claim = store
-        .claim_child_resume(&CHILD.into(), &CHILD.into())
-        .await
-        .unwrap();
-    assert_eq!(
-        store
-            .inner
-            .load_session_meta(&CHILD.into())
-            .await
-            .unwrap()
-            .agent_status,
-        AgentStatus::Active
-    );
-
-    old.finish(AgentStatus::Cancelled).await.unwrap();
-
-    assert_eq!(
-        store
-            .inner
-            .load_session_meta(&CHILD.into())
-            .await
-            .unwrap()
-            .agent_status,
-        AgentStatus::Active,
-        "旧认领的迟到终态不得覆盖新认领"
-    );
-    drop(new_claim);
 }

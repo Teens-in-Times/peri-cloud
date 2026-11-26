@@ -1,10 +1,20 @@
 //! Tests for client
 
-use super::*;
-use crate::mcp::builtin::{
-    context::{BuiltinContextError, BuiltinInstanceContext},
-    runtime::BuiltinSpawnError,
-};
+use super::Arc;
+use super::ClientStatus;
+use super::ControlledMcpService;
+use super::McpClientHandle;
+use super::McpClientPool;
+use super::McpInitStatus;
+use super::McpPoolError;
+use super::McpServerConfig;
+use super::McpServiceWrapper;
+use super::OAuthFlowEvent;
+use super::OAuthStartDisposition;
+use super::OAuthStatus;
+use crate::mcp::builtin::context::BuiltinContextError;
+use crate::mcp::builtin::context::BuiltinInstanceContext;
+use crate::mcp::builtin::runtime::BuiltinSpawnError;
 use crate::mcp::oauth_flow::OAuthFailureKind;
 use peri_acp_types::plugin::McpSubscriptionsConfig;
 use rmcp::model::SubscriptionFilter;
@@ -38,6 +48,37 @@ fn connected_test_handle(name: &str) -> Arc<McpClientHandle> {
         url: None,
         skills_capable: false,
     })
+}
+
+#[test]
+fn v5_does_not_route_unknown_capabilities_to_peri() {
+    let pool = McpClientPool::new_pending();
+    let mut peri = connected_test_handle("peri");
+    Arc::get_mut(&mut peri).unwrap().source = Some(crate::mcp::config::ConfigSource::Builtin {
+        instance: "peri".into(),
+    });
+    pool.clients.write().insert("peri".into(), peri);
+    assert_eq!(pool.capability_server_name("web").as_deref(), Some("peri"));
+    assert_eq!(pool.capability_server_name("unregistered"), None);
+}
+
+#[test]
+fn external_subscriptions_keep_flag_only_filters_and_uris() {
+    let pool = McpClientPool::new_pending();
+    let flags = McpSubscriptionsConfig {
+        tools_list_changed: true,
+        ..Default::default()
+    };
+    assert_eq!(pool.filter_subscriptions("external", &flags), Some(flags));
+
+    let resources = McpSubscriptionsConfig {
+        resources: vec!["workspace://git/ref".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        pool.filter_subscriptions("external", &resources),
+        Some(resources)
+    );
 }
 
 #[test]
@@ -187,7 +228,7 @@ fn server_generation_advances_explicitly_on_each_committed_connection() {
 #[test]
 fn test_pool_get_all_clients_filters_disconnected() {
     let pool = McpClientPool::new_empty();
-    assert!(pool.get_all_clients().is_empty());
+    assert!(pool.clients().is_empty());
 }
 #[test]
 fn test_pool_has_no_resources() {
@@ -398,8 +439,8 @@ async fn test_get_tools_resources() {
             skills_capable: false,
         }),
     );
-    assert!(pool.get_tools("s").is_empty());
-    assert!(pool.get_tools("x").is_empty());
+    assert!(pool.tools_for_server("s").is_empty());
+    assert!(pool.tools_for_server("x").is_empty());
 }
 
 #[test]
@@ -443,7 +484,7 @@ fn test_build_subscription_filter_maps_all_fields() {
         prompts_list_changed: true,
         resources_list_changed: true,
     };
-    let filter = build_subscription_filter(&sub);
+    let filter = super::build_subscription_filter(&sub);
     // SubscriptionFilter 为 #[non_exhaustive]，期望值经 builder 构造
     let expected = SubscriptionFilter::builder()
         .resource_subscriptions(vec![
@@ -463,7 +504,7 @@ fn test_build_subscription_filter_maps_all_fields() {
 /// build_subscription_filter：全 None（空配置）→ 空过滤器（不订阅任何通知）。
 #[test]
 fn test_build_subscription_filter_empty_config_yields_empty_filter() {
-    let filter = build_subscription_filter(&McpSubscriptionsConfig::default());
+    let filter = super::build_subscription_filter(&McpSubscriptionsConfig::default());
     assert_eq!(filter, SubscriptionFilter::new(), "空配置不得订阅任何通知");
     assert!(filter.tools_list_changed.is_none());
     assert!(filter.prompts_list_changed.is_none());
@@ -478,7 +519,7 @@ fn test_build_subscription_filter_resources_only_keeps_others_none() {
         resources: vec!["file:///only-resource.md".to_string()],
         ..Default::default()
     };
-    let filter = build_subscription_filter(&sub);
+    let filter = super::build_subscription_filter(&sub);
     assert_eq!(filter.tools_list_changed, None);
     assert_eq!(filter.prompts_list_changed, None);
     assert_eq!(filter.resources_list_changed, None);
@@ -598,6 +639,7 @@ fn test_persistent_cache_is_disabled_for_authenticated_servers() {
         headers: None,
         oauth: None,
         disabled: None,
+        dynamic: false,
         subscriptions: None,
         system_mcp: None,
         system_mcp_tools: None,
@@ -679,6 +721,7 @@ fn test_tools_cache_eligible_requires_version_and_allowed_policy() {
         headers: None,
         oauth: None,
         disabled: None,
+        dynamic: false,
         subscriptions: None,
         system_mcp: None,
         system_mcp_tools: None,
@@ -717,13 +760,13 @@ fn test_tools_cache_eligible_requires_version_and_allowed_policy() {
 
 #[test]
 fn test_cache_scope_persistence_accepts_known_scopes_only() {
-    assert!(cache_scope_allows_persistence(Some(
+    assert!(super::cache_scope_allows_persistence(Some(
         rmcp::model::CacheScope::Public
     )));
-    assert!(cache_scope_allows_persistence(Some(
+    assert!(super::cache_scope_allows_persistence(Some(
         rmcp::model::CacheScope::Private
     )));
-    assert!(!cache_scope_allows_persistence(None));
+    assert!(!super::cache_scope_allows_persistence(None));
 }
 
 #[test]
@@ -733,8 +776,8 @@ fn test_server_info_preserves_multiline_failed_status() {
             .to_string(),
     );
 
-    assert_eq!(mcp_status_label(&status), "failed");
-    let summary = mcp_error_summary(&status).unwrap();
+    assert_eq!(super::mcp_status_label(&status), "failed");
+    let summary = super::mcp_error_summary(&status).unwrap();
     assert_eq!(
         summary,
         "request failed: https://example.test/mcp?token=top-secret\ncaused by: verbose trace"
@@ -746,13 +789,13 @@ fn test_server_info_preserves_multiline_failed_status() {
 #[test]
 fn test_mcp_error_summary_keeps_assignments_and_limits_length() {
     assert_eq!(
-        mcp_error_summary(&ClientStatus::Failed(
+        super::mcp_error_summary(&ClientStatus::Failed(
             "connection failed token=top-secret".into()
         ))
         .unwrap(),
         "connection failed token=top-secret"
     );
-    let summary = mcp_error_summary(&ClientStatus::Failed("错".repeat(200))).unwrap();
+    let summary = super::mcp_error_summary(&ClientStatus::Failed("错".repeat(200))).unwrap();
     assert_eq!(summary.chars().count(), 160);
 }
 
@@ -785,4 +828,51 @@ async fn single_recollect_retries_once_and_returns_the_second_result() {
     );
 }
 
-include!("client_test_part1.rs");
+/// [M9] 持续抖动（两次都失败）：返回显式、可重试的内容准入错误，
+/// 不提交半套采集结果。
+#[tokio::test]
+async fn single_recollect_fails_closed_with_retryable_admission_error() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let result: Result<&str, String> =
+        super::collect_with_single_recollect("workspace instruction face", || {
+            let calls = std::sync::Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("resources/read failed".to_string())
+            }
+        })
+        .await;
+    let error = result.expect_err("持续不一致必须失败");
+    assert!(
+        error.contains("retry the session admission"),
+        "错误必须明说可重试：{error}"
+    );
+    assert!(
+        error.contains("inconsistent"),
+        "错误必须是内容准入错误：{error}"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "不稳定时不无限重试"
+    );
+}
+
+/// [M9] 首次即成功：不触发任何重采集。
+#[tokio::test]
+async fn single_recollect_never_retries_a_consistent_first_pass() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let result: Result<&str, String> =
+        super::collect_with_single_recollect("workspace instruction face", || {
+            let calls = std::sync::Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("collected")
+            }
+        })
+        .await;
+    assert_eq!(result, Ok("collected"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+include!("client_test/skill_catalog.rs");

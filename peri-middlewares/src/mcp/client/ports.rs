@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    Arc, ClientStatus, CommandRegistry, HashMap, HashSet, InboxHandle, McpBuiltinWorkspaceState,
+    McpClientPool, McpInitStatus, McpOAuthStartDisposition, McpPoolShutdownReport, McpResourceInfo,
+    McpServerConnectionStatus, McpServerInfo, McpServerOAuthStatus, McpSkillRegistry,
+    McpSubscriptionPort, McpToolInfo, OAuthStartDisposition, OAuthStatus, ServerInfo,
+    SkillMetadata, TaskManager,
+};
 use peri_acp_types::plugin::McpSubscriptionsConfig;
 
 // 3.0 批 2 波 2：装配注入端口实现（ACP 侧只持 `Arc<dyn McpPoolPort>`）。
@@ -20,6 +26,12 @@ impl peri_acp_types::ports::McpPoolPort for McpClientPool {
         session_id: &str,
     ) -> Option<Arc<dyn peri_acp_types::mcp_control::SessionMcpCatalogPort>> {
         Some(crate::mcp::control::catalog_source(self, session_id))
+    }
+    fn dynamic_loader_bindings(
+        self: Arc<Self>,
+        session_id: &str,
+    ) -> Vec<peri_acp_types::mcp_control::DynamicLoaderBinding> {
+        crate::mcp::loader::dynamic_loader_bindings(&self, Some(session_id))
     }
     fn cancel_oauth_flow(&self, flow_id: &str) -> Result<bool, String> {
         Ok(McpClientPool::cancel_oauth_flow(self, flow_id))
@@ -63,7 +75,12 @@ impl peri_acp_types::ports::McpPoolPort for McpClientPool {
     }
 
     fn has_instance(&self, instance: &str) -> bool {
-        McpClientPool::get_client(self, instance).is_some()
+        if self.v5_single_exit_configured()
+            && peri_acp_types::builtin_mcp::capability(instance).is_some()
+        {
+            return self.capability_available(instance);
+        }
+        McpClientPool::client(self, instance).is_some()
     }
 
     fn bind_agent_session(
@@ -263,7 +280,13 @@ impl peri_acp_types::ports::McpPoolPort for McpClientPool {
     }
 
     fn builtin_workspace_state(&self) -> McpBuiltinWorkspaceState {
-        match McpClientPool::get_client(self, "workspace") {
+        if self
+            .builtin_instance_context()
+            .is_some_and(|context| context.closed.contains("workspace"))
+        {
+            return McpBuiltinWorkspaceState::NotConnected;
+        }
+        match McpClientPool::capability_client(self, "workspace") {
             None => McpBuiltinWorkspaceState::Absent,
             Some(handle) if matches!(handle.status, ClientStatus::Connected) => {
                 McpBuiltinWorkspaceState::Connected

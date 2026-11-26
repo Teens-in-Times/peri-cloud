@@ -11,6 +11,7 @@
 //!   纯历史变换见 `store::history`
 //! - `session_resources` — 会话资源门面契约（SessionResources + 中性领域 I/O、错误与能力枚举）
 //! - `history_page` — 历史分页契约（HistoryCursor/HistoryPage/HistoryPageBounds + 页装配与边界事实的唯一规则）
+//! - `history_v2` — Peri History V2 wire 契约（协商 / initial / open/page/seek/body/close / WindowPage / 错误）
 //! - `projection` — compact 投影指令纯数据契约
 //! - `identity` — §9 身份标识契约（AgentId/EventEnvelope/CancelRequest/...）
 //! - `event` / `event_v2` — 事件契约（ExecutorEvent + v2 三层事件 + EventBus + v1 兼容映射）
@@ -25,6 +26,7 @@
 //!   快照 / 能力声明 / 预算常量）
 //! - `tool_invocation` — canonical 执行身份与来源契约（InvocationId/ToolCallId/InvocationOrigin）
 //! - `tool_outcome` — raw 工具结果与远端错误契约（RawToolResult/RemoteToolError 权威定义）
+//! - `tool_proxy` — 宿主工具代理名称与字段契约（ToolSearch/ToolInvoke + 迁移期 alias）
 //! - `compact` — compact 契约（CompactOutcome/FullEscalationReason + 提取函数）
 //! - `error` — 层边界错误契约（AgentError）
 //! - `permission` — 权限模式契约（PermissionMode/SharedPermissionMode）
@@ -38,7 +40,7 @@
 //! - `workflow` — workflow 协议契约（AgentRunParams/ProgressEvent/AgentExecutor/...）
 //! - `hooks` — hook 契约（HookEvent/HookType/RegisteredHook/...）
 //! - `plugin` — 插件契约（PluginManifest/LoadedPlugin/PluginLoadResult/PluginManagerPort）
-//! - `builtin_mcp` — builtin MCP 注册表纯数据（实例 / 原始工具名 / effective name / direct / 声明模板）
+//! - `builtin_mcp` — builtin MCP 注册表纯数据（实例 / 原始工具名 / effective name / direct / 声明模板；`v5` 子模块为单出口能力声明与迁移映射，默认路径未切换）
 //! - `ports` — 装配注入端口（McpPoolPort/ToolSearchPort/AgentCatalogPort）
 
 pub mod acp_mcp;
@@ -58,11 +60,17 @@ pub mod device_executor;
 pub mod error;
 pub mod event;
 pub mod event_data;
+mod event_origin;
 pub mod event_v2;
 pub mod frozen;
 pub mod goal;
+pub mod history_common;
 pub mod history_page;
+mod history_page_visibility;
+pub mod history_v2;
 pub mod history_window;
+#[path = "history_window/request.rs"]
+mod history_window_request;
 pub mod hooks;
 pub mod identity;
 pub mod interaction;
@@ -70,7 +78,8 @@ pub mod mcp;
 pub mod mcp_apps;
 pub mod mcp_apps_facade;
 pub mod mcp_control;
-pub mod mcp_skills;
+pub mod mcp_skill_registry;
+pub use mcp_skill_registry as mcp_skills;
 pub mod messages;
 pub mod meta_harness;
 pub mod model;
@@ -78,6 +87,8 @@ pub mod monitor;
 pub mod oauth_credentials;
 pub mod peri_caps;
 pub use peri_caps::PeriCaps;
+#[path = "context_archive/archive_chunk_batch.rs"]
+mod archive_chunk_batch;
 pub mod context_archive;
 pub mod permission;
 pub mod plugin;
@@ -90,7 +101,10 @@ pub mod sentinel;
 pub mod session;
 pub mod session_authorization;
 pub mod session_resources;
-pub mod session_store;
+pub mod session_store_deployment;
+pub use session_store_deployment as session_store;
+#[path = "store/history_projection.rs"]
+mod history_projection;
 pub mod skills;
 pub mod store;
 pub mod summary;
@@ -99,6 +113,7 @@ pub mod tasks;
 pub mod thread;
 pub mod tool_invocation;
 pub mod tool_outcome;
+pub mod tool_proxy;
 pub mod tools;
 pub mod workflow;
 

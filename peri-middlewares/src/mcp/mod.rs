@@ -19,6 +19,7 @@ pub mod discover_tool;
 #[allow(clippy::result_large_err)]
 pub mod initialize;
 mod invocation;
+pub(crate) mod loader;
 pub mod middleware;
 pub mod oauth_flow;
 pub mod reconnect;
@@ -38,6 +39,8 @@ pub mod tool_bridge;
 mod tool_execution;
 mod tool_request;
 pub mod transport;
+// v5 单出口 P2：workspace 等上游 server 的通用代理（尚未接入默认装配）。
+pub mod upstream_proxy;
 
 pub use acp::AcpMcpService;
 pub use agent_registry::{ActivatedMcpAgent, McpAgentMetadata, McpAgentRegistry};

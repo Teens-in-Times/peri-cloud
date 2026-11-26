@@ -21,14 +21,16 @@
 //! 返回 typed [`AgentError::NotAvailableWithoutTurn`]）；事后钩子在无 turn 时
 //! 显式记录跳过（裁决 R2），不得回退到伪造事实。
 
+use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
 use peri_acp_types::mcp_apps::SkippedPostHook;
+use peri_acp_types::mcp_control::SessionToolCatalogPreparationPort;
 
-use super::StageContext;
 use crate::agent::events_v2::{EventBus, RenderEvent};
+use crate::agent::stages::context::StageContext;
 use crate::error::{AgentError, AgentResult};
 use crate::messages::{BaseMessage, MessageId};
 use crate::middleware::MiddlewareChain;
@@ -156,6 +158,8 @@ pub struct InvocationContext {
     context_usage: Option<ContextUsage>,
     /// 会话资源端口（idempotent reminder 等）。
     session_resources: Option<Arc<dyn SessionResources>>,
+    /// 下一轮会话目录的准备端口（执行期持有，供 dynamic MCP Loader 验证）。
+    session_tool_catalog: Option<Arc<dyn SessionToolCatalogPreparationPort>>,
     /// 会话级后台结果处理责任 owner；`None` = 本入口没有可关联的会话 mailbox
     /// （idle App / Host 入口），终态投递退回一次性实例。
     async_result_mailbox: Option<Arc<crate::session::async_result_mailbox::AsyncResultMailbox>>,
@@ -198,6 +202,7 @@ pub struct PostHookSkipSink {
 }
 
 impl PostHookSkipSink {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -277,6 +282,8 @@ impl InvocationContext {
             dispatch_message_id,
             context_usage,
             session_resources,
+            session_tool_catalog: Some(Arc::clone(&stage.runtime.tool_catalog)
+                as Arc<dyn SessionToolCatalogPreparationPort>),
             async_result_mailbox: Some(Arc::clone(&stage.session.async_result_mailbox)),
             resolver: Arc::clone(&stage.runtime.tool_invocation_resolver),
             chain: Arc::clone(&stage.runtime.middleware_chain),
@@ -439,6 +446,13 @@ impl InvocationContext {
         self.session_resources.as_ref()
     }
 
+    /// 下一轮目录准备端口；按执行生命周期持有，不写入被调工具的持久状态。
+    pub(crate) fn session_tool_catalog(
+        &self,
+    ) -> Option<Arc<dyn SessionToolCatalogPreparationPort>> {
+        self.session_tool_catalog.clone()
+    }
+
     /// 会话级后台结果处理责任 owner；idle 入口没有时可回退到一次性实例。
     pub(crate) fn async_result_mailbox(
         &self,
@@ -503,6 +517,7 @@ impl InvocationContext {
     ///
     /// 本执行**不产生**模型可见事件（`events: None`）：不冒充模型工具调用、
     /// 不写 `step`、不写 `turn_generation`。
+    #[must_use]
     pub fn from_source(source: SessionInvocationSource) -> Self {
         let attribution = InteractionAttribution::from_invocation_origin(&source.origin);
         // `None`（未知）⇒ 视图退化为空切片：**这是保守化，不是等价事实**。
@@ -523,6 +538,8 @@ impl InvocationContext {
             dispatch_message_id: None,
             context_usage: source.context_usage,
             session_resources: source.session_resources,
+            // idle 入口没有 session catalog 投影：不能为其伪造下一轮目录。
+            session_tool_catalog: None,
             async_result_mailbox: None,
             resolver: source.resolver,
             chain: source.chain,
@@ -580,3 +597,69 @@ pub struct SessionInvocationSource {
 #[cfg(test)]
 #[path = "invocation_context_test.rs"]
 mod tests;
+
+impl Debug for ExecutionEntryOrigin {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            Self::ModelBatch => "ModelBatch",
+            Self::Single(..) => "Single",
+        };
+        formatter
+            .debug_tuple("ExecutionEntryOrigin")
+            .field(&variant)
+            .finish()
+    }
+}
+
+impl Debug for InvocationContext {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InvocationContext")
+            .field("session_id_present", &self.session_id.is_some())
+            .field("run_id_present", &self.run_id.is_some())
+            .field("history_len", &self.history_len)
+            .field(
+                "dispatch_message_id_present",
+                &self.dispatch_message_id.is_some(),
+            )
+            .field("context_usage_present", &self.context_usage.is_some())
+            .field(
+                "session_resources_present",
+                &self.session_resources.is_some(),
+            )
+            .field(
+                "async_result_mailbox_present",
+                &self.async_result_mailbox.is_some(),
+            )
+            .field("turn_present", &self.turn.is_some())
+            .field("attribution_present", &self.attribution.is_some())
+            .field("events_present", &self.events.is_some())
+            .field("post_hook_skips_present", &self.post_hook_skips.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Debug for PostHookSkipSink {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PostHookSkipSink")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Debug for SessionInvocationSource {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionInvocationSource")
+            .field("session_id_present", &self.session_id.is_some())
+            .field("run_id_present", &self.run_id.is_some())
+            .field("messages_present", &self.messages.is_some())
+            .field("context_usage_present", &self.context_usage.is_some())
+            .field(
+                "session_resources_present",
+                &self.session_resources.is_some(),
+            )
+            .field("post_hook_skips_present", &self.post_hook_skips.is_some())
+            .finish_non_exhaustive()
+    }
+}

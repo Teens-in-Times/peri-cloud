@@ -19,6 +19,7 @@ use crate::acp_mcp::{AcpMcpError, AcpMcpInbound, AcpMcpRegistry, AcpMcpServerSpe
 use crate::agents::AgentCatalogEntry;
 use crate::command_registry::CommandRegistry;
 pub use crate::mcp_control::SessionMcpCatalogPort;
+pub use crate::mcp_control::SessionToolCatalogPreparationPort;
 use crate::mcp_control::{
     McpControlError, McpControlRequest, McpControlResponse, McpServerControl,
 };
@@ -46,6 +47,7 @@ pub enum McpPoolShutdownReport {
 }
 
 impl McpPoolShutdownReport {
+    #[must_use]
     pub fn is_complete(self) -> bool {
         matches!(self, Self::Complete { .. })
     }
@@ -184,6 +186,7 @@ pub struct McpResourceSubscription {
 
 impl McpResourceSubscription {
     /// 由实现方构造：`updates` 为通知转发通道，`cancel` 触发注销。
+    #[must_use]
     pub fn new(updates: tokio::sync::mpsc::Receiver<String>, cancel: CancellationToken) -> Self {
         Self { updates, cancel }
     }
@@ -227,6 +230,7 @@ pub enum PeripheralTasks {
 
 impl PeripheralTasks {
     /// Query was not answered; `detail` keeps the diagnostic cause.
+    #[must_use]
     pub fn unknown(detail: impl Into<String>) -> Self {
         Self::Unknown {
             detail: detail.into(),
@@ -268,6 +272,16 @@ pub trait McpPoolPort: Any + Send + Sync {
         _session_id: &str,
     ) -> Option<Arc<dyn SessionMcpCatalogPort>> {
         None
+    }
+    /// 当前会话可见的 dynamic Loader 绑定（Host 生成插件指引的受控来源）。
+    ///
+    /// 与 `catalog_source` 的 Loader 面同源：关闭 / 禁用 / 不可见来源不产出。
+    /// 默认返回空——替换实现未声明该能力时不生成任何指引。
+    fn dynamic_loader_bindings(
+        self: Arc<Self>,
+        _session_id: &str,
+    ) -> Vec<crate::mcp_control::DynamicLoaderBinding> {
+        Vec::new()
     }
     /// Cancel an exact active OAuth flow in this pool.
     fn cancel_oauth_flow(&self, _flow_id: &str) -> Result<bool, String> {

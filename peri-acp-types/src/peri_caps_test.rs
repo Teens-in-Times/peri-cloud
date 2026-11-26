@@ -1,4 +1,4 @@
-use super::{default_ui_commands, PeriCaps};
+use super::PeriCaps;
 
 #[test]
 fn test_session_workspace_v1_requires_explicit_negotiation() {
@@ -40,6 +40,10 @@ fn test_user_input_queue_cap_is_opt_in_and_echoed() {
     );
     let enabled = serde_json::json!({"peri.userInputQueue":true});
     let caps = PeriCaps::from_client_meta(enabled.as_object().unwrap());
+    assert!(!caps.user_input_queue_tool_boundary);
+    let tui_meta = PeriCaps::all_enabled().to_agent_meta();
+    assert_eq!(tui_meta["peri.userInputQueue.toolBoundary"], true);
+    assert!(PeriCaps::from_client_meta(&tui_meta).user_input_queue_tool_boundary);
     assert!(caps.user_input_queue, "显式协商后启用");
     assert_eq!(
         caps.to_agent_meta()["peri.userInputQueue"],
@@ -50,6 +54,34 @@ fn test_user_input_queue_cap_is_opt_in_and_echoed() {
         PeriCaps::all_enabled().user_input_queue,
         "内嵌客户端声明消费能力"
     );
+}
+
+/// 旧 Host 的 enqueue 拒绝未知字段：子能力必须独立协商并原样回显。
+#[test]
+fn test_user_input_queue_plugin_selections_is_separately_negotiated() {
+    let legacy = json!({"peri.userInputQueue": true});
+    let caps = PeriCaps::from_client_meta(legacy.as_object().unwrap());
+    assert!(
+        !caps.user_input_queue_plugin_selections,
+        "仅声明队列不能让客户端发送 pluginSelections"
+    );
+    assert_eq!(
+        caps.to_agent_meta()["peri.userInputQueue.pluginSelections"],
+        false,
+        "未声明时回显 false，客户端 fail-closed"
+    );
+
+    let enabled = json!({
+        "peri.userInputQueue": true,
+        "peri.userInputQueue.pluginSelections": true,
+    });
+    let caps = PeriCaps::from_client_meta(enabled.as_object().unwrap());
+    assert!(caps.user_input_queue_plugin_selections);
+    assert_eq!(
+        caps.to_agent_meta()["peri.userInputQueue.pluginSelections"],
+        true
+    );
+    assert!(PeriCaps::all_enabled().user_input_queue_plugin_selections);
 }
 use crate::command::command_route::UiCommandSpec;
 use serde_json::json;
@@ -165,7 +197,7 @@ fn test_all_enabled() {
     assert!(caps.plan_entry_active_form);
     assert!(caps.rewind);
     // ui_commands 填默认 11 条明细（数据迁移自 dispatch/commands.rs UI_COMMANDS）
-    assert_eq!(caps.ui_commands, default_ui_commands());
+    assert_eq!(caps.ui_commands, super::default_ui_commands());
     assert_eq!(caps.ui_commands.len(), 11);
     let names: Vec<&str> = caps.ui_commands.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(
@@ -188,7 +220,7 @@ fn test_ui_commands_roundtrip() {
     // 旧客户端 bool true → 退化为默认 11 条明细（等价现状行为）
     let meta = serde_json::json!({ "peri.uiCommands": true });
     let caps = PeriCaps::from_client_meta(meta.as_object().unwrap());
-    assert_eq!(caps.ui_commands, default_ui_commands());
+    assert_eq!(caps.ui_commands, super::default_ui_commands());
     // bool false → 空
     let meta = serde_json::json!({ "peri.uiCommands": false });
     let caps = PeriCaps::from_client_meta(meta.as_object().unwrap());

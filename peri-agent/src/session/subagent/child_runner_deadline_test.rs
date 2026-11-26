@@ -1,10 +1,40 @@
-use super::*;
+use crate::agent::async_tasks::handoff::ChildSettlementWindow;
+use crate::agent::async_tasks::TaskManager;
+use peri_acp_types::tasks::TaskManager as _;
+
+use crate::agent::react::ReactLLM;
+use crate::agent::react::Reasoning;
+use crate::agent::react::StreamingContext;
+use crate::agent::react::ToolCall;
+
+use crate::middleware::chain::MiddlewareChain;
+use crate::session::queue::MessageSource;
+use crate::session::queue::QueuedMessage;
+
+use crate::session::subagent::child_runner::tests::ToolThenExpireLlm;
+use crate::session::subagent::ChildHandoffReason;
+use crate::session::subagent::ChildRunOutcome;
+use crate::session::subagent::SubagentHost;
+use crate::session::FrozenContext;
+use crate::session::Session;
+use crate::tools::BaseTool;
+
+use peri_acp_types::tasks::BgTaskKind;
+use peri_acp_types::tasks::BgTaskRegistration;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// [回归测试] 已投递终态但真实清理未确认时，不能仅凭 active_count=0 结束。
 #[tokio::test(start_paused = true)]
 async fn accepted_terminal_with_pending_cleanup_hands_off_instead_of_settled() {
-    let (child, manager, built, _, finished) = child_with_shell_task(false);
-    assert!(manager.complete(&finished, nested_result()));
+    let (child, manager, built, _, finished) =
+        crate::session::subagent::child_runner::tests::child_with_shell_task(false);
+    assert!(manager.complete(
+        &finished,
+        crate::session::subagent::child_runner::tests::nested_result()
+    ));
     let cleanup = manager
         .register(BgTaskRegistration {
             task_id: "cleanup-pending".into(),
@@ -13,16 +43,16 @@ async fn accepted_terminal_with_pending_cleanup_hands_off_instead_of_settled() {
             pid: None,
             kill: Some(Box::new(|| {})),
         })
-        .unwrap();
-    let mut result = nested_result();
+        .expect("the register fixture result is required for this assertion");
+    let mut result = crate::session::subagent::child_runner::tests::nested_result();
     result.task_id = cleanup.task_id().into();
     assert!(manager.complete(&cleanup, result));
     assert_eq!(manager.active_count(), 0);
     assert!(!manager.has_pending_deliveries());
-    let permit = permit_for(&child, &built.context);
+    let permit = crate::session::subagent::child_runner::tests::permit_for(&child, &built.context);
     let outcome = tokio::time::timeout(
         Duration::from_secs(125),
-        run_child_until_terminal(built.context, 10, &child),
+        crate::session::subagent::child_runner::run_child_until_terminal(built.context, 10, &child),
     )
     .await
     .expect("the cleanup obligation must reach the existing handoff deadline");
@@ -50,56 +80,68 @@ fn install_started_window(
 /// 完成与 D 同刻，且完成通知先被调度：activity 胜出，正常 Settled。
 #[tokio::test(start_paused = true)]
 async fn completion_just_before_deadline_prefers_settled() {
-    let (child, manager, mut built, _, ticket) = child_with_shell_task(false);
+    let (child, manager, mut built, _, ticket) =
+        crate::session::subagent::child_runner::tests::child_with_shell_task(false);
     let deadline = install_started_window(&mut built.context);
     tokio::time::advance(Duration::from_secs(119)).await;
     let settle_manager = manager.clone();
     let settle = tokio::spawn(async move {
         tokio::time::sleep_until(deadline - Duration::from_millis(1)).await;
-        assert!(settle_manager.complete(&ticket, nested_result()));
+        assert!(settle_manager.complete(
+            &ticket,
+            crate::session::subagent::child_runner::tests::nested_result()
+        ));
     });
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
-    let permit = permit_for(&child, &built.context);
+    let permit = crate::session::subagent::child_runner::tests::permit_for(&child, &built.context);
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
-        run_child_until_terminal(built.context, 10, &child),
+        crate::session::subagent::child_runner::run_child_until_terminal(built.context, 10, &child),
     )
     .await
     .expect("same-instant completion must settle before D handoff");
     if let Some(permit) = permit {
         permit.finish(Ok(()));
     }
-    settle.await.unwrap();
+    settle
+        .await
+        .expect("the settle fixture result is required for this assertion");
     assert!(matches!(outcome, ChildRunOutcome::Settled), "{outcome:?}");
 }
 
 /// 完成发生在 D 之后：deadline 先胜出，交接且不误报成功。
 #[tokio::test(start_paused = true)]
 async fn completion_just_after_deadline_hands_off() {
-    let (child, manager, mut built, _, ticket) = child_with_shell_task(false);
+    let (child, manager, mut built, _, ticket) =
+        crate::session::subagent::child_runner::tests::child_with_shell_task(false);
     let deadline = install_started_window(&mut built.context);
     tokio::time::advance(Duration::from_secs(119)).await;
     let settle_manager = manager.clone();
     let settle = tokio::spawn(async move {
         tokio::time::sleep_until(deadline + Duration::from_millis(1)).await;
-        assert!(settle_manager.complete(&ticket, nested_result()));
+        assert!(settle_manager.complete(
+            &ticket,
+            crate::session::subagent::child_runner::tests::nested_result()
+        ));
     });
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
-    let permit = permit_for(&child, &built.context);
+    let permit = crate::session::subagent::child_runner::tests::permit_for(&child, &built.context);
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
-        run_child_until_terminal(built.context, 10, &child),
+        crate::session::subagent::child_runner::run_child_until_terminal(built.context, 10, &child),
     )
     .await
     .expect("deadline must win before the later completion");
     if let Some(permit) = permit {
         permit.finish(Ok(()));
     }
-    settle.await.unwrap();
+    settle
+        .await
+        .expect("the settle fixture result is required for this assertion");
     assert!(
         matches!(outcome, ChildRunOutcome::HandedOff { .. }),
         "{outcome:?}"
@@ -109,7 +151,8 @@ async fn completion_just_after_deadline_hands_off() {
 /// cancel 与 D 同刻且 cancel 先被调度：cancel 优先，不得误判为普通交接。
 #[tokio::test(start_paused = true)]
 async fn cancel_just_before_deadline_prefers_interrupted() {
-    let (child, _manager, mut built, _, _ticket) = child_with_shell_task(false);
+    let (child, _manager, mut built, _, _ticket) =
+        crate::session::subagent::child_runner::tests::child_with_shell_task(false);
     let deadline = install_started_window(&mut built.context);
     tokio::time::advance(Duration::from_secs(119)).await;
     let cancel = child.config().cancel_token.clone();
@@ -120,17 +163,19 @@ async fn cancel_just_before_deadline_prefers_interrupted() {
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
-    let permit = permit_for(&child, &built.context);
+    let permit = crate::session::subagent::child_runner::tests::permit_for(&child, &built.context);
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
-        run_child_until_terminal(built.context, 10, &child),
+        crate::session::subagent::child_runner::run_child_until_terminal(built.context, 10, &child),
     )
     .await
     .expect("cancel must interrupt before the deadline handoff");
     if let Some(permit) = permit {
         permit.finish(Ok(()));
     }
-    canceller.await.unwrap();
+    canceller
+        .await
+        .expect("the canceller fixture result is required for this assertion");
     assert!(
         matches!(outcome, ChildRunOutcome::Interrupted),
         "{outcome:?}"
@@ -140,7 +185,8 @@ async fn cancel_just_before_deadline_prefers_interrupted() {
 /// cancel 发生在 D 之后：deadline 先结束计算，Shell 不被自动取消。
 #[tokio::test(start_paused = true)]
 async fn cancel_just_after_deadline_hands_off_without_cancelling_shell() {
-    let (child, manager, mut built, _, _ticket) = child_with_shell_task(false);
+    let (child, manager, mut built, _, _ticket) =
+        crate::session::subagent::child_runner::tests::child_with_shell_task(false);
     let deadline = install_started_window(&mut built.context);
     tokio::time::advance(Duration::from_secs(119)).await;
     let cancel = child.config().cancel_token.clone();
@@ -151,17 +197,19 @@ async fn cancel_just_after_deadline_hands_off_without_cancelling_shell() {
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
-    let permit = permit_for(&child, &built.context);
+    let permit = crate::session::subagent::child_runner::tests::permit_for(&child, &built.context);
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
-        run_child_until_terminal(built.context, 10, &child),
+        crate::session::subagent::child_runner::run_child_until_terminal(built.context, 10, &child),
     )
     .await
     .expect("deadline must win before the later cancel");
     if let Some(permit) = permit {
         permit.finish(Ok(()));
     }
-    canceller.await.unwrap();
+    canceller
+        .await
+        .expect("the canceller fixture result is required for this assertion");
     assert!(
         matches!(outcome, ChildRunOutcome::HandedOff { .. }),
         "{outcome:?}"
@@ -173,13 +221,13 @@ async fn cancel_just_after_deadline_hands_off_without_cancelling_shell() {
 #[tokio::test(start_paused = true)]
 async fn admitted_act_tool_result_hands_off_instead_of_settled() {
     let manager = Arc::new(TaskManager::new());
-    let child = make_child(manager.clone(), true);
+    let child = crate::session::subagent::child_runner::tests::make_child(manager.clone(), true);
     child.queue().push_sync(QueuedMessage::prompt(
         MessageSource::UserInput,
         crate::messages::BaseMessage::human("use a tool"),
     ));
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut built = build_v2_subagent_context(
+    let mut built = crate::session::subagent::build_v2_subagent_context(
         Some(child.clone()),
         Box::new(ToolThenExpireLlm {
             calls: calls.clone(),
@@ -194,17 +242,21 @@ async fn admitted_act_tool_result_hands_off_instead_of_settled() {
         None,
         None,
         None,
-        Some(agent_id_from_child_thread(
-            &child.store().thread_id.clone().unwrap(),
+        Some(crate::session::subagent::agent_id_from_child_thread(
+            &child
+                .store()
+                .thread_id
+                .clone()
+                .expect("the clone fixture result is required for this assertion"),
         )),
     );
     let window = Arc::new(ChildSettlementWindow::default());
     window.start();
     built.context.async_ctx.child_settlement = Some(window);
-    let permit = permit_for(&child, &built.context);
+    let permit = crate::session::subagent::child_runner::tests::permit_for(&child, &built.context);
     let outcome = tokio::time::timeout(
         Duration::from_secs(200),
-        run_child_until_terminal(built.context, 10, &child),
+        crate::session::subagent::child_runner::run_child_until_terminal(built.context, 10, &child),
     )
     .await
     .expect("runner must finish after admitted Act");
@@ -217,111 +269,6 @@ async fn admitted_act_tool_result_hands_off_instead_of_settled() {
     assert!(receipt.tasks.is_empty());
     assert_eq!(receipt.unprocessed_tool_calls, vec!["call-1"]);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-}
-
-/// 父级映射：已准入 Act tool result 的交接必须 success=false。
-#[tokio::test(start_paused = true)]
-async fn admitted_act_tool_result_parent_result_is_failure() {
-    let manager = Arc::new(TaskManager::new());
-    let parent_manager = Arc::new(TaskManager::new());
-    let child = make_child(manager, true);
-    child.queue().push_sync(QueuedMessage::prompt(
-        MessageSource::UserInput,
-        crate::messages::BaseMessage::human("use a tool"),
-    ));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut built = build_v2_subagent_context(
-        Some(child.clone()),
-        Box::new(ToolThenExpireLlm {
-            calls: calls.clone(),
-        }),
-        Arc::new(MiddlewareChain::new()),
-        Vec::new(),
-        Arc::new(|_| true),
-        None,
-        "/tmp",
-        child.config().cancel_token.as_ref().clone(),
-        None,
-        None,
-        None,
-        None,
-        Some(agent_id_from_child_thread(
-            &child.store().thread_id.clone().unwrap(),
-        )),
-    );
-    let window = Arc::new(ChildSettlementWindow::default());
-    window.start();
-    built.context.async_ctx.child_settlement = Some(window);
-    let child_id = child.store().thread_id.clone().unwrap();
-    let terminal_route = child
-        .subagent_host()
-        .and_then(|host| host.child_owner.clone())
-        .and_then(|owner| owner.resources.clone())
-        .map(
-            |store| crate::session::subagent::terminal_settlement::TerminalMqRoute {
-                store,
-                target: child_id.clone(),
-                mailbox: None,
-            },
-        );
-    let task_id = crate::session::subagent::run_sync::new_sync_task_id();
-    let (delivered_tx, delivered_rx) = tokio::sync::oneshot::channel();
-    let delivered_tx = parking_lot::Mutex::new(Some(delivered_tx));
-    let run_id = child_id.clone();
-    let run_session = child.clone();
-    let call = tokio::spawn(
-        crate::session::subagent::run_sync::run_sync_with_registered_handoff(
-            child.clone(),
-            child_id.clone(),
-            "fixture".into(),
-            Some(parent_manager),
-            Some(task_id),
-            Some(Arc::new(
-                move |result: &crate::agent::events::BackgroundTaskResult, _| {
-                    if let Some(sender) = delivered_tx.lock().take() {
-                        let _ = sender.send(result.clone());
-                    }
-                    Ok(())
-                },
-            )),
-            terminal_route,
-            move |handoff, _| async move {
-                crate::session::subagent::run_sync::run_sync_subagent(
-                    &run_id,
-                    "fixture",
-                    "/tmp",
-                    10,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    built,
-                    run_session,
-                    None,
-                    Some(handoff),
-                )
-                .await
-            },
-        ),
-    );
-    let completion = call.await.unwrap().unwrap();
-    let crate::session::subagent::run_sync::SyncCompletion::Pending(pending) = completion else {
-        panic!("admitted Act tool result must detach as Pending");
-    };
-    assert_eq!(pending.receipt.unprocessed_tool_calls, vec!["call-1"]);
-    let delivered = tokio::time::timeout(Duration::from_secs(5), delivered_rx)
-        .await
-        .expect("parent result must be delivered")
-        .unwrap();
-    assert!(!delivered.success);
-    assert!(!delivered.timed_out);
-    assert!(delivered.output.contains("status: incomplete"));
-    assert!(delivered.output.contains("call-1"));
 }
 
 struct StopAfterTool;
@@ -426,7 +373,8 @@ async fn assert_act_receipt(stop: bool) {
         FrozenContext::builder().build(),
         Some(uuid::Uuid::now_v7().to_string()),
     );
-    let (owner, store) = bind_owner_store(&child, &manager);
+    let (owner, store) =
+        crate::session::subagent::child_runner::tests::bind_owner_store(&child, &manager);
     child.set_subagent_host(SubagentHost {
         task_manager: Some(manager.clone()),
         child_owner: Some(owner),
@@ -441,7 +389,7 @@ async fn assert_act_receipt(stop: bool) {
     if stop {
         chain.add(Box::new(StopAfterBatch));
     }
-    let built = build_v2_subagent_context(
+    let built = crate::session::subagent::build_v2_subagent_context(
         Some(child.clone()),
         Box::new(ToolCallOnceLlm {
             calls: calls.clone(),
@@ -457,12 +405,19 @@ async fn assert_act_receipt(stop: bool) {
         None,
         None,
         None,
-        Some(agent_id_from_child_thread(
-            &child.store().thread_id.clone().unwrap(),
+        Some(crate::session::subagent::agent_id_from_child_thread(
+            &child
+                .store()
+                .thread_id
+                .clone()
+                .expect("the clone fixture result is required for this assertion"),
         )),
     );
-    let permit = permit_for(&child, &built.context).unwrap();
-    let outcome = run_child_until_terminal(built.context, 1, &child).await;
+    let permit = crate::session::subagent::child_runner::tests::permit_for(&child, &built.context)
+        .expect("the permit for fixture result is required for this assertion");
+    let outcome =
+        crate::session::subagent::child_runner::run_child_until_terminal(built.context, 1, &child)
+            .await;
     permit.finish(Ok(()));
     let receipt = match outcome {
         ChildRunOutcome::HandedOff { receipt } if stop => {
@@ -515,113 +470,4 @@ async fn assert_act_receipt(stop: bool) {
         receipt.unprocessed_tool_calls.join(", ")
     )));
     assert!(notice.contains("status: incomplete"));
-}
-
-/// HookStop 在 Act 之后到达：无其他义务，仍须交接 tool result；只调用一次模型。
-#[tokio::test(start_paused = true)]
-async fn hook_stop_after_act_hands_off_tool_result_and_parent_fails() {
-    let manager = Arc::new(TaskManager::new());
-    let parent_manager = Arc::new(TaskManager::new());
-    let child = make_child(manager, true);
-    child.queue().push_sync(QueuedMessage::prompt(
-        MessageSource::UserInput,
-        crate::messages::BaseMessage::human("run a tool then stop"),
-    ));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let built = build_v2_subagent_context(
-        Some(child.clone()),
-        Box::new(ToolCallOnceLlm {
-            calls: calls.clone(),
-            tool_name: "StopAfterTool",
-        }),
-        Arc::new({
-            let mut chain = MiddlewareChain::new();
-            chain.add(Box::new(StopAfterBatch));
-            chain
-        }),
-        vec![Arc::new(StopAfterTool)],
-        Arc::new(|_| true),
-        None,
-        "/tmp",
-        child.config().cancel_token.as_ref().clone(),
-        None,
-        None,
-        None,
-        None,
-        Some(agent_id_from_child_thread(
-            &child.store().thread_id.clone().unwrap(),
-        )),
-    );
-    let child_id = child.store().thread_id.clone().unwrap();
-    let terminal_route = child
-        .subagent_host()
-        .and_then(|host| host.child_owner.clone())
-        .and_then(|owner| owner.resources.clone())
-        .map(
-            |store| crate::session::subagent::terminal_settlement::TerminalMqRoute {
-                store,
-                target: child_id.clone(),
-                mailbox: None,
-            },
-        );
-    let task_id = crate::session::subagent::run_sync::new_sync_task_id();
-    let (delivered_tx, delivered_rx) = tokio::sync::oneshot::channel();
-    let delivered_tx = parking_lot::Mutex::new(Some(delivered_tx));
-    let run_id = child_id.clone();
-    let run_session = child.clone();
-    let call = tokio::spawn(
-        crate::session::subagent::run_sync::run_sync_with_registered_handoff(
-            child.clone(),
-            child_id,
-            "fixture".into(),
-            Some(parent_manager),
-            Some(task_id),
-            Some(Arc::new(
-                move |result: &crate::agent::events::BackgroundTaskResult, _| {
-                    if let Some(sender) = delivered_tx.lock().take() {
-                        let _ = sender.send(result.clone());
-                    }
-                    Ok(())
-                },
-            )),
-            terminal_route,
-            move |handoff, _| async move {
-                crate::session::subagent::run_sync::run_sync_subagent(
-                    &run_id,
-                    "fixture",
-                    "/tmp",
-                    10,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    built,
-                    run_session,
-                    None,
-                    Some(handoff),
-                )
-                .await
-            },
-        ),
-    );
-    let completion = call.await.unwrap().unwrap();
-    let crate::session::subagent::run_sync::SyncCompletion::Pending(pending) = completion else {
-        panic!("HookStop with unprocessed tool result must detach as Pending");
-    };
-    assert_eq!(pending.receipt.reason, ChildHandoffReason::HookStop);
-    assert_eq!(pending.receipt.unprocessed_tool_calls, vec!["call-1"]);
-    let delivered = tokio::time::timeout(Duration::from_secs(5), delivered_rx)
-        .await
-        .expect("parent result must be delivered")
-        .unwrap();
-    assert!(!delivered.success);
-    assert!(!delivered.timed_out);
-    assert!(delivered.output.contains("status: incomplete"));
-    assert!(delivered.output.contains("call-1"));
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "no second Reason");
 }

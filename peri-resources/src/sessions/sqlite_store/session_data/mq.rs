@@ -7,115 +7,29 @@
 //! 判定顺序固定为「历史 → MQ → 插入」：历史事实优先于 MQ 事实（已移交的 ID 不会再入队），
 //! 条件插入再挡一次与 Receive 的并发。
 
-use super::*;
-use crate::sessions::failure::{conflict, corrupt};
-use crate::sessions::mq_rows::{
-    decode_entry, decode_header, enqueued_at_now, is_same_watermark, item_outcome, kind_token,
-    payload_json, policy_ensures_processing, policy_json, same_payload, source_token, title_of,
-    RawMqHeader, RawMqRow, DELETE_THREAD_MQ_ROW_SQL, INSERT_MESSAGE_SQL, INSERT_THREAD_MQ_SQL,
-    SELECT_MESSAGE_ROW_SQL, SELECT_THREAD_MQ_BY_ID_SQL, SELECT_THREAD_MQ_POLICIES_SQL,
+use super::{
+    MessageId, SessionResourceResult, SqliteConnection, SqliteSessionData,
+    TerminalSettlementOutcome, ThreadId,
 };
+use crate::sessions::sqlite_store::session_data::refresh_history_derivations;
+
+use crate::sessions::mq_rows::RawMqHeader;
+use crate::sessions::mq_rows::RawMqRow;
+use crate::sessions::mq_rows::DELETE_THREAD_MQ_ROW_SQL;
+use crate::sessions::mq_rows::INSERT_MESSAGE_SQL;
+use crate::sessions::mq_rows::INSERT_THREAD_MQ_SQL;
+use crate::sessions::mq_rows::SELECT_MESSAGE_ROW_SQL;
+use crate::sessions::mq_rows::SELECT_THREAD_MQ_BY_ID_SQL;
+use crate::sessions::mq_rows::SELECT_THREAD_MQ_POLICIES_SQL;
 use peri_acp_types::session::{
     MessageSource, MqCancelOutcome, MqEnqueueDisposition, MqEnqueueOutcome, MqEntry, MqFilter,
     MqHeader, MqInput, MqReceiveDisposition, MqReceiveItem, MqReceiveItemOutcome, MqReceiveOutcome,
     MqReceiveSelection, MqReceiveStatus, MqWatermark,
 };
-/// 单行读取的列（`thread_id` 在最前，用于跨 thread 判定）。
-type MqRow = (
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-);
 
-/// 列表读取的列（不带 `thread_id`：查询本身就按它过滤）。
-type MqListRow = (
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-);
-
-/// 控制面读取的列：没有 `payload_json`。
-type MqHeaderRow = (String, String, String, String, String);
-
-/// 把 `MqFilter` 翻译成 SQL：过滤与上限都在数据库侧完成，正文查询不会先取全表。
-///
-/// 顺序键与 [`MqWatermark`] 一致：`(enqueued_at, id)` 字典序对固定格式时间与
-/// 小写 UUID 就等于消费顺序。
-fn filtered_mq_select(
-    columns: &str,
-    filter: &MqFilter,
-) -> SessionResourceResult<(String, Vec<String>)> {
-    let mut sql = format!("SELECT {columns} FROM thread_mq WHERE thread_id = ?1");
-    let mut binds: Vec<String> = Vec::new();
-    if let Some(after) = &filter.after {
-        sql.push_str(" AND (enqueued_at > ?2 OR (enqueued_at = ?2 AND id > ?3))");
-        binds.push(after.enqueued_at.clone());
-        binds.push(after.id.as_uuid().to_string());
-    }
-    if filter.user_input_only {
-        let placeholder = binds.len() + 2;
-        sql.push_str(&format!(" AND source = ?{placeholder}"));
-        binds.push(source_token(&MessageSource::UserInput)?);
-    }
-    if !filter.sources.is_empty() {
-        let placeholders = (0..filter.sources.len())
-            .map(|offset| format!("?{}", binds.len() + offset + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        sql.push_str(&format!(" AND source IN ({placeholders})"));
-        for source in &filter.sources {
-            binds.push(source_token(source)?);
-        }
-    }
-    if !filter.kinds.is_empty() {
-        let placeholders = (0..filter.kinds.len())
-            .map(|offset| format!("?{}", binds.len() + offset + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        sql.push_str(&format!(" AND kind IN ({placeholders})"));
-        for kind in &filter.kinds {
-            binds.push(kind_token(*kind)?);
-        }
-    }
-    sql.push_str(" ORDER BY enqueued_at, id");
-    if let Some(limit) = filter.limit {
-        sql.push_str(&format!(" LIMIT {limit}"));
-    }
-    Ok((sql, binds))
-}
-
-fn entry_of(row: &MqRow) -> SessionResourceResult<MqEntry> {
-    decode_entry(RawMqRow {
-        id: &row.1,
-        enqueued_at: &row.2,
-        kind: &row.3,
-        source: &row.4,
-        policy_json: &row.5,
-        payload_json: &row.6,
-        original_draft: row.7.as_deref(),
-    })
-}
-
-fn listed_entry_of(row: &MqListRow) -> SessionResourceResult<MqEntry> {
-    decode_entry(RawMqRow {
-        id: &row.0,
-        enqueued_at: &row.1,
-        kind: &row.2,
-        source: &row.3,
-        policy_json: &row.4,
-        payload_json: &row.5,
-        original_draft: row.6.as_deref(),
-    })
-}
+use super::mq_payload::{
+    entry_of, filtered_mq_select, listed_entry_of, MqHeaderRow, MqListRow, MqRow,
+};
 
 /// 结算批内的结果接纳：与 [`INSERT_THREAD_MQ_SQL`] 同列同条件，额外要求 child 仍 `active`。
 ///
@@ -153,14 +67,15 @@ impl SqliteSessionData {
         // MQ 与最终 own history 必须用同一个稳定 ID：载荷自带别的 id 会让「删除 MQ 行」
         // 与「历史里那一条」指向两个身份，移交后既查不回也去重不了。
         if input.payload.id() != input.id {
-            return Err(invalid_input(
+            return Err(super::invalid_input(
                 "MQ payload id must match the queued message id",
             ));
         }
-        let payload = payload_json(&input.payload)?;
-        let policy = policy_json(&input.policy);
-        let kind = kind_token(input.kind)?;
-        let source = source_token(&input.source)?;
+        let payload =
+            crate::sessions::mq_rows::payload_json(&input.payload, &input.plugin_selections)?;
+        let policy = crate::sessions::mq_rows::policy_json(&input.policy);
+        let kind = crate::sessions::mq_rows::kind_token(input.kind)?;
+        let source = crate::sessions::mq_rows::source_token(&input.source)?;
         let ensures_processing = input.policy.ensures_processing();
         let message_id = input.id.as_uuid().to_string();
         let incoming = RawMqRow {
@@ -177,7 +92,7 @@ impl SqliteSessionData {
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         self.require_session(&mut tx, thread_id).await?;
         // 「历史 → MQ → 条件插入」一次走完：条件插入 0 行只可能来自并发 Receive 抢先
         // （本机写入由 `BEGIN IMMEDIATE` 串行化，跨进程的竞争者也被同一把锁挡住）。
@@ -189,10 +104,10 @@ impl SqliteSessionData {
                 .await?;
             tx.commit()
                 .await
-                .map_err(|_| commit_failure(Some(thread_id.clone())))?;
+                .map_err(|_| super::commit_failure(Some(thread_id.clone())))?;
             return Ok(outcome);
         }
-        let enqueued_at = enqueued_at_now();
+        let enqueued_at = crate::sessions::mq_rows::enqueued_at_now();
         let inserted = sqlx::query(INSERT_THREAD_MQ_SQL)
             .bind(thread_id.as_str())
             .bind(incoming.id)
@@ -204,11 +119,11 @@ impl SqliteSessionData {
             .bind(incoming.original_draft)
             .execute(&mut *tx)
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         let outcome = if inserted.rows_affected() == 1 {
             MqEnqueueOutcome {
                 disposition: MqEnqueueDisposition::Inserted,
-                entry: decode_entry(RawMqRow {
+                entry: crate::sessions::mq_rows::decode_entry(RawMqRow {
                     enqueued_at: &enqueued_at,
                     ..incoming
                 })?,
@@ -216,7 +131,7 @@ impl SqliteSessionData {
         } else {
             // 判定的三条事实在插入时都不成立、插入又没落行：只能是对手在两次语句之间提交了
             // 同 ID。如实报告冲突，由调用方按稳定 ID 重读，不制造第二行。
-            return Err(conflict(
+            return Err(crate::sessions::failure::conflict(
                 "MQ enqueue raced the same message id; read the id back before retrying",
             ));
         };
@@ -224,7 +139,7 @@ impl SqliteSessionData {
             .await?;
         tx.commit()
             .await
-            .map_err(|_| commit_failure(Some(thread_id.clone())))?;
+            .map_err(|_| super::commit_failure(Some(thread_id.clone())))?;
         Ok(outcome)
     }
 
@@ -249,7 +164,7 @@ impl SqliteSessionData {
         .bind(thread_id.as_str())
         .execute(&mut *connection)
         .await
-        .map_err(|error| map_sqlx(&error))?;
+        .map_err(|error| super::map_sqlx(&error))?;
         Ok(())
     }
 
@@ -267,12 +182,12 @@ impl SqliteSessionData {
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         self.require_session(&mut tx, thread_id).await?;
         if pending_ensures_processing(&mut tx, thread_id).await? {
             tx.commit()
                 .await
-                .map_err(|_| commit_failure(Some(thread_id.clone())))?;
+                .map_err(|_| super::commit_failure(Some(thread_id.clone())))?;
             return Ok(false);
         }
         let updated = sqlx::query(
@@ -281,10 +196,10 @@ impl SqliteSessionData {
         .bind(thread_id.as_str())
         .execute(&mut *tx)
         .await
-        .map_err(|error| map_sqlx(&error))?;
+        .map_err(|error| super::map_sqlx(&error))?;
         tx.commit()
             .await
-            .map_err(|_| commit_failure(Some(thread_id.clone())))?;
+            .map_err(|_| super::commit_failure(Some(thread_id.clone())))?;
         Ok(updated.rows_affected() == 1)
     }
 
@@ -299,15 +214,15 @@ impl SqliteSessionData {
     ) -> SessionResourceResult<Option<MqEnqueueOutcome>> {
         if let Some((owner, _content)) = message_fact(connection, incoming.id).await? {
             if owner != thread_id.as_str() {
-                return Err(conflict(
+                return Err(crate::sessions::failure::conflict(
                     "message id already belongs to another thread's history",
                 ));
             }
             return Ok(Some(MqEnqueueOutcome {
                 disposition: MqEnqueueDisposition::AlreadyHandedOff,
                 // 历史行不保存入队时间，也没有 MQ 行：这里回的是请求内容的投影。
-                entry: decode_entry(RawMqRow {
-                    enqueued_at: &enqueued_at_now(),
+                entry: crate::sessions::mq_rows::decode_entry(RawMqRow {
+                    enqueued_at: &crate::sessions::mq_rows::enqueued_at_now(),
                     ..*incoming
                 })?,
             }));
@@ -316,16 +231,18 @@ impl SqliteSessionData {
             return Ok(None);
         };
         if row.0 != thread_id.as_str() {
-            return Err(conflict("message id already belongs to another thread"));
+            return Err(crate::sessions::failure::conflict(
+                "message id already belongs to another thread",
+            ));
         }
         // 逐列比对**已序列化的形态**：两边的 token 由同一份序列化派生，文本相等即值相等。
         let same = row.3 == incoming.kind
             && row.4 == incoming.source
             && row.5 == incoming.policy_json
-            && same_payload(&row.6, incoming.payload_json)
+            && crate::sessions::mq_rows::same_payload(&row.6, incoming.payload_json)
             && row.7.as_deref() == incoming.original_draft;
         if !same {
-            return Err(conflict(
+            return Err(crate::sessions::failure::conflict(
                 "a different message already uses this id in the thread MQ",
             ));
         }
@@ -352,7 +269,7 @@ impl SqliteSessionData {
         let rows = query
             .fetch_all(&self.database.pool)
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         rows.iter().map(listed_entry_of).collect()
     }
 
@@ -372,10 +289,10 @@ impl SqliteSessionData {
         let rows = query
             .fetch_all(&self.database.pool)
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         rows.iter()
             .map(|row| {
-                decode_header(RawMqHeader {
+                crate::sessions::mq_rows::decode_header(RawMqHeader {
                     id: &row.0,
                     enqueued_at: &row.1,
                     kind: &row.2,
@@ -392,8 +309,9 @@ impl SqliteSessionData {
             .bind(thread_id.as_str())
             .fetch_one(&self.database.pool)
             .await
-            .map_err(|error| map_sqlx(&error))?;
-        usize::try_from(count).map_err(|_| corrupt("thread MQ count is not representable"))
+            .map_err(|error| super::map_sqlx(&error))?;
+        usize::try_from(count)
+            .map_err(|_| crate::sessions::failure::corrupt("thread MQ count is not representable"))
     }
 
     /// 存在性：SQL `EXISTS`，不读正文也不计数。
@@ -403,7 +321,7 @@ impl SqliteSessionData {
                 .bind(thread_id.as_str())
                 .fetch_one(&self.database.pool)
                 .await
-                .map_err(|error| map_sqlx(&error))?;
+                .map_err(|error| super::map_sqlx(&error))?;
         Ok(exists != 0)
     }
 
@@ -419,12 +337,14 @@ impl SqliteSessionData {
         .bind(thread_id.as_str())
         .fetch_optional(&self.database.pool)
         .await
-        .map_err(|error| map_sqlx(&error))?;
+        .map_err(|error| super::map_sqlx(&error))?;
         row.map(|(enqueued_at, id)| {
             let id = id
                 .parse::<uuid::Uuid>()
                 .map(peri_acp_types::messages::MessageId::from)
-                .map_err(|_| corrupt("MQ row has an invalid message id"))?;
+                .map_err(|_| {
+                    crate::sessions::failure::corrupt("MQ row has an invalid message id")
+                })?;
             Ok(MqWatermark { enqueued_at, id })
         })
         .transpose()
@@ -442,7 +362,7 @@ impl SqliteSessionData {
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         self.require_session(&mut tx, thread_id).await?;
         let Some(row) = mq_row_by_id(&mut tx, &message_id).await? else {
             // 没有 MQ 行时只有两种事实：已在历史（并发 Receive 已提交）或当前不存在。
@@ -454,18 +374,18 @@ impl SqliteSessionData {
             };
             tx.commit()
                 .await
-                .map_err(|_| commit_failure(Some(thread_id.clone())))?;
+                .map_err(|_| super::commit_failure(Some(thread_id.clone())))?;
             return Ok(status);
         };
         if row.0 != thread_id.as_str() {
             tx.commit()
                 .await
-                .map_err(|_| commit_failure(Some(thread_id.clone())))?;
+                .map_err(|_| super::commit_failure(Some(thread_id.clone())))?;
             return Ok(MqCancelOutcome::NotFound);
         }
         let entry = entry_of(&row)?;
         if entry.source != MessageSource::UserInput {
-            return Err(invalid_input(
+            return Err(super::invalid_input(
                 "only pending user input can be cancelled from the thread MQ",
             ));
         }
@@ -476,7 +396,7 @@ impl SqliteSessionData {
             .bind(&entry.enqueued_at)
             .execute(&mut *tx)
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         let outcome = if deleted.rows_affected() == 1 {
             MqCancelOutcome::Cancelled(entry)
         } else {
@@ -484,7 +404,7 @@ impl SqliteSessionData {
         };
         tx.commit()
             .await
-            .map_err(|_| commit_failure(Some(thread_id.clone())))?;
+            .map_err(|_| super::commit_failure(Some(thread_id.clone())))?;
         Ok(outcome)
     }
 
@@ -499,7 +419,7 @@ impl SqliteSessionData {
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         self.require_session(&mut tx, thread_id).await?;
         let mut items = Vec::with_capacity(selection.items.len());
         let mut inserted = Vec::new();
@@ -512,18 +432,18 @@ impl SqliteSessionData {
         if !inserted.is_empty() {
             // 计数与更新时间是历史的派生事实：与本次写入同一事务，热态与冷恢复不会分叉。
             refresh_history_derivations(&mut tx, thread_id).await?;
-            if let Some(title) = title_of(&inserted) {
+            if let Some(title) = crate::sessions::mq_rows::title_of(&inserted) {
                 sqlx::query("UPDATE threads SET title = ?1 WHERE id = ?2 AND title IS NULL")
                     .bind(&title)
                     .bind(thread_id.as_str())
                     .execute(&mut *tx)
                     .await
-                    .map_err(|error| map_sqlx(&error))?;
+                    .map_err(|error| super::map_sqlx(&error))?;
             }
         }
         tx.commit()
             .await
-            .map_err(|_| commit_failure(Some(thread_id.clone())))?;
+            .map_err(|_| super::commit_failure(Some(thread_id.clone())))?;
         Ok(MqReceiveOutcome { items })
     }
 
@@ -536,12 +456,22 @@ impl SqliteSessionData {
     ) -> SessionResourceResult<MqReceiveItemOutcome> {
         let message_id = item.entry.id.as_uuid().to_string();
         let Some(row) = mq_row_by_id(&mut *connection, &message_id).await? else {
-            return Ok(item_outcome(item.entry.id, MqReceiveStatus::Missing, None));
+            return Ok(crate::sessions::mq_rows::item_outcome(
+                item.entry.id,
+                MqReceiveStatus::Missing,
+                None,
+            ));
         };
         let entry = entry_of(&row)?;
-        if row.0 != thread_id.as_str() || !is_same_watermark(&entry, &item.entry.watermark()) {
+        if row.0 != thread_id.as_str()
+            || !crate::sessions::mq_rows::is_same_watermark(&entry, &item.entry.watermark())
+        {
             // 选择基于旧快照：行已被取消/移交，或同 ID 重新入队。什么都不写。
-            return Ok(item_outcome(item.entry.id, MqReceiveStatus::Missing, None));
+            return Ok(crate::sessions::mq_rows::item_outcome(
+                item.entry.id,
+                MqReceiveStatus::Missing,
+                None,
+            ));
         }
         let status = match item.disposition {
             MqReceiveDisposition::Suppress => MqReceiveStatus::Suppressed,
@@ -549,7 +479,13 @@ impl SqliteSessionData {
                 match message_fact(&mut *connection, &message_id).await? {
                     Some((owner, content)) => {
                         if owner == thread_id.as_str()
-                            && same_payload(&content, &payload_json(&entry.payload)?)
+                            && crate::sessions::mq_rows::same_payload(
+                                &content,
+                                &crate::sessions::mq_rows::payload_json(
+                                    &entry.payload,
+                                    &entry.plugin_selections,
+                                )?,
+                            )
                         {
                             MqReceiveStatus::AlreadyPresent
                         } else {
@@ -562,10 +498,13 @@ impl SqliteSessionData {
                             .bind(&message_id)
                             .bind(thread_id.as_str())
                             .bind(crate::sessions::canonical::payload_role(&entry.payload))
-                            .bind(payload_json(&entry.payload)?)
+                            .bind(crate::sessions::mq_rows::payload_json(
+                                &entry.payload,
+                                &entry.plugin_selections,
+                            )?)
                             .execute(&mut *connection)
                             .await
-                            .map_err(|error| map_sqlx(&error))?;
+                            .map_err(|error| super::map_sqlx(&error))?;
                         if written.rows_affected() == 1 {
                             inserted.push(entry.clone());
                             MqReceiveStatus::Committed
@@ -582,11 +521,11 @@ impl SqliteSessionData {
             .bind(&entry.enqueued_at)
             .execute(&mut *connection)
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         if deleted.rows_affected() != 1 {
             // `BEGIN IMMEDIATE` 下读到的行不可能在事务内被别的写者删掉。真的发生 0 行时，
             // Commit 历史已经写入，不能再报 Missing 让调用方重试；Suppress 没有写入，按缺失。
-            return Ok(item_outcome(
+            return Ok(crate::sessions::mq_rows::item_outcome(
                 item.entry.id,
                 if status == MqReceiveStatus::Suppressed {
                     MqReceiveStatus::Missing
@@ -600,7 +539,11 @@ impl SqliteSessionData {
                 },
             ));
         }
-        Ok(item_outcome(item.entry.id, status, Some(entry)))
+        Ok(crate::sessions::mq_rows::item_outcome(
+            item.entry.id,
+            status,
+            Some(entry),
+        ))
     }
 
     /// 本地 child 终态结算：终态、工作意图与结果接纳共用一次 `BEGIN IMMEDIATE`。
@@ -621,7 +564,7 @@ impl SqliteSessionData {
     ) -> SessionResourceResult<MqEnqueueOutcome> {
         self.writable()?;
         if input.payload.id() != input.id {
-            return Err(invalid_input(
+            return Err(super::invalid_input(
                 "MQ payload id must match the queued message id",
             ));
         }
@@ -630,7 +573,7 @@ impl SqliteSessionData {
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         self.require_session(&mut tx, child).await?;
         // 幂等判据是「这次结算是否已落地」，不是「状态是否相同」：同状态但不同
         // 正文的 panic 兜底重放也必须被吞掉。判定与写入同在本次 `BEGIN IMMEDIATE`
@@ -643,18 +586,19 @@ impl SqliteSessionData {
             converge_terminal_work_state(&mut tx, child, current).await?;
             tx.commit()
                 .await
-                .map_err(|_| commit_failure(Some(child.clone())))?;
+                .map_err(|_| super::commit_failure(Some(child.clone())))?;
             return Ok(settled_without_write(input));
         }
         if target != child {
             self.require_session(&mut tx, target).await?;
         }
-        let payload = payload_json(&input.payload)?;
-        let policy = policy_json(&input.policy);
+        let payload =
+            crate::sessions::mq_rows::payload_json(&input.payload, &input.plugin_selections)?;
+        let policy = crate::sessions::mq_rows::policy_json(&input.policy);
         let ensures_processing = input.policy.ensures_processing();
-        let kind = kind_token(input.kind)?;
-        let source = source_token(&input.source)?;
-        let enqueued_at = enqueued_at_now();
+        let kind = crate::sessions::mq_rows::kind_token(input.kind)?;
+        let source = crate::sessions::mq_rows::source_token(&input.source)?;
+        let enqueued_at = crate::sessions::mq_rows::enqueued_at_now();
         let incoming = RawMqRow {
             id: &message_id,
             enqueued_at: &enqueued_at,
@@ -679,11 +623,11 @@ impl SqliteSessionData {
             .bind(child.as_str())
             .execute(&mut *tx)
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         let outcome = if inserted.rows_affected() == 1 {
             Some(MqEnqueueOutcome {
                 disposition: MqEnqueueDisposition::Inserted,
-                entry: decode_entry(incoming)?,
+                entry: crate::sessions::mq_rows::decode_entry(incoming)?,
             })
         } else {
             // 0 行不是成功：先按既有事实归类。跨 thread 冲突在这里返回；同 ID 已落地
@@ -692,7 +636,9 @@ impl SqliteSessionData {
             if fact.is_none() && !current.is_terminal() {
                 // 批前快照为 active 且没有任何结果事实，条件插入仍 0 行：状态不可解释，
                 // 不能把未写入报告成成功。
-                return Err(conflict("child terminal settlement lost its active row"));
+                return Err(crate::sessions::failure::conflict(
+                    "child terminal settlement lost its active row",
+                ));
             }
             fact
         };
@@ -706,7 +652,7 @@ impl SqliteSessionData {
                     .bind(child.as_str())
                     .execute(&mut *tx)
                     .await
-                    .map_err(|error| map_sqlx(&error))?;
+                    .map_err(|error| super::map_sqlx(&error))?;
             }
             let updated = sqlx::query(SETTLE_CHILD_TERMINAL_SQL)
                 .bind(status.as_str())
@@ -715,11 +661,13 @@ impl SqliteSessionData {
                 .bind(child.as_str())
                 .execute(&mut *tx)
                 .await
-                .map_err(|error| map_sqlx(&error))?;
+                .map_err(|error| super::map_sqlx(&error))?;
             if updated.rows_affected() != 1 {
                 // 同一 `BEGIN IMMEDIATE` 内读到的不是终态且行存在，条件更新仍 0 行说明
                 // 状态不可解释；不能把未写入报告成成功。
-                return Err(conflict("child terminal settlement lost its active row"));
+                return Err(crate::sessions::failure::conflict(
+                    "child terminal settlement lost its active row",
+                ));
             }
         } else {
             // 终态先提交、工作意图后到：收敛残留的 `working`，不覆盖终态也不新增结果行。
@@ -727,7 +675,7 @@ impl SqliteSessionData {
         }
         tx.commit()
             .await
-            .map_err(|_| commit_failure(Some(child.clone())))?;
+            .map_err(|_| super::commit_failure(Some(child.clone())))?;
         Ok(outcome.unwrap_or_else(|| settled_without_write(input)))
     }
 
@@ -748,14 +696,14 @@ impl SqliteSessionData {
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         self.require_session(&mut tx, child).await?;
         let current = stored_agent_status(&mut tx, child).await?;
         if current.is_terminal() {
             converge_terminal_work_state(&mut tx, child, current).await?;
             tx.commit()
                 .await
-                .map_err(|_| commit_failure(Some(child.clone())))?;
+                .map_err(|_| super::commit_failure(Some(child.clone())))?;
             return Ok(TerminalSettlementOutcome::AlreadyTerminal(current));
         }
         let updated = sqlx::query(
@@ -768,15 +716,17 @@ impl SqliteSessionData {
         .bind(child.as_str())
         .execute(&mut *tx)
         .await
-        .map_err(|error| map_sqlx(&error))?;
+        .map_err(|error| super::map_sqlx(&error))?;
         if updated.rows_affected() != 1 {
             // 同一 `BEGIN IMMEDIATE` 内读到的不是终态且行存在，条件更新仍 0 行说明
             // 状态不可解释；不能把未写入报告成成功。
-            return Err(conflict("child terminal settlement lost its active row"));
+            return Err(crate::sessions::failure::conflict(
+                "child terminal settlement lost its active row",
+            ));
         }
         tx.commit()
             .await
-            .map_err(|_| commit_failure(Some(child.clone())))?;
+            .map_err(|_| super::commit_failure(Some(child.clone())))?;
         Ok(TerminalSettlementOutcome::Settled)
     }
 
@@ -796,7 +746,7 @@ impl SqliteSessionData {
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         self.require_session(&mut tx, thread_id).await?;
         for reminder in reminders {
             self.append_terminal_reminder_on(&mut tx, thread_id, reminder.id, &reminder.reminder)
@@ -809,7 +759,9 @@ impl SqliteSessionData {
                 continue;
             };
             let entry = entry_of(&current)?;
-            if current.0 != thread_id.as_str() || !is_same_watermark(&entry, &row.watermark()) {
+            if current.0 != thread_id.as_str()
+                || !crate::sessions::mq_rows::is_same_watermark(&entry, &row.watermark())
+            {
                 continue;
             }
             sqlx::query(DELETE_THREAD_MQ_ROW_SQL)
@@ -818,11 +770,11 @@ impl SqliteSessionData {
                 .bind(&entry.enqueued_at)
                 .execute(&mut *tx)
                 .await
-                .map_err(|error| map_sqlx(&error))?;
+                .map_err(|error| super::map_sqlx(&error))?;
         }
         tx.commit()
             .await
-            .map_err(|_| commit_failure(Some(thread_id.clone())))?;
+            .map_err(|_| super::commit_failure(Some(thread_id.clone())))?;
         Ok(())
     }
 
@@ -833,16 +785,16 @@ impl SqliteSessionData {
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         self.require_session(&mut tx, thread_id).await?;
         sqlx::query(crate::sessions::canonical::DELETE_THREAD_MQ_BY_THREAD_SQL)
             .bind(thread_id.as_str())
             .execute(&mut *tx)
             .await
-            .map_err(|error| map_sqlx(&error))?;
+            .map_err(|error| super::map_sqlx(&error))?;
         tx.commit()
             .await
-            .map_err(|_| commit_failure(Some(thread_id.clone())))?;
+            .map_err(|_| super::commit_failure(Some(thread_id.clone())))?;
         Ok(())
     }
 }
@@ -855,7 +807,7 @@ async fn mq_row_by_id(
         .bind(id)
         .fetch_optional(&mut *connection)
         .await
-        .map_err(|error| map_sqlx(&error))
+        .map_err(|error| super::map_sqlx(&error))
 }
 
 /// 该 thread 是否有仍要求继续处理的待发行。
@@ -869,9 +821,9 @@ async fn pending_ensures_processing(
         .bind(thread_id.as_str())
         .fetch_all(&mut *connection)
         .await
-        .map_err(|error| map_sqlx(&error))?;
+        .map_err(|error| super::map_sqlx(&error))?;
     for (policy_json,) in &rows {
-        if policy_ensures_processing(policy_json)? {
+        if crate::sessions::mq_rows::policy_ensures_processing(policy_json)? {
             return Ok(true);
         }
     }
@@ -886,7 +838,7 @@ pub(super) async fn message_fact(
         .bind(id)
         .fetch_optional(&mut *connection)
         .await
-        .map_err(|error| map_sqlx(&error))
+        .map_err(|error| super::map_sqlx(&error))
 }
 
 /// 当前 `threads.agent_status`；调用方必须落在同一个事务里（判定与写入同一快照）。
@@ -898,13 +850,13 @@ async fn stored_agent_status(
         .bind(id.as_str())
         .fetch_optional(&mut *connection)
         .await
-        .map_err(|error| map_sqlx(&error))?;
+        .map_err(|error| super::map_sqlx(&error))?;
     let Some((status,)) = row else {
-        return Err(not_found());
+        return Err(super::not_found());
     };
     status
         .parse()
-        .map_err(|_| corrupt("stored agent status is not readable"))
+        .map_err(|_| crate::sessions::failure::corrupt("stored agent status is not readable"))
 }
 
 /// 按稳定消息 ID 判断这次结算是否已经落在目标 thread：MQ 行或历史行恰好一处成立。
@@ -932,12 +884,13 @@ fn settled_without_write(input: MqInput) -> MqEnqueueOutcome {
         disposition: MqEnqueueDisposition::Existing,
         entry: MqEntry {
             id: input.id,
-            enqueued_at: enqueued_at_now(),
+            enqueued_at: crate::sessions::mq_rows::enqueued_at_now(),
             kind: input.kind,
             source: input.source,
             payload: input.payload,
             policy: input.policy,
             original_draft: input.original_draft,
+            plugin_selections: input.plugin_selections,
         },
     }
 }
@@ -955,6 +908,6 @@ async fn converge_terminal_work_state(
         .bind(child.as_str())
         .execute(&mut *connection)
         .await
-        .map_err(|error| map_sqlx(&error))?;
+        .map_err(|error| super::map_sqlx(&error))?;
     Ok(())
 }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use peri_acp_types::mcp::McpSubscriptionPort;
-use peri_acp_types::monitor::monitor_alert_delivery_id;
+use peri_acp_types::monitor;
 use peri_acp_types::plugin::ConfigSource;
 use peri_acp_types::ports::McpPoolPort;
 use peri_acp_types::session::{
@@ -22,13 +22,15 @@ use rmcp::service::{Peer, RoleClient};
 use serde_json::json;
 
 use crate::mcp::apps::McpCapabilityProfile;
-use crate::mcp::builtin::runtime::{
-    spawn_builtin_transport_with_handler, BuiltinInstanceSupervisor, BuiltinServerExit,
-    BUILTIN_CONVERGE_TIMEOUT,
-};
-use crate::mcp::client::{
-    serve_client_auto, ClientStatus, McpClientHandle, McpClientPool, McpServiceWrapper,
-};
+use crate::mcp::builtin::runtime;
+use crate::mcp::builtin::runtime::BuiltinInstanceSupervisor;
+use crate::mcp::builtin::runtime::BuiltinServerExit;
+use crate::mcp::builtin::runtime::BUILTIN_CONVERGE_TIMEOUT;
+use crate::mcp::client;
+use crate::mcp::client::ClientStatus;
+use crate::mcp::client::McpClientHandle;
+use crate::mcp::client::McpClientPool;
+use crate::mcp::client::McpServiceWrapper;
 use crate::mcp::current_invocation_fixture::CurrentInvocationFixture;
 use crate::mcp::tool_bridge::McpToolBridge;
 use crate::mcp::McpTaskOwner;
@@ -82,12 +84,13 @@ impl MonitorLink {
 async fn connect_monitor() -> MonitorLink {
     let dir = tempfile::tempdir().expect("tempdir");
     let server = MonitorMcpServer::new(dir.path().to_string_lossy().into_owned());
-    let transport = spawn_builtin_transport_with_handler("monitor", server);
+    let transport = runtime::spawn_builtin_transport_with_handler("monitor", server);
     let (io, supervisor) = transport.into_parts();
-    let service = serve_client_auto(io, &McpCapabilityProfile::disabled(), HANDSHAKE_TIMEOUT)
-        .await
-        .expect("monitor handshake must not time out")
-        .expect("monitor handshake must not fail");
+    let service =
+        client::serve_client_auto(io, &McpCapabilityProfile::disabled(), HANDSHAKE_TIMEOUT)
+            .await
+            .expect("monitor handshake must not time out")
+            .expect("monitor handshake must not fail");
     MonitorLink {
         service,
         supervisor,
@@ -477,7 +480,7 @@ async fn completed_monitor_merges_its_alert_into_the_terminal_reminder() {
     assert!(messages[0].delivery_id.is_some());
     assert_ne!(
         messages[0].delivery_id,
-        Some(monitor_alert_delivery_id(&monitor_id, 1)),
+        Some(monitor::monitor_alert_delivery_id(&monitor_id, 1)),
         "the merged reminder keeps the terminal delivery id, not the alert id"
     );
     let body = reminder_body(&messages[0]);
@@ -695,6 +698,72 @@ async fn deadline_monitor_terminal_state_wakes_the_owner() {
     assert!(!body.contains("time(s)"), "no alert was configured: {body}");
 
     shutdown_link(link, pool, owner).await;
+}
+
+/// monitor 实例与 transport 一起消失：宿主立即结算并只投递一条终态提醒。
+#[cfg(unix)]
+#[tokio::test]
+async fn monitor_instance_loss_settles_immediately_with_one_unresolved_reminder() {
+    let link = connect_monitor().await;
+    let (mut owner, spawner) = McpTaskOwner::new();
+    let pool = pool_with_monitor(&link, spawner);
+    let (queue, manager) = register_bridge_session(&pool, "session-a");
+
+    let receipt = start_monitor_via_bridge(
+        &pool,
+        &link,
+        "session-a",
+        json!({ "command": "sleep 30", "label": "disconnect" }),
+    )
+    .await;
+    let monitor_id = receipt_field(&receipt, "monitor_id");
+    assert!(
+        manager
+            .snapshot()
+            .tasks
+            .iter()
+            .any(|task| task.status == "running"),
+        "the monitor task must be registered before its owner disappears"
+    );
+
+    // Drop the client service and the builtin instance, but keep the pool and
+    // the session manager: only the owner disappears, not the host.
+    let mut link = link;
+    let _ = link.service.close_with_timeout(CLOSE_TIMEOUT).await;
+    let outcome = link.supervisor.close(BUILTIN_CONVERGE_TIMEOUT).await;
+    assert!(
+        !matches!(outcome.server, BuiltinServerExit::AbortedAfterTimeout),
+        "server task must converge, not abort: {outcome:?}"
+    );
+
+    wait_settled_external(&manager).await;
+    let messages = drain(&queue);
+    assert_eq!(
+        messages.len(),
+        1,
+        "an owner loss must settle with exactly one terminal reminder: {messages:?}"
+    );
+    assert_eq!(messages[0].kind, MessageKind::Defer);
+    let body = reminder_body(&messages[0]);
+    assert!(body.contains(&monitor_id), "{body}");
+    assert!(body.contains("unresolved"), "{body}");
+    assert_eq!(
+        manager.snapshot().tasks[0].status,
+        "failed",
+        "the lost task must not stay active"
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        drain(&queue).is_empty(),
+        "the owner loss must not deliver a second reminder"
+    );
+
+    wait_host_registration_release(&owner).await;
+    pool.clients.write().clear();
+    drop(pool);
+    owner.begin_shutdown();
+    let _ = owner.shutdown().await;
 }
 
 /// 重复完成 / 取消 monitor 任务后，宿主登记必须回到基线，终态提醒不重复。
