@@ -2,7 +2,7 @@
 
 支持多个独立账号的云 Agent：推理循环在服务器，工具在各自选择的 Windows / Linux 实例上执行，官方 QQBot 与可选的个人 QQ / OneBot 是并存的聊天入口。服务器本地实例仅属于管理员。
 
-本项目基于 [Peri](https://github.com/KonghaYao/peri) 的 Rust Agent 核心，拆出原生执行器并加入账号、设备连接、网关和常驻服务。发布包不包含 TUI。保留依赖所需的编译期提示词与 workflow 资源。当前候选版本 `v0.8.0-rc.1`（Peri v4 核心），仅供个人预览验证，未替代现有生产部署。发布范围与验收门槛见 [候选说明](docs/releases/v0.8.0-rc.1.md)。
+本项目基于 [Peri](https://github.com/KonghaYao/peri) 的 Rust Agent 核心，拆出原生执行器并加入账号、设备连接、网关和常驻服务。发布包不包含 TUI。保留依赖所需的编译期提示词与 workflow 资源。当前候选版本 `v0.8.0-rc.1`（Peri 上游核心），仅供个人预览验证，未替代现有生产部署。发布范围与验收门槛见 [候选说明](docs/releases/v0.8.0-rc.1.md)。
 
 ## 能做什么
 

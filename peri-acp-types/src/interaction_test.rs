@@ -2,6 +2,7 @@ use crate::identity::AttemptId;
 use crate::interaction::AttachmentId;
 use crate::interaction::ConnectionEpoch;
 use crate::interaction::InteractionAttribution;
+use crate::interaction::InteractionResponse;
 use crate::interaction::TrustedInteractionOwner;
 use crate::interaction::UnansweredCause;
 use crate::interaction::ELICITATION_UNANSWERED_META_KEY;

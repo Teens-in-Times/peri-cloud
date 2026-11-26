@@ -174,7 +174,7 @@ async fn provider_usage_calibrates_total_input_and_fresh_overflow_waits_instead_
         cache_creation_input_tokens: Some(200),
         cache_read_input_tokens: Some(300),
     };
-    let response = ModelResponse::new(
+    let response = ModelResponse::try_new(
         ModelMessage::assistant_text("complete"),
         StopReason::EndTurn,
         Some(usage),

@@ -2,6 +2,7 @@ use super::{Arc, ClientStatus, ConfigSource, McpClientPool, McpInitStatus, Syste
 use crate::mcp::builtin::context::BuiltinInstanceContext;
 use peri_acp_types::ports::McpPoolPort;
 use std::fmt::Debug;
+use std::path::Path;
 
 const SCRIPT: &str = r#"
 const fs = require('node:fs');
