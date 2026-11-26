@@ -130,7 +130,7 @@ SQLite 日志记录入站消息、会话、云任务、审批、执行器任务�
 
 设备绑定时，执行器提供只读工作区接口：项目指令候选（`AGENTS.md` → `CLAUDE.md` → `.claude/AGENTS.md`，另加 `CLAUDE.local.md`）、`.claude/skills` 下的 `SKILL.md` 目录，以及按已发现项读取正文。接口沿用现有 Bearer 认证，复核会话绑定与工作区身份，只接受工作区相对路径并拒绝符号链接、父目录逃逸和越界；云端不读取主控文件系统。指令按会话冻结；技能工具按需从同一设备读取正文，加载技能不授予执行权限。当前不展开 `CLAUDE.md` 的 `@import`，技能覆盖项目 .agents/skills / .claude/skills 及明确安装的账号、管理员技能；实际归属见上下文装配契约。
 
-MCP 服务按账号保存在 CloudJournal（schema 15），每个会话的池只含该账号启用的服务，不读取主控配置文件、builtin 实例或 stdio。`/mcp` 只接受公网 HTTPS 端点，拒绝 URL 凭据、查询参数、回环/内网/保留地址，HTTP 重定向一律不跟随；不保存 MCP 凭据，因此当前不支持需要 OAuth 或自定义头的服务。MCP 工具保留 `mcp__` 前缀审批，`ExecuteExtraTool` 在派发前解析真实目标，包装工具不能绕过审批。
+MCP 服务按账号保存在 CloudJournal（schema 15），每个会话的池只含该账号启用的服务，不读取主控配置文件、builtin 实例或 stdio。`/mcp` 只接受公网 HTTPS 端点，拒绝 URL 凭据、查询参数、回环/内网/保留地址，HTTP 重定向一律不跟随；不保存 MCP 凭据，因此当前不支持需要 OAuth 或自定义头的服务。MCP 工具保留 `mcp__` 前缀审批，`ToolInvoke`（兼容旧名 `ExecuteExtraTool`）在派发前解析真实目标，包装工具不能绕过审批。
 
 ## 网关访问控制
 
