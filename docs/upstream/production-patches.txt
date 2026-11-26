@@ -33,6 +33,7 @@ peri-agent/src/agent/stages/archive_capability.rs
 peri-agent/src/agent/stages/micro_facts.rs
 peri-agent/src/lib.rs
 peri-middlewares/src/subagent/tool/tool_test.rs
+peri-middlewares/src/subagent/tool/tool_test/resume_test.rs
 # Windows-specific test imports and Unix-only fixture fields.
 
 # Manual 199382c5 sync: split records/tests/fork wiring below the 1000-line limit.

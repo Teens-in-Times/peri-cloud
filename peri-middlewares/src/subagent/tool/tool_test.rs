@@ -796,7 +796,15 @@ impl BackgroundCapture {
 
     /// 等待下一次后台完成并返回结果；超时即判失败。
     pub(crate) async fn wait(&self) -> peri_acp_types::event::BackgroundTaskResult {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        self.wait_with_timeout(std::time::Duration::from_secs(10))
+            .await
+    }
+
+    async fn wait_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> peri_acp_types::event::BackgroundTaskResult {
+        tokio::time::timeout(timeout, async {
             loop {
                 if let Some(result) = self.completions.lock().unwrap().pop() {
                     return result;

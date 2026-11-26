@@ -902,7 +902,11 @@ async fn test_resume_thread_id_fork_title_uses_parent_tools_and_default_iteratio
     assert!(receipt.contains("Background task"), "{receipt}");
 
     // 迭代上限耗尽 → max_iterations（fork resume 上限 = DEFAULT_SUBAGENT_MAX_ITERATIONS）
-    let completed = capture.wait().await;
+    // This case persists all 400 iterations before the completion callback. Allow
+    // for slower Windows storage while still asserting the exact default budget.
+    let completed = capture
+        .wait_with_timeout(std::time::Duration::from_secs(120))
+        .await;
     assert!(!completed.success, "预算耗尽必须落为失败终态");
     assert_eq!(completed.child_thread_id.as_deref(), Some(id.as_str()));
     let failure = completed
