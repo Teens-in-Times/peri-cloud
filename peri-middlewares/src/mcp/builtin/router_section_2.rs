@@ -417,8 +417,11 @@ impl std::fmt::Debug for BuiltinRouter {
     }
 }
 
+#[path = "router/readiness.rs"]
 mod readiness;
+#[path = "router/router_handler.rs"]
 mod router_handler;
+#[path = "router/tasks.rs"]
 mod tasks;
 
 pub use readiness::{CapabilityReadiness, CapabilityStatus, RouterReadiness};
