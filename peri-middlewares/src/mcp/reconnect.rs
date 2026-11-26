@@ -1,22 +1,35 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use super::{
-    auth_store::static_credential_key,
-    builtin::runtime::BUILTIN_CONVERGE_TIMEOUT,
-    client::{
-        build_authed_transport, build_http_transport, serve_client_auto_for_server,
-        setup_subscription, ClientStatus, McpClientHandle, McpClientPool, McpPoolError,
-        OAuthStartDisposition, OAuthStatus, SHUTDOWN_TIMEOUT,
-    },
-    initialize::{
-        commit_discovery_failure, commit_discovery_success, connect_timeout,
-        downgrade_resource_listing, fail_tool_discovery, fail_workspace_resource_discovery,
-        list_discovered_tools,
-    },
-    oauth_flow::{OAuthFlowEvent, OAuthFlowManager},
-    transport::{TransportConfig, TransportKind},
-};
+use super::auth_store;
+use super::builtin::runtime::BUILTIN_CONVERGE_TIMEOUT;
+use super::client;
+use super::client::ClientStatus;
+use super::client::McpClientHandle;
+use super::client::McpClientPool;
+use super::client::McpPoolError;
+use super::client::McpServiceWrapper;
+use super::client::OAuthStartDisposition;
+use super::client::OAuthStatus;
+use super::client::SHUTDOWN_TIMEOUT;
+use super::config::McpServerConfig;
+use super::initialize;
+use super::oauth_flow::OAuthFlowEvent;
+use super::oauth_flow::OAuthFlowManager;
+use super::transport::TransportConfig;
+use super::transport::TransportKind;
+
+/// 一条已建立并通过发现验证、但尚未提交的连接。
+pub(crate) struct ReadyConnection {
+    pub(crate) handle: Arc<McpClientHandle>,
+    pub(crate) service: McpServiceWrapper,
+}
+
+/// 共享连接逻辑的结果：已就绪，或 HTTP 需要交互式 OAuth。
+pub(crate) enum ConnectOutcome {
+    Connected(ReadyConnection),
+    NeedsAuthorization,
+}
 
 impl McpClientPool {
     pub fn spawn_reconnect(
@@ -65,6 +78,8 @@ impl McpClientPool {
         self.reconnect_managed(server_name, oauth_event_callback, true)
             .await
     }
+
+    /// 重连：关闭既有连接后，复用共享连接逻辑重新建立并提交。
     pub(crate) async fn reconnect_managed(
         self: &Arc<Self>,
         server_name: &str,
@@ -98,21 +113,54 @@ impl McpClientPool {
             .get(server_name)
             .map(|c| c.status.clone());
         self.clients.write().remove(server_name);
+        match self
+            .connect_managed(
+                server_name,
+                &server_config,
+                oauth_event_callback,
+                interactive_oauth,
+                &|| true,
+            )
+            .await?
+        {
+            ConnectOutcome::NeedsAuthorization => Ok(()),
+            ConnectOutcome::Connected(ready) => {
+                self.commit_ready(server_name, ready, old_status, || true)
+                    .await
+            }
+        }
+    }
+
+    /// 从受控配置建立并验证一条连接。
+    ///
+    /// 不关闭旧连接、不判断重连资格：transport / OAuth / 发现 / 句柄构造由首次加载、
+    /// 初始化后的重连共用；关闭旧连接与提交时机由各自调用场景决定。
+    /// `admit` 在发布失败证据前检查；迟到结果不得覆盖已经停止或换代的目标。
+    pub(crate) async fn connect_managed(
+        self: &Arc<Self>,
+        server_name: &str,
+        server_config: &McpServerConfig,
+        oauth_event_callback: Option<Box<dyn Fn(OAuthFlowEvent) + Send + Sync>>,
+        interactive_oauth: bool,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> Result<ConnectOutcome, McpPoolError> {
         if matches!(
             server_config.source,
             Some(super::config::ConfigSource::Builtin { .. })
         ) && !self.builtin_available.load(Ordering::Acquire)
         {
             let reason = "builtin handler is unavailable in this deployment".to_string();
-            McpClientPool::insert_failed(self, server_name, reason.clone());
-            commit_discovery_failure(self, server_name, false);
+            if admit() {
+                McpClientPool::insert_failed(self, server_name, reason.clone());
+                initialize::commit_discovery_failure(self, server_name, false);
+            }
             return Err(McpPoolError::ConnectionFailed {
                 server: server_name.to_string(),
                 reason,
             });
         }
 
-        let tc = TransportConfig::try_from(&server_config).map_err(|e| {
+        let tc = TransportConfig::try_from(server_config).map_err(|e| {
             McpPoolError::ConnectionFailed {
                 server: server_name.to_string(),
                 reason: format!("传输层构建失败: {e}"),
@@ -120,18 +168,19 @@ impl McpClientPool {
         })?;
         // 三分类（IF-D1）：超时与日志字段同源；`is_http` 仅用于 AuthRequired 判定。
         let kind = tc.kind();
-        let timeout = connect_timeout(kind);
+        let timeout = initialize::connect_timeout(kind);
         let is_http = matches!(kind, TransportKind::Http);
         // lifecycle 自动协商；subscriptions 只负责连接后订阅。
         let subscriptions = server_config
             .subscriptions
             .as_ref()
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty())
+            .and_then(|subscriptions| self.filter_subscriptions(server_name, subscriptions));
 
         let mut used_oauth = false;
         let result = match &tc {
             // builtin 分支：重建一条**全新的**同进程链路（新 duplex + 新 handler 实例，
-            // 旧 task 已在上方收敛并移除）。与 stdio 路径同构：typed 原因 + 失败证据 +
+            // 旧 task 已在关闭路径收敛并移除）。与 stdio 路径同构：typed 原因 + 失败证据 +
             // `ConnectionFailed`，不 panic、不静默降级。
             TransportConfig::Builtin { instance } => {
                 // 与 initialize 同一条构造入口：实例解析、上下文读取与 tick 挂载都在 pool
@@ -144,8 +193,10 @@ impl McpClientPool {
                     Ok(transport) => transport,
                     Err(error) => {
                         let reason = format!("builtin 启动失败: {error}");
-                        McpClientPool::insert_failed(self, server_name, reason.clone());
-                        commit_discovery_failure(self, server_name, false);
+                        if admit() {
+                            McpClientPool::insert_failed(self, server_name, reason.clone());
+                            initialize::commit_discovery_failure(self, server_name, false);
+                        }
                         return Err(McpPoolError::ConnectionFailed {
                             server: server_name.to_string(),
                             reason,
@@ -158,7 +209,8 @@ impl McpClientPool {
                 {
                     let _ = previous.close(BUILTIN_CONVERGE_TIMEOUT).await;
                 }
-                let connected = serve_client_auto_for_server(io, self, server_name, timeout).await;
+                let connected =
+                    client::serve_client_auto_for_server(io, self, server_name, timeout).await;
                 // 握手失败 / 超时：新链路当场收口，不留 orphan。
                 if !matches!(connected, Ok(Ok(_))) {
                     self.close_builtin_task(server_name).await;
@@ -169,8 +221,10 @@ impl McpClientPool {
             TransportConfig::Stdio { command, args, env } => {
                 if !self.stdio_available.load(Ordering::Acquire) {
                     let reason = crate::platform::STDIO_UNAVAILABLE.to_string();
-                    McpClientPool::insert_failed(self, server_name, reason.clone());
-                    commit_discovery_failure(self, server_name, false);
+                    if admit() {
+                        McpClientPool::insert_failed(self, server_name, reason.clone());
+                        initialize::commit_discovery_failure(self, server_name, false);
+                    }
                     return Err(McpPoolError::ConnectionFailed {
                         server: server_name.to_string(),
                         reason,
@@ -184,13 +238,21 @@ impl McpClientPool {
                             reason: "MCP execution directory is not initialized".into(),
                         })?;
                 match self.spawn_stdio_transport(server_name, command, args, env, cwd) {
-                    Ok(t) => serve_client_auto_for_server(t, self, server_name, timeout).await,
+                    Ok(t) => {
+                        client::serve_client_auto_for_server(t, self, server_name, timeout).await
+                    }
                     Err(e) => {
-                        McpClientPool::insert_failed(self, server_name, format!("stdio 失败: {e}"));
-                        commit_discovery_failure(self, server_name, false);
+                        let reason = format!("stdio 失败: {e}");
+                        if admit() {
+                            McpClientPool::insert_failed(self, server_name, reason.clone());
+                            initialize::commit_discovery_failure(self, server_name, false);
+                        }
+                        // spawn helper 可能已登记 owner（attach 失败）：必须 close/join
+                        // 后重试才能复用同一个 pool/slot 位置。
+                        self.discard_uncommitted_resources(server_name).await;
                         return Err(McpPoolError::ConnectionFailed {
                             server: server_name.to_string(),
-                            reason: format!("stdio 失败: {e}"),
+                            reason,
                         });
                     }
                 }
@@ -210,16 +272,20 @@ impl McpClientPool {
                 let token_store = self.oauth_credentials().ok();
                 if oauth.is_some() && token_store.is_none() {
                     if !interactive_oauth {
-                        McpClientPool::insert_needs_auth(
-                            self,
-                            server_name,
-                            "OAuth authorization required".into(),
-                        );
-                        return Ok(());
+                        if admit() {
+                            McpClientPool::insert_needs_auth(
+                                self,
+                                server_name,
+                                "OAuth authorization required".into(),
+                            );
+                        }
+                        return Ok(ConnectOutcome::NeedsAuthorization);
                     }
                     let reason = "OAuth credentials were not injected".to_string();
-                    McpClientPool::insert_failed(self, server_name, reason.clone());
-                    commit_discovery_failure(self, server_name, false);
+                    if admit() {
+                        McpClientPool::insert_failed(self, server_name, reason.clone());
+                        initialize::commit_discovery_failure(self, server_name, false);
+                    }
                     return Err(McpPoolError::ConnectionFailed {
                         server: server_name.to_string(),
                         reason,
@@ -229,7 +295,7 @@ impl McpClientPool {
                     Some(config.clone())
                 } else if let Some(token_store) = token_store.as_ref() {
                     let default_oauth = super::config::OAuthConfig::default();
-                    let key = static_credential_key(server_name, url, &default_oauth);
+                    let key = auth_store::static_credential_key(server_name, url, &default_oauth);
                     token_store
                         .load_server(&key)
                         .await
@@ -276,49 +342,50 @@ impl McpClientPool {
                     match oauth_result {
                         Ok(()) => {
                             used_oauth = true;
-                            if let Some(am) = mgr.get_authorization_manager(server_name) {
-                                serve_client_auto_for_server(
-                                    build_authed_transport(url, headers, am),
+                            if let Some(am) = mgr.authorization_manager(server_name) {
+                                client::serve_client_auto_for_server(
+                                    client::build_authed_transport(url, headers, am),
+                                    self,
+                                    server_name,
+                                    timeout,
+                                )
+                                .await
+                            } else if oauth.is_none() {
+                                client::serve_client_auto_for_server(
+                                    client::build_http_transport(url, headers),
                                     self,
                                     server_name,
                                     timeout,
                                 )
                                 .await
                             } else {
-                                if oauth.is_none() {
-                                    serve_client_auto_for_server(
-                                        build_http_transport(url, headers),
-                                        self,
-                                        server_name,
-                                        timeout,
-                                    )
-                                    .await
-                                } else {
-                                    let reason =
-                                        "OAuth authorization produced no credential manager"
-                                            .to_string();
+                                let reason = "OAuth authorization produced no credential manager"
+                                    .to_string();
+                                if admit() {
                                     McpClientPool::insert_failed(self, server_name, reason.clone());
-                                    commit_discovery_failure(self, server_name, false);
-                                    return Err(McpPoolError::ConnectionFailed {
-                                        server: server_name.to_string(),
-                                        reason,
-                                    });
+                                    initialize::commit_discovery_failure(self, server_name, false);
                                 }
+                                return Err(McpPoolError::ConnectionFailed {
+                                    server: server_name.to_string(),
+                                    reason,
+                                });
                             }
                         }
                         Err(e) => {
                             if !interactive_oauth {
-                                McpClientPool::insert_needs_auth(
-                                    self,
-                                    server_name,
-                                    "OAuth authorization required".into(),
-                                );
-                                return Ok(());
+                                if admit() {
+                                    McpClientPool::insert_needs_auth(
+                                        self,
+                                        server_name,
+                                        "OAuth authorization required".into(),
+                                    );
+                                }
+                                return Ok(ConnectOutcome::NeedsAuthorization);
                             }
                             if oauth.is_none() {
                                 tracing::warn!(server = %server_name, error = %e, "OAuth 恢复失败，尝试裸连接");
-                                serve_client_auto_for_server(
-                                    build_http_transport(url, headers),
+                                client::serve_client_auto_for_server(
+                                    client::build_http_transport(url, headers),
                                     self,
                                     server_name,
                                     timeout,
@@ -326,8 +393,10 @@ impl McpClientPool {
                                 .await
                             } else {
                                 let reason = format!("OAuth 恢复失败: {e}");
-                                McpClientPool::insert_failed(self, server_name, reason.clone());
-                                commit_discovery_failure(self, server_name, false);
+                                if admit() {
+                                    McpClientPool::insert_failed(self, server_name, reason.clone());
+                                    initialize::commit_discovery_failure(self, server_name, false);
+                                }
                                 return Err(McpPoolError::ConnectionFailed {
                                     server: server_name.to_string(),
                                     reason,
@@ -336,8 +405,8 @@ impl McpClientPool {
                         }
                     }
                 } else {
-                    serve_client_auto_for_server(
-                        build_http_transport(url, headers),
+                    client::serve_client_auto_for_server(
+                        client::build_http_transport(url, headers),
                         self,
                         server_name,
                         timeout,
@@ -353,9 +422,9 @@ impl McpClientPool {
                 // 订阅配置存在：按 server 配置重建 subscriptions/listen 长流
                 // （2026-07-28）。失败仅告警——server 可能不支持，连接本身仍可用。
                 // A24 关闭门与 initialize 同源（`pool.subscription_allowed` 唯一判定）。
-                if let Some(sub) = subscriptions {
+                if let Some(sub) = &subscriptions {
                     if self.subscription_allowed(server_name) {
-                        setup_subscription(self, &rs, server_name, sub).await;
+                        client::setup_subscription(self, &rs, server_name, sub).await;
                     } else {
                         tracing::info!(
                             server = %server_name,
@@ -369,19 +438,32 @@ impl McpClientPool {
                 // 严格发现：`tools/list` 的 `Err` 不是「没有工具」。System MCP 走
                 // 本次 live round-trip（不用历史缓存代替健康证据），失败即
                 // ToolDiscoveryFailed，不提交 Connected。
-                let tools =
-                    match list_discovered_tools(self, server_name, &peer, &server_config).await {
-                        Ok(tools) => tools,
-                        Err(error) => {
-                            // 不留下「无句柄」的模糊状态：显式 Failed + 本代发现失败
-                            // 证据，闸门据此立即判定，而不是等到 deadline。
-                            fail_tool_discovery(self, server_name, &error.to_string());
-                            return Err(McpPoolError::ToolDiscoveryFailed {
-                                server: server_name.to_string(),
-                                reason: error.to_string(),
-                            });
+                let tools = match initialize::list_discovered_tools(
+                    self,
+                    server_name,
+                    &peer,
+                    server_config,
+                )
+                .await
+                {
+                    Ok(tools) => tools,
+                    Err(error) => {
+                        // 未提交连接必须当场收口：失败 attempt 不得留下半开 transport
+                        // 或让后续重复加载累积 service/process。
+                        let mut service = rs;
+                        let _ = service.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+                        self.release_stopped_resources(server_name);
+                        // 不留下「无句柄」的模糊状态：显式 Failed + 本代发现失败
+                        // 证据，闸门据此立即判定，而不是等到 deadline。
+                        if admit() {
+                            initialize::fail_tool_discovery(self, server_name, &error.to_string());
                         }
-                    };
+                        return Err(McpPoolError::ToolDiscoveryFailed {
+                            server: server_name.to_string(),
+                            reason: error.to_string(),
+                        });
+                    }
+                };
                 let resources = match self.list_all_resources_cached(server_name, &peer).await {
                     Ok(resources) => resources,
                     Err(error) => {
@@ -391,17 +473,20 @@ impl McpClientPool {
                         ) {
                             let mut service = rs;
                             let _ = service.close_with_timeout(SHUTDOWN_TIMEOUT).await;
-                            fail_workspace_resource_discovery(
-                                self,
-                                server_name,
-                                &error.to_string(),
-                            );
+                            self.release_stopped_resources(server_name);
+                            if admit() {
+                                initialize::fail_workspace_resource_discovery(
+                                    self,
+                                    server_name,
+                                    &error.to_string(),
+                                );
+                            }
                             return Err(McpPoolError::ResourceDiscoveryFailed {
                                 server: server_name.to_string(),
                                 reason: error.to_string(),
                             });
                         }
-                        downgrade_resource_listing(server_name, &error.to_string());
+                        initialize::downgrade_resource_listing(server_name, &error.to_string());
                         Vec::new()
                     }
                 };
@@ -431,31 +516,24 @@ impl McpClientPool {
                     url: server_config.url.clone(),
                     skills_capable,
                 });
-                let committed = Arc::clone(&handle);
-                if let Err(mut service) =
-                    self.try_commit_connection(server_name.to_string(), handle, rs)
-                {
-                    let _ = service.close_with_timeout(SHUTDOWN_TIMEOUT).await;
-                    // 提交被拒（pool 关闭）：不留任何可被读成成功的证据。
-                    self.clear_discovery_evidence(server_name);
-                    return Err(McpPoolError::ConnectionFailed {
-                        server: server_name.to_string(),
-                        reason: "MCP pool is closing".to_string(),
-                    });
-                }
-                self.record_status_change(server_name, old_status.as_ref());
-                // 重连同样只能由真实成功的 live `tools/list` 产生本代发现证据。
-                commit_discovery_success(self, server_name, &committed);
-                Ok(())
+                Ok(ConnectOutcome::Connected(ReadyConnection {
+                    handle,
+                    service: rs,
+                }))
             }
             Ok(Err(e)) => {
                 let err_str = e.to_string();
-                if McpClientPool::is_auth_required_error(&err_str, is_http) {
-                    McpClientPool::insert_needs_auth(self, server_name, err_str.clone());
-                } else {
-                    McpClientPool::insert_failed(self, server_name, err_str.clone());
+                if admit() {
+                    if McpClientPool::is_auth_required_error(&err_str, is_http) {
+                        McpClientPool::insert_needs_auth(self, server_name, err_str.clone());
+                    } else {
+                        McpClientPool::insert_failed(self, server_name, err_str.clone());
+                    }
+                    initialize::commit_discovery_failure(self, server_name, false);
                 }
-                commit_discovery_failure(self, server_name, false);
+                // 握手失败时 transport 的 Drop 只 terminate 子进程；owner 还在
+                // pool/slot 里，必须 close/join 后才能让下一次 attempt 复用位置。
+                self.discard_uncommitted_resources(server_name).await;
                 Err(McpPoolError::ConnectionFailed {
                     server: server_name.to_string(),
                     reason: err_str,
@@ -463,13 +541,52 @@ impl McpClientPool {
             }
             Err(_) => {
                 let msg = "连接超时";
-                McpClientPool::insert_failed(self, server_name, msg.to_string());
-                commit_discovery_failure(self, server_name, false);
+                if admit() {
+                    McpClientPool::insert_failed(self, server_name, msg.to_string());
+                    initialize::commit_discovery_failure(self, server_name, false);
+                }
+                // 超时丢弃了 serve future，未提交的 owner 同样需要显式收口。
+                self.discard_uncommitted_resources(server_name).await;
                 Err(McpPoolError::ConnectionFailed {
                     server: server_name.to_string(),
                     reason: msg.to_string(),
                 })
             }
         }
+    }
+
+    /// 提交已验证连接：提交前再检查 pool / server / attempt 准入，并作为一组发布。
+    pub(crate) async fn commit_ready(
+        self: &Arc<Self>,
+        server_name: &str,
+        ready: ReadyConnection,
+        old_status: Option<ClientStatus>,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<(), McpPoolError> {
+        let ReadyConnection { handle, service } = ready;
+        if let Err(mut service) = self.try_commit_connection_guarded(
+            server_name.to_string(),
+            handle.clone(),
+            service,
+            admit,
+        ) {
+            // 提交被拒：关闭新获得的资源，不把旧结果挂回已停止的服务器。
+            let _ = service.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+            self.release_stopped_resources(server_name);
+            self.clear_discovery_evidence(server_name);
+            let reason = if self.is_open() {
+                "MCP connection was superseded before commit"
+            } else {
+                "MCP pool is closing"
+            };
+            return Err(McpPoolError::ConnectionFailed {
+                server: server_name.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+        self.record_status_change(server_name, old_status.as_ref());
+        // 重连同样只能由真实成功的 live `tools/list` 产生本代发现证据。
+        initialize::commit_discovery_success(self, server_name, &handle);
+        Ok(())
     }
 }

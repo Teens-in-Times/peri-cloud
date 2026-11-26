@@ -7,21 +7,13 @@ peri-acp-types/src/error.rs
 peri-acp-types/src/interaction.rs
 peri-acp-types/src/interaction_test.rs
 peri-acp-types/src/lib.rs
-peri-acp-types/src/session.rs
-peri-agent/Cargo.toml
-peri-agent/src/agent/async_tasks/shell.rs
 peri-agent/src/agent/compact_v2/full.rs
 peri-agent/src/agent/compact_v2/descriptions/summary_system_prompt.md
 peri-agent/src/agent/compact_v2/descriptions/summary_user_prompt.md
-peri-agent/src/agent/compact_v2/full_continuation_test.rs
-peri-agent/src/agent/model_bridge.rs
 peri-agent/src/agent/stages/tool_dispatch/execution.rs
 peri-agent/src/agent/stages/tool_dispatch/execution_test.rs
-peri-agent/src/session/turn.rs
 peri-agent/src/session/turn_test.rs
-peri-agent/src/session/transcript.rs
 peri-agent/src/session/transcript_persistence_test.rs
-peri-middlewares/Cargo.toml
 peri-middlewares/src/mcp/client/transport.rs
 peri-middlewares/src/mcp/client/transport_test.rs
 peri-middlewares/src/mcp/initialize.rs
@@ -30,65 +22,32 @@ peri-middlewares/src/prompt_tool_name_lock_test.rs
 peri-middlewares/src/subagent/tool/subagent_lifecycle_test.rs
 peri-middlewares/src/tools/ask_user_tool.rs
 peri-middlewares/src/tools/ask_user_tool_test.rs
-peri-model/Cargo.toml
-peri-model/src/openai_compatible/mod.rs
 peri-process/Cargo.toml
 peri-process/src/lib.rs
 peri-resources/Cargo.toml
 peri-resources/src/sessions/discovery.rs
-peri-js-runtime/Cargo.toml
-peri-workflow/Cargo.toml
 
 # Deployment archive port and source/test module size limits.
-peri-acp-types/src/event.rs
 peri-agent/src/agent/compact_v2/micro.rs
 peri-agent/src/agent/stages/archive_capability.rs
-peri-agent/src/agent/stages/loop_iteration_test.rs
 peri-agent/src/agent/stages/micro_facts.rs
-peri-agent/src/context_archive.rs
 peri-agent/src/lib.rs
-peri-agent/src/session/subagent/resume_cases_test.rs
-peri-middlewares/src/subagent/tool/tool_test/integration_v2_test.rs
 peri-middlewares/src/subagent/tool/tool_test.rs
-peri-resources/src/sessions/remote/session_sql.rs
-peri-resources/src/sessions/sqlite_store/schema_test.rs
+peri-middlewares/src/subagent/tool/tool_test/resume_test.rs
 # Windows-specific test imports and Unix-only fixture fields.
-peri-resources/src/sessions/sqlite_store/database.rs
-peri-workflow/src/tool_test.rs
-mcp-packages/common/src/shell_lifecycle_test.rs
 
 # Manual 199382c5 sync: split records/tests/fork wiring below the 1000-line limit.
-peri-acp-types/src/session_resources.rs
-peri-agent/src/agent/stages/tool_dispatch_test.rs
-peri-resources/src/sessions/sqlite_store/session_data.rs
-peri-resources/src/sessions/sqlite_store/session_data/port.rs
 
 # Manual dcd4d116 sync: isolate cancellation regression to keep tests below 1000 lines.
-peri-agent/src/session/subagent/run_sync_test.rs
 
 # Manual de1a93ab sync: compile the Unix-only OAuth fixture helper only on Unix.
 mcp-packages/credentials/src/model_auth/oauth.rs
 
 # Manual b6e32afd sync: retain all upstream tests in lexical chunks below 1000 lines.
-peri-agent/src/agent/compact_v2/full_test.rs
-peri-middlewares/src/mcp/client/subscription_tasks_test.rs
-peri-middlewares/src/mcp/client_test.rs
-peri-middlewares/src/permission/mod_test.rs
-peri-middlewares/src/subagent/tool/tool_test/resume_test.rs
 
 # Manual 40d1a65f sync: split the queue, migration and regression sources.
-peri-acp-types/src/session/queue.rs
-peri-acp-types/src/session/queue_mq_test.rs
-peri-agent/src/session/subagent/child_runner_test.rs
-peri-agent/src/session/subagent/resume_owner_reuse_test.rs
-peri-config/src/system_test.rs
-peri-resources/src/sessions/remote/schema_upgrade.rs
-peri-resources/src/sessions/remote/schema_upgrade_test.rs
-peri-resources/src/sessions/sqlite_store/session_mq_test.rs
 
 # Preserve the Cloud compatible-provider client settings with the upstream transport route.
-peri-model/src/anthropic/mod.rs
-peri-model/src/openai_responses/mod.rs
 peri-model/src/transport/http.rs
 
 # Executor hardening: shared file tools, private output storage, and execution evidence.
@@ -101,19 +60,14 @@ mcp-packages/workspace/Cargo.toml
 mcp-packages/workspace/src/filesystem/draft.rs
 mcp-packages/workspace/src/filesystem/edit.rs
 mcp-packages/workspace/src/filesystem/folder.rs
-mcp-packages/workspace/src/filesystem/folder_test.rs
 mcp-packages/workspace/src/filesystem/glob.rs
 mcp-packages/workspace/src/filesystem/glob_patterns.rs
 mcp-packages/workspace/src/filesystem/grep.rs
 mcp-packages/workspace/src/filesystem/grep_args.rs
-mcp-packages/workspace/src/filesystem/grep_format.rs
-mcp-packages/workspace/src/filesystem/grep_guard_test.rs
 mcp-packages/workspace/src/filesystem/mod.rs
 mcp-packages/workspace/src/filesystem/read.rs
 mcp-packages/workspace/src/filesystem/transaction.rs
 mcp-packages/workspace/src/filesystem/write.rs
-mcp-packages/workspace/src/terminal.rs
-mcp-packages/workspace/src/workspace.rs
 peri-acp-types/src/messages/message_test.rs
 peri-acp-types/src/tools.rs
 peri-acp-types/src/tools_test.rs
@@ -123,8 +77,52 @@ peri-agent/src/agent/stages/act_test.rs
 peri-agent/src/agent/stages/micro_exposure_test.rs
 peri-agent/src/agent/stages/micro_turn_exposure_test.rs
 peri-middlewares/src/mcp/tool_execution.rs
-peri-middlewares/src/subagent/tool/define.rs
 
 # Peri 9d27a634：拆分超长测试与 SQLite 接线，保留上游测试及原子更新。
-peri-middlewares/src/mcp/skill_discovery_test.rs
-peri-resources/src/sessions/sqlite_store/session_data/lifecycle.rs
+
+# Manual a2c01499 sync: relocated Cloud interfaces, shared file tools and lexical source splits.
+mcp-packages/workspace/src/terminal/bash_tool.rs
+mcp-packages/workspace/src/workspace/workspace_mcp_server.rs
+peri-acp-types/src/history_page.rs
+peri-acp-types/src/history_v2_test.rs
+peri-acp-types/src/session/turn_id.rs
+peri-acp-types/src/workflow.rs
+peri-agent/src/agent/agent_model_bridge.rs
+peri-agent/src/agent/async_tasks/registry/background_task_registry.rs
+peri-agent/src/agent/compact_v2/full/full_compact.rs
+peri-agent/src/context_archive_reader.rs
+peri-agent/src/session/subagent/resume_dispatch_test.rs
+peri-agent/src/session/transcript/message_transcript.rs
+peri-agent/src/session/turn_context.rs
+peri-agent/src/session/user_input_mailbox_control_test.rs
+peri-agent/src/session/user_input_mailbox_test.rs
+peri-middlewares/prompts/sections/01_intro.md
+peri-middlewares/prompts/sections/03_doing_tasks.md
+peri-middlewares/prompts/sections/05_using_tools.md
+peri-middlewares/prompts/sections/07_runtime.md
+peri-middlewares/prompts/sections/11_subagent.md
+peri-middlewares/prompts/sections/13_skills.md
+peri-middlewares/src/mcp/builtin/router.rs
+peri-middlewares/src/mcp/client/mcp_client_pool.rs
+peri-middlewares/src/mcp/session_invocation/session_invocation_service.rs
+peri-middlewares/src/mcp/session_invocation_test.rs
+peri-middlewares/src/mcp/tool_bridge.rs
+peri-middlewares/src/mcp/upstream_proxy_wire_test.rs
+peri-model/src/anthropic/mod_test.rs
+peri-model/src/openai_compatible/open_ai_model.rs
+peri-workflow/src/journal_test.rs
+peri-workflow/src/progress_test.rs
+peri-workflow/src/runner_test.rs
+peri-workflow/src/runtime/tasks.rs
+peri-workflow/src/runtime/tasks_test.rs
+peri-workflow/src/runtime_test.rs
+
+# Regression for the relocated Cloud summary-only entry.
+peri-agent/src/agent/compact_v2/full_test.rs
+
+# Windows once-hook fixture allows concurrent observation of its output.
+peri-middlewares/src/assembly_once_scope_test.rs
+
+# Shared scanner cancellation-token regression wiring.
+mcp-packages/workspace/src/filesystem/folder_test.rs
+mcp-packages/workspace/src/filesystem/grep_guard_test.rs

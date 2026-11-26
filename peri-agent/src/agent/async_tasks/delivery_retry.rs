@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use super::BackgroundTaskRegistry;
+use crate::agent::async_tasks::registry::BackgroundTaskRegistry;
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -33,7 +33,14 @@ impl BackgroundTaskRegistry {
                 if cancel.is_cancelled() {
                     break;
                 }
-                registry.retry_pending_deliveries();
+                // 重试复用生产者的同步投递桥；等待存储提交同样不能占住 worker。
+                let retry_registry = Arc::clone(&registry);
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || retry_registry.retry_pending_deliveries())
+                        .await
+                {
+                    tracing::warn!(%error, "pending task delivery retry task failed");
+                }
                 let mut running = registry.delivery_worker_running.lock();
                 if registry.pending_deliveries.lock().is_empty()
                     && registry.settlements_in_flight.load(Ordering::SeqCst) == 0

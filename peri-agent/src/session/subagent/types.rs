@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
 use peri_acp_types::identity::AgentId;
@@ -97,7 +98,7 @@ pub enum ChildHandoffReason {
 /// 子 Agent 模型来源（H1）：ACP 模型工厂只负责模型解析与创建。
 ///
 /// `AgentModelBridge` 的统一装配点在有子链可用的 Agent 层 session factory
-/// （[`build_subagent_session_v2`](super::factory::context)）——身份 system 与
+/// （`build_subagent_session_v2`）——身份 system 与
 /// 请求时 `collect_prompt_contributions()` provider 在那里一次装上，定义型 /
 /// fork、前台 / 后台、live resume 与冷恢复共用，不再由工厂预先封装 bridge。
 ///
@@ -112,6 +113,7 @@ pub struct SubagentLlmSource {
 impl SubagentLlmSource {
     /// 生产构造：只做模型解析结果投影；`model_name` 由工厂从解析出的 provider
     /// 提供（`peri_model::Model` 无名称接口），供持久化 metadata 与恢复核对。
+    #[must_use]
     pub fn model(model: Arc<dyn peri_model::Model>, model_name: impl Into<String>) -> Self {
         Self {
             model,
@@ -120,11 +122,13 @@ impl SubagentLlmSource {
         }
     }
 
+    #[must_use]
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
         self
     }
 
+    #[must_use]
     pub fn model_name(&self) -> &str {
         &self.model_name
     }
@@ -134,6 +138,7 @@ impl SubagentLlmSource {
     ///
     /// 这**不是**子 Agent 装配旁路：子链一律经 [`Self::into_react_llm`] 装身份与
     /// provider；本入口仅服务 hook 的独立 LLM 消费者。
+    #[must_use]
     pub fn into_plain_bridge(self) -> Box<dyn ReactLLM + Send + Sync> {
         let mut bridge = crate::agent::model_bridge::AgentModelBridge::new(self.model);
         if let Some(session_id) = self.session_id {
@@ -151,7 +156,7 @@ impl SubagentLlmSource {
         environment_prompt: Option<Arc<str>>,
         legacy_embedded_instructions: bool,
         provider: crate::agent::model_bridge::SystemContributionProvider,
-        normalize_persisted_identity: bool,
+        persisted_identity: Option<crate::messages::MessageId>,
     ) -> Box<dyn ReactLLM + Send + Sync> {
         let mut bridge = crate::agent::model_bridge::AgentModelBridge::new(self.model)
             .with_external_instructions(external_instructions)
@@ -162,27 +167,25 @@ impl SubagentLlmSource {
             bridge = bridge.with_session_id(session_id);
         }
         if !identity_system.trim().is_empty() {
-            bridge = bridge
-                .with_system(identity_system)
-                .with_absorbed_system_message(normalize_persisted_identity);
+            bridge = bridge.with_system(identity_system);
         }
-        Box::new(bridge)
+        Box::new(bridge.with_absorbed_system_message(persisted_identity))
     }
 }
 
 /// Fork 指令类型，决定 fork agent 使用的 system directive 模板
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkDirectiveKind {
-    /// 使用 [`build_fork_directive`]（英文，Agent 工具路径）
+    /// 使用 [`build_fork_directive`](crate::session::subagent::build_fork_directive)（英文，Agent 工具路径）
     Fork,
-    /// 使用 [`build_bg_fork_directive`]（中文，/bg 命令路径）
+    /// 使用 [`build_bg_fork_directive`](crate::session::subagent::build_bg_fork_directive)（中文，/bg 命令路径）
     Bg,
 }
 
 /// subagent 取消策略（与 ThreadMeta.cancel_policy 强类型对齐）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentCancelPolicy {
-    /// Parent cancel → child cancel（同步 fork / 同步 agent 定义）
+    /// Parent cancel → child cancel（历史线程记录保留；新建后台委派默认 Independent）
     Cascade,
     /// 仅 session 级 cancel_all_agents 可停止（后台）
     Independent,
@@ -197,13 +200,6 @@ impl SubagentCancelPolicy {
     }
 }
 
-/// 运行模式：同步（当前 turn 内跑完）或后台（tokio::spawn + TaskManager 注册）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubagentRunMode {
-    Sync,
-    Background,
-}
-
 /// 子 agent 生命周期 hook 触发闭包（middlewares 构造，内部触发 RegisteredHook）。
 ///
 /// 参数：(child_thread_id, agent_name, cwd)。`child_thread_id` 是子会话的真实
@@ -215,8 +211,8 @@ pub type SubagentLifecycleStop = Arc<dyn Fn(&str, &str, &str, &str, bool) + Send
 
 // ─── 子链装配（依赖反转，ARC-MIDDLEWARE-001） ───────────────────────────────
 
-/// 子 agent 链装配上下文：frozen 数据由 [`spawn_subagent`] 从父 session copy 后注入。
-#[derive(Debug, Clone, Default)]
+/// 子 agent 链装配上下文：frozen 数据由 [`spawn_subagent`](crate::session::subagent::SessionFactory::spawn_subagent) 从父 session copy 后注入。
+#[derive(Clone, Default)]
 pub struct SubagentChainContext {
     /// 工作目录（解析 skill 文件路径）
     pub cwd: String,
@@ -231,16 +227,63 @@ pub struct SubagentChainContext {
     /// 装配期关闭的 middleware 名集合（父会话冻结状态投影；
     /// 子链独立装配，必须同样过滤——设计 §2.5）。
     pub meta_harness_disabled: HashSet<String>,
+    /// 父会话的共享权限模式（含外部 MCP 审批范围）。
+    ///
+    /// 子链不继承全量 HITL，但声明的审批范围是**会话事实**：父会话声明了
+    /// 范围时，子 agent 的外部 MCP 调用同样必须进入审批，否则委派就是绕过。
+    /// `None`/空范围时子链行为与基线一致。
+    pub permission_mode: Option<Arc<peri_acp_types::permission::SharedPermissionMode>>,
+    /// 父会话的交互 broker；与 [`Self::permission_mode`] 一起构成子链审批通道。
+    pub interaction_broker: Option<Arc<dyn peri_acp_types::interaction::UserInteractionBroker>>,
+}
+
+impl std::fmt::Debug for SubagentChainContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SubagentChainContext")
+            .field("cwd", &self.cwd)
+            .field("skill_names", &self.skill_names)
+            .field("frozen_claude_md_present", &self.frozen_claude_md.is_some())
+            .field(
+                "frozen_claude_local_md_present",
+                &self.frozen_claude_local_md.is_some(),
+            )
+            .field(
+                "frozen_skill_summary_present",
+                &self.frozen_skill_summary.is_some(),
+            )
+            .field("meta_harness_disabled", &self.meta_harness_disabled)
+            .field("permission_mode_present", &self.permission_mode.is_some())
+            .field(
+                "interaction_broker_present",
+                &self.interaction_broker.is_some(),
+            )
+            .finish()
+    }
 }
 
 /// 子 agent 中间件链装配器：由中间件层提供实现。
 ///
-/// 链序（AgentsMd→Skills→[SkillPreload]→Todo→[ToolSearch]）是行为契约，实现方必须保持
+/// 链序（AgentsMd→Skills→\[SkillPreload\]→Todo→\[ToolSearch\]）是行为契约，实现方必须保持
 /// `peri-middlewares/src/subagent/tool/mod.rs` 的 `build_subagent_middlewares`
 /// 顺序（ARC-MIDDLEWARE-001）。
 pub trait SubagentChainAssembler: Send + Sync {
+    #[must_use]
     fn assemble(&self, ctx: &SubagentChainContext) -> MiddlewareChain;
 
+    /// Apply runtime restrictions to the historical identity without changing stored history.
+    fn project_resumed_identity(
+        &self,
+        identity: &str,
+        _cwd: &str,
+        _recorded: Option<peri_acp_types::skills::SkillToolAccess>,
+        _frozen: Option<&peri_acp_types::meta_harness::MetaHarnessState>,
+        tool_filter: crate::session::tool_catalog::ToolFilter,
+    ) -> Result<(String, crate::session::tool_catalog::ToolFilter), String> {
+        Ok((identity.to_owned(), tool_filter))
+    }
+
+    #[must_use]
     fn bind_tools(
         &self,
         _session: &Arc<Session>,
@@ -259,8 +302,8 @@ pub trait SubagentChainAssembler: Send + Sync {
 #[derive(Clone, Default)]
 #[allow(clippy::type_complexity)]
 pub struct SubagentHost {
-    pub close_state: Arc<super::close::SubagentCloseState>,
-    pub child_owner: Option<Arc<super::ParkedChildOwner>>,
+    pub close_state: Arc<crate::session::subagent::close::SubagentCloseState>,
+    pub child_owner: Option<Arc<crate::session::subagent::resource_owner::ParkedChildOwner>>,
     pub mcp_pool: Option<Arc<dyn peri_acp_types::ports::McpPoolPort>>,
     /// 会话资源门面（生产路径非 None；None 仅测试/遗留路径，跳过落库）
     pub session_resources: Option<Arc<dyn SessionResources>>,
@@ -280,7 +323,7 @@ pub struct SubagentHost {
     pub langfuse_bridge: Option<Arc<dyn LangfuseBridgeLike>>,
     /// Frozen CLAUDE.local.md（父 session 冻结数据中唯一不在 FrozenContext 的字段）
     pub frozen_claude_local_md: Option<Arc<String>>,
-    /// 父线程 ID 回退值：被 [`parent_thread_id_of`] 在 spawn 写盘读取
+    /// 父线程 ID 回退值：被 `parent_thread_id_of` 在 spawn 写盘读取
     /// （主 session `store().thread_id` 恒 None 时是本链的权威值，由 executor
     /// 以 `ctx.thread_id` 注入；生产路径为 spawn_subagent 从 parent session
     /// 读取的同一回退源）
@@ -295,7 +338,7 @@ pub struct SubagentHost {
 
 // ─── spawn 配置与产物 ────────────────────────────────────────────────────────
 
-/// 子 agent 创建意图 + 装配产物 + 运行时通道（统一入口 [`spawn_subagent`] 的输入）。
+/// 子 agent 创建意图 + 装配产物 + 运行时通道（统一入口 [`spawn_subagent`](crate::session::subagent::SessionFactory::spawn_subagent) 的输入）。
 ///
 /// 父侧数据（cwd / parent_thread_id / frozen claude_md / skill_summary / date /
 /// cascade cancel token）在 `parent` 存在时从 parent Session 读取，config 中
@@ -315,8 +358,6 @@ pub struct SubagentSpawnConfig {
     pub max_iterations: usize,
     /// fork directive 模板（None = 不包装，直接 push prompt——agent 定义路径）
     pub fork_directive_kind: Option<ForkDirectiveKind>,
-    /// 运行模式
-    pub run_mode: SubagentRunMode,
     /// agent 定义声明的 skills（SkillPreload 装配输入）
     pub skill_names: Vec<String>,
     // ── 装配产物 ──
@@ -346,7 +387,7 @@ pub struct SubagentSpawnConfig {
     // ── 运行时通道 ──
     /// 会话资源门面（None = 不落库，仅测试/遗留路径）
     pub session_resources: Option<Arc<dyn SessionResources>>,
-    /// 父 agent 事件 handler（同步路径事件转发 / 重试事件追踪）
+    /// 父 agent 事件 handler（事件转发 / 重试事件追踪）
     pub event_handler: Option<Arc<dyn AgentEventHandler>>,
     /// bg 任务完成事件发送通道（bg pump）
     pub bg_event_sender: Option<tokio::sync::mpsc::UnboundedSender<ExecutorEvent>>,
@@ -393,62 +434,12 @@ pub struct SubagentSpawnConfig {
 pub struct SubagentSpawned {
     /// 子线程 ID（= 子 session thread_id = 身份键来源）
     pub child_thread_id: String,
-    /// 后台任务或已移交同步执行的 ID（bg-/sync-{uuid v7}）
-    pub task_id: Option<String>,
+    /// 后台任务 ID（`bg-{uuid v7}`）；运行期查询/取消用，不是线程身份
+    pub task_id: String,
     /// 子 session（调用方读取 transcript）
     pub session: Arc<Session>,
-    /// 生成的 cancel token（Background 注册 / 返回消息使用）
+    /// 生成的 cancel token（Background 注册使用）
     pub cancel_token: CancellationToken,
-    /// 是否被中断（Sync 模式；Background 模式恒 false）
-    pub interrupted: bool,
-    /// 同步子 Agent 的运行中任务，移交给当前进程的子会话 worker 后才填写。
-    pub pending_tasks: Vec<String>,
-    /// 本次执行冻结的交接记录；Some 表示委派未完成且资源已有 owner。
-    pub handoff: Option<ChildHandoffReceipt>,
-}
-
-impl SubagentSpawned {
-    pub fn pending_message(&self) -> Option<String> {
-        if let Some(receipt) = &self.handoff {
-            let task_id = self
-                .task_id
-                .as_deref()
-                .unwrap_or("none (handoff committed before sync task registration)");
-            let pending = if receipt.tasks.is_empty() {
-                "none (retained queue messages are recorded in the handoff reminder)".to_string()
-            } else {
-                receipt
-                    .tasks
-                    .iter()
-                    .map(|task| task.task_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let produced = super::util::extract_last_ai_text(&self.session);
-            return Some(format!(
-                "child_thread_id: {}\nstatus: incomplete\ntask_id: {}\nPending tasks: {}\nResource owner: {}\n\
-                 This sub-agent's current run has ended; the delegation is incomplete. Background work \
-                 exceeded the settlement window and remains owned by the child session. Shell tasks keep \
-                 their real state and are not cancelled automatically. Late results stay in the child queue \
-                 and do not resume the old run. Query/cancel the tasks or explicitly resume with \
-                 Agent(resume_thread_id: {}, prompt: ...).\nProduced output:\n{}\n\
-                 The output above is from this run and does not mean the pending tasks completed.",
-                self.child_thread_id, task_id, pending, receipt.owner_session_id,
-                self.child_thread_id, produced
-            ));
-        }
-        (!self.pending_tasks.is_empty()).then(|| {
-            format!(
-                "child_thread_id: {}\nstatus: incomplete\ntask_id: {}\nPending tasks: {}. \
-                 The current run has ended; the delegation is incomplete. Results stay in the child \
-                 queue and do not resume the old run. Explicitly resume with Agent(resume_thread_id: {}).",
-                self.child_thread_id,
-                self.task_id.as_deref().unwrap_or("none"),
-                self.pending_tasks.join(", "),
-                self.child_thread_id
-            )
-        })
-    }
 }
 
 /// Typed failure crossing the Agent-owned subagent boundary.
@@ -459,19 +450,16 @@ pub struct SubagentFailure {
     error: crate::error::AgentError,
     execution_finished: bool,
     reason: SubagentFailureReason,
-    handoff: Option<ChildHandoffReceipt>,
-    handoff_failure: Option<String>,
-    handoff_flush_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentFailureReason {
     ExecutionFailed,
     ChildTasksHandedOff,
-    HandoffUnconfirmed,
 }
 
 impl SubagentFailure {
+    #[must_use]
     pub fn new(
         child_thread_id: impl Into<String>,
         agent_name: impl Into<String>,
@@ -483,13 +471,11 @@ impl SubagentFailure {
             error,
             execution_finished: false,
             reason: SubagentFailureReason::ExecutionFailed,
-            handoff: None,
-            handoff_failure: None,
-            handoff_flush_failure: None,
         }
     }
 
     /// 计算已结束但委派未完成；父结果必须 success=false 且保留待处理引用。
+    #[must_use]
     pub fn handed_off(
         child_thread_id: impl Into<String>,
         agent_name: impl Into<String>,
@@ -515,83 +501,29 @@ impl SubagentFailure {
             agent_name: agent_name.into(),
             execution_finished: true,
             reason: SubagentFailureReason::ChildTasksHandedOff,
-            handoff: Some(receipt),
-            handoff_failure: None,
-            handoff_flush_failure: None,
         }
     }
 
+    #[must_use]
     pub fn reason(&self) -> SubagentFailureReason {
         self.reason
-    }
-
-    /// 失败同时保留已提交的交接记录；父结果仍以原错误为主。
-    pub fn failed_with_handoff(
-        child_thread_id: impl Into<String>,
-        agent_name: impl Into<String>,
-        error: crate::error::AgentError,
-        receipt: ChildHandoffReceipt,
-    ) -> Self {
-        let mut failure = Self::new(child_thread_id, agent_name, error);
-        failure.execution_finished = true;
-        failure.handoff = Some(receipt);
-        failure
-    }
-
-    pub fn handoff(&self) -> Option<&ChildHandoffReceipt> {
-        self.handoff.as_ref()
-    }
-
-    pub fn handoff_failure(&self) -> Option<&str> {
-        self.handoff_failure.as_deref()
-    }
-
-    pub fn handoff_flush_failure(&self) -> Option<&str> {
-        self.handoff_flush_failure.as_deref()
-    }
-
-    /// 执行（可选）失败且交接写入未确认：原错误与提交失败同时可见。
-    pub fn handoff_failed(
-        child_thread_id: impl Into<String>,
-        agent_name: impl Into<String>,
-        cause: Option<crate::error::AgentError>,
-        failure: &ChildHandoffFailure,
-    ) -> Self {
-        let has_cause = cause.is_some();
-        let error = cause.unwrap_or_else(|| handoff_failure_agent_error(failure));
-        let reason = if has_cause {
-            SubagentFailureReason::ExecutionFailed
-        } else {
-            SubagentFailureReason::HandoffUnconfirmed
-        };
-        Self {
-            child_thread_id: child_thread_id.into(),
-            agent_name: agent_name.into(),
-            error,
-            execution_finished: true,
-            reason,
-            handoff: failure.receipt.clone(),
-            handoff_failure: Some(format!(
-                "{}: {}",
-                handoff_failure_label(failure),
-                failure.error
-            )),
-            handoff_flush_failure: failure.flush_error.clone(),
-        }
     }
 
     pub(crate) fn execution_finished(&self) -> bool {
         self.execution_finished
     }
 
+    #[must_use]
     pub fn child_thread_id(&self) -> &str {
         &self.child_thread_id
     }
 
+    #[must_use]
     pub fn agent_name(&self) -> &str {
         &self.agent_name
     }
 
+    #[must_use]
     pub fn error(&self) -> &crate::error::AgentError {
         &self.error
     }
@@ -619,25 +551,18 @@ impl SubagentFailure {
         peri_acp_types::error::SafeSubagentFailure::from_agent_error(child_thread_id, error)
     }
 
+    #[must_use]
     pub fn public_message(&self) -> String {
-        let mut message = self.error.user_facing_message();
-        if let Some(failure) = &self.handoff_failure {
-            message.push_str(&format!("; {failure}"));
-        }
-        if let Some(failure) = &self.handoff_flush_failure {
-            message.push_str(&format!("; handoff history flush failed: {failure}"));
-        }
-        message
+        self.error.user_facing_message()
     }
 }
 
 impl std::fmt::Display for SubagentFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         let message = self.public_message();
         let outcome = match self.reason {
             SubagentFailureReason::ExecutionFailed => "execution failed",
             SubagentFailureReason::ChildTasksHandedOff => "execution incomplete",
-            SubagentFailureReason::HandoffUnconfirmed => "handoff unconfirmed",
         };
         write!(
             formatter,
@@ -655,7 +580,7 @@ impl std::error::Error for SubagentFailure {
 
 // ─── resume 配置（统一恢复入口 [`resume_subagent`] 的输入） ─────────────────
 
-/// 子 agent 恢复意图 + 装配产物 + 运行时通道（[`SessionFactory::resume_subagent`] 的输入）。
+/// 子 agent 恢复意图 + 装配产物 + 运行时通道（[`SessionFactory::resume_subagent`](crate::session::subagent::SessionFactory::resume_subagent) 的输入）。
 ///
 /// 与 [`SubagentSpawnConfig`] 的字段差异（恢复语义禁止项，不提供）：
 /// - 无 `parent_messages` / `system_prompt` / `fork_directive_kind`（F4：已在旧
@@ -675,8 +600,6 @@ pub struct SubagentResumeConfig {
     pub prompt: Option<String>,
     /// 子 agent 名（None 时从 meta.title 取）
     pub agent_name: Option<String>,
-    /// 运行模式（恢复时由本次调用决定，issue 决策 8）
-    pub run_mode: SubagentRunMode,
     /// 最大 ReAct 迭代次数
     pub max_iterations: usize,
     // ── 装配产物 ──
@@ -704,7 +627,7 @@ pub struct SubagentResumeConfig {
     /// resume 认领不需要调用方另持所有权：`claim_child_resume` 在 root 的写侧门禁内
     /// 完成「读状态 + 写 active」，调用方只提交领域结果。
     pub session_resources: Arc<dyn SessionResources>,
-    /// 父 agent 事件 handler（同步路径事件转发 / 重试事件追踪）
+    /// 父 agent 事件 handler（事件转发 / 重试事件追踪）
     pub event_handler: Option<Arc<dyn AgentEventHandler>>,
     /// bg 任务完成事件发送通道（bg pump）
     pub bg_event_sender: Option<tokio::sync::mpsc::UnboundedSender<ExecutorEvent>>,
@@ -741,4 +664,180 @@ pub struct SubagentResumeConfig {
     pub frozen_skill_summary: Option<String>,
     /// Frozen 日期 YYYY-MM-DD（回退值）
     pub frozen_date: Option<String>,
+}
+
+impl Debug for SubagentLlmSource {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubagentLlmSource")
+            .field("model_name", &self.model_name)
+            .field("session_id_present", &self.session_id.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Debug for SubagentHost {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubagentHost")
+            .field("child_owner_present", &self.child_owner.is_some())
+            .field("mcp_pool_present", &self.mcp_pool.is_some())
+            .field(
+                "session_resources_present",
+                &self.session_resources.is_some(),
+            )
+            .field("task_manager_present", &self.task_manager.is_some())
+            .field("bg_event_sender_present", &self.bg_event_sender.is_some())
+            .field("on_bg_complete_present", &self.on_bg_complete.is_some())
+            .field(
+                "completion_target_present",
+                &self.completion_target.is_some(),
+            )
+            .field("register_runtime_present", &self.register_runtime.is_some())
+            .field(
+                "deregister_runtime_present",
+                &self.deregister_runtime.is_some(),
+            )
+            .field("langfuse_bridge_present", &self.langfuse_bridge.is_some())
+            .field(
+                "frozen_claude_local_md_present",
+                &self.frozen_claude_local_md.is_some(),
+            )
+            .field("parent_thread_id_present", &self.parent_thread_id.is_some())
+            .field("frozen_claude_md_present", &self.frozen_claude_md.is_some())
+            .field(
+                "frozen_skill_summary_present",
+                &self.frozen_skill_summary.is_some(),
+            )
+            .field(
+                "session_mcp_catalog_present",
+                &self.session_mcp_catalog.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Debug for SubagentSpawnConfig {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubagentSpawnConfig")
+            .field("agent_name", &self.agent_name)
+            .field("prompt", &self.prompt)
+            .field("parent_messages_len", &self.parent_messages.len())
+            .field("max_iterations", &self.max_iterations)
+            .field(
+                "fork_directive_kind_present",
+                &self.fork_directive_kind.is_some(),
+            )
+            .field("skill_names_len", &self.skill_names.len())
+            .field("tools_len", &self.tools.len())
+            .field("system_prompt_present", &self.system_prompt.is_some())
+            .field(
+                "tool_invocation_resolver_present",
+                &self.tool_invocation_resolver.is_some(),
+            )
+            .field("compact_config_present", &self.compact_config.is_some())
+            .field("context_budget_present", &self.context_budget.is_some())
+            .field("compact_llm_present", &self.compact_llm.is_some())
+            .field(
+                "session_resources_present",
+                &self.session_resources.is_some(),
+            )
+            .field("event_handler_present", &self.event_handler.is_some())
+            .field("bg_event_sender_present", &self.bg_event_sender.is_some())
+            .field("task_manager_present", &self.task_manager.is_some())
+            .field("on_bg_complete_present", &self.on_bg_complete.is_some())
+            .field("langfuse_bridge_present", &self.langfuse_bridge.is_some())
+            .field(
+                "on_subagent_start_present",
+                &self.on_subagent_start.is_some(),
+            )
+            .field("on_subagent_stop_present", &self.on_subagent_stop.is_some())
+            .field("register_runtime_present", &self.register_runtime.is_some())
+            .field(
+                "deregister_runtime_present",
+                &self.deregister_runtime.is_some(),
+            )
+            .field("parent_agent_id_present", &self.parent_agent_id.is_some())
+            .field(
+                "parent_tool_call_id_present",
+                &self.parent_tool_call_id.is_some(),
+            )
+            .field("cancel_token_present", &self.cancel_token.is_some())
+            .field("cwd_present", &self.cwd.is_some())
+            .field("parent_thread_id_present", &self.parent_thread_id.is_some())
+            .field("frozen_claude_md_present", &self.frozen_claude_md.is_some())
+            .field(
+                "frozen_claude_local_md_present",
+                &self.frozen_claude_local_md.is_some(),
+            )
+            .field(
+                "frozen_skill_summary_present",
+                &self.frozen_skill_summary.is_some(),
+            )
+            .field("frozen_date_present", &self.frozen_date.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Debug for SubagentSpawned {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubagentSpawned")
+            .field("child_thread_id", &self.child_thread_id)
+            .field("task_id", &self.task_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Debug for SubagentResumeConfig {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubagentResumeConfig")
+            .field("thread_id", &self.thread_id)
+            .field("prompt_present", &self.prompt.is_some())
+            .field("agent_name_present", &self.agent_name.is_some())
+            .field("max_iterations", &self.max_iterations)
+            .field("tools_len", &self.tools.len())
+            .field(
+                "tool_invocation_resolver_present",
+                &self.tool_invocation_resolver.is_some(),
+            )
+            .field("compact_config_present", &self.compact_config.is_some())
+            .field("context_budget_present", &self.context_budget.is_some())
+            .field("compact_llm_present", &self.compact_llm.is_some())
+            .field("event_handler_present", &self.event_handler.is_some())
+            .field("bg_event_sender_present", &self.bg_event_sender.is_some())
+            .field("task_manager_present", &self.task_manager.is_some())
+            .field("on_bg_complete_present", &self.on_bg_complete.is_some())
+            .field("langfuse_bridge_present", &self.langfuse_bridge.is_some())
+            .field(
+                "on_subagent_start_present",
+                &self.on_subagent_start.is_some(),
+            )
+            .field("on_subagent_stop_present", &self.on_subagent_stop.is_some())
+            .field("register_runtime_present", &self.register_runtime.is_some())
+            .field(
+                "deregister_runtime_present",
+                &self.deregister_runtime.is_some(),
+            )
+            .field("parent_agent_id_present", &self.parent_agent_id.is_some())
+            .field(
+                "parent_tool_call_id_present",
+                &self.parent_tool_call_id.is_some(),
+            )
+            .field("cancel_token_present", &self.cancel_token.is_some())
+            .field("cwd_present", &self.cwd.is_some())
+            .field("frozen_claude_md_present", &self.frozen_claude_md.is_some())
+            .field(
+                "frozen_claude_local_md_present",
+                &self.frozen_claude_local_md.is_some(),
+            )
+            .field(
+                "frozen_skill_summary_present",
+                &self.frozen_skill_summary.is_some(),
+            )
+            .field("frozen_date_present", &self.frozen_date.is_some())
+            .finish_non_exhaustive()
+    }
 }

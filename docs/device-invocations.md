@@ -4,7 +4,7 @@
 
 ## 契约
 
-- 主助手的 `Read / Write / Edit / Glob / Grep / Bash` 均要求 `device_id`；原生字段保持展开的类型化 Schema，不再通过 `execute_device(tool, input)` 包装。缺失、非法或未授权设备均拒绝，不回退到当前设备。别名与 ExecuteExtraTool 仍进入同一规范调用路径。
+- 主助手的 `Read / Write / Edit / Glob / Grep / Bash` 均要求 `device_id`；原生字段保持展开的类型化 Schema，不再通过 `execute_device(tool, input)` 包装。缺失、非法或未授权设备均拒绝，不回退到当前设备。别名与 `ToolInvoke`（兼容旧名 `ExecuteExtraTool`）仍进入同一规范调用路径。
 - `workspace` 可选，指定时由目标执行器规范化；省略时在本轮首次受理该设备时固定设备默认工作区。同轮同一请求目标复用原绑定；设备/工作区变化不修改已绑定动作。定时设备任务仍固定原计划的设备和工作区。
 - `list_devices` 返回当前 OAuth 用户可见的设备 ID、名称、平台及默认工作区。登记不代表在线，不返回地址、令牌或 SSH 信息。
 - `prepare_device(device_id, workspace?)` 是可选的环境与项目资料查询，认证执行器并返回有界环境、项目指令及主助手工具 Schema；直接执行不需要先调用它。工作区资料保留来源、长度、截断和版本。

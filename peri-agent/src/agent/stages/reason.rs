@@ -3,15 +3,29 @@
 //! 流程：catalog → before_model → 最终压力检查 → snapshot → LlmCallStart →
 //!       LLM.generate_reasoning（与 cancel 竞争）→ LlmCallEnd → after_model
 
-use super::middleware_runner::{
-    run_after_model, run_before_model, run_before_reason_catalog, run_on_error,
-};
-use super::{ReasonInput, ReasonOutput};
 use crate::agent::events_v2::{ObserveEvent, TurnErrorReason};
 use crate::agent::react::{Reasoning, StreamingContext};
+
+use crate::agent::stages::ReasonInput;
+use crate::agent::stages::ReasonOutput;
 use crate::error::{AgentError, AgentResult};
 
+use crate::messages::MessageId;
+use std::ops::ControlFlow;
+
 pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
+    // Standalone stage callers own their input snapshot. The RCRA runner can also
+    // return to Receive before committing to a model request.
+    match run_reason_with_admission(input, None).await? {
+        ControlFlow::Continue(output) => Ok(output),
+        ControlFlow::Break(_) => unreachable!("standalone Reason does not defer to Receive"),
+    }
+}
+
+pub(super) async fn run_reason_with_admission(
+    input: ReasonInput,
+    missing: Option<&[MessageId]>,
+) -> AgentResult<ControlFlow<Vec<MessageId>, ReasonOutput>> {
     let ctx = &input.context;
     let step = ctx.session.turn.current_step();
     let turn_id = ctx.turn_id();
@@ -24,7 +38,7 @@ pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
     let _view_release = ctx.model_view.release_guard();
 
     // 固定准备阶段之前的视图；Full reset/Micro 缩减本身不应触发第二次评估。
-    super::compact::context_pressure::refresh(ctx)?;
+    crate::agent::stages::compact::context_pressure::refresh(ctx)?;
 
     // hooks 前的 canonical 修订：准备阶段新增历史是驻留预算补检的独立证据，
     // 不要求投影 token 增长（例如低 token 但大正文）。
@@ -39,10 +53,10 @@ pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
         }
     };
     *ctx.runtime.tools.write() = refreshed.tool_map();
-    run_before_reason_catalog(ctx).await?;
+    crate::agent::stages::middleware_runner::run_before_reason_catalog(ctx).await?;
 
     // before_model middleware（goal_middleware / compact_middleware 等在此注入）
-    run_before_model(ctx).await?;
+    crate::agent::stages::middleware_runner::run_before_model(ctx).await?;
     let catalog = {
         let working = ctx.runtime.tools.read();
         ctx.runtime
@@ -53,11 +67,11 @@ pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
 
     // Validate restored recovery dependencies against the final permission-filtered catalog,
     // even below the Micro trigger. Never replay canonical bodies to bypass a removed tool.
-    super::archive_capability::validate(ctx, &catalog).await?;
+    crate::agent::stages::archive_capability::validate(ctx, &catalog).await?;
 
     // before_model 和动态工具发布在常规 Compact 之后。只有准备阶段确实新增
     // 压力且达到 Full 阈值时补检一次；不重复运行模型/compact hooks。
-    let prepared_input_grew = super::compact::context_pressure::refresh(ctx)?;
+    let prepared_input_grew = crate::agent::stages::compact::context_pressure::refresh(ctx)?;
     let canonical_changed =
         ctx.session.transcript.read().view_revision() != canonical_revision_before_hooks;
     let resident_exceeded = ctx
@@ -74,8 +88,12 @@ pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
                 .iter()
                 .map(|item| item.delivery_id)
                 .collect();
-            super::compact::resident_gate(ctx, config.max_resident_history_bytes, &protected_ids)
-                .is_exceeded()
+            crate::agent::stages::compact::resident_gate(
+                ctx,
+                config.max_resident_history_bytes,
+                &protected_ids,
+            )
+            .is_exceeded()
         });
     let needs_compact = (prepared_input_grew
         && ctx
@@ -97,7 +115,7 @@ pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
             }))
         || (canonical_changed && resident_exceeded);
     if needs_compact {
-        super::compact::run_compact_core(super::CompactInput {
+        crate::agent::stages::compact::run_compact_core(crate::agent::stages::CompactInput {
             context: ctx.clone(),
             has_tool_calls: input.has_tool_calls,
         })
@@ -119,7 +137,11 @@ pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
             .model_view
             .view_with_protected(&guard, &capabilities, &protected);
         ctx.model_view.release();
-        (view?, protected)
+        let view = view?;
+        // 目录只在 pin_working_tools 之后才最终确定；硬记忆里的可执行入口按这份
+        // 目录重算，过期工具名不得进入真实请求。
+        let view = refresh_request_recovery(view, ctx, &guard, &catalog);
+        (view, protected)
     };
     // receipt 只绑定最终请求里实际存在的受保护消息：投影或配对修复若丢弃了某条，
     // 它就没有被本次响应消费，不能进入 included_ids。
@@ -129,12 +151,6 @@ pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
         .map(|item| item.delivery_id)
         .filter(|id| messages_snapshot.iter().any(|message| message.id() == *id))
         .collect();
-    let receipt = ctx.session.async_result_mailbox.capture_request(
-        format!("{}:{step}", ctx.session.turn.execution_binding().attempt_id),
-        format!("{turn_id}:{step}"),
-        &included,
-    );
-
     let exposure = crate::agent::compact_v2::exposure::RequestExposure::capture(
         &messages_snapshot,
         &ctx.session.transcript.read(),
@@ -168,25 +184,9 @@ pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
         "Reason 阶段：准备调用 LLM"
     );
 
-    // emit LlmCallStart（携带 messages + tools 快照，对齐 v1 Langfuse Generation input）
-    // messages 为 Arc 浅拷贝，与下方 LLM 调用共享同一份快照
-    let start_tools: Vec<crate::tools::ToolDefinition> =
-        tool_refs.iter().map(|t| t.definition()).collect();
-    ctx.runtime
-        .event_bus
-        .emit_observe(ObserveEvent::LlmCallStart {
-            turn_id,
-            agent_id,
-            step,
-            messages: messages_snapshot.clone(),
-            tools: start_tools,
-        });
-
     // 构造 StreamingContext：LLM 适配器（AgentModelBridge）在流式解析过程中
     // 直接 emit v2 RenderEvent/ObserveEvent（v1 ExecutorEvent 流式中间态已退役，
     // v1 兼容映射仅保留在 ACP 协议序列化面）。身份（turn_id/agent_id）随上下文注入。
-    let turn_id = ctx.turn_id();
-    let agent_id = ctx.session.agent_id;
     let streaming = Some(StreamingContext {
         event_bus: std::sync::Arc::clone(&ctx.runtime.event_bus),
         turn_id,
@@ -207,7 +207,7 @@ pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
     let (new_visible_work, last_entry) = {
         let transcript = ctx.session.transcript.read();
         (
-            super::compact_progress::CompactBudgetRecovery::has_new_work_after(
+            crate::agent::stages::compact_progress::CompactBudgetRecovery::has_new_work_after(
                 watermark,
                 &transcript,
                 true,
@@ -215,6 +215,39 @@ pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
             transcript.entries().last().map(|entry| entry.id()),
         )
     };
+    let start_tools: Vec<crate::tools::ToolDefinition> =
+        tool_refs.iter().map(|t| t.definition()).collect();
+    // All asynchronous request preparation has finished. Admit the snapshot
+    // before creating receipts or emitting a start event for an actual call.
+    let steer_gate = if let Some(mailbox) = &ctx.session.user_input_mailbox {
+        match mailbox.admit_model_request(
+            input.has_tool_calls && missing.is_some(),
+            missing.unwrap_or_default(),
+        ) {
+            Ok(guard) => Some(guard),
+            Err(ids) => return Ok(ControlFlow::Break(ids)),
+        }
+    } else {
+        None
+    };
+    let receipt = ctx.session.async_result_mailbox.capture_request(
+        format!("{}:{step}", ctx.session.turn.execution_binding().attempt_id),
+        format!("{turn_id}:{step}"),
+        &included,
+    );
+
+    // emit LlmCallStart（携带 messages + tools 快照，对齐 v1 Langfuse Generation input）
+    // messages 为 Arc 浅拷贝，与下方 LLM 调用共享同一份快照
+    ctx.runtime
+        .event_bus
+        .emit_observe(ObserveEvent::LlmCallStart {
+            turn_id,
+            agent_id,
+            step,
+            messages: messages_snapshot.clone(),
+            tools: start_tools,
+        });
+
     let budget_probe = ctx
         .compact
         .budget_recovery
@@ -225,58 +258,60 @@ pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
     // 使用 generate_reasoning_with_observed_body：观测体复用本次调用已构建的
     // request（消除每轮 request 双构建），LlmRequestPayload 在成功后、LlmCallEnd
     // 之前 emit——Langfuse 按 step 缓存 raw_body，时序兼容（on_llm_end 前到达即可）。
-    let (reasoning, observed_body): (Reasoning, Option<serde_json::Value>) = tokio::select! {
+    let model_result = tokio::select! {
         biased;
         _ = ctx.session.turn.cancel_token.cancelled() => {
             return Err(AgentError::Interrupted);
         }
-        result = ctx.runtime.llm.generate_reasoning_with_observed_body(&messages_snapshot, &tool_refs, streaming) => {
-            match result {
-                Ok((r, body)) => (r, body),
-                Err(e) => {
-                    tracing::error!(
-                        step,
-                        model = %ctx.runtime.llm.model_name(),
-                        error = %e,
-                        "LLM generate_reasoning 失败"
-                    );
-                    // LLM 报错时 emit LlmCallEnd，让消费者可见
-                    ctx.runtime.event_bus.emit_observe(ObserveEvent::LlmCallEnd {
-                        turn_id,
-                        agent_id,
-                        step,
-                        model: ctx.runtime.llm.model_name(),
-                        output: format!("ERROR: {}", e),
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cache_creation_input_tokens: None,
-                        cache_read_input_tokens: None,
-                        request_id: None,
-                    });
-                    // TurnError：通知 TUI 显示错误 SystemNote（v2_bridge → AgentExecutionFailed → 红色消息）
-                    // S1.3：LLM 内部自报 cancel（model_bridge.rs is_cancelled → Err(Interrupted)，
-                    // 外层 biased select 的 cancel 分支未必抢先，微竞态可达）必须映射为
-                    // Interrupted，不能吞成 LlmFailure（遥测分类错误）。
-                    let reason = match &e {
-                        AgentError::LlmHttpError { .. }
-                        | AgentError::LlmError(..)
-                        | AgentError::ModelError(..) => {
-                            TurnErrorReason::LlmFailure
-                        }
-                        AgentError::Interrupted => TurnErrorReason::Interrupted,
-                        _ => TurnErrorReason::LlmFailure,
-                    };
-                    ctx.runtime.event_bus.emit_observe(ObserveEvent::TurnError {
-                        turn_id,
-                        agent_id,
-                        reason,
-                        message: e.to_string(),
-                    });
-                    // 通过 middleware chain 触发 on_error
-                    let _ = run_on_error(ctx, &e).await;
-                    return Err(e);
-                }
-            }
+        result = ctx.runtime.llm.generate_reasoning_with_observed_body(&messages_snapshot, &tool_refs, streaming) => result,
+    };
+    // select 返回即关闭窗口：错误处理与 payload 处理期间不得再被 steer 取消。
+    drop(steer_gate);
+
+    let (reasoning, observed_body): (Reasoning, Option<serde_json::Value>) = match model_result {
+        Ok((r, body)) => (r, body),
+        Err(e) => {
+            tracing::error!(
+                step,
+                model = %ctx.runtime.llm.model_name(),
+                error = %e,
+                "LLM generate_reasoning 失败"
+            );
+            // LLM 报错时 emit LlmCallEnd，让消费者可见
+            ctx.runtime
+                .event_bus
+                .emit_observe(ObserveEvent::LlmCallEnd {
+                    turn_id,
+                    agent_id,
+                    step,
+                    model: ctx.runtime.llm.model_name(),
+                    output: format!("ERROR: {}", e),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    request_id: None,
+                });
+            // TurnError：通知 TUI 显示错误 SystemNote（v2_bridge → AgentExecutionFailed → 红色消息）
+            // S1.3：LLM 内部自报 cancel（model_bridge.rs is_cancelled → Err(Interrupted)，
+            // 外层 biased select 的 cancel 分支未必抢先，微竞态可达）必须映射为
+            // Interrupted，不能吞成 LlmFailure（遥测分类错误）。
+            let reason = match &e {
+                AgentError::LlmHttpError { .. }
+                | AgentError::LlmError(..)
+                | AgentError::ModelError(..) => TurnErrorReason::LlmFailure,
+                AgentError::Interrupted => TurnErrorReason::Interrupted,
+                _ => TurnErrorReason::LlmFailure,
+            };
+            ctx.runtime.event_bus.emit_observe(ObserveEvent::TurnError {
+                turn_id,
+                agent_id,
+                reason,
+                message: e.to_string(),
+            });
+            // 通过 middleware chain 触发 on_error
+            let _ = crate::agent::stages::middleware_runner::run_on_error(ctx, &e).await;
+            return Err(e);
         }
     };
 
@@ -379,15 +414,53 @@ pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
     }
 
     // after_model middleware（hook_middleware / git_attribution 等在此）
-    run_after_model(ctx, &reasoning).await?;
+    crate::agent::stages::middleware_runner::run_after_model(ctx, &reasoning).await?;
 
-    Ok(ReasonOutput {
+    Ok(ControlFlow::Continue(ReasonOutput {
         reasoning,
         catalog,
         messages_snapshot,
         receipt,
         exposure,
-    })
+    }))
+}
+
+/// 按当次最终工具目录重算硬记忆的可执行入口。
+///
+/// 只在请求里确实存在硬记忆时读取任务注册表 revision；目录未变时返回原 `Arc`，
+/// 不复制正文，也不改写 canonical transcript。
+fn refresh_request_recovery(
+    view: std::sync::Arc<Vec<crate::messages::BaseMessage>>,
+    ctx: &crate::agent::stages::StageContext,
+    transcript: &crate::session::transcript::MessageTranscript,
+    catalog: &crate::session::tool_catalog::SessionToolCatalogSnapshot,
+) -> std::sync::Arc<Vec<crate::messages::BaseMessage>> {
+    if !crate::agent::compact_v2::has_hard_memory(&view) {
+        return view;
+    }
+    let tools = crate::agent::compact_v2::RecoveryTools::from_catalog(catalog);
+    let scope = ctx.project_session_id();
+    let live_revision = ctx
+        .task_manager
+        .as_ref()
+        .map(|manager| manager.snapshot().revision);
+    let (rebuilt, report) = crate::agent::compact_v2::refresh_recovery_memory(
+        &view,
+        transcript,
+        &tools,
+        scope.as_deref(),
+        live_revision,
+    );
+    let Some(rebuilt) = rebuilt else {
+        return view;
+    };
+    tracing::debug!(
+        rendered = report.rendered,
+        corrected = report.corrected,
+        advanced = report.advanced,
+        "Reason: 已按最终工具目录重算恢复入口"
+    );
+    std::sync::Arc::new(rebuilt)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -395,3 +468,7 @@ pub async fn run_reason(input: ReasonInput) -> AgentResult<ReasonOutput> {
 #[cfg(test)]
 #[path = "reason_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "recovery_request_test.rs"]
+mod recovery_request_tests;

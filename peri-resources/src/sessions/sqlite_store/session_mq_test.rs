@@ -3,6 +3,7 @@
 //! 断言以**可观察事实**为准：重开数据库后的行、历史表与 MQ 表的实际内容、以及两种竞争结果
 //! 的互斥。夹具用真实临时文件而不是 `:memory:`——「提交前后重开」只有落盘才可验证。
 
+use peri_acp_types::store::ThreadStore;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use peri_acp_types::messages::{BaseMessage, MessageId};
 use peri_acp_types::session::{
     MessageKind, MessagePolicy, MessageSource, MqCancelOutcome, MqEnqueueDisposition, MqFilter,
     MqInput, MqReceiveDisposition, MqReceiveItem, MqReceivePurpose, MqReceiveSelection,
-    MqReceiveStatus,
+    MqReceiveStatus, PluginSelection,
 };
 use peri_acp_types::session_resources::{
     RewindBoundary, SessionResourceErrorKind, TerminalSettlementOutcome,
@@ -18,7 +19,8 @@ use peri_acp_types::session_resources::{
 use peri_acp_types::store::PersistedPayload;
 use peri_acp_types::thread::{ThreadId, ThreadMeta};
 
-use super::*;
+use super::{SqliteSessionData, SqliteThreadStore};
+
 use crate::sessions::canonical;
 use crate::sessions::data::SessionDataPort;
 
@@ -34,7 +36,7 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let store = SqliteThreadStore::new(directory.path().join("threads.db"))
+        let store = SqliteThreadStore::try_new(directory.path().join("threads.db"))
             .await
             .unwrap();
         let data = SqliteSessionData::new(Arc::clone(&store.database));
@@ -69,6 +71,7 @@ fn input(id: MessageId, text: &str) -> MqInput {
         payload: PersistedPayload::Message(human(id, text)),
         policy: MessagePolicy::ensure_processing(),
         original_draft: Some(text.to_owned()),
+        plugin_selections: Vec::new(),
     }
 }
 
@@ -135,6 +138,7 @@ async fn enqueue_survives_reopen_with_every_fact() {
         payload: PersistedPayload::Message(human(id, "child done")),
         policy: MessagePolicy::passive(),
         original_draft: Some("draft text".to_owned()),
+        plugin_selections: Vec::new(),
     };
     let outcome = fixture
         .data
@@ -148,7 +152,7 @@ async fn enqueue_survives_reopen_with_every_fact() {
 
     let path = fixture.path();
     fixture.store.close().await;
-    let reopened = SqliteThreadStore::new(&path).await.unwrap();
+    let reopened = SqliteThreadStore::try_new(&path).await.unwrap();
     let data = SqliteSessionData::new(Arc::clone(&reopened.database));
     let entries = data.mq_query(&thread, MqFilter::default()).await.unwrap();
     assert_eq!(entries.len(), 1);
@@ -164,6 +168,35 @@ async fn enqueue_survives_reopen_with_every_fact() {
     assert_eq!(
         peri_acp_types::store::serialize_persisted_payload(&entry.payload).unwrap(),
         peri_acp_types::store::serialize_persisted_payload(&requested.payload).unwrap()
+    );
+    reopened.close().await;
+}
+
+/// 待发用户输入的插件选择随 payload JSON 落盘，重开后仍在（不新增表列）。
+#[tokio::test]
+async fn queued_user_input_keeps_plugin_selections_across_reopen() {
+    let fixture = Fixture::new().await;
+    let thread = fixture.thread("mq selections").await;
+    let mut requested = input(MessageId::new(), "选插件");
+    requested.plugin_selections = vec![
+        PluginSelection::new("alpha"),
+        PluginSelection::new("beta@market"),
+    ];
+    fixture
+        .data
+        .mq_enqueue(&thread, requested.clone())
+        .await
+        .unwrap();
+
+    let path = fixture.path();
+    fixture.store.close().await;
+    let reopened = SqliteThreadStore::try_new(&path).await.unwrap();
+    let data = SqliteSessionData::new(Arc::clone(&reopened.database));
+    let entries = data.mq_query(&thread, MqFilter::default()).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].plugin_selections, requested.plugin_selections,
+        "插件选择必须随行恢复，否则重启后标签与指引都会丢失"
     );
     reopened.close().await;
 }
@@ -378,6 +411,7 @@ async fn control_plane_queries_do_not_decode_mq_payloads() {
                     payload: PersistedPayload::Message(human(id, &body)),
                     policy: MessagePolicy::ensure_processing(),
                     original_draft: None,
+                    plugin_selections: Vec::new(),
                 },
             )
             .await
@@ -572,4 +606,375 @@ async fn cancel_returns_the_row_and_refuses_non_user_input() {
     assert_eq!(mq_count(&fixture, &thread).await, 1, "拒绝不得删行");
 }
 
-include!("session_mq_receive_test.rs");
+/// 取消与 Receive 竞争：串行化下只有一个结果成立，且不会出现「删了待发项却报告已发送」。
+#[tokio::test]
+async fn cancel_and_receive_have_exactly_one_winner() {
+    let fixture = Fixture::new().await;
+    let thread = fixture.thread("mq").await;
+    let id = MessageId::new();
+    let entry = fixture
+        .data
+        .mq_enqueue(&thread, input(id, "race"))
+        .await
+        .unwrap();
+    let (cancelled, received) = tokio::join!(
+        fixture.data.mq_cancel(&thread, id),
+        fixture.data.mq_receive(
+            &thread,
+            selection(&entry.entry, MqReceiveDisposition::Commit)
+        ),
+    );
+    let cancel = cancelled.unwrap();
+    let receive = received.unwrap();
+    let committed = receive.items[0].status == MqReceiveStatus::Committed;
+    let cancelled_now = matches!(cancel, MqCancelOutcome::Cancelled(_));
+    assert!(
+        committed ^ cancelled_now,
+        "只有一个结果成立：cancel={cancel:?} receive={:?}",
+        receive.items[0].status
+    );
+    if committed {
+        assert!(matches!(cancel, MqCancelOutcome::AlreadyHandedOff));
+        assert_eq!(history_len(&fixture, &thread).await, 1);
+    } else {
+        assert_eq!(receive.items[0].status, MqReceiveStatus::Missing);
+        assert_eq!(history_len(&fixture, &thread).await, 0);
+    }
+    assert_eq!(mq_count(&fixture, &thread).await, 0);
+}
+
+/// 历史已有同 ID 不同内容：Conflict 删 MQ 行、绝不写历史（整批仍是提交，但历史不动）。
+#[tokio::test]
+async fn receive_conflict_removes_the_pending_row_without_writing_history() {
+    let fixture = Fixture::new().await;
+    let thread = fixture.thread("mq").await;
+    let id = MessageId::new();
+    let entry = fixture
+        .data
+        .mq_enqueue(&thread, input(id, "pending"))
+        .await
+        .unwrap();
+    let history = PersistedPayload::Message(human(id, "already different"));
+    fixture
+        .data
+        .append_history(&thread, &[history])
+        .await
+        .unwrap();
+
+    let outcome = fixture
+        .data
+        .mq_receive(
+            &thread,
+            selection(&entry.entry, MqReceiveDisposition::Commit),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.items[0].status, MqReceiveStatus::Conflict);
+    assert_eq!(mq_count(&fixture, &thread).await, 0);
+    let (content,): (String,) =
+        sqlx::query_as("SELECT content FROM messages WHERE thread_id = ?1 AND message_id = ?2")
+            .bind(thread.as_str())
+            .bind(id.as_uuid().to_string())
+            .fetch_one(&fixture.store.database.pool)
+            .await
+            .unwrap();
+    assert!(
+        content.contains("already different"),
+        "历史不能被待发内容覆盖: {content}"
+    );
+}
+
+/// 同 ID 同内容已在历史：AlreadyPresent，只删 MQ 行。
+#[tokio::test]
+async fn receive_reports_already_present_for_the_same_content() {
+    let fixture = Fixture::new().await;
+    let thread = fixture.thread("mq").await;
+    let id = MessageId::new();
+    let requested = input(id, "same content");
+    let entry = fixture
+        .data
+        .mq_enqueue(&thread, requested.clone())
+        .await
+        .unwrap();
+    fixture
+        .data
+        .append_history(&thread, &[requested.payload])
+        .await
+        .unwrap();
+    let outcome = fixture
+        .data
+        .mq_receive(
+            &thread,
+            selection(&entry.entry, MqReceiveDisposition::Commit),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.items[0].status, MqReceiveStatus::AlreadyPresent);
+    assert_eq!(history_len(&fixture, &thread).await, 1);
+    assert_eq!(mq_count(&fixture, &thread).await, 0);
+}
+
+/// 选择基于旧快照（水位不符）是 Missing：什么都不写。
+#[tokio::test]
+async fn receive_missing_selection_writes_nothing() {
+    let fixture = Fixture::new().await;
+    let thread = fixture.thread("mq").await;
+    let id = MessageId::new();
+    let entry = fixture
+        .data
+        .mq_enqueue(&thread, input(id, "pending"))
+        .await
+        .unwrap();
+    let mut stale = entry.entry.clone();
+    stale.enqueued_at = "2000-01-01T00:00:00.000000Z".to_owned();
+    let outcome = fixture
+        .data
+        .mq_receive(&thread, selection(&stale, MqReceiveDisposition::Commit))
+        .await
+        .unwrap();
+    assert_eq!(outcome.items[0].status, MqReceiveStatus::Missing);
+    assert_eq!(history_len(&fixture, &thread).await, 0);
+    assert_eq!(
+        mq_count(&fixture, &thread).await,
+        1,
+        "不匹配的行必须原样保留"
+    );
+}
+
+/// 批次内失败必须整批回滚：损坏行让 Receive 失败时，历史与其它 MQ 行都不动。
+#[tokio::test]
+async fn receive_rolls_back_the_whole_batch_on_a_corrupt_row() {
+    let fixture = Fixture::new().await;
+    let thread = fixture.thread("mq").await;
+    let good = fixture
+        .data
+        .mq_enqueue(&thread, input(MessageId::new(), "good"))
+        .await
+        .unwrap();
+    let corrupt = MessageId::new();
+    sqlx::query(
+        "INSERT INTO thread_mq (thread_id, id, enqueued_at, kind, source, policy_json,
+            payload_json, original_draft) VALUES (?1, ?2, ?3, 'prompt', 'user_input', ?4, ?5, NULL)",
+    )
+    .bind(thread.as_str())
+    .bind(corrupt.as_uuid().to_string())
+    .bind("2026-11-01T00:00:00.000000Z")
+    .bind(serde_json::to_string(&MessagePolicy::ensure_processing()).unwrap())
+    .bind("not a persisted payload")
+    .execute(&fixture.store.database.pool)
+    .await
+    .unwrap();
+    let broken = peri_acp_types::session::MqEntry {
+        id: corrupt,
+        enqueued_at: "2026-11-01T00:00:00.000000Z".to_owned(),
+        kind: MessageKind::Prompt,
+        source: MessageSource::UserInput,
+        payload: good.entry.payload.clone(),
+        policy: MessagePolicy::ensure_processing(),
+        original_draft: None,
+        plugin_selections: Vec::new(),
+    };
+    let selection = MqReceiveSelection {
+        items: vec![
+            MqReceiveItem {
+                entry: good.entry.clone(),
+                disposition: MqReceiveDisposition::Commit,
+            },
+            MqReceiveItem {
+                entry: broken,
+                disposition: MqReceiveDisposition::Commit,
+            },
+        ],
+        purpose: MqReceivePurpose::ModelLoop,
+        execution: selection(&good.entry, MqReceiveDisposition::Commit).execution,
+    };
+    let error = fixture
+        .data
+        .mq_receive(&thread, selection)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.kind(), SessionResourceErrorKind::Corrupt { .. }),
+        "{error:?}"
+    );
+    assert_eq!(history_len(&fixture, &thread).await, 0, "前一项也不得写入");
+    assert_eq!(mq_count(&fixture, &thread).await, 2, "两个待发行都原样保留");
+}
+
+/// Suppress 只删 MQ 行，不写历史。
+#[tokio::test]
+async fn receive_suppress_removes_only_the_pending_row() {
+    let fixture = Fixture::new().await;
+    let thread = fixture.thread("mq").await;
+    let entry = fixture
+        .data
+        .mq_enqueue(
+            &thread,
+            MqInput {
+                kind: MessageKind::Info,
+                source: MessageSource::HookStopIntent,
+                original_draft: None,
+                ..input(MessageId::new(), "stale control")
+            },
+        )
+        .await
+        .unwrap();
+    let outcome = fixture
+        .data
+        .mq_receive(
+            &thread,
+            selection(&entry.entry, MqReceiveDisposition::Suppress),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.items[0].status, MqReceiveStatus::Suppressed);
+    assert_eq!(history_len(&fixture, &thread).await, 0);
+    assert_eq!(mq_count(&fixture, &thread).await, 0);
+}
+
+/// 移交同时维护计数与首条用户消息标题。
+#[tokio::test]
+async fn receive_maintains_count_and_derived_title() {
+    let fixture = Fixture::new().await;
+    let thread = fixture.thread("mq").await;
+    let entry = fixture
+        .data
+        .mq_enqueue(&thread, input(MessageId::new(), "derived title"))
+        .await
+        .unwrap();
+    fixture
+        .data
+        .mq_receive(
+            &thread,
+            selection(&entry.entry, MqReceiveDisposition::Commit),
+        )
+        .await
+        .unwrap();
+    let (title, count): (Option<String>, i64) =
+        sqlx::query_as("SELECT title, message_count FROM threads WHERE id = ?1")
+            .bind(thread.as_str())
+            .fetch_one(&fixture.store.database.pool)
+            .await
+            .unwrap();
+    assert_eq!(title.as_deref(), Some("derived title"));
+    assert_eq!(count, 1);
+}
+
+/// 提交前重开：MQ 行在、历史不在；移交后重开：历史在、MQ 不在。
+#[tokio::test]
+async fn reopen_on_both_sides_of_the_receive_commit() {
+    let fixture = Fixture::new().await;
+    let thread = fixture.thread("mq").await;
+    let entry = fixture
+        .data
+        .mq_enqueue(&thread, input(MessageId::new(), "survives"))
+        .await
+        .unwrap();
+    let path = fixture.path();
+    fixture.store.close().await;
+    let reopened = SqliteThreadStore::try_new(&path).await.unwrap();
+    let data = SqliteSessionData::new(Arc::clone(&reopened.database));
+    assert_eq!(
+        data.mq_query(&thread, MqFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "提交前重开：MQ 行还在"
+    );
+    let history: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE thread_id = ?1")
+        .bind(thread.as_str())
+        .fetch_one(&reopened.database.pool)
+        .await
+        .unwrap();
+    assert_eq!(history, 0, "提交前重开：历史不存在");
+
+    let received = data
+        .mq_receive(
+            &thread,
+            selection(&entry.entry, MqReceiveDisposition::Commit),
+        )
+        .await
+        .unwrap();
+    assert_eq!(received.items[0].status, MqReceiveStatus::Committed);
+    reopened.close().await;
+    let third = SqliteThreadStore::try_new(&path).await.unwrap();
+    let data = SqliteSessionData::new(Arc::clone(&third.database));
+    assert!(data
+        .mq_query(&thread, MqFilter::default())
+        .await
+        .unwrap()
+        .is_empty());
+    let history: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE thread_id = ?1")
+        .bind(thread.as_str())
+        .fetch_one(&third.database.pool)
+        .await
+        .unwrap();
+    assert_eq!(history, 1);
+    third.close().await;
+}
+
+/// rewind 与 mq_clear 都清理该 thread 的待发行，且不碰历史保留前缀。
+#[tokio::test]
+async fn rewind_and_clear_drop_pending_rows() {
+    let fixture = Fixture::new().await;
+    let thread = fixture.thread("mq").await;
+    let first = fixture
+        .data
+        .mq_enqueue(&thread, input(MessageId::new(), "first"))
+        .await
+        .unwrap();
+    fixture
+        .data
+        .mq_receive(
+            &thread,
+            selection(&first.entry, MqReceiveDisposition::Commit),
+        )
+        .await
+        .unwrap();
+    fixture
+        .data
+        .mq_enqueue(&thread, input(MessageId::new(), "pending"))
+        .await
+        .unwrap();
+    let outcome = fixture
+        .data
+        .rewind_history(&thread, RewindBoundary::KeepThrough(first.entry.id), &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        peri_acp_types::session_resources::RewindOutcome::Applied
+    );
+    assert_eq!(mq_count(&fixture, &thread).await, 0, "rewind 清空待发行");
+    assert_eq!(history_len(&fixture, &thread).await, 1, "保留前缀不动");
+
+    fixture
+        .data
+        .mq_enqueue(&thread, input(MessageId::new(), "again"))
+        .await
+        .unwrap();
+    fixture.data.mq_clear(&thread).await.unwrap();
+    assert_eq!(mq_count(&fixture, &thread).await, 0);
+}
+
+/// thread 删除清理 MQ（显式删除，不依赖级联）。
+#[tokio::test]
+async fn deleting_the_thread_drops_pending_rows() {
+    let fixture = Fixture::new().await;
+    let thread = fixture.thread("mq").await;
+    let id = MessageId::new();
+    fixture
+        .data
+        .mq_enqueue(&thread, input(id, "pending"))
+        .await
+        .unwrap();
+    fixture.data.delete_tree(&thread).await.unwrap();
+    let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM thread_mq WHERE id = ?1")
+        .bind(id.as_uuid().to_string())
+        .fetch_one(&fixture.store.database.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+include!("session_mq_settlement_test.rs");

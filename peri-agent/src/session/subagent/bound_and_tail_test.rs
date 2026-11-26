@@ -1,8 +1,23 @@
 //! Bound subagent identity and background tail behavior.
 
-use super::*;
+use crate::agent::async_tasks::TaskManager;
+
+use crate::session::subagent::tests::EmptyChainAssembler;
+use crate::session::subagent::tests::TailChunkLLM;
+use crate::session::subagent::tests::TailOutcome;
+
+use crate::session::subagent::SessionFactory;
+use crate::session::subagent::SubagentCancelPolicy;
+use crate::session::subagent::SubagentSpawnConfig;
+use crate::session::test_resources::mock::MockSessionResources;
+use crate::session::FrozenContext;
+use crate::session::Session;
+use peri_acp_types::identity::AgentId;
+use peri_acp_types::session_resources::FrozenSnapshotBytes;
 use peri_acp_types::session_resources::SessionResources as _;
 use peri_acp_types::tasks::TaskManager as _;
+use peri_acp_types::thread::AgentStatus;
+use std::sync::Arc;
 
 #[derive(Clone, Default)]
 struct LogBuffer(Arc<parking_lot::Mutex<Vec<u8>>>);
@@ -31,12 +46,13 @@ fn capture_logs() -> (LogBuffer, tracing::subscriber::DefaultGuard) {
 }
 
 fn matching_log(logs: &LogBuffer, message: &str) -> String {
-    let text = String::from_utf8(logs.0.lock().clone()).unwrap();
+    let text =
+        String::from_utf8(logs.0.lock().clone()).expect("the fixture text must be valid UTF-8");
     let lines: Vec<_> = text.lines().filter(|line| line.contains(message)).collect();
     assert_eq!(lines.len(), 1, "日志必须恰好出现一次：{text}");
     // --nocapture 时输出实际捕获行，便于核验字段；不安装全局 subscriber。
     std::io::Write::write_all(&mut std::io::stdout(), format!("{}\n", lines[0]).as_bytes())
-        .unwrap();
+        .expect("the write all fixture result is required for this assertion");
     lines[0].to_owned()
 }
 
@@ -56,7 +72,6 @@ async fn background_subagent_panic_settles_and_logs() {
         let (logs, _capture) = capture_logs();
         let manager = Arc::new(TaskManager::new());
         let mut config = tail_spawn_config(MockSessionResources::new(), TailOutcome::Completed);
-        config.run_mode = SubagentRunMode::Background;
         config.task_manager = Some(manager.clone());
         config.on_subagent_start = Some(Arc::new(|_, _, _| panic!("后台执行测试 panic")));
         let results = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -67,8 +82,10 @@ async fn background_subagent_panic_settles_and_logs() {
                 Ok(())
             }));
         }
-        let spawned = SessionFactory::spawn_subagent(None, config).await.unwrap();
-        let task_id = spawned.task_id.unwrap();
+        let spawned = SessionFactory::spawn_subagent(None, config)
+            .await
+            .expect("the spawn subagent fixture result is required for this assertion");
+        let task_id = spawned.task_id.clone();
         wait_execution_idle(&manager).await;
         assert_eq!(manager.active_count(), 0);
         assert_eq!(manager.snapshot().tasks[0].status, "failed");
@@ -87,7 +104,7 @@ async fn background_subagent_panic_settles_and_logs() {
         assert!(line.contains(&format!("task_id={task_id}")));
         assert!(line.contains(&format!("thread_id={}", spawned.child_thread_id)));
         assert!(!String::from_utf8(logs.0.lock().clone())
-            .unwrap()
+            .expect("the clone fixture result is required for this assertion")
             .contains("scope still uncertain"));
         manager.begin_session_close();
         assert!(manager.wait_session_close().await);
@@ -98,80 +115,84 @@ async fn background_subagent_panic_settles_and_logs() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn subagent_terminal_write_failure_logs_and_background_reports_failure() {
-    for background in [false, true] {
-        let (logs, _capture) = capture_logs();
-        let store = MockSessionResources::new();
-        let manager = Arc::new(TaskManager::new());
-        let mut config = tail_spawn_config(store.clone(), TailOutcome::Completed);
-        let stopped_store = store.clone();
-        config.on_subagent_stop = Some(Arc::new(move |_, _, _, _, _| {
-            // 只在最后的状态 patch 前注入失败，不干扰执行与持久化结算。
-            stopped_store.restrict_to_history_read_only();
-        }));
-        let delivered = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        if background {
-            config.run_mode = SubagentRunMode::Background;
-            config.task_manager = Some(manager.clone());
-            let delivered = delivered.clone();
-            config.on_bg_complete = Some(Arc::new(move |result, _| {
-                delivered.lock().push(result.success);
-                Ok(())
-            }));
-        }
-        let spawned = SessionFactory::spawn_subagent(None, config).await;
-        let line = if background {
-            let spawned = spawned.expect("后台注册应成功，终态失败经结果交付");
-            wait_execution_idle(&manager).await;
-            assert_eq!(*delivered.lock(), vec![false]);
-            assert_eq!(manager.snapshot().tasks[0].status, "failed");
-            let line = matching_log(&logs, "subagent terminal status write failed");
-            assert!(line.contains(&format!("thread_id={}", spawned.child_thread_id)));
-            line
-        } else {
-            let error = spawned.err().expect("同步终态写入失败必须返回错误");
-            assert!(error.to_string().contains("terminal_status_persist_failed"));
-            matching_log(&logs, "terminal_status_persist_failed")
-        };
-        assert!(line.contains("ERROR"));
-        let error = peri_acp_types::session_resources::SessionResourceError::new(
-            peri_acp_types::session_resources::SessionResourceErrorKind::Unsupported,
-        );
-        assert!(line.contains(&format!("error={error}")));
-    }
+    let (logs, _capture) = capture_logs();
+    let store = MockSessionResources::new();
+    let manager = Arc::new(TaskManager::new());
+    let mut config = tail_spawn_config(store.clone(), TailOutcome::Completed);
+    let stopped_store = store.clone();
+    config.on_subagent_stop = Some(Arc::new(move |_, _, _, _, _| {
+        // 只在最后的状态 patch 前注入失败，不干扰执行与持久化结算。
+        stopped_store.restrict_to_history_read_only();
+    }));
+    let delivered = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    config.task_manager = Some(manager.clone());
+    let delivered_sink = delivered.clone();
+    config.on_bg_complete = Some(Arc::new(move |result, _| {
+        delivered_sink.lock().push(result.success);
+        Ok(())
+    }));
+    let spawned = SessionFactory::spawn_subagent(None, config)
+        .await
+        .expect("后台注册应成功，终态失败经结果交付");
+    wait_execution_idle(&manager).await;
+    assert_eq!(*delivered.lock(), vec![false]);
+    assert_eq!(manager.snapshot().tasks[0].status, "failed");
+    let line = matching_log(&logs, "subagent terminal status write failed");
+    assert!(line.contains(&format!("thread_id={}", spawned.child_thread_id)));
+    assert!(line.contains("ERROR"));
+    let error = peri_acp_types::session_resources::SessionResourceError::new(
+        peri_acp_types::session_resources::SessionResourceErrorKind::Unsupported,
+    );
+    assert!(line.contains(&format!("error={error}")));
 }
 
 #[tokio::test]
 async fn test_bound_subagent_resume_requires_same_root_but_allows_siblings() {
     // 真门面：绑定、父子链都由真实实现提供（不可用 mock 自证）。
     let repo = crate::session::test_resources::git_repository();
-    let db = tempfile::tempdir().unwrap();
+    let db = tempfile::tempdir().expect("the temporary test directory must be available");
     let store: Arc<dyn peri_acp_types::session_resources::SessionResources> = Arc::new(
         peri_resources::sessions::SessionResourcesImpl::open(db.path().join("sessions.db"))
             .await
-            .unwrap(),
+            .expect("the temporary session store fixture must open successfully"),
     );
-    let workspace = store.resolve_workspace(repo.path()).await.unwrap();
-    let cwd = workspace.cwd.to_str().unwrap();
-    let root_a_id = create_bound_root(&store, &workspace, None).await;
-    let root_b_id = create_bound_root(&store, &workspace, None).await;
+    let workspace = store
+        .resolve_workspace(repo.path())
+        .await
+        .expect("the resolve workspace fixture result is required for this assertion");
+    let cwd = workspace
+        .cwd
+        .to_str()
+        .expect("the fixture text must be valid UTF-8");
+    let root_a_id =
+        crate::session::subagent::tests::create_bound_root(&store, &workspace, None).await;
+    let root_b_id =
+        crate::session::subagent::tests::create_bound_root(&store, &workspace, None).await;
     // child 的 frozen 必须是 root 已保存快照的逐字节副本（门面在 save_child 内校验）。
     let frozen = FrozenSnapshotBytes::new("{\"version\":1,\"root\":true}");
-    let child_id = save_bound_child(&store, &workspace, &root_a_id, &frozen).await;
-    let sibling_id = save_bound_child(&store, &workspace, &root_a_id, &frozen).await;
+    let child_id =
+        crate::session::subagent::tests::save_bound_child(&store, &workspace, &root_a_id, &frozen)
+            .await;
+    let sibling_id =
+        crate::session::subagent::tests::save_bound_child(&store, &workspace, &root_a_id, &frozen)
+            .await;
     let caller_b = Session::new(
         Arc::from(cwd),
         FrozenContext::builder().build(),
         Some(root_b_id),
     );
-    let mut config = resume_config(MockSessionResources::new(), child_id.clone());
+    let mut config = crate::session::subagent::tests::resume_config(
+        MockSessionResources::new(),
+        child_id.clone(),
+    );
     config.session_resources = Arc::clone(&store);
-    let error = resume_err(Some(&caller_b), config).await;
+    let error = crate::session::subagent::tests::resume_err(Some(&caller_b), config).await;
     assert!(error.contains("another root session"), "{error}");
     assert_eq!(
         store
             .load_session_meta(&child_id)
             .await
-            .unwrap()
+            .expect("the load session meta fixture result is required for this assertion")
             .agent_status,
         AgentStatus::Done
     );
@@ -180,16 +201,20 @@ async fn test_bound_subagent_resume_requires_same_root_but_allows_siblings() {
         FrozenContext::builder().build(),
         Some(sibling_id),
     );
-    let mut config = resume_config(MockSessionResources::new(), child_id.clone());
+    let mut config = crate::session::subagent::tests::resume_config(
+        MockSessionResources::new(),
+        child_id.clone(),
+    );
     config.session_resources = Arc::clone(&store);
     SessionFactory::resume_subagent(Some(&sibling), config)
         .await
         .expect("same-root siblings can resume");
+    crate::session::subagent::tests::wait_status_settled(&*store, &child_id).await;
     assert_eq!(
         store
             .load_session_meta(&child_id)
             .await
-            .unwrap()
+            .expect("the load session meta fixture result is required for this assertion")
             .agent_status,
         AgentStatus::Done
     );
@@ -209,7 +234,6 @@ fn tail_spawn_config(
         cancel_policy: SubagentCancelPolicy::Independent,
         max_iterations: 10,
         fork_directive_kind: None,
-        run_mode: SubagentRunMode::Sync,
         skill_names: Vec::new(),
         llm: crate::session::test_resources::mock::model::fixture_source(
             std::sync::Arc::new(TailChunkLLM(outcome)),
@@ -249,20 +273,28 @@ fn tail_spawn_config(
 async fn spawn_guard_accepts_same_directory_with_trailing_separator() {
     // session/load 恢复后的 live cwd 带尾分隔符，父快照保留创建时的无分隔符形态。
     let store = MockSessionResources::new();
+    let manager = Arc::new(TaskManager::new());
     let mut config = tail_spawn_config(store.clone(), TailOutcome::Completed);
+    config.task_manager = Some(manager.clone());
     config.cwd = Some("/tmp/tail-fixture/".into());
-    let spawned = SessionFactory::spawn_subagent(None, config).await.unwrap();
-    let child = store.load_meta(&spawned.child_thread_id).await.unwrap();
+    let spawned = SessionFactory::spawn_subagent(None, config)
+        .await
+        .expect("the spawn subagent fixture result is required for this assertion");
+    wait_execution_idle(&manager).await;
+    let child = store
+        .load_meta(&spawned.child_thread_id)
+        .await
+        .expect("the load meta fixture result is required for this assertion");
     assert_eq!(child.cwd, "/tmp/tail-fixture/");
     assert_eq!(
         store
             .load_session_binding(&spawned.child_thread_id)
             .await
-            .unwrap(),
+            .expect("the load session binding fixture result is required for this assertion"),
         store
             .load_session_binding(&"tail-parent".to_owned())
             .await
-            .unwrap()
+            .expect("the to owned fixture result is required for this assertion")
     );
 }
 
@@ -270,11 +302,19 @@ async fn spawn_guard_accepts_same_directory_with_trailing_separator() {
 async fn spawn_guard_accepts_subdirectory_session_path() {
     // sessionPath 非空：父会话 cwd 是工作区子目录，派发继承同一目录。
     let store = MockSessionResources::new();
+    let manager = Arc::new(TaskManager::new());
     let mut config = tail_spawn_config(store.clone(), TailOutcome::Completed);
+    config.task_manager = Some(manager.clone());
     store.register_bound_session("tail-parent", "/tmp/tail-fixture/sub");
     config.cwd = Some("/tmp/tail-fixture/sub".into());
-    let spawned = SessionFactory::spawn_subagent(None, config).await.unwrap();
-    let child = store.load_meta(&spawned.child_thread_id).await.unwrap();
+    let spawned = SessionFactory::spawn_subagent(None, config)
+        .await
+        .expect("the spawn subagent fixture result is required for this assertion");
+    wait_execution_idle(&manager).await;
+    let child = store
+        .load_meta(&spawned.child_thread_id)
+        .await
+        .expect("the load meta fixture result is required for this assertion");
     assert_eq!(child.cwd, "/tmp/tail-fixture/sub");
 }
 
@@ -298,84 +338,73 @@ async fn spawn_guard_rejects_different_directory() {
 #[tokio::test(flavor = "current_thread")]
 async fn subagent_start_uses_model_call_identity_for_spawn_and_resume() {
     use crate::agent::events::{ExecutorEvent, FnEventHandler};
-    for background in [false, true] {
-        let store = MockSessionResources::new();
-        let manager = Arc::new(TaskManager::new());
-        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let capture = events.clone();
-        let handler = Arc::new(FnEventHandler(move |event| capture.lock().push(event)));
-        let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut config = tail_spawn_config(store.clone(), TailOutcome::Completed);
-        config.parent_tool_call_id = Some("spawn-model-call".into());
-        config.event_handler = Some(handler.clone());
-        config.bg_event_sender = Some(event_sender.clone());
-        config.run_mode = if background {
-            SubagentRunMode::Background
-        } else {
-            SubagentRunMode::Sync
-        };
-        config.task_manager = background.then(|| manager.clone());
-        let spawned = SessionFactory::spawn_subagent(None, config).await.unwrap();
-        if background {
-            wait_execution_idle(&manager).await;
-        }
-        let parent = Session::new(
-            Arc::from("/tmp/tail-fixture"),
-            FrozenContext::builder().build(),
-            Some("tail-parent".into()),
-        );
-        let mut config = resume_config(store.clone(), spawned.child_thread_id.clone());
-        config.parent_tool_call_id = Some("resume-model-call".into());
-        config.event_handler = Some(handler);
-        config.bg_event_sender = Some(event_sender);
-        config.run_mode = if background {
-            SubagentRunMode::Background
-        } else {
-            SubagentRunMode::Sync
-        };
-        config.task_manager = background.then(|| manager.clone());
-        SessionFactory::resume_subagent(Some(&parent), config)
-            .await
-            .unwrap();
-        if background {
-            wait_execution_idle(&manager).await;
-        }
-        while let Ok(event) = event_receiver.try_recv() {
-            events.lock().push(event);
-        }
-        let starts: Vec<_> = events
-            .lock()
-            .iter()
-            .filter_map(|event| match event.payload() {
-                ExecutorEvent::SubagentStarted {
-                    parent_tool_call_id,
-                    instance_id,
-                    is_background,
-                    ..
-                } => Some((
-                    parent_tool_call_id.clone(),
-                    instance_id.clone(),
-                    *is_background,
-                )),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            starts,
-            vec![
-                (
-                    Some("spawn-model-call".into()),
-                    spawned.child_thread_id.clone(),
-                    background
-                ),
-                (
-                    Some("resume-model-call".into()),
-                    spawned.child_thread_id,
-                    background
-                ),
-            ]
-        );
+    let store = MockSessionResources::new();
+    let manager = Arc::new(TaskManager::new());
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let capture = events.clone();
+    let handler = Arc::new(FnEventHandler(move |event| capture.lock().push(event)));
+    let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut config = tail_spawn_config(store.clone(), TailOutcome::Completed);
+    config.parent_tool_call_id = Some("spawn-model-call".into());
+    config.event_handler = Some(handler.clone());
+    config.bg_event_sender = Some(event_sender.clone());
+    config.task_manager = Some(manager.clone());
+    let spawned = SessionFactory::spawn_subagent(None, config)
+        .await
+        .expect("the spawn subagent fixture result is required for this assertion");
+    wait_execution_idle(&manager).await;
+    let parent = Session::new(
+        Arc::from("/tmp/tail-fixture"),
+        FrozenContext::builder().build(),
+        Some("tail-parent".into()),
+    );
+    let mut config = crate::session::subagent::tests::resume_config(
+        store.clone(),
+        spawned.child_thread_id.clone(),
+    );
+    config.parent_tool_call_id = Some("resume-model-call".into());
+    config.event_handler = Some(handler);
+    config.bg_event_sender = Some(event_sender);
+    config.task_manager = Some(manager.clone());
+    SessionFactory::resume_subagent(Some(&parent), config)
+        .await
+        .expect("the resume subagent fixture result is required for this assertion");
+    wait_execution_idle(&manager).await;
+    while let Ok(event) = event_receiver.try_recv() {
+        events.lock().push(event);
     }
+    let starts: Vec<_> = events
+        .lock()
+        .iter()
+        .filter_map(|event| match event.payload() {
+            ExecutorEvent::SubagentStarted {
+                parent_tool_call_id,
+                instance_id,
+                is_background,
+                ..
+            } => Some((
+                parent_tool_call_id.clone(),
+                instance_id.clone(),
+                *is_background,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts,
+        vec![
+            (
+                Some("spawn-model-call".into()),
+                spawned.child_thread_id.clone(),
+                true
+            ),
+            (
+                Some("resume-model-call".into()),
+                spawned.child_thread_id,
+                true
+            ),
+        ]
+    );
 }
 
 struct TailPanicBridge {
@@ -423,7 +452,6 @@ async fn assert_background_tail_completion(outcome: TailOutcome, panic_forwarder
     let bridge_stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let lifecycle_turns = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let mut config = tail_spawn_config(store.clone(), outcome);
-    config.run_mode = SubagentRunMode::Background;
     config.task_manager = Some(manager.clone());
     config.bg_event_sender = Some(event_tx);
     config.langfuse_bridge = Some(Arc::new(TailPanicBridge {
@@ -439,9 +467,9 @@ async fn assert_background_tail_completion(outcome: TailOutcome, panic_forwarder
         complete_tx
             .lock()
             .take()
-            .unwrap()
+            .expect("complete tx lock fixture must provide its pending value exactly once")
             .send((result.clone(), events, callback_manager.active_count()))
-            .unwrap();
+            .expect("complete tx lock test receiver must remain available for this delivery");
         Ok(())
     }));
     let spawned = SessionFactory::spawn_subagent(None, config)
@@ -451,9 +479,16 @@ async fn assert_background_tail_completion(outcome: TailOutcome, panic_forwarder
         tokio::time::timeout(std::time::Duration::from_secs(5), complete_rx)
             .await
             .expect("关闭 producer 后必须完成排空，不能被 guard 持有死锁")
-            .unwrap();
+            .expect("the expect fixture result is required for this assertion");
     assert_eq!(active_at_callback, 1, "通知先于 TaskManager 终态");
-    assert_eq!(manager.active_count(), 0, "真实执行收尾后任务结束");
+    // 投递结论返回后终态才提交；结算可能落在阻塞池，等待它完成而不是假设同拍发生。
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while manager.active_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("真实执行收尾后任务结束");
     let turns = lifecycle_turns.lock();
     assert_eq!(turns.len(), if panic_forwarder { 1 } else { 2 });
     if !panic_forwarder {
@@ -615,37 +650,57 @@ async fn test_spawn_subagent_background_forwarder_panic_preserves_cancellation()
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_spawn_subagent_sync_forwarder_panic_is_failure() {
-    use crate::agent::events::{ExecutorEvent, FnEventHandler};
+async fn test_spawn_subagent_terminal_bridge_panic_is_failure() {
+    use crate::agent::events::{BackgroundTaskResult, ExecutorEvent};
     let store = MockSessionResources::new();
-    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let capture = events.clone();
-    let bridge_stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let manager = Arc::new(TaskManager::new());
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let event_rx = Arc::new(parking_lot::Mutex::new(event_rx));
+    let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+    let complete_tx = parking_lot::Mutex::new(Some(complete_tx));
+    let callback_rx = event_rx.clone();
     let mut config = tail_spawn_config(store.clone(), TailOutcome::Completed);
-    config.langfuse_bridge = Some(Arc::new(TailPanicBridge {
-        stops: bridge_stops.clone(),
-        panic_on_chunk: true,
-        lifecycle_turns: Arc::new(parking_lot::Mutex::new(Vec::new())),
+    config.task_manager = Some(manager.clone());
+    config.bg_event_sender = Some(event_tx);
+    config.langfuse_bridge = Some(Arc::new(TerminalPanicBridge));
+    config.on_bg_complete = Some(Arc::new(move |result: &BackgroundTaskResult, _| {
+        let mut events = Vec::new();
+        while let Ok(event) = callback_rx.lock().try_recv() {
+            events.push(event);
+        }
+        complete_tx
+            .lock()
+            .take()
+            .expect("terminal bridge completion must be delivered once")
+            .send((result.clone(), events))
+            .expect("terminal bridge result receiver must remain available");
+        Ok(())
     }));
-    config.event_handler = Some(Arc::new(FnEventHandler(move |event| {
-        capture.lock().push(event);
-    })));
-    let error = match SessionFactory::spawn_subagent(None, config).await {
-        Ok(_) => panic!("forwarder panic 不得返回成功"),
-        Err(error) => error,
-    };
-    assert!(error
-        .to_string()
-        .contains("Subagent event forwarding failed"));
-    assert!(error.to_string().contains("child_thread_id:"));
-    assert_eq!(bridge_stops.load(std::sync::atomic::Ordering::SeqCst), 0);
-    let child_id = error
-        .downcast_ref::<crate::session::subagent::SubagentFailure>()
-        .unwrap()
-        .child_thread_id();
+    let spawned = SessionFactory::spawn_subagent(None, config)
+        .await
+        .expect("后台注册成功，终态失败经结果交付");
+    let (result, events) = tokio::time::timeout(std::time::Duration::from_secs(5), complete_rx)
+        .await
+        .expect("terminal bridge failure must complete the background task")
+        .expect("the completion fixture result is required for this assertion");
+    wait_execution_idle(&manager).await;
+    assert!(!result.success);
+    assert!(
+        result
+            .output
+            .contains("Subagent terminal event forwarding failed"),
+        "背景结果必须保留终态转发失败原因: {}",
+        result.output
+    );
+    assert_eq!(
+        result
+            .subagent_failure
+            .as_ref()
+            .map(|failure| failure.child_thread_id()),
+        Some(spawned.child_thread_id.as_str())
+    );
     assert_eq!(
         events
-            .lock()
             .iter()
             .filter(|event| matches!(
                 event.payload(),
@@ -656,9 +711,9 @@ async fn test_spawn_subagent_sync_forwarder_panic_is_failure() {
     );
     assert_eq!(
         store
-            .load_meta(&child_id.to_owned())
+            .load_meta(&spawned.child_thread_id)
             .await
-            .unwrap()
+            .expect("the load meta fixture result is required for this assertion")
             .agent_status,
         AgentStatus::Error
     );
@@ -676,50 +731,6 @@ impl crate::agent::LangfuseBridgeLike for TerminalPanicBridge {
             panic!("terminal forwarding fixture panic");
         }
     }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn test_spawn_subagent_terminal_bridge_panic_is_failure() {
-    use crate::agent::events::{ExecutorEvent, FnEventHandler};
-    let store = MockSessionResources::new();
-    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let capture = events.clone();
-    let mut config = tail_spawn_config(store.clone(), TailOutcome::Completed);
-    config.langfuse_bridge = Some(Arc::new(TerminalPanicBridge));
-    config.event_handler = Some(Arc::new(FnEventHandler(move |event| {
-        capture.lock().push(event);
-    })));
-    let error = match SessionFactory::spawn_subagent(None, config).await {
-        Ok(_) => panic!("terminal bridge panic 不得返回成功"),
-        Err(error) => error,
-    };
-    assert!(error
-        .to_string()
-        .contains("Subagent terminal event forwarding failed"));
-    assert!(error.to_string().contains("child_thread_id:"));
-    assert_eq!(
-        events
-            .lock()
-            .iter()
-            .filter(|event| matches!(
-                event.payload(),
-                ExecutorEvent::SubagentStopped { is_error: true, .. }
-            ))
-            .count(),
-        1
-    );
-    let child_id = error
-        .downcast_ref::<crate::session::subagent::SubagentFailure>()
-        .unwrap()
-        .child_thread_id();
-    assert_eq!(
-        store
-            .load_meta(&child_id.to_owned())
-            .await
-            .unwrap()
-            .agent_status,
-        AgentStatus::Error
-    );
 }
 
 /// [回归] 子 agent 的初始指令未被 MQ 接纳时，启动必须失败并把已持久化的 child
@@ -750,5 +761,33 @@ async fn test_spawn_subagent_fails_when_initial_prompt_cannot_be_admitted() {
         child.agent_status,
         AgentStatus::Error,
         "失败启动的 child 必须标记为 Error"
+    );
+}
+
+/// [回归] 初始指令已接纳但后台 dispatch 不可用时，已持久化的 child 不得停留在
+/// hidden/Active 且没有任务支撑。
+#[tokio::test(flavor = "current_thread")]
+async fn test_spawn_dispatch_failure_marks_persisted_child_error() {
+    let store = MockSessionResources::new();
+    let config = tail_spawn_config(store.clone(), TailOutcome::Completed);
+
+    let error = match SessionFactory::spawn_subagent(None, config).await {
+        Ok(_) => panic!("后台任务不可用时 spawn 必须失败"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("Background tasks not available"),
+        "必须保留原始 dispatch 错误: {error}"
+    );
+
+    let child = store
+        .threads()
+        .into_iter()
+        .find(|meta| meta.parent_thread_id.as_deref() == Some("tail-parent"))
+        .expect("child thread was persisted before the failed dispatch");
+    assert_eq!(
+        child.agent_status,
+        AgentStatus::Error,
+        "dispatch 失败后已持久化的 child 必须标记为 Error"
     );
 }

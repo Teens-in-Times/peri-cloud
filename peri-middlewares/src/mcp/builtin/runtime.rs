@@ -9,25 +9,24 @@
 //!   复制判定（映射在 `mcp/initialize.rs` 的 `connect_timeout` / `transport_label`）。
 //! - 每个实例一条**独立** duplex 与一个**独立** task（隔离契约：不得共用 transport）。
 
-use std::{
-    pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    task::{Context, Poll},
-};
+use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 
-use rmcp::{
-    serve_server,
-    service::{QuitReason, ServerInitializeError},
-    ServerHandler,
-};
+use rmcp;
+use rmcp::service::QuitReason;
+use rmcp::service::ServerInitializeError;
+use rmcp::ServerHandler;
 use thiserror::Error;
-use tokio::{
-    io::{AsyncRead, DuplexStream, ReadBuf, ReadHalf, WriteHalf},
-    task::JoinHandle,
-};
+use tokio::io::AsyncRead;
+use tokio::io::DuplexStream;
+use tokio::io::ReadBuf;
+use tokio::io::ReadHalf;
+use tokio::io::WriteHalf;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::context::BuiltinInstanceContext;
@@ -83,6 +82,11 @@ pub(crate) enum BuiltinSpawnError {
     /// 当前注册表内实例均由 dispatch 显式接线；该分支保护未来新增实现避免静默回退。
     #[error("builtin 实例 handler 尚未接线: {instance}")]
     HandlerNotWired { instance: String },
+    /// v5 单出口 router 装配失败（全部能力不可用 / 能力依赖非法）。
+    ///
+    /// 错误文本只含能力名与固定规则文本，不含路径 / env / 凭据。
+    #[error("builtin 单出口装配失败: {reason}")]
+    RouterBuild { reason: String },
 }
 
 /// server task 的退出事实。
@@ -267,6 +271,19 @@ impl BuiltinInstanceSupervisor {
             #[cfg(not(target_os = "emscripten"))]
             workspace_tasks: None,
         }
+    }
+
+    /// 测试专用：用给定 server task 句柄组装一代监督者（无 tick）。
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        instance: String,
+        handle: tokio::task::JoinHandle<BuiltinServerExit>,
+    ) -> Self {
+        Self::new(
+            instance.clone(),
+            BuiltinServerTask { instance, handle },
+            None,
+        )
     }
 
     /// 有界关闭：①`tick.take()` → [`TickGuard::shutdown`] ②server task `converge`。
@@ -459,7 +476,7 @@ where
     let server_read = ObservedRead::new(server_read, Arc::clone(&saw_inbound));
     let task_instance = instance.to_string();
     let handle = tokio::spawn(async move {
-        match serve_server(handler, (server_read, server_write)).await {
+        match rmcp::serve_server(handler, (server_read, server_write)).await {
             // `waiting()` 消费 running service；输入流 EOF / 对端关闭即返回 QuitReason。
             Ok(running) => match running.waiting().await {
                 Ok(reason) => BuiltinServerExit::Quit(reason),
@@ -516,6 +533,17 @@ pub(crate) fn spawn_builtin_transport_with_context(
             instance: instance.to_string(),
         }
     })?;
+    if peri_acp_types::builtin_mcp::is_v5_server_name(instance) {
+        let (router, workspace_tasks) =
+            super::router::build_host_router(ctx, env).map_err(|error| {
+                BuiltinSpawnError::RouterBuild {
+                    reason: error.to_string(),
+                }
+            })?;
+        let mut transport = spawn_builtin_transport_with_handler(instance, router);
+        transport.workspace_tasks = workspace_tasks;
+        return Ok(transport);
+    }
     if !ctx.instance_input_ready(instance) {
         return Err(BuiltinSpawnError::InstanceInputMissing {
             instance: instance.to_string(),

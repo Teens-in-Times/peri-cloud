@@ -1,19 +1,17 @@
-use std::{
-    collections::VecDeque,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
-    time::Duration,
-};
+use std::collections::VecDeque;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{stream, StreamExt};
-use tokio::time::timeout;
+use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use super::{HttpBody, HttpRequest, HttpResponse, HttpTransport};
-use crate::{ModelError, ModelResult, TransportErrorKind};
+use crate::{ModelError, ModelResult, ModelRuntimeConfig, TransportErrorKind};
 
 #[test]
 fn reqwest_error_keeps_message_and_underlying_parse_cause() {
@@ -142,6 +140,29 @@ async fn fake_transport_reports_midstream_body_failure() {
     ));
 }
 
+#[test]
+fn client_builder_failure_returns_displayable_error_instead_of_panicking() {
+    // 平台 TLS 根证书不可用等 builder 失败只影响该 client（#478）。
+    let error = super::http::build_client(
+        reqwest::Client::builder().tls_backend_preconfigured(()),
+        &ModelRuntimeConfig::with_full_observation(),
+        true,
+    )
+    .expect_err("builder 失败必须返回错误");
+
+    assert_eq!(error.transport_kind(), Some(TransportErrorKind::Tls));
+    assert!(error.to_string().contains("tls"));
+    let diagnostic = error.diagnostic();
+    assert_eq!(diagnostic.message(), Some("builder error"));
+    assert!(
+        diagnostic
+            .causes()
+            .iter()
+            .any(|cause| cause.contains("Unknown TLS backend")),
+        "错误必须保留 builder 原始诊断: {diagnostic:?}"
+    );
+}
+
 #[tokio::test]
 async fn fake_transport_connect_wait_observes_cancellation() {
     let transport = Arc::new(FakeTransport::new(vec![Response::PendingConnect]));
@@ -154,7 +175,7 @@ async fn fake_transport_connect_wait_observes_cancellation() {
 
     tokio::task::yield_now().await;
     cancellation.cancel();
-    let result = timeout(Duration::from_millis(100), send)
+    let result = time::timeout(Duration::from_millis(100), send)
         .await
         .expect("connect cancellation must resolve")
         .expect("task must not panic");
@@ -171,7 +192,7 @@ async fn fake_transport_body_read_observes_cancellation() {
 
     tokio::task::yield_now().await;
     cancellation.cancel();
-    let item = timeout(Duration::from_millis(100), read)
+    let item = time::timeout(Duration::from_millis(100), read)
         .await
         .expect("body cancellation must resolve")
         .expect("task must not panic")

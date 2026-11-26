@@ -63,7 +63,15 @@ impl McpClientPool {
             if cancel.is_cancelled() {
                 break;
             }
-            if self.clients.read().contains_key(WORKSPACE_INSTANCE) {
+            if self.remote_workspace_deferred() {
+                // S9a3a：远端 workspace 的 cold 面只宣告 tools，`shell_task_list`
+                // 是 tools/call —— 首轮扫描会启动真实后端。恢复监听属于可选探测，
+                // 等首个真实调用后（`workspace_remote_started`）再按既有节奏扫描。
+                tracing::debug!(
+                    session_id,
+                    "remote workspace is still cold; shell task discovery deferred until first real call"
+                );
+            } else if self.capability_client("workspace").is_some() {
                 match self
                     .adopt_workspace_tasks_before(session_id, &cutoff, &mut adopted, &cancel)
                     .await
@@ -176,9 +184,7 @@ impl McpClientPool {
         started_at: Option<&str>,
     ) -> Result<AdoptionOutcome, String> {
         let peer = self
-            .clients
-            .read()
-            .get(WORKSPACE_INSTANCE)
+            .capability_client("workspace")
             .and_then(|client| client.peer.clone())
             .ok_or_else(|| "workspace shell task owner is not connected".to_owned())?;
         let owner_scoped = self

@@ -1,4 +1,9 @@
-use super::*;
+use super::AgentCancellationToken;
+use super::Arc;
+use super::BaseTool;
+use super::HostFixture;
+use super::SubAgentTool;
+use super::SubagentLlmSource;
 
 // ─── S3.1 注册门控 + S3.2 取消收尾（issue 2026-08-05）────────────────────
 
@@ -28,11 +33,52 @@ fn make_registered_bg_task(id: &str) -> peri_agent::agent::async_tasks::Backgrou
     }
 }
 
+/// 有界汇合点：`parties` 个调用都到达后一起放行；任一调用缺席时最多等 10s 就继续，
+/// 让用例以断言失败收场，而不是只能等 CI 的超时看门狗强杀整个测试进程。
+struct BoundedGate {
+    arrived: std::sync::Mutex<usize>,
+    released: std::sync::Condvar,
+    parties: usize,
+    timeout: std::time::Duration,
+}
+
+impl BoundedGate {
+    fn new(parties: usize) -> Self {
+        Self {
+            arrived: std::sync::Mutex::new(0),
+            released: std::sync::Condvar::new(),
+            parties,
+            timeout: std::time::Duration::from_secs(10),
+        }
+    }
+
+    fn wait(&self) {
+        let mut arrived = self.arrived.lock().expect("gate mutex poisoned");
+        *arrived += 1;
+        if *arrived >= self.parties {
+            self.released.notify_all();
+            return;
+        }
+        let deadline = std::time::Instant::now() + self.timeout;
+        while *arrived < self.parties {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            arrived = self
+                .released
+                .wait_timeout(arrived, remaining)
+                .expect("gate condvar poisoned")
+                .0;
+        }
+    }
+}
+
 /// [回归测试] S3.1 幽灵任务：spawn 前失败（session execution scope 已关闭）的
 /// 任务必须不执行。
 ///
 /// 触发点：`TaskManager::shutdown()` 关闭 scope 后，后台挂载 admission 被拒——
-/// 4 个并发 invoke 在 llm_factory 同步汇合（barrier 制造确定性并发窗口）后全部
+/// 4 个并发 invoke 在 llm_factory 同步汇合（有界汇合点制造确定性并发窗口）后全部
 /// 失败，每个必须：
 /// - invoke 如实返回错误（带关闭原因）
 /// - 不执行 run_react_loop（零 LLM 推理调用）
@@ -51,10 +97,9 @@ fn make_registered_bg_task(id: &str) -> peri_agent::agent::async_tasks::Backgrou
 async fn test_bg_register_failure_does_not_execute_task() {
     use peri_agent::agent::events::ExecutorEvent;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Barrier;
     use tokio::sync::mpsc;
 
-    let dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let agents_dir = dir.path().join(".claude").join("agents");
     std::fs::create_dir_all(&agents_dir).unwrap();
     std::fs::write(
@@ -71,8 +116,9 @@ async fn test_bg_register_failure_does_not_execute_task() {
     );
     assert_eq!(registry.active_count(), 0);
 
-    // barrier：4 个 invoke 全部到达 llm_factory 后放行（确定性并发窗口）
-    let gate = Arc::new(Barrier::new(4));
+    // 有界汇合：4 个 invoke 全部到达 llm_factory 后放行（确定性并发窗口），
+    // 若有调用没能走到这里，10s 后继续并以断言失败暴露，而不是无限等待。
+    let gate = Arc::new(BoundedGate::new(4));
     let llm_calls = Arc::new(AtomicUsize::new(0));
     let llm_calls_clone = Arc::clone(&llm_calls);
     let gate_clone = Arc::clone(&gate);
@@ -87,14 +133,14 @@ async fn test_bg_register_failure_does_not_execute_task() {
             request: peri_model::ModelRequest,
             cancellation: tokio_util::sync::CancellationToken,
         ) -> Vec<peri_model::ModelResult<peri_model::ModelStreamEvent>> {
-            use crate::subagent::test_support::*;
+            use crate::subagent::test_support;
             let _ = &cancellation;
-            let _messages = base_messages(&request);
-            let defined = defined_tools(&request);
+            let _messages = test_support::base_messages(&request);
+            let defined = test_support::defined_tools(&request);
             let _tools: Vec<&dyn BaseTool> = defined.iter().map(|t| t as &dyn BaseTool).collect();
 
             self.calls.fetch_add(1, Ordering::SeqCst);
-            text_events("bg gate done")
+            test_support::text_events("bg gate done")
         }
     }
     crate::subagent::test_support::fixture_model_impl!(GateLLM);
@@ -150,11 +196,11 @@ async fn test_bg_register_failure_does_not_execute_task() {
     )
     .with_register_runtime(register_cb)
     .with_deregister_runtime(deregister_cb);
-    let tool = host.bind(with_agent_face(tool, dir.path()).await);
+    let tool = host.bind(super::with_agent_face(tool, dir.path()).await);
 
-    // 4 个并发 invoke——必须各自 tokio::spawn（llm_factory 内的 Barrier::wait()
-    // 是同步阻塞：若在 join_all 单任务内逐个 poll，第一个 future 会卡死当前
-    // worker，其余 3 个永远不被 poll，barrier 凑不齐 4 个参与者而死锁）。
+    // 4 个并发 invoke——必须各自 tokio::spawn（llm_factory 内的 BoundedGate::wait()
+    // 会同步阻塞：若在 join_all 单任务内逐个 poll，第一个 future 会卡死当前 worker，
+    // 其余 3 个永远不被 poll，汇合点凑不齐 4 个参与者而只能等超时）。
     let tool = Arc::new(tool);
     let mut handles = Vec::new();
     for index in 0..4 {
@@ -262,7 +308,7 @@ async fn test_bg_cancel_trigger_token_and_cleanup() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
 
-    let dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let agents_dir = dir.path().join(".claude").join("agents");
     std::fs::create_dir_all(&agents_dir).unwrap();
     std::fs::write(
@@ -289,16 +335,16 @@ async fn test_bg_cancel_trigger_token_and_cleanup() {
             request: peri_model::ModelRequest,
             cancellation: tokio_util::sync::CancellationToken,
         ) -> Vec<peri_model::ModelResult<peri_model::ModelStreamEvent>> {
-            use crate::subagent::test_support::*;
+            use crate::subagent::test_support;
             let _ = &cancellation;
-            let _messages = base_messages(&request);
-            let defined = defined_tools(&request);
+            let _messages = test_support::base_messages(&request);
+            let defined = test_support::defined_tools(&request);
             let _tools: Vec<&dyn BaseTool> = defined.iter().map(|t| t as &dyn BaseTool).collect();
 
             self.calls.fetch_add(1, Ordering::SeqCst);
             // 阻塞直到被取消（select 放弃本 future）
             self.gate.notified().await;
-            text_events("never")
+            test_support::text_events("never")
         }
     }
     crate::subagent::test_support::fixture_model_impl!(BlockingLLM);
@@ -346,7 +392,7 @@ async fn test_bg_cancel_trigger_token_and_cleanup() {
         dir.path().to_str().unwrap().to_string(),
     )
     .with_deregister_runtime(deregister_cb);
-    let tool = host.bind(with_agent_face(tool, dir.path()).await);
+    let tool = host.bind(super::with_agent_face(tool, dir.path()).await);
 
     let msg = tool
         .invoke(
@@ -447,7 +493,7 @@ async fn test_bg_more_than_three_concurrent_tasks_start_complete_cancel() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
 
-    let dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let agents_dir = dir.path().join(".claude").join("agents");
     std::fs::create_dir_all(&agents_dir).unwrap();
     std::fs::write(
@@ -482,15 +528,15 @@ async fn test_bg_more_than_three_concurrent_tasks_start_complete_cancel() {
             request: peri_model::ModelRequest,
             cancellation: tokio_util::sync::CancellationToken,
         ) -> Vec<peri_model::ModelResult<peri_model::ModelStreamEvent>> {
-            use crate::subagent::test_support::*;
+            use crate::subagent::test_support;
             let _ = &cancellation;
-            let _messages = base_messages(&request);
-            let defined = defined_tools(&request);
+            let _messages = test_support::base_messages(&request);
+            let defined = test_support::defined_tools(&request);
             let _tools: Vec<&dyn BaseTool> = defined.iter().map(|t| t as &dyn BaseTool).collect();
 
             self.calls.fetch_add(1, Ordering::SeqCst);
             let _ = self.release.acquire().await;
-            text_events("bulk done")
+            test_support::text_events("bulk done")
         }
     }
     crate::subagent::test_support::fixture_model_impl!(BulkLLM);
@@ -533,7 +579,7 @@ async fn test_bg_more_than_three_concurrent_tasks_start_complete_cancel() {
         dir.path().to_str().unwrap().to_string(),
     )
     .with_deregister_runtime(deregister_cb);
-    let tool = host.bind(with_agent_face(tool, dir.path()).await);
+    let tool = host.bind(super::with_agent_face(tool, dir.path()).await);
 
     // 启动 6 个后台任务：全部必须成功返回（不再有并发上限拦截）
     let mut task_ids = Vec::new();

@@ -68,6 +68,7 @@ pub struct PageQuery {
     pub limit: usize,
 }
 
+#[must_use]
 pub fn parse_page_query(uri: &str) -> PageQuery {
     let mut query = PageQuery {
         after: None,
@@ -188,6 +189,7 @@ pub fn read_payload(runtime: &WorkflowRuntime, uri: &str) -> Result<Value, Resou
 }
 
 /// 订阅唤醒对应的**规范** URI（分页参数不参与订阅身份）。
+#[must_use]
 pub fn update_uri(update: &WorkflowResourceUpdate) -> String {
     match update {
         WorkflowResourceUpdate::RunsIndex => RUNS_URI.to_string(),
@@ -207,6 +209,10 @@ fn event_page_payload<T: serde::Serialize>(page: EventLogPage<T>) -> Value {
 }
 
 /// 任务事件页 + 基线快照的合并正文（`workflow://tasks` 与 run 级任务视图）。
+///
+/// 两种任务种类都出现在投影中（同一张任务表）：`task.params.kind` 为 `agent` /
+/// `tool`；tool 任务省略 `agentId`，终态结果在 `toolOutcome`（agent 任务在
+/// `result`）。消费者按 `kind` 分派，不另建第二套任务视图。
 ///
 /// 读取顺序与不变量（对抗审查 F3）：
 /// 1. **先读事件页、后读基线**：基线的 `head_sequence` ≥ 页上界。

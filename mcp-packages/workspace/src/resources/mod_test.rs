@@ -8,7 +8,13 @@ use peri_acp_types::workspace_resources::{
     META_KEY_SCOPE, MIME_MARKDOWN,
 };
 
-use super::*;
+use crate::resources::ResourceBody;
+use crate::resources::ResourceBudget;
+use crate::resources::ResourceError;
+use crate::resources::ResourceRoot;
+use crate::resources::WorkspaceResourceProvider;
+use crate::resources::WorkspaceResourcesInput;
+use peri_acp_types::workspace_resources::INSTRUCTION_LOCAL_URI;
 
 fn tempdir() -> tempfile::TempDir {
     tempfile::tempdir().expect("临时目录夹具必须可创建")
@@ -247,7 +253,7 @@ fn empty_input_still_lists_builtin_skills_and_instruction_index() {
     );
     assert!(
         uris.iter().any(|uri| uri.starts_with("skill://builtin/")),
-        "builtin 默认启用（7 个内置技能）"
+        "builtin 默认启用（内置技能列表非空）"
     );
     assert!(
         !uris.contains(&INSTRUCTION_MAIN_URI),
@@ -367,13 +373,13 @@ fn list_skills_uses_single_scan_snapshot_and_survives_later_removal() {
         budget: ResourceBudget::default(),
     };
     let budget = input.budget;
-    let catalog = super::skills::scan_catalog(&input, &budget);
+    let catalog = crate::resources::skills::scan_catalog(&input, &budget);
     assert_eq!(catalog.len(), 2);
 
     std::fs::remove_dir_all(skills.path().join("beta")).expect("删除 beta");
     let typed = catalog
         .iter()
-        .map(super::typed_skill_from_record)
+        .map(crate::resources::typed_skill_from_record)
         .collect::<Result<Vec<_>, _>>()
         .expect("快照转换不再回查磁盘");
     assert_eq!(typed.len(), 2);
@@ -476,5 +482,29 @@ fn list_skill_preserves_raw_description_for_activation() {
         list.skills[0].frontmatter.description.trim_end(),
         raw_description.trim_end(),
         "激活的 trim_end-only 比对必须通过"
+    );
+}
+
+#[test]
+fn declared_workspace_resource_templates_match_wire_values() {
+    let cwd = tempdir();
+    let provider = WorkspaceResourceProvider::new(cwd.path(), WorkspaceResourcesInput::new());
+    let mut wire: Vec<String> = provider
+        .list_resource_templates()
+        .into_iter()
+        .map(|template| template.uri_template)
+        .collect();
+    let mut declared: Vec<String> = peri_acp_types::builtin_mcp::capability("workspace")
+        .expect("workspace capability 必须已声明")
+        .resources
+        .resource_templates
+        .iter()
+        .map(|uri| (*uri).to_owned())
+        .collect();
+    wire.sort_unstable();
+    declared.sort_unstable();
+    assert_eq!(
+        declared, wire,
+        "v5 声明表的资源模板必须与 workspace wire 值逐字一致"
     );
 }

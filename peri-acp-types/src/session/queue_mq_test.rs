@@ -1,13 +1,37 @@
 //! MessageQueue 持久门面语义：入队即事实、发送选择、原子移交、水位与唤醒。
 
-use super::*;
 use crate::identity::AttemptId;
 use crate::messages::{BaseMessage, MessageId};
+use crate::session::message_queue::message_queue::MessageQueue;
+use crate::session::message_queue::queued_message::MessageKind;
+use crate::session::message_queue::queued_message::MessageSource;
+use crate::session::message_queue::queued_message::QueuedMessage;
+#[cfg(test)]
+use crate::session::mq::MqEnqueueOutcome;
+#[cfg(test)]
+use crate::session::mq::MqEntry;
+#[cfg(test)]
+use crate::session::mq::MqFilter;
+#[cfg(test)]
+use crate::session::mq::MqInput;
+#[cfg(test)]
+use crate::session::mq::MqReceiveDisposition;
+#[cfg(test)]
+use crate::session::mq::MqReceiveOutcome;
+#[cfg(test)]
+use crate::session::mq::MqReceiveSelection;
+#[cfg(test)]
+use crate::session::mq::ThreadMqStore;
 use crate::session::mq_memory::InMemoryMqStore;
+#[cfg(test)]
+use crate::session::ExecutionBinding;
+#[cfg(test)]
+use crate::session::MessagePolicy;
 use crate::session::SessionInbox;
 use crate::session::{
-    MqCancelOutcome, MqEnqueueDisposition, MqReceiveStatus, MqSendStatus, TurnId,
+    MqCancelOutcome, MqEnqueueDisposition, MqReceivePurpose, MqReceiveStatus, MqSendStatus, TurnId,
 };
+use crate::session::{ProducerQueue, QueueClosed, QueueOwner, QueuedPayload};
 use crate::session_resources::{
     BindingRecheck, BindingState, ChildResumeClaim, ChildSnapshot, CloseSettlement, ForkSnapshot,
     FrozenSnapshotBytes, FrozenState, NewSession, NewSessionDraft, PersistenceRecovery,
@@ -25,6 +49,8 @@ use crate::thread::{ThreadId, ThreadMeta};
 use crate::workspace::{ResolvedWorkspace, ScopedThreadPage, ScopedThreadQuery};
 use async_trait::async_trait;
 use serde_json::json;
+#[cfg(test)]
+use std::sync::Arc;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -494,127 +520,4 @@ async fn expired_run_binding_is_suppressed_without_writing_history() {
     assert!(queue.is_empty().await.unwrap());
 }
 
-// ─── 身份、原始稿与幂等 ──────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn system_reminder_delivery_id_is_fixed_on_enqueue() {
-    let queue = MessageQueue::new();
-    let body = reminder("done");
-    let outcome = queue
-        .enqueue(QueuedMessage::system_reminder(
-            MessageKind::Defer,
-            MessageSource::SubAgentComplete,
-            body.clone(),
-        ))
-        .await
-        .unwrap();
-    let id = outcome.entry.id;
-    assert_eq!(outcome.entry.payload.id(), id);
-
-    let snapshot = queue.snapshot().await.unwrap();
-    assert_eq!(snapshot.len(), 1);
-    assert_eq!(snapshot[0].delivery_id, Some(id));
-    assert_eq!(
-        snapshot[0].enqueued_at,
-        Some(outcome.entry.enqueued_at.clone())
-    );
-    assert!(matches!(
-        &snapshot[0].payload,
-        QueuedPayload::SystemReminder(actual) if actual == &body
-    ));
-}
-
-#[tokio::test]
-async fn same_delivery_id_is_idempotent_and_conflicts_are_rejected() {
-    let queue = MessageQueue::new();
-    let id = MessageId::new();
-    let first = QueuedMessage::system_reminder_with_delivery_id(
-        MessageKind::Defer,
-        MessageSource::SubAgentComplete,
-        reminder("done"),
-        id,
-    );
-    let inserted = queue.enqueue(first.clone()).await.unwrap();
-    assert_eq!(inserted.disposition, MqEnqueueDisposition::Inserted);
-    let again = queue.enqueue(first).await.unwrap();
-    assert_eq!(again.disposition, MqEnqueueDisposition::Existing);
-    assert_eq!(again.entry.id, inserted.entry.id);
-    assert_eq!(again.entry.enqueued_at, inserted.entry.enqueued_at);
-
-    let conflicting = QueuedMessage::system_reminder_with_delivery_id(
-        MessageKind::Defer,
-        MessageSource::SubAgentComplete,
-        reminder("different"),
-        id,
-    );
-    assert!(queue.enqueue(conflicting).await.is_err());
-    assert_eq!(queue.len().await.unwrap(), 1);
-}
-
-#[tokio::test]
-async fn cancel_returns_the_original_draft() {
-    let queue = MessageQueue::new();
-    let entry = queue
-        .enqueue(prompt("draft text").with_original_draft("raw draft"))
-        .await
-        .unwrap()
-        .entry;
-    match queue.cancel_user_input(&entry.id).await.unwrap() {
-        MqCancelOutcome::Cancelled(row) => {
-            assert_eq!(row.id, entry.id);
-            assert_eq!(row.original_draft.as_deref(), Some("raw draft"));
-        }
-        other => panic!("expected a cancelled row, got {other:?}"),
-    }
-    assert!(queue.is_empty().await.unwrap());
-    assert!(matches!(
-        queue.cancel_user_input(&entry.id).await.unwrap(),
-        MqCancelOutcome::NotFound
-    ));
-}
-
-// ─── 水位 ────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn watermark_and_ensure_processing_after_follow_enqueue_order() {
-    let queue = MessageQueue::new();
-    assert_eq!(queue.admission_watermark().await.unwrap(), None);
-
-    let info = queue
-        .enqueue(QueuedMessage::info(
-            MessageSource::SystemInjected,
-            BaseMessage::human("info"),
-        ))
-        .await
-        .unwrap()
-        .entry;
-    let watermark = queue.admission_watermark().await.unwrap().unwrap();
-    assert_eq!(watermark, info.watermark());
-    assert!(!queue
-        .has_ensure_processing_after(&Some(watermark.clone()))
-        .await
-        .unwrap());
-    assert!(!queue.has_ensure_processing_after(&None).await.unwrap());
-
-    let defer = queue
-        .enqueue(QueuedMessage::defer(
-            MessageSource::SubAgentComplete,
-            BaseMessage::human("done"),
-        ))
-        .await
-        .unwrap()
-        .entry;
-    assert!(queue
-        .has_ensure_processing_after(&Some(watermark))
-        .await
-        .unwrap());
-    assert_eq!(
-        queue.admission_watermark().await.unwrap(),
-        Some(defer.watermark())
-    );
-    assert!(queue.has_ensure_processing_after(&None).await.unwrap());
-}
-
-// ─── 唤醒 ────────────────────────────────────────────────────────────────────
-
-include!("queue_mq_send_test.rs");
+include!("queue_mq_test_part2_test.rs");

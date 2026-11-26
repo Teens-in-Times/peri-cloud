@@ -1,10 +1,16 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use rmcp::{
-    model::{CancelledNotificationParam, ClientRequest, CustomRequest, RequestId, ServerResult},
-    service::{Peer, PeerRequestOptions, RoleClient},
-};
+use rmcp::model::CancelledNotificationParam;
+use rmcp::model::ClientRequest;
+use rmcp::model::CustomRequest;
+use rmcp::model::RequestId;
+use rmcp::model::ServerResult;
+use rmcp::service::Peer;
+use rmcp::service::PeerRequestOptions;
+use rmcp::service::RoleClient;
 
 use crate::mcp::{ClientStatus, McpClientPool};
 
@@ -91,10 +97,8 @@ impl McpWorkspaceFileReader {
         let closed = crate::mcp::builtin::closed_instances(disabled);
         Self {
             pool: pool.filter(|pool| {
-                let source = pool
-                    .get_client("workspace")
-                    .and_then(|handle| handle.source.clone());
-                !crate::mcp::builtin::is_closed_source("workspace", source.as_ref(), &closed)
+                let source = pool.capability_source("workspace");
+                !crate::mcp::builtin::is_capability_closed("workspace", source.as_ref(), &closed)
             }),
             session_id,
         }
@@ -110,7 +114,7 @@ impl McpWorkspaceFileReader {
             .filter(|pool| !workspace_closed(pool))
             .ok_or(WorkspaceReadError::Unavailable)?;
         let handle = pool
-            .get_client_visible_to("workspace", self.session_id.as_deref())
+            .capability_client_visible_to("workspace", self.session_id.as_deref())
             .filter(|handle| matches!(handle.status, ClientStatus::Connected))
             .filter(|handle| crate::mcp::builtin::is_workspace_source(handle.source.as_ref()))
             .ok_or(WorkspaceReadError::Unavailable)?;
@@ -144,7 +148,7 @@ impl McpWorkspaceFileReader {
         if workspace_closed(pool)
             || pool.acp_owners.read().get("workspace").cloned() != owner
             || !pool
-                .get_client_visible_to("workspace", self.session_id.as_deref())
+                .capability_client_visible_to("workspace", self.session_id.as_deref())
                 .is_some_and(|current| {
                     Arc::ptr_eq(&current, &handle)
                         && matches!(current.status, ClientStatus::Connected)
@@ -199,6 +203,16 @@ impl WorkspaceFileReader for McpWorkspaceFileReader {
     }
 
     async fn current_branch(&self) -> Result<Option<String>, WorkspaceReadError> {
+        // S9a3a：cold 远端 workspace 的 `workspace/gitBranch` 是自定义 MCP 请求，
+        // 与 tools/call 一样会启动真实后端。git 归因的分支观察属于可选探测，
+        // 首个真实调用之前按不可得处理（调用方忽略该错误）；启动后下一轮恢复。
+        if self
+            .pool
+            .as_ref()
+            .is_some_and(|pool| pool.remote_workspace_deferred())
+        {
+            return Err(WorkspaceReadError::Unavailable);
+        }
         let result = self.request("workspace/gitBranch", None).await?;
         match result.get("branch") {
             Some(serde_json::Value::Null) => Ok(None),
@@ -211,10 +225,8 @@ impl WorkspaceFileReader for McpWorkspaceFileReader {
 fn workspace_closed(pool: &McpClientPool) -> bool {
     !pool.is_open()
         || pool.builtin_instance_context().is_some_and(|context| {
-            let source = pool
-                .get_client("workspace")
-                .and_then(|handle| handle.source.clone());
-            crate::mcp::builtin::is_closed_source("workspace", source.as_ref(), &context.closed)
+            let source = pool.capability_source("workspace");
+            crate::mcp::builtin::is_capability_closed("workspace", source.as_ref(), &context.closed)
         })
 }
 

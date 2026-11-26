@@ -9,10 +9,17 @@
 //! 错误——技能内容与目录现在都经 MCP 侧，见 `crate::mcp::skill_discovery_test`
 //! 与 `peri-acp` 的会话端到端用例。
 
-use peri_agent::{agent::state::AgentState, middleware::r#trait::Middleware};
-use tempfile::tempdir;
+use peri_agent::agent::state::AgentState;
+use peri_agent::middleware::r#trait::Middleware;
+use tempfile;
 
-use super::*;
+use super::Arc;
+use super::McpSkillRegistry;
+use super::SkillMetadata;
+use super::SkillOrigin;
+use super::SkillSource;
+use super::SkillsMiddleware;
+use peri_agent::middleware::PromptSectionZone;
 
 /// Helper: call prompt_contribution with concrete State type for testing.
 fn contribution(mw: &SkillsMiddleware) -> Option<String> {
@@ -52,16 +59,18 @@ fn registry_with(server: &str, skills: Vec<SkillMetadata>) -> Arc<McpSkillRegist
 fn test_annotation_keeps_source_without_fabricating_tool_prefix() {
     for server in ["workspace", "plugin:foo.bar"] {
         let meta = fake_skill(server, "project", "hello");
-        let annotated = annotate_mcp_content(&meta, "# Body");
+        let annotated = super::annotate_mcp_content(&meta, "# Body");
         assert_eq!(
             annotated.lines().next().unwrap(),
             format!(
-            "This skill is served by MCP server \"{server}\", uri: skill://project/hello/SKILL.md."
-        )
+                "This skill is served by MCP server \"{server}\", uri: skill://project/hello/SKILL.md."
+            )
         );
         assert!(!annotated.contains("mcp__"));
         assert!(!annotated.contains("SearchExtraTools"));
         assert!(!annotated.contains("ExecuteExtraTool"));
+        assert!(!annotated.contains("ToolSearch"));
+        assert!(!annotated.contains("ToolInvoke"));
         assert!(annotated.ends_with("\n\n# Body"));
     }
 }
@@ -129,7 +138,7 @@ fn source_label_falls_back_to_mcp_for_foreign_uri_shapes() {
 async fn without_registry_cache_and_contribution_stay_empty() {
     // 未装配技能面：没有摘要，也不回落任何本地来源（J5）；工具面在调用时
     // 读取 registry，未装配 ⇒ 目录不可用的稳定错误（见 tools_test）。
-    let dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let mw = SkillsMiddleware::new();
     let mut state = AgentState::new(dir.path().to_str().unwrap());
     mw.before_agent(&mut state).await.unwrap();
@@ -194,7 +203,7 @@ async fn tool_face_reflects_catalog_changes() {
 /// 外部 origin 保持既有延迟发现语义（不进 prompt）。
 #[tokio::test]
 async fn unfrozen_contribution_uses_system_origins_only() {
-    let dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let reg = registry_with(
         "workspace",
         vec![fake_skill("workspace", "project", "local-skill")],
@@ -226,7 +235,7 @@ async fn unfrozen_contribution_uses_system_origins_only() {
 /// 冻结摘要优先：会话内不再按当轮投影重渲染（ARC-FROZEN-001 的投递面）。
 #[tokio::test]
 async fn frozen_summary_wins_over_current_projection() {
-    let dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let reg = registry_with(
         "workspace",
         vec![fake_skill("workspace", "project", "appeared-later")],
@@ -293,7 +302,7 @@ fn skills_section_declaration_shape() {
     // 段落文件不再硬编码任何本地路径/扫描参数（J5 失同步防线）
     let file_content = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../peri-acp/prompts/sections/13_skills.md"
+        "/prompts/sections/13_skills.md"
     ));
     assert!(
         !file_content.contains("Each skill root is scanned recursively"),
@@ -307,7 +316,7 @@ fn skills_section_declaration_shape() {
 
 #[test]
 fn discovery_protocol_describes_mcp_sources_without_local_paths() {
-    let text = format_discovery_protocol();
+    let text = super::format_discovery_protocol();
     assert!(
         text.contains("MCP"),
         "协议文本应说明技能经 MCP 提供: {text}"
@@ -327,4 +336,233 @@ fn discovery_protocol_describes_mcp_sources_without_local_paths() {
             "协议文本不得残留本地扫描/路径事实（{stale}）: {text}"
         );
     }
+}
+
+#[test]
+fn resume_with_restricted_skills_preserves_frozen_identity_and_rejects_ambiguous_overrides() {
+    use peri_acp_types::meta_harness::{sections, MetaHarnessState};
+    use peri_acp_types::skills::SkillToolAccess;
+
+    let full = SkillsMiddleware::sections();
+    let body = full[0].content.as_str();
+    let identity = format!("frozen persona\n\n{body}\n\nfrozen language");
+    let (load, access) = SkillsMiddleware::project_resumed_identity(
+        &identity,
+        Some(SkillToolAccess::Full),
+        None,
+        SkillToolAccess::LoadOnly,
+        None,
+    )
+    .unwrap();
+    assert_eq!(access, SkillToolAccess::LoadOnly);
+    assert!(load.starts_with("frozen persona\n\n"));
+    assert!(load.ends_with("\n\nfrozen language"));
+    assert!(load.contains("`SkillTool("));
+    assert!(!load.contains("DiscoverSkillsTool"));
+
+    let mut frozen = MetaHarnessState::default();
+    frozen
+        .section_overrides
+        .insert(sections::SKILLS.id.into(), "private custom owner".into());
+    let identity = "frozen persona\n\nprivate custom owner\n\nfrozen language";
+    assert_eq!(
+        SkillsMiddleware::project_resumed_identity(
+            identity,
+            None,
+            Some(&frozen),
+            SkillToolAccess::None,
+            None,
+        )
+        .unwrap(),
+        (
+            "frozen persona\n\nfrozen language".to_owned(),
+            SkillToolAccess::None
+        )
+    );
+    frozen.section_overrides.insert(
+        sections::SKILLS.id.into(),
+        "private skill at {{cwd}}".into(),
+    );
+    assert!(SkillsMiddleware::project_resumed_identity(
+        "frozen persona\n\nprivate skill at /workspace",
+        Some(SkillToolAccess::Full),
+        Some(&frozen),
+        SkillToolAccess::None,
+        None,
+    )
+    .is_err());
+}
+
+#[test]
+fn resumes_released_skills_bytes_and_preserves_the_frozen_operation_ceiling() {
+    use peri_acp_types::skills::SkillToolAccess::{self, DiscoverOnly, Full, LoadOnly};
+
+    let old = include_str!("fixtures/released_25c183e_section.txt");
+    let identity = format!("frozen persona\n\n{old}\n\nfrozen language");
+    for requested in [Full, DiscoverOnly] {
+        let (projected, access) =
+            SkillsMiddleware::project_resumed_identity(&identity, None, None, requested, None)
+                .unwrap();
+        assert_eq!(access, SkillToolAccess::None);
+        assert_eq!(projected, "frozen persona\n\nfrozen language");
+        assert!(!projected.contains("This includes coordination calls"));
+    }
+    let sections = SkillsMiddleware::sections_for_tools(DiscoverOnly);
+    let body = sections[0].content.as_str();
+    let discover = format!("frozen persona\n\n{body}\n\nfrozen language");
+    let (unchanged, access) =
+        SkillsMiddleware::project_resumed_identity(&discover, Some(DiscoverOnly), None, Full, None)
+            .unwrap();
+    assert_eq!((unchanged, access), (discover.clone(), DiscoverOnly));
+
+    let (removed, access) = SkillsMiddleware::project_resumed_identity(
+        &discover,
+        Some(DiscoverOnly),
+        None,
+        LoadOnly,
+        None,
+    )
+    .unwrap();
+    assert_eq!(removed, "frozen persona\n\nfrozen language");
+    assert_eq!(access, SkillToolAccess::None);
+    let allowed = SkillsMiddleware::new().collect_tools(".");
+    assert!(allowed.iter().all(|tool| !access.permits(tool.as_ref())));
+}
+
+#[test]
+fn resumes_crlf_frozen_skills_sections_produced_on_windows() {
+    use peri_acp_types::skills::SkillToolAccess::{self, DiscoverOnly, Full};
+
+    // Windows checkouts may already deliver CRLF, so normalize before converting:
+    // converting an existing `\r\n` again would yield `\r\r\n` and break matching.
+    fn crlf(text: &str) -> String {
+        let converted = text.replace("\r\n", "\n").replace('\n', "\r\n");
+        assert!(
+            !converted.contains("\r\r\n"),
+            "CRLF conversion double-encoded an existing carriage return"
+        );
+        converted
+    }
+
+    // Windows checkouts/builds may store frozen sections with CRLF line endings;
+    // recognition must not depend on the line endings of the producing platform.
+    let old = crlf(include_str!("fixtures/released_25c183e_section.txt"));
+    // Multibyte context makes byte offsets diverge from normalized indices.
+    let identity = format!("冻结人格\r\n\r\n{old}\r\n\r\n冻结语言");
+    let (projected, access) =
+        SkillsMiddleware::project_resumed_identity(&identity, None, None, Full, None).unwrap();
+    assert_eq!(access, SkillToolAccess::None);
+    assert_eq!(projected, "冻结人格\r\n\r\n冻结语言");
+
+    let sections = SkillsMiddleware::sections_for_tools(DiscoverOnly);
+    let body = crlf(sections[0].content.as_str());
+    let discover = format!("冻结人格\r\n\r\n{body}\r\n\r\n冻结语言");
+    let (unchanged, access) =
+        SkillsMiddleware::project_resumed_identity(&discover, Some(DiscoverOnly), None, Full, None)
+            .unwrap();
+    assert_eq!((unchanged, access), (discover.clone(), DiscoverOnly));
+}
+
+#[test]
+fn historical_custom_skills_need_a_recorded_ceiling() {
+    use peri_acp_types::messages::BaseMessage;
+    use peri_acp_types::meta_harness::{sections, MetaHarnessState};
+    use peri_acp_types::skills::SkillToolAccess;
+    use peri_acp_types::store::{
+        deserialize_persisted_payload, serialize_persisted_payload, PersistedPayload,
+    };
+
+    let mut frozen = MetaHarnessState::default();
+    let custom = "Custom skill guidance";
+    frozen
+        .section_overrides
+        .insert(sections::SKILLS.id.into(), custom.into());
+    let identity = format!("frozen persona\n\n{custom}\n\nfrozen language");
+
+    for (stamp, expected) in [
+        (None, SkillToolAccess::None),
+        (Some(SkillToolAccess::Full), SkillToolAccess::Full),
+    ] {
+        let mut message = BaseMessage::system(identity.clone());
+        if let Some(access) = stamp {
+            message = message.with_child_skill_ceiling(access);
+        }
+        let json = serialize_persisted_payload(&PersistedPayload::Message(message)).unwrap();
+        let restored = deserialize_persisted_payload(&json).unwrap();
+        let message = restored.as_message().unwrap();
+        assert_eq!(message.child_skill_ceiling(), stamp);
+        let (projected, access) = SkillsMiddleware::project_resumed_identity(
+            &message.content(),
+            message.child_skill_ceiling(),
+            Some(&frozen),
+            SkillToolAccess::Full,
+            None,
+        )
+        .unwrap();
+        assert_eq!(access, expected);
+        assert_eq!(projected.contains(custom), stamp.is_some());
+        assert!(projected.starts_with("frozen persona\n\n"));
+        assert!(projected.ends_with("frozen language"));
+    }
+
+    let malformed = format!("frozen persona\n\n{custom}\n\n{custom}");
+    assert!(SkillsMiddleware::project_resumed_identity(
+        &malformed,
+        Some(SkillToolAccess::Full),
+        Some(&frozen),
+        SkillToolAccess::Full,
+        None,
+    )
+    .is_err());
+}
+
+#[test]
+fn modern_rendered_skills_override_resumes_with_full_or_restricted_access() {
+    use peri_acp_types::meta_harness::{sections, MetaHarnessState};
+    use peri_acp_types::skills::SkillToolAccess;
+
+    let mut frozen = MetaHarnessState::default();
+    frozen.section_overrides.insert(
+        sections::SKILLS.id.into(),
+        r"Custom: {{cwd}} and \{{cwd\}}".into(),
+    );
+    let without_section = "persona\n\nlanguage";
+    assert_eq!(
+        SkillsMiddleware::project_resumed_identity(
+            without_section,
+            Some(SkillToolAccess::None),
+            Some(&frozen),
+            SkillToolAccess::Full,
+            Some("Custom: /workspace/child and {{cwd}}"),
+        )
+        .unwrap(),
+        (without_section.to_owned(), SkillToolAccess::None),
+    );
+    let rendered = "Custom: /workspace/child and {{cwd}}";
+    let identity = format!("persona\n\n{rendered}\n\nlanguage");
+    let project = |identity: &str, access| {
+        SkillsMiddleware::project_resumed_identity(
+            identity,
+            Some(SkillToolAccess::Full),
+            Some(&frozen),
+            access,
+            Some(rendered),
+        )
+    };
+    assert_eq!(
+        project(&identity, SkillToolAccess::Full).unwrap(),
+        (identity.clone(), SkillToolAccess::Full),
+    );
+    let (restricted, access) = project(&identity, SkillToolAccess::DiscoverOnly).unwrap();
+    assert_eq!(access, SkillToolAccess::DiscoverOnly);
+    assert!(restricted.starts_with("persona\n\n"));
+    assert!(restricted.ends_with("\n\nlanguage"));
+    assert!(restricted.contains("DiscoverSkillsTool"));
+    assert!(!restricted.contains(rendered));
+    assert!(project(&format!("{identity}\n\n{rendered}"), SkillToolAccess::Full).is_err());
+    assert!(project(
+        &identity.replace("/workspace/child", "/wrong"),
+        SkillToolAccess::Full
+    )
+    .is_err());
 }

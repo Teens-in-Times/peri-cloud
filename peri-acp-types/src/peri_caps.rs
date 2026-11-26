@@ -1,4 +1,5 @@
 use crate::command::command_route::UiCommandSpec;
+use crate::history_v2::HistoryServerCapability;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -60,6 +61,15 @@ pub struct PeriCaps {
     /// 用户待发送队列与逐条发送控制，默认不协商。
     #[serde(default)]
     pub user_input_queue: bool,
+    /// TUI Enter selects this input for the next model boundary of an active turn.
+    #[serde(default)]
+    pub user_input_queue_tool_boundary: bool,
+    /// 入队请求可携带 `pluginSelections`（`peri.userInputQueue.pluginSelections`）。
+    ///
+    /// 旧 Host 的 `EnqueueUserInputRequest` 拒绝未知字段，因此该能力必须独立协商：
+    /// 客户端只在服务端明确回显 true 时发送选择，否则保留草稿与选择并提示不可用。
+    #[serde(default)]
+    pub user_input_queue_plugin_selections: bool,
     /// Versioned project/workspace queries and immutable session execution context.
     #[serde(default)]
     pub session_workspace_v1: bool,
@@ -79,13 +89,20 @@ pub struct PeriCaps {
     /// 门控按**当前连接**的协商结果判定。
     #[serde(default)]
     pub history_window_v1: bool,
+    /// `peri.history`：History V2（windowed profile）的服务端回显。
+    ///
+    /// 客户端声明只在 `initialize` 的 `_meta` 中出现（由 `session_caps` 协商，
+    /// 本结构不解析）；Some 表示服务端已确认 V2 可用并写入
+    /// `agentCapabilities._meta["peri.history"]`。默认 None = 不宣告。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_v2: Option<HistoryServerCapability>,
     /// ACP MCP register/restart/stop control, negotiated on the current connection.
     #[serde(default)]
     pub mcp_control_v1: bool,
     /// `peri.uiCommands`：TUI 上送的 ui 域命令明细（空 = 不广播 ui 条目）。
     /// 门控语义反转：TUI 声明明细 → ACP 注册为 `ui:*` 条目，而非 ACP 附加
     /// 硬编码列表；旧客户端 bool `true` 由 [`PeriCaps::from_client_meta`]
-    /// 退化为 [`default_ui_commands`] 明细（注册冲突按注册表裁决，见该函数
+    /// 退化为 `default_ui_commands` 明细（注册冲突按注册表裁决，见该函数
     /// 注释）。
     #[serde(default)]
     pub ui_commands: Vec<UiCommandSpec>,
@@ -111,9 +128,16 @@ impl PeriCaps {
             rewind: meta_bool(meta, "peri.rewind"),
             system_reminder: meta_bool(meta, "peri.systemReminder"),
             user_input_queue: meta_bool(meta, "peri.userInputQueue"),
+            user_input_queue_tool_boundary: meta_bool(meta, "peri.userInputQueue.toolBoundary"),
+            user_input_queue_plugin_selections: meta_bool(
+                meta,
+                "peri.userInputQueue.pluginSelections",
+            ),
             session_workspace_v1: meta_bool(meta, "peri.sessionWorkspaceV1"),
             history_pagination: meta_bool(meta, "peri.historyPagination"),
             history_window_v1: meta_bool(meta, "peri.historyWindowV1"),
+            // V2 需要服务端能力门与显式错误，不能由 infallible 的展示解析代劳。
+            history_v2: None,
             mcp_control_v1: meta_bool(meta, "peri.mcpControlV1"),
             ui_commands: Self::meta_ui_commands(meta),
         }
@@ -121,7 +145,7 @@ impl PeriCaps {
 
     /// `peri.uiCommands` 兼容两态解析：
     /// - 数组 → `Vec<UiCommandSpec>`（serde 解析失败按空处理 + warn）；
-    /// - 旧客户端 bool `true` → 退化为 [`default_ui_commands`] 明细（明细与旧
+    /// - 旧客户端 bool `true` → 退化为 `default_ui_commands` 明细（明细与旧
     ///   ACP 硬编码列表一致；注册时同名冲突按注册表裁决，见该函数注释）；
     /// - 未声明 / `false` / 其他类型 → 空（外部客户端默认不接收界面性命令）。
     fn meta_ui_commands(meta: &serde_json::Map<String, Value>) -> Vec<UiCommandSpec> {
@@ -178,6 +202,14 @@ impl PeriCaps {
             Value::Bool(self.user_input_queue),
         );
         m.insert(
+            "peri.userInputQueue.toolBoundary".into(),
+            Value::Bool(self.user_input_queue_tool_boundary),
+        );
+        m.insert(
+            "peri.userInputQueue.pluginSelections".into(),
+            Value::Bool(self.user_input_queue_plugin_selections),
+        );
+        m.insert(
             "peri.sessionWorkspaceV1".into(),
             Value::Bool(self.session_workspace_v1),
         );
@@ -189,6 +221,12 @@ impl PeriCaps {
             "peri.historyWindowV1".into(),
             Value::Bool(self.history_window_v1),
         );
+        if let Some(history_v2) = &self.history_v2 {
+            let server_meta = history_v2
+                .to_meta()
+                .expect("HistoryServerCapability 序列化不应失败");
+            m.extend(server_meta);
+        }
         m.insert("peri.mcpControlV1".into(), Value::Bool(self.mcp_control_v1));
         m.insert(
             "peri.uiCommands".into(),
@@ -214,9 +252,12 @@ impl PeriCaps {
             rewind: true,
             system_reminder: true,
             user_input_queue: true,
+            user_input_queue_tool_boundary: true,
+            user_input_queue_plugin_selections: true,
             session_workspace_v1: true,
             history_pagination: true,
             history_window_v1: true,
+            history_v2: None,
             mcp_control_v1: true,
             ui_commands: default_ui_commands(),
         }

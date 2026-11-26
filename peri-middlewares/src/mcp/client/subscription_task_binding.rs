@@ -6,7 +6,7 @@ use peri_acp_types::system_reminder::{
     ReminderSource as CanonicalReminderSource, SystemReminder, TrustedSystemReminderFactory,
     SYSTEM_REMINDER_VERSION,
 };
-use peri_acp_types::tasks::{BgTaskKind, ExternalTaskRegistration, TaskManager};
+use peri_acp_types::tasks::{BgTaskKind, ExternalTaskOwner, ExternalTaskRegistration, TaskManager};
 use rmcp::model::{CancelTaskParams, CancelTaskRequest, ClientRequest, ServerResult};
 use rmcp::service::PeerRequestOptions;
 use serde_json::json;
@@ -236,9 +236,9 @@ impl McpClientPool {
                     .upgrade()
                     .ok_or_else(|| "MCP pool unavailable".to_owned())?;
                 let peer = pool
-                    .clients
-                    .read()
-                    .get(&server)
+                    .capability_server_name(&server)
+                    .or_else(|| pool.client(&server).map(|_| server.clone()))
+                    .and_then(|resolved| pool.clients.read().get(&resolved).cloned())
                     .and_then(|client| client.peer.clone())
                     .ok_or_else(|| "MCP task owner disconnected".to_owned())?;
                 let mut params = CancelTaskParams::new(raw_id);
@@ -300,19 +300,30 @@ impl McpClientPool {
                     >
             },
         );
+        // `server` 是任务面板身份（v5 下为 capability 名）；客户端仍按 wire
+        // server（`peri`）查，否则单出口的能力任务会被判成 owner 缺失。
+        let wire_server = self
+            .capability_server_name(server)
+            .unwrap_or_else(|| server.to_owned());
         let owner_identity = self
             .clients
             .read()
-            .get(server)
+            .get(&wire_server)
             .map(|client| format!("mcp:{server}:{:?}", client.source))
             .ok_or_else(|| "MCP task owner unavailable".to_owned())?;
+        // Monitor 的请求键是 monitor 端任务 ID；其他 MCP 任务保留 server 作用域。
+        let owner = if self.is_monitor_server(server) {
+            ExternalTaskOwner::monitor(raw_task_id)
+        } else {
+            ExternalTaskOwner::mcp(server, raw_task_id)
+        };
         Ok((
             manager,
             ExternalTaskRegistration {
                 session_id: session_id.to_owned(),
                 initiator_session_id: Some(initiator_session_id.to_owned()),
                 owner_identity,
-                owner_task_id: raw_task_id.to_owned(),
+                owner,
                 kind,
                 summary: summary.to_owned(),
                 started_at: Some(started_at.to_owned()),

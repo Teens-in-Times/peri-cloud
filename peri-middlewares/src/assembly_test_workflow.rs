@@ -1,5 +1,3 @@
-use super::*;
-
 #[path = "assembly_workflow_mcp_test.rs"]
 mod mcp_owner;
 
@@ -12,7 +10,7 @@ mod mcp_owner;
 /// 才能观察到该能力面（无池构造器的行为与迁移前的非 Web 部分逐位一致）。
 #[test]
 fn workflow_build_tools_filters_disabled() {
-    let factory = default_workflow_middleware_factory();
+    let factory = crate::assembly::default_workflow_middleware_factory();
     // 无池构造器：不产生任何 builtin bridge（既有调用点语义不变）。
     let without_pool = factory.build_tools(
         "/tmp/contract-test",
@@ -31,8 +29,9 @@ fn workflow_build_tools_filters_disabled() {
     // 带池工厂：全开时声明 `direct` 的 builtin 工具进入工具列表，deferred 的缺席
     // （面④是 direct-only 面：`open_builtin_bridges` 只保留 direct，本条链没有
     // ToolSearch 可发现）。
-    let pool_factory =
-        default_workflow_middleware_factory_with_pool(Some(pool_with_builtin_instances()));
+    let pool_factory = super::default_workflow_middleware_factory_with_pool(Some(
+        super::pool_with_builtin_instances(),
+    ));
     let all = pool_factory.build_tools(
         "/tmp/contract-test",
         &std::collections::HashSet::new(),
@@ -40,28 +39,30 @@ fn workflow_build_tools_filters_disabled() {
         None,
     );
     let all_names: Vec<&str> = all.iter().map(|t| t.name()).collect();
-    for (name, direct) in peri_acp_types::builtin_mcp::BUILTIN_MCP_INSTANCES
-        .iter()
-        .flat_map(|instance| instance.tools.iter())
-        .map(|declaration| (declaration.effective_name, declaration.direct))
     {
-        let entry = all.iter().find(|tool| tool.name() == name);
-        if direct {
-            let entry = entry.unwrap_or_else(|| {
-                panic!("workflow agent 工具列表应含 direct builtin 工具 {name}: {all_names:?}")
-            });
-            assert_eq!(
-                entry.is_direct(),
-                direct,
-                "workflow agent 侧的 {name} 必须保持声明的直连性（A6 面③）"
-            );
-        } else {
-            assert!(
-                entry.is_none(),
-                "workflow agent 工具列表（面④）不得含 deferred builtin 工具 {name}：\
+        let builtin_tool_declarations = peri_acp_types::builtin_mcp::BUILTIN_MCP_INSTANCES
+            .iter()
+            .flat_map(|instance| instance.tools.iter())
+            .map(|declaration| (declaration.legacy_name, declaration.direct));
+        for (name, direct) in builtin_tool_declarations {
+            let entry = all.iter().find(|tool| tool.name() == name);
+            if direct {
+                let entry = entry.unwrap_or_else(|| {
+                    panic!("workflow agent 工具列表应含 direct builtin 工具 {name}: {all_names:?}")
+                });
+                assert_eq!(
+                    entry.is_direct(),
+                    direct,
+                    "workflow agent 侧的 {name} 必须保持声明的直连性（A6 面③）"
+                );
+            } else {
+                assert!(
+                    entry.is_none(),
+                    "workflow agent 工具列表（面④）不得含 deferred builtin 工具 {name}：\
                  deferred 工具不进 direct-only 面（`open_builtin_bridges` 只保留 direct；\
                  这两条链没有 ToolSearch 可发现，注入即模型看不见的注册项）: {all_names:?}"
-            );
+                );
+            }
         }
     }
     for expected in ["SkillTool", "DiscoverSkillsTool"] {
@@ -73,11 +74,11 @@ fn workflow_build_tools_filters_disabled() {
     // workspace 实例的 7 个工具按原名进入 workflow 工具面。
     let workspace = peri_acp_types::builtin_mcp::find("workspace")
         .expect("workspace 必须是已实现实例（W3-A 冻结注册表）");
-    for declaration in workspace.tools {
+    for declaration in workspace.tools.iter().filter(|tool| tool.advertised) {
         assert!(
-            all_names.contains(&declaration.effective_name),
+            all_names.contains(&declaration.legacy_name),
             "全开时 workflow 工具 {} 应存在: {all_names:?}",
-            declaration.effective_name
+            declaration.legacy_name
         );
     }
 
@@ -94,18 +95,25 @@ fn workflow_build_tools_filters_disabled() {
         }
     }
 
+    let mcp_disabled = ["McpMiddleware".to_owned()].into_iter().collect();
+    let mcp_closed = pool_factory.build_tools("/tmp/contract-test", &mcp_disabled, None, None);
+    assert!(mcp_closed
+        .iter()
+        .all(|tool| tool.mcp_server_name().is_none()));
+    assert!(mcp_closed.iter().any(|tool| tool.name() == "SkillTool"));
+
     // v4-part-4 W3-C1：workspace 实例关闭键（`WorkspaceMiddleware`）在面④同样生效——
     // 7 个 `*` 一个不剩。名字面从注册表派生。
     {
         let disabled: std::collections::HashSet<String> =
-            std::iter::once("WorkspaceMiddleware".to_string()).collect();
+            std::iter::once("workspace".to_string()).collect();
         let tools = pool_factory.build_tools("/tmp/contract-test", &disabled, None, None);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         for declaration in workspace.tools {
             assert!(
-                !names.contains(&declaration.effective_name),
+                !names.contains(&declaration.legacy_name),
                 "workflow disabled WorkspaceMiddleware 后 {} 仍存在: {names:?}",
-                declaration.effective_name
+                declaration.legacy_name
             );
         }
         assert!(
@@ -116,8 +124,8 @@ fn workflow_build_tools_filters_disabled() {
 
     // builtin 实例关闭：workflow agent 的工具列表同样归零（IF-D10 面③）。
     for (policy_key, gone, survivor) in [
-        ("WebMiddleware", "WebSearch", "artifact"),
-        ("ArtifactMiddleware", "artifact", "WebSearch"),
+        ("web", "WebSearch", "artifact"),
+        ("artifact", "artifact", "WebSearch"),
     ] {
         let disabled: std::collections::HashSet<String> =
             std::iter::once(policy_key.to_string()).collect();
@@ -138,7 +146,7 @@ fn workflow_build_tools_filters_disabled() {
     let all_keys: std::collections::HashSet<String> =
         peri_acp_types::builtin_mcp::BUILTIN_MCP_INSTANCES
             .iter()
-            .map(|instance| instance.policy_key.to_string())
+            .map(|instance| instance.name.to_string())
             .collect();
     let tools = pool_factory.build_tools("/tmp/contract-test", &all_keys, None, None);
     assert!(
@@ -156,10 +164,10 @@ fn workflow_build_tools_filters_disabled() {
 /// Workflow agent 中间件链按 disabled 集合过滤，未禁用项保持原相对顺序。
 #[test]
 fn workflow_build_middlewares_filters_disabled() {
-    let factory = default_workflow_middleware_factory();
+    let factory = crate::assembly::default_workflow_middleware_factory();
     // 全开：完整链序（与迁移前一致，顺序是行为契约）
     let all = factory.build_middlewares(
-        &workflow_context_with_disabled(&[]),
+        &super::workflow_context_with_disabled(&[]),
         "contract-model",
         &["test-skill".to_string()],
         None,
@@ -177,6 +185,15 @@ fn workflow_build_middlewares_filters_disabled() {
         ]
     );
 
+    let skills = all
+        .iter()
+        .find(|middleware| middleware.name() == "SkillsMiddleware")
+        .unwrap();
+    assert!(
+        skills.collect_tools("/tmp").is_empty(),
+        "workflow skills must come only from the filtered factory tool list"
+    );
+
     // 逐个禁用：链上消失；剩余项相对顺序不变
     for mw in [
         "AgentsMdMiddleware",
@@ -187,7 +204,7 @@ fn workflow_build_middlewares_filters_disabled() {
         "PermissionMiddleware",
     ] {
         let middlewares = factory.build_middlewares(
-            &workflow_context_with_disabled(&[mw]),
+            &super::workflow_context_with_disabled(&[mw]),
             "contract-model",
             &["test-skill".to_string()],
             None,
@@ -223,7 +240,7 @@ async fn workflow_shell_tool_face_is_the_workspace_bridge() {
     let cwd = fixture.path().to_str().unwrap();
 
     // 无池侧：壳工具本体不存在（裸名 `Bash` 0 项）。
-    let no_pool = default_workflow_middleware_factory().build_tools(
+    let no_pool = crate::assembly::default_workflow_middleware_factory().build_tools(
         cwd,
         &std::collections::HashSet::new(),
         None,
@@ -237,9 +254,10 @@ async fn workflow_shell_tool_face_is_the_workspace_bridge() {
     );
 
     // 带池侧：唯一形态是 builtin `workspace` 实例的桥，直连性 = 注册表声明。
-    let with_pool =
-        default_workflow_middleware_factory_with_pool(Some(pool_with_builtin_instances()))
-            .build_tools(cwd, &std::collections::HashSet::new(), None, None);
+    let with_pool = super::default_workflow_middleware_factory_with_pool(Some(
+        super::pool_with_builtin_instances(),
+    ))
+    .build_tools(cwd, &std::collections::HashSet::new(), None, None);
     let declared = peri_acp_types::builtin_mcp::find("workspace")
         .expect("workspace 必须是已实现实例")
         .tools
@@ -248,18 +266,18 @@ async fn workflow_shell_tool_face_is_the_workspace_bridge() {
         .expect("workspace 必须声明 Bash");
     let shell = with_pool
         .iter()
-        .find(|tool| tool.name() == declared.effective_name)
+        .find(|tool| tool.name() == declared.legacy_name)
         .unwrap_or_else(|| {
             panic!(
                 "带池侧 workflow 面应含 {}: {:?}",
-                declared.effective_name,
+                declared.legacy_name,
                 with_pool.iter().map(|t| t.name()).collect::<Vec<_>>()
             )
         });
     assert!(
         shell.is_direct(),
         "{} 的直连性必须等于注册表声明（AW3-03）",
-        declared.effective_name
+        declared.legacy_name
     );
     assert_eq!(
         with_pool
@@ -278,11 +296,9 @@ async fn workflow_shell_tool_face_is_the_workspace_bridge() {
 /// 仅 (Some, Some) 才是有效审批（其余为 `disabled()`，不得声明 10_hitl）。
 #[test]
 fn workflow_capability_policy_matches_real_assembly() {
-    use crate::permission::PermissionMiddleware;
-    use crate::prompt_policy::workflow_chain_capabilities;
-    use peri_agent::middleware::prompt_sections::SectionCapabilities;
+    use peri_acp_types::meta_harness::{AssemblyPlan, ChainSlot, ExecutionProfile};
 
-    let factory = default_workflow_middleware_factory();
+    let factory = crate::assembly::default_workflow_middleware_factory();
     for disabled in [
         Vec::<&str>::new(),
         vec!["SkillsMiddleware"],
@@ -294,28 +310,32 @@ fn workflow_capability_policy_matches_real_assembly() {
         for (broker_present, mode_present) in
             [(false, false), (true, false), (false, true), (true, true)]
         {
-            let ctx = workflow_context_with_approval(&disabled, broker_present, mode_present);
+            let ctx =
+                super::workflow_context_with_approval(&disabled, broker_present, mode_present);
             let mut chain = peri_agent::middleware::chain::MiddlewareChain::new();
             for middleware in factory.build_middlewares(&ctx, "contract-model", &[], None) {
                 chain.add(middleware);
             }
 
-            let facts = SectionCapabilities::from_sections(&chain.collect_prompt_sections());
-            let expected = workflow_chain_capabilities(&set, broker_present, mode_present);
-            let same_rule =
-                PermissionMiddleware::workflow_approval_active(broker_present, mode_present);
-            assert_eq!(
-                facts.approval, expected.approval,
-                "disabled={disabled:?} broker={broker_present} mode={mode_present}"
+            let plan = AssemblyPlan::new(
+                &set,
+                ExecutionProfile::Workflow {
+                    broker: broker_present,
+                    permission_mode: mode_present,
+                },
             );
-            assert_eq!(
-                facts.approval,
-                !set.contains("PermissionMiddleware") && same_rule,
-                "策略投影与装配同源规则一致（D3）"
-            );
-            assert_eq!(facts.ask_user, expected.ask_user, "ask_user 对拍");
-            assert_eq!(facts.subagent, expected.subagent, "subagent 对拍");
-            assert_eq!(facts.skills, expected.skills, "skills 对拍");
+            let sections = chain.collect_prompt_sections();
+            for owner in [
+                ChainSlot::Skills,
+                ChainSlot::Permission,
+                ChainSlot::AskUser,
+                ChainSlot::SubAgent,
+            ] {
+                assert_eq!(
+                    sections.iter().any(|s| s.owner == Some(owner)),
+                    plan.declares_sections(owner)
+                );
+            }
         }
     }
 }

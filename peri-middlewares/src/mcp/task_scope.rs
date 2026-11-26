@@ -1,15 +1,17 @@
 //! Deployment-owned task lifecycle for work that may retain an MCP pool.
 
-use std::{
-    collections::HashMap,
-    future::Future,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex, Weak,
-    },
-};
+use std::collections::HashMap;
+use std::fmt;
+use std::fmt::{Debug, Formatter};
+use std::future::Future;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
 
-use tokio::{sync::Notify, task::AbortHandle};
+use tokio::sync::Notify;
+use tokio::task::AbortHandle;
 use tokio_util::task::TaskTracker;
 
 pub use peri_acp_types::ports::McpTaskShutdownReport;
@@ -20,6 +22,12 @@ pub enum McpTaskKey {
     OAuth(String),
     Reconnect(String),
     Subscription(String),
+    /// 首次加载 attempt（plan 6.2）。`attempt` 是该 slot 内分配的序号：
+    /// 单个 attempt 在受管任务中收尾，连接受 slot 生命周期约束。
+    LoadAttempt {
+        server: String,
+        attempt: u64,
+    },
     /// 宿主面按实例资源订阅（`McpPoolPort::subscribe_instance_resource` 的转发任务）。
     ///
     /// 与 [`Self::Subscription`]（配置驱动的 server 级订阅循环）分开：本键按**每次
@@ -64,6 +72,7 @@ enum TaskPhase {
     Stopping,
 }
 
+#[derive(Default)]
 struct Completion {
     done: AtomicBool,
     notify: Notify,
@@ -116,10 +125,26 @@ pub struct McpTaskOwner {
     inner: Option<Arc<McpTaskInner>>,
 }
 
+impl Debug for McpTaskOwner {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpTaskOwner")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Weak task admission handle held by the pool and callbacks.
 #[derive(Clone)]
 pub struct McpTaskSpawner {
     inner: Weak<McpTaskInner>,
+}
+
+impl Debug for McpTaskSpawner {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpTaskSpawner")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -170,6 +195,7 @@ impl Drop for CompletionGuard {
 }
 
 impl McpTaskOwner {
+    #[must_use]
     pub fn new() -> (Self, McpTaskSpawner) {
         let inner = Arc::new(McpTaskInner {
             state: Mutex::new(McpTaskState {
@@ -354,6 +380,27 @@ impl McpTaskSpawner {
             self.stop_key(&key).await;
         }
     }
+    /// 停止某个 server 的全部首次加载 attempt（close / stop 路径调用）。
+    pub(crate) async fn stop_load_attempts(&self, server: &str) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let keys: Vec<McpTaskKey> = inner
+            .state
+            .lock()
+            .expect("MCP task state poisoned")
+            .records
+            .keys()
+            .filter(
+                |key| matches!(key, McpTaskKey::LoadAttempt { server: name, .. } if name == server),
+            )
+            .cloned()
+            .collect();
+        for key in keys {
+            self.stop_key(&key).await;
+        }
+    }
+
     pub(crate) async fn stop_instance_resource_subscriptions(&self, instance: &str) {
         let Some(inner) = self.inner.upgrade() else {
             return;

@@ -51,6 +51,8 @@ pub enum ProtocolErrorKind {
     InvalidJsonObject,
     AssistantMessageRequired,
     StreamEndedWithoutCompleted,
+    /// 单行或单事件超过 SSE 解码预算；重放同一响应不会恢复。
+    SseDecodeBudgetExceeded,
     ToolCallMissingId,
     ToolCallMissingName,
     ToolCallInvalidArguments,
@@ -69,6 +71,7 @@ impl fmt::Display for ProtocolErrorKind {
             Self::InvalidJsonObject => "invalid JSON object",
             Self::AssistantMessageRequired => "assistant message required",
             Self::StreamEndedWithoutCompleted => "stream ended without completion",
+            Self::SseDecodeBudgetExceeded => "SSE decode budget exceeded",
             Self::ToolCallMissingId => "tool call missing id",
             Self::ToolCallMissingName => "tool call missing name",
             Self::ToolCallInvalidArguments => "tool call has invalid arguments",
@@ -104,6 +107,7 @@ impl ProtocolError {
         }
     }
 
+    #[must_use]
     pub fn kind(&self) -> ProtocolErrorKind {
         self.kind
     }
@@ -182,18 +186,19 @@ pub struct ModelErrorDiagnostic {
 
 /// Untrusted diagnostic facts supplied by a serialization boundary. Keeping
 /// these inputs together makes it harder to omit fields covered by validation.
-pub struct ModelErrorDiagnosticParts<'a> {
+#[derive(Debug)]
+pub struct ModelErrorDiagnosticParts<'diagnostic> {
     pub category: ModelErrorCategory,
     pub status: Option<u16>,
-    pub provider: Option<&'a str>,
-    pub request_id: Option<&'a str>,
+    pub provider: Option<&'diagnostic str>,
+    pub request_id: Option<&'diagnostic str>,
     pub transport: Option<TransportErrorKind>,
     pub protocol: Option<ProtocolErrorKind>,
     pub retry_attempts: Option<u32>,
     pub retry_kind: Option<RetryErrorKind>,
-    pub message: Option<&'a str>,
-    pub body: Option<&'a str>,
-    pub causes: &'a [String],
+    pub message: Option<&'diagnostic str>,
+    pub body: Option<&'diagnostic str>,
+    pub causes: &'diagnostic [String],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,10 +318,12 @@ impl ModelErrorDiagnostic {
         })
     }
 
+    #[must_use]
     pub fn category(&self) -> ModelErrorCategory {
         self.category
     }
 
+    #[must_use]
     pub fn category_name(&self) -> &'static str {
         match self.category() {
             ModelErrorCategory::Transport => "transport",
@@ -364,6 +371,7 @@ impl ModelErrorDiagnostic {
         self.body.as_deref()
     }
 
+    #[must_use]
     pub fn causes(&self) -> &[String] {
         &self.causes
     }
@@ -424,16 +432,19 @@ impl ModelError {
         Self(Box::new(inner), None, ErrorDetails::default())
     }
 
+    #[must_use]
     pub fn with_message(mut self, message: impl AsRef<str>) -> Self {
         self.2.message = Some(bounded_text(message));
         self
     }
 
+    #[must_use]
     pub fn with_body(mut self, body: impl AsRef<str>) -> Self {
         self.2.body = Some(bounded_text(body));
         self
     }
 
+    #[must_use]
     pub fn with_causes(mut self, causes: impl IntoIterator<Item = String>) -> Self {
         self.2.causes = bounded_causes(causes);
         self
@@ -457,6 +468,7 @@ impl ModelError {
         self.1.as_deref().map(|(diagnostic, _)| diagnostic)
     }
 
+    #[must_use]
     pub fn interruption_logged(&self) -> bool {
         self.1.as_deref().is_some_and(|(_, logged)| *logged)
     }
@@ -470,6 +482,7 @@ impl ModelError {
         self
     }
 
+    #[must_use]
     pub fn transport(kind: TransportErrorKind, provider: Option<impl AsRef<str>>) -> Self {
         Self::new(ModelErrorInner::Transport {
             kind,
@@ -477,6 +490,7 @@ impl ModelError {
         })
     }
 
+    #[must_use]
     pub fn http_status(
         status: u16,
         provider: impl AsRef<str>,
@@ -489,10 +503,12 @@ impl ModelError {
         })
     }
 
+    #[must_use]
     pub fn protocol(kind: ProtocolErrorKind) -> Self {
         Self::new(ModelErrorInner::Protocol(ProtocolError::new(kind)))
     }
 
+    #[must_use]
     pub fn protocol_with_summary(kind: ProtocolErrorKind, summary: impl AsRef<str>) -> Self {
         Self::new(ModelErrorInner::Protocol(ProtocolError::with_summary(
             kind,
@@ -501,10 +517,12 @@ impl ModelError {
         .with_message(summary)
     }
 
+    #[must_use]
     pub fn cancelled() -> Self {
         Self::new(ModelErrorInner::Cancelled)
     }
 
+    #[must_use]
     pub fn stream_interrupted(
         provider: Option<impl AsRef<str>>,
         request_id: Option<impl AsRef<str>>,
@@ -539,15 +557,18 @@ impl ModelError {
         })
     }
 
+    #[must_use]
     pub fn is_cancelled(&self) -> bool {
         matches!(&*self.0, ModelErrorInner::Cancelled)
     }
 
+    #[must_use]
     pub fn is_stream_interrupted(&self) -> bool {
         matches!(&*self.0, ModelErrorInner::StreamInterrupted { .. })
     }
 
     /// 包括中断投影保留的原始诊断，避免上层将终态错误误当作可续跑断流。
+    #[must_use]
     pub fn is_terminal_provider_failure(&self) -> bool {
         self.protocol_error().map(|error| error.kind()) == Some(ProtocolErrorKind::ProviderTerminal)
             || self
@@ -625,6 +646,7 @@ impl ModelError {
 
     /// Return the bounded diagnostic projection. Invalid or absent provider and
     /// request identities are represented as `None`, never as a sentinel.
+    #[must_use]
     pub fn diagnostic(&self) -> ModelErrorDiagnostic {
         let mut diagnostic = match &*self.0 {
             ModelErrorInner::Transport { kind, provider } => ModelErrorDiagnostic {

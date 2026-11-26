@@ -1,10 +1,10 @@
 //! ACP session MCP control and the current pool catalog contract.
-use crate::{
-    plugin::{McpServerConfig, OAuthConfig},
-    tools::BaseTool,
-};
+use crate::plugin::McpServerConfig;
+use crate::plugin::OAuthConfig;
+use crate::tools::BaseTool;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
@@ -29,6 +29,7 @@ pub enum McpControlRequest {
     },
 }
 impl McpControlRequest {
+    #[must_use]
     pub fn session_id(&self) -> &str {
         match self {
             Self::Register { session_id, .. }
@@ -36,6 +37,7 @@ impl McpControlRequest {
             | Self::Stop { session_id, .. } => session_id,
         }
     }
+    #[must_use]
     pub fn server_name(&self) -> &str {
         match self {
             Self::Register { server_name, .. }
@@ -70,10 +72,7 @@ impl McpControlRequest {
             {
                 return Err(McpControlError::invalid("invalid registration name"));
             }
-            if crate::builtin_mcp::BUILTIN_MCP_INSTANCES
-                .iter()
-                .any(|item| item.instance.eq_ignore_ascii_case(server_name))
-            {
+            if crate::builtin_mcp::v5::is_reserved_server_name_ignore_ascii_case(server_name) {
                 return Err(McpControlError::invalid("reserved MCP server name"));
             }
             config.validate()?;
@@ -142,6 +141,7 @@ impl McpRegistrationConfig {
             headers: None,
             oauth: None,
             disabled: None,
+            dynamic: false,
             subscriptions: None,
             system_mcp: None,
             system_mcp_tools: None,
@@ -197,6 +197,7 @@ pub struct McpControlError {
     pub message: String,
 }
 impl McpControlError {
+    #[must_use]
     pub fn new(code: i32, kind: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -204,9 +205,11 @@ impl McpControlError {
             message: message.into(),
         }
     }
+    #[must_use]
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::new(-32602, "invalid_request", message)
     }
+    #[must_use]
     pub fn unsupported() -> Self {
         Self::new(-32000, "unsupported", "MCP server control is unavailable")
     }
@@ -219,6 +222,7 @@ pub struct McpServerControl {
     pub unavailable_reason: Option<String>,
 }
 impl McpServerControl {
+    #[must_use]
     pub fn available() -> Self {
         Self {
             restart: true,
@@ -226,6 +230,7 @@ impl McpServerControl {
             unavailable_reason: None,
         }
     }
+    #[must_use]
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
             restart: false,
@@ -239,13 +244,80 @@ impl Default for McpServerControl {
         Self::unavailable("unavailable")
     }
 }
+/// The session's published MCP tool catalog at one generation.
 #[derive(Clone, Default)]
 pub struct SessionMcpCatalogSnapshot {
     pub generation: u64,
     pub tools: Vec<Arc<dyn BaseTool>>,
 }
+/// Reads the published catalog without retaining a mutable registry guard.
 pub trait SessionMcpCatalogPort: Send + Sync {
     fn snapshot(&self) -> Arc<SessionMcpCatalogSnapshot>;
+}
+
+/// 一条当前会话可见的 dynamic MCP Loader 绑定（plan 9.1 / 9.3）。
+///
+/// Host 生成插件指引时只消费本投影：Loader 名称由池按受控配置身份计算，
+/// 客户端不提交名称、地址或凭证。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicLoaderBinding {
+    /// 模型可见的 Loader 工具名（`LoadMCP__...`）。
+    pub loader: String,
+    /// 受控配置的 server key（不含传输地址与凭证）。
+    pub server_key: String,
+    /// 插件来源标识（`name@marketplace`）；非插件来源为 `None`。
+    pub plugin_source: Option<String>,
+}
+
+/// Source identity of one admitted tool in a prepared session catalog.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SessionToolSource {
+    /// Core tools and middleware-contributed tools (including meta tools).
+    CoreOrMiddleware,
+    /// Tools projected from one MCP server, including its dynamic loader.
+    Mcp(String),
+}
+
+/// Candidate catalog the next Reason would publish, built without committing it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionToolCatalogPreparation {
+    /// Pool generation the candidate was built from.
+    pub generation: u64,
+    /// Admitted tool names grouped by source identity.
+    pub admitted: BTreeMap<SessionToolSource, Vec<String>>,
+}
+
+impl SessionToolCatalogPreparation {
+    /// Admitted tool names for one source; empty when the source contributed none.
+    #[must_use]
+    pub fn admitted_for(&self, source: &SessionToolSource) -> &[String] {
+        self.admitted.get(source).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// The session catalog rejected the candidate view (filter collision or invalid source).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("session tool catalog cannot be prepared: {reason}")]
+pub struct SessionToolCatalogPrepareError {
+    pub reason: String,
+}
+
+impl SessionToolCatalogPrepareError {
+    #[must_use]
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Read-only preparation port for the catalog the next Reason will use.
+///
+/// Implementations must reuse the session's candidate construction and tool filter
+/// but must not publish the candidate or change the current Act view.
+pub trait SessionToolCatalogPreparationPort: Send + Sync {
+    fn prepare_next(&self)
+        -> Result<SessionToolCatalogPreparation, SessionToolCatalogPrepareError>;
 }
 
 #[cfg(test)]

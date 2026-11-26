@@ -130,7 +130,7 @@ SQLite 日志记录入站消息、会话、云任务、审批、执行器任务�
 
 设备绑定时，执行器提供只读工作区接口：项目指令候选（`AGENTS.md` → `CLAUDE.md` → `.claude/AGENTS.md`，另加 `CLAUDE.local.md`）、`.claude/skills` 下的 `SKILL.md` 目录，以及按已发现项读取正文。接口沿用现有 Bearer 认证，复核会话绑定与工作区身份，只接受工作区相对路径并拒绝符号链接、父目录逃逸和越界；云端不读取主控文件系统。指令按会话冻结；技能工具按需从同一设备读取正文，加载技能不授予执行权限。当前不展开 `CLAUDE.md` 的 `@import`，技能覆盖项目 .agents/skills / .claude/skills 及明确安装的账号、管理员技能；实际归属见上下文装配契约。
 
-MCP 服务按账号保存在 CloudJournal（schema 15），每个会话的池只含该账号启用的服务，不读取主控配置文件、builtin 实例或 stdio。`/mcp` 只接受公网 HTTPS 端点，拒绝 URL 凭据、查询参数、回环/内网/保留地址，HTTP 重定向一律不跟随；不保存 MCP 凭据，因此当前不支持需要 OAuth 或自定义头的服务。MCP 工具保留 `mcp__` 前缀审批，`ExecuteExtraTool` 在派发前解析真实目标，包装工具不能绕过审批。
+MCP 服务按账号保存在 CloudJournal（schema 15），每个会话的池只含该账号启用的服务，不读取主控配置文件、builtin 实例或 stdio。`/mcp` 只接受公网 HTTPS 端点，拒绝 URL 凭据、查询参数、回环/内网/保留地址，HTTP 重定向一律不跟随；不保存 MCP 凭据，因此当前不支持需要 OAuth 或自定义头的服务。MCP 工具保留 `mcp__` 前缀审批，`ToolInvoke`（兼容旧名 `ExecuteExtraTool`）在派发前解析真实目标，包装工具不能绕过审批。
 
 ## 网关访问控制
 
@@ -164,7 +164,7 @@ schema 23 持久保存原生操作的单次取消请求。执行窗口可在原�
 
 ## 上下文装配与设备观察扩展
 
-上游核心基线现为 `dcd4d116`，最近的 SDK 同步子执行取消收尾修复见 [同步记录](upstream/peri-dcd4d116a12d.md)。Cloud schema 25 增加会话绑定的原文恢复副本，主会话 Micro Compact 可收起已闭合、已被模型读取且可恢复的工具交换，Full 继续生成摘要。`ReadContextArchive` 按预算和游标读取，重新核对用户、会话代次、隐私 epoch 与有效期；隐藏推理不通过工具暴露。云端只接入窄归档端口，原 CloudJournal、持久任务和操作账本继续拥有状态权威。异步任务结果另存模型消费回执，投递、模型处理、任务验收和渠道送达分别结算。远程执行器继续校验冻结目录身份。归档接入范围与验证见 [原同步记录](upstream/peri-e598d178.md)。
+上游核心基线现为 `a2c0149938b7`，本轮模块迁移、压缩、恢复及 MCP / 工作流适配见 [同步记录](upstream/peri-a2c0149938b7.md)。Cloud schema 25 增加会话绑定的原文恢复副本，主会话 Micro Compact 可收起已闭合、已被模型读取且可恢复的工具交换，Full 继续生成摘要。`ReadContextArchive` 按预算和游标读取，重新核对用户、会话代次、隐私 epoch 与有效期；隐藏推理不通过工具暴露。云端只接入窄归档端口，原 CloudJournal、持久任务和操作账本继续拥有状态权威。异步任务结果另存模型消费回执，投递、模型处理、任务验收和渠道送达分别结算。远程执行器继续校验冻结目录身份。归档接入范围与验证见 [原同步记录](upstream/peri-e598d178.md)。
 
 ContextAssembler 保留来源、角色、大小及版本清单，支持每来源累计预算与总预算；base/role 只执行已注册的一层宏替换。SOUL 属于助手层，cwd 优先 AGENTS.md，再回退 CLAUDE.md，local 是独立补充。全局 Skill 按 operator/account 明确安装，项目 Skill 来自认证工作区；只注入目录，正文按需读取。环境快照通过独立认证只读接口取得，并校验原 binding，不创建 job 或执行探测命令。MCP 延续账号明确配置和现有权限链。完整契约、范围与验证见 [上下文装配](context-assembly.md)。
 提示词规则由宿主承接：主会话类型化审批、完整活跃约束快照、原调用回执复用、空工具摘要、QQ Markdown 降级和生效 Skill 目录。实现边界见 [宿主契约](prompt-host-contracts.md)。

@@ -1,3 +1,5 @@
+use std::fmt;
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -6,7 +8,7 @@ use peri_agent::tools::BaseTool;
 use rmcp::model::{ContentBlock, Tool};
 use thiserror::Error;
 
-use super::client::output_store::format_output;
+use super::client::output_store;
 use super::client::{McpClientHandle, McpClientPool};
 
 /// MCP 工具调用错误
@@ -50,6 +52,21 @@ pub struct McpToolBridge {
     admission: Option<super::connection_gate::McpCallGate>,
     output_pool: Option<std::sync::Weak<McpClientPool>>,
     output_session_id: Option<String>,
+}
+
+impl Debug for McpToolBridge {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpToolBridge")
+            .field("server_name", &self.server_name)
+            .field("tool_name", &self.tool_name)
+            .field("full_name", &self.full_name)
+            .field("description", &self.description)
+            .field("model_visible", &self.model_visible)
+            .field("direct", &self.direct)
+            .field("server_generation", &self.server_generation)
+            .finish_non_exhaustive()
+    }
 }
 
 /// External MCP requests share a 120-second deadline across send and response.
@@ -135,6 +152,7 @@ pub(crate) fn declared_model_hidden(client: &McpClientHandle, tool_name: &str) -
 }
 
 impl McpToolBridge {
+    #[must_use]
     pub fn new(server_name: &str, tool: &Tool, client: Arc<McpClientHandle>) -> Self {
         let tool_name = tool.name.to_string();
         let full_name = effective_mcp_tool_name(server_name, &tool_name);
@@ -161,6 +179,7 @@ impl McpToolBridge {
         }
     }
 
+    #[must_use]
     pub fn with_output_store(
         mut self,
         pool: &Arc<McpClientPool>,
@@ -171,11 +190,13 @@ impl McpToolBridge {
         self
     }
 
+    #[must_use]
     pub fn with_server_generation(mut self, generation: u64) -> Self {
         self.server_generation = generation;
         self
     }
 
+    #[must_use]
     pub fn with_binding_leases(
         mut self,
         registry: Arc<super::apps::McpAppBindingRegistry>,
@@ -275,7 +296,7 @@ impl BaseTool for McpToolBridge {
     /// ACP / 模型面）各自从返回值解读，不得经旁路 registry 捞取。
     ///
     /// `isError: true` 是工具报告的**结果事实**而不是调用失败：它作为
-    /// [`ToolOutcome::Reported`] 的正常返回值离开本函数。只有 transport/协议层失败
+    /// [`peri_agent::tools::ToolOutcome::Reported`] 的正常返回值离开本函数。只有 transport/协议层失败
     /// 才返回 `Err`。
     async fn invoke_output(
         &self,
@@ -291,17 +312,12 @@ impl BaseTool for McpToolBridge {
             None => None,
         };
         // 1. 检查连接状态
-        match &self.client.peer {
-            Some(_) => {}
-            None => {
-                return Err(Box::new(ToolCallError::NotConnected {
-                    server: self.server_name.clone(),
-                    status: format!("{:?}", self.client.status),
-                }));
-            }
-        }
-
-        let peer = self.client.peer.as_ref().unwrap();
+        let Some(peer) = &self.client.peer else {
+            return Err(Box::new(ToolCallError::NotConnected {
+                server: self.server_name.clone(),
+                status: format!("{:?}", self.client.status),
+            }));
+        };
         let session_id = ctx.session_id.as_deref().ok_or_else(|| {
             Box::new(ToolCallError::CallFailed {
                 server: self.server_name.clone(),
@@ -339,7 +355,12 @@ impl BaseTool for McpToolBridge {
         // WorkspaceRemote）与 monitor 实例按直接发起会话隔离后台任务，其他
         // server 不注入 Peri 元数据。
         if let Some(owner) = super::client::task_owner_metadata::task_owner_meta(
-            self.client.source.as_ref(),
+            self.client.source.as_ref().filter(|source| {
+                super::client::task_owner_metadata::tool_uses_task_owner(
+                    Some(source),
+                    &self.tool_name,
+                )
+            }),
             session_id,
         ) {
             request.meta = Some(owner);
@@ -352,11 +373,19 @@ impl BaseTool for McpToolBridge {
 
         // Workspace tools retain their own deadlines (Bash promotes at <=120s).
         // Source identity, not a spoofable server name, grants this behavior.
-        let timeout = (!matches!(
-            self.client.source.as_ref(),
-            Some(super::config::ConfigSource::Builtin { instance }) if instance == "workspace"
-        ))
-        .then_some(TOOL_CALL_TIMEOUT);
+        let workspace_tool = match self.client.source.as_ref() {
+            Some(super::config::ConfigSource::Builtin { instance }) if instance == "workspace" => {
+                true
+            }
+            Some(super::config::ConfigSource::Builtin { instance })
+                if peri_acp_types::builtin_mcp::is_v5_server_name(instance) =>
+            {
+                peri_acp_types::builtin_mcp::capability_of_original_tool(&self.tool_name)
+                    .is_some_and(|(capability, _)| capability.name == "workspace")
+            }
+            _ => false,
+        };
+        let timeout = (!workspace_tool).then_some(TOOL_CALL_TIMEOUT);
         let response = match super::tool_request::call_tool(peer, request, timeout).await {
             Ok(response) => response,
             Err(error) => {
@@ -384,6 +413,15 @@ impl BaseTool for McpToolBridge {
                 ));
             }
         };
+        // S9a3a：远端 workspace 的首个真实调用已经转发成功（cold 代理此刻才启动
+        // 真实后端）。这里解锁宿主侧可选探测，并做一次启动后资源重发现；失败只
+        // 记 WARN，不影响本次工具结果。
+        if matches!(
+            self.client.source,
+            Some(super::config::ConfigSource::WorkspaceRemote)
+        ) {
+            pool.note_remote_workspace_call(&self.client).await;
+        }
         let result = match response {
             rmcp::model::CallToolResponse::Complete(result) => {
                 execution_guard.confirm_stopped();
@@ -392,18 +430,31 @@ impl BaseTool for McpToolBridge {
             rmcp::model::CallToolResponse::Task(created) => {
                 let task_created_at = created.task.created_at;
                 let task_id = created.task.task_id;
-                let owner_scoped = super::client::task_owner_metadata::source_uses_task_owner(
+                let capability_source = super::client::task_owner_metadata::tool_capability(
                     self.client.source.as_ref(),
+                    &self.tool_name,
                 );
+                let owner_scoped = capability_source
+                    .is_some_and(|capability| capability.host_injection.task_owner_scoped)
+                    || (capability_source.is_none()
+                        && super::client::task_owner_metadata::source_uses_task_owner(
+                            self.client.source.as_ref(),
+                        ));
                 let is_shell = self.tool_name == "Bash"
-                    && (matches!(
-                        self.client.source.as_ref(),
-                        Some(super::config::ConfigSource::Builtin { instance })
-                            if instance == "workspace"
-                    ) || matches!(
-                        self.client.source.as_ref(),
-                        Some(super::config::ConfigSource::WorkspaceRemote)
-                    ));
+                    && (capability_source.is_some_and(|capability| capability.name == "workspace")
+                        || matches!(
+                            self.client.source.as_ref(),
+                            Some(super::config::ConfigSource::Builtin { instance })
+                                if instance == "workspace"
+                        )
+                        || matches!(
+                            self.client.source.as_ref(),
+                            Some(super::config::ConfigSource::WorkspaceRemote)
+                        ));
+                // 任务面板与终态语义按能力身份（workspace/monitor）而不是出口名。
+                let task_server = capability_source
+                    .map(|capability| capability.legacy_instance.to_string())
+                    .unwrap_or_else(|| self.server_name.clone());
                 let summary = if is_shell {
                     input
                         .get("command")
@@ -421,7 +472,7 @@ impl BaseTool for McpToolBridge {
                     session_id,
                     Some(session_id),
                     delivery.clone(),
-                    &self.server_name,
+                    &task_server,
                     &task_id,
                     kind,
                     summary,
@@ -443,7 +494,7 @@ impl BaseTool for McpToolBridge {
                 };
                 let public_id = ticket.task_id().to_owned();
                 if let Err(error) = pool.spawn_managed_task_subscription(
-                    self.server_name.clone(),
+                    task_server,
                     session_id.to_owned(),
                     task_id.clone(),
                     ticket,
@@ -466,10 +517,14 @@ impl BaseTool for McpToolBridge {
                 // the terminal state always wakes the initiator once (with any
                 // unreported hits merged into it). The receipt below must still
                 // not promise resumable delivery.
-                let is_monitor = matches!(
-                    self.client.source.as_ref(),
-                    Some(super::config::ConfigSource::Builtin { instance }) if instance == "monitor"
-                );
+                // v5 单出口按能力身份判定；迁移期仍按实例名。
+                let is_monitor = capability_source
+                    .is_some_and(|capability| capability.name == "monitor")
+                    || (capability_source.is_none()
+                        && matches!(
+                            self.client.source.as_ref(),
+                            Some(super::config::ConfigSource::Builtin { instance }) if instance == "monitor"
+                        ));
                 if is_monitor {
                     // The model sees the receipt, not the raw `CreateTaskResult`.
                     // Expose both ids: `public_id` is the host task id (host task
@@ -630,7 +685,8 @@ impl BaseTool for McpToolBridge {
             .as_deref()
             .or(ctx.session_id.as_deref());
         let text = if raw.is_error() {
-            let reason = format_output(pool.as_deref(), session_id, formatted, true).await;
+            let reason =
+                output_store::format_output(pool.as_deref(), session_id, formatted, true).await;
             ToolCallError::CallFailed {
                 server: self.server_name.clone(),
                 tool: self.tool_name.clone(),
@@ -638,7 +694,7 @@ impl BaseTool for McpToolBridge {
             }
             .to_string()
         } else {
-            format_output(pool.as_deref(), session_id, formatted, false).await
+            output_store::format_output(pool.as_deref(), session_id, formatted, false).await
         };
         // 远端 JSON-RPC error 的原始载荷尚未在协议失败分支接线，见该分支注释。
         super::tool_execution::complete(self, text, raw)
@@ -718,7 +774,7 @@ fn build_bridges(
     session_id: Option<&str>,
 ) -> Vec<McpToolBridge> {
     let mut bridges: Vec<McpToolBridge> = Vec::new();
-    let mut clients = pool.get_all_clients_visible_to(session_id);
+    let mut clients = pool.clients_visible_to(session_id);
     clients.sort_by(|left, right| left.name.cmp(&right.name));
     for client in clients {
         let generation = pool.handle_generation(&client);
@@ -753,6 +809,7 @@ fn build_bridges(
 ///
 /// 不过滤会话归属（部署面视图）：会话内装配必须走
 /// [`build_tool_bridges_visible_to`]，否则会拿到其他会话声明的 ACP 工具。
+#[must_use]
 pub fn build_tool_bridges(pool: &Arc<McpClientPool>) -> Vec<Box<dyn BaseTool>> {
     build_deferred_tool_bridges(pool)
         .into_iter()
@@ -761,6 +818,7 @@ pub fn build_tool_bridges(pool: &Arc<McpClientPool>) -> Vec<Box<dyn BaseTool>> {
 }
 
 /// 会话可见的 bridge 集合（[`build_tool_bridges`] 的 ACP 归属过滤版）。
+#[must_use]
 pub fn build_tool_bridges_visible_to(
     pool: &Arc<McpClientPool>,
     session_id: Option<&str>,
@@ -776,193 +834,4 @@ pub fn build_tool_bridges_visible_to(
 #[path = "tool_bridge_test.rs"]
 mod tests;
 
-/// C-INJ-01 focused 回归：typed bridge 的 direct 提升不改变 bridge 身份，
-/// 且既有 public `build_tool_bridges` 的 deferred 默认行为不变。
-#[cfg(test)]
-mod direct_flag_tests {
-    use super::*;
-    use crate::mcp::client::ClientStatus;
-
-    fn make_tool(tool_name: &str) -> Tool {
-        serde_json::from_value(serde_json::json!({
-            "name": tool_name,
-            "description": "Read a file",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "path": { "type": "string" } }
-            }
-        }))
-        .unwrap()
-    }
-
-    fn make_handle(server: &str, tools: Vec<Tool>, status: ClientStatus) -> Arc<McpClientHandle> {
-        Arc::new(McpClientHandle {
-            call_gate: Default::default(),
-            name: server.to_string(),
-            version: None,
-            connected_at: None,
-            protocol_version: None,
-            cache_version: None,
-            peer: None,
-            tools,
-            resources: vec![],
-            status,
-            oauth_status: Default::default(),
-            source: None,
-            url: None,
-            skills_capable: false,
-        })
-    }
-
-    fn make_builtin_handle(instance: &str) -> Arc<McpClientHandle> {
-        Arc::new(McpClientHandle {
-            call_gate: Default::default(),
-            name: instance.to_string(),
-            version: None,
-            connected_at: None,
-            protocol_version: None,
-            cache_version: None,
-            peer: None,
-            tools: vec![],
-            resources: vec![],
-            status: ClientStatus::Connected,
-            oauth_status: Default::default(),
-            source: Some(crate::mcp::config::ConfigSource::Builtin {
-                instance: instance.to_string(),
-            }),
-            url: None,
-            skills_capable: false,
-        })
-    }
-
-    /// host-only 发现过滤：bridge 的 `visible_to_model()` 等于注册表逐工具
-    /// `model_visible`（builtin 来源）；非 builtin 来源不受声明表影响。
-    ///
-    /// 派生式断言：首个 host-only 条目（workflow 的 `WorkflowAgentResult`）随实例
-    /// 注册落地后自动被覆盖，不需要改本用例。
-    #[test]
-    fn builtin_declared_model_visibility_is_applied_to_bridges() {
-        for instance in peri_acp_types::builtin_mcp::BUILTIN_MCP_INSTANCES {
-            for tool in instance.tools {
-                let bridge = McpToolBridge::new(
-                    instance.name,
-                    &make_tool(tool.original_name),
-                    make_builtin_handle(instance.name),
-                );
-                assert_eq!(
-                    bridge.visible_to_model(),
-                    tool.model_visible,
-                    "{}/{} 的桥接可见性必须等于注册表 model_visible",
-                    instance.name,
-                    tool.original_name
-                );
-            }
-        }
-        // 非 builtin 来源（source: None）：同名工具名不受 builtin 声明表影响。
-        let external = McpToolBridge::new(
-            "workflow",
-            &make_tool("WorkflowAgentResult"),
-            make_handle("workflow", vec![], ClientStatus::Connected),
-        );
-        assert!(
-            external.visible_to_model(),
-            "非 builtin 来源不得消费 builtin 声明表"
-        );
-    }
-
-    #[test]
-    fn test_system_direct_flag_preserves_bridge_identity() {
-        let bridge = McpToolBridge::new(
-            "workspace",
-            &make_tool("Read"),
-            make_handle("workspace", vec![], ClientStatus::Disconnected),
-        );
-        assert!(!bridge.is_direct(), "new 缺省必须为 deferred");
-        let name = bridge.name().to_string();
-        let parameters = bridge.parameters();
-        assert!(bridge.visible_to_model());
-
-        let promoted = bridge.with_system_direct();
-        assert!(promoted.is_direct());
-        assert_eq!(promoted.name(), "Read");
-        assert_ne!(promoted.name(), name);
-        assert_eq!(promoted.original_tool_name(), "Read");
-        assert_eq!(promoted.mcp_server_name(), Some("workspace"));
-        assert_eq!(promoted.parameters(), parameters);
-        assert!(
-            promoted.visible_to_model(),
-            "direct 不等于绕过 model visibility"
-        );
-    }
-
-    /// typed builder 的输入取注册表中**声明 deferred** 的 builtin 工具。
-    ///
-    /// 只有输入确实声明为 deferred，「不提升」才是有信息的断言：wave 3 起 `workspace`
-    /// 的 7 个工具全部 `direct: true`（注册表第五项），继续拿它当输入会变成「提升」的
-    /// 反面 —— 断言会红，而修法绝不是放宽断言。名字从注册表派生，不新增第二份名单。
-    #[test]
-    fn test_build_tool_bridges_keeps_deferred_default_and_matches_typed() {
-        let (instance, tool) = peri_acp_types::builtin_mcp::BUILTIN_MCP_INSTANCES
-            .iter()
-            .find_map(|instance| {
-                instance
-                    .tools
-                    .iter()
-                    .find(|tool| !tool.direct)
-                    .map(|tool| (instance, tool))
-            })
-            .expect("注册表必须至少保留一个 deferred 声明的 builtin 工具");
-        let pool = Arc::new(McpClientPool::new_pending());
-        let handle = make_handle(
-            instance.name,
-            vec![make_tool(tool.original_name)],
-            ClientStatus::Connected,
-        );
-        pool.clients
-            .write()
-            .insert(instance.name.to_string(), Arc::clone(&handle));
-
-        let typed = build_typed_tool_bridges(&pool);
-        let boxed = build_tool_bridges(&pool);
-        assert_eq!(typed.len(), 1);
-        assert_eq!(boxed.len(), typed.len());
-        assert_eq!(boxed[0].name(), typed[0].name());
-        assert!(
-            !typed[0].is_direct(),
-            "注册表声明 deferred 的 builtin 工具（{}）在 typed builder 中必须保持 deferred",
-            tool.effective_name
-        );
-        assert!(
-            !boxed[0].is_direct(),
-            "public builder 必须保持 deferred 默认"
-        );
-        // 既有 generation / binding leases 传递行为不得因提取 typed builder 而丢失
-        assert_eq!(typed[0].server_generation, pool.handle_generation(&handle));
-        assert!(typed[0].binding_leases.is_some());
-    }
-
-    #[test]
-    fn remote_workspace_direct_tools_follow_live_list_without_registry_names() {
-        let pool = Arc::new(McpClientPool::new_pending());
-        let mut handle = make_handle(
-            "workspace",
-            vec![make_tool("NewRemoteTool")],
-            ClientStatus::Connected,
-        );
-        Arc::get_mut(&mut handle).unwrap().source =
-            Some(super::super::config::ConfigSource::WorkspaceRemote);
-        pool.clients.write().insert("workspace".into(), handle);
-        let typed = build_typed_tool_bridges(&pool);
-        assert_eq!(typed.len(), 1);
-        assert_eq!(typed[0].name(), "NewRemoteTool");
-        assert!(typed[0].is_direct());
-        assert_eq!(typed[0].builtin_mcp_instance(), None);
-
-        let empty = Arc::new(McpClientPool::new_pending());
-        let mut handle = make_handle("workspace", vec![], ClientStatus::Connected);
-        Arc::get_mut(&mut handle).unwrap().source =
-            Some(super::super::config::ConfigSource::WorkspaceRemote);
-        empty.clients.write().insert("workspace".into(), handle);
-        assert!(build_typed_tool_bridges(&empty).is_empty());
-    }
-}
+include!("tool_bridge_section_2.rs");

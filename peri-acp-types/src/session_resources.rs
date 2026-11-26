@@ -17,96 +17,45 @@
 //! 只读入口（`AccessMode::ReadOnly`）不得靠创建一个临时未绑定会话绕过执行授权。
 //! 旧 `ThreadStore`（[`crate::store::ThreadStore`]）是迁移桥，见其模块文档。
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::Arc;
-
-use async_trait::async_trait;
-
-use crate::history_page::{
-    HistoryCursor, HistoryForwardCursor, HistoryPage, HistoryPageBounds, HistorySegment,
-};
-use crate::history_window::{
-    HistoryBodyChunk, HistoryCommittedTail, HistoryReadTicket, HistorySource,
-};
-use crate::messages::MessageId;
-use crate::session::{
-    MqCancelOutcome, MqEnqueueOutcome, MqEntry, MqFilter, MqHeader, MqInput, MqReceiveOutcome,
-    MqReceiveSelection, MqWatermark,
-};
-use crate::store::{CompactionChange, MessageFlags, PersistedPayload};
-use crate::system_reminder::TrustedSystemReminder;
-use crate::thread::{AgentStatus, ThreadId, ThreadMeta, WorkState};
-use crate::workspace::{ResolvedWorkspace, ScopedThreadPage, ScopedThreadQuery};
-
 pub mod history;
 
 pub mod history_window;
 pub use history_window::{
-    HistoryWindowEntry, HistoryWindowPagePlan, HistoryWindowReadIntent, HistoryWindowRows,
-    HistoryWindowTailExpectation, InheritedHistoryEntry, SessionHistoryWindowBounds,
+    HistoryEntryMetadata, HistoryWindowEntry, HistoryWindowPagePlan, HistoryWindowReadIntent,
+    HistoryWindowRows, HistoryWindowTailExpectation, InheritedHistoryEntry,
+    SessionHistoryWindowBounds,
 };
 
 mod metadata;
 pub use metadata::*;
 
-mod error;
+mod session_resource_error;
+use session_resource_error as error;
 
 pub use error::{
     CloseSettlement, SessionResourceError, SessionResourceErrorKind, SessionResourceResult,
 };
 
-/// 未发布创建的句柄（J2 两阶段的第二阶段）：frozen 一次性提交，或整条草稿被撤销。
-///
-/// 语义（与失败补偿矩阵同源）：
-///
-/// - 提交是 **write-once CAS**：仅当这条 identity 从未提交过 frozen 时生效；重复调用返回
-///   typed 冲突（[`SessionResourceErrorKind::Conflict`]），不覆盖已提交字节；
-/// - 提交前检查未决持久化，执行唯一性由 peri-sdk 负责；
-/// - [`Self::abandon`] 只撤销**未提交**的草稿（幂等）；已提交 frozen 的草稿必须拒绝删除
-///   ——那会销毁一个「已定稿、未发布」的合法中间态；
-#[async_trait]
-pub trait SessionInitialization: Send + Sync {
-    fn thread_id(&self) -> &ThreadId;
+#[expect(
+    clippy::module_inception,
+    reason = "The facade preserves API paths; the leaf is named for its primary type as required by the Rust guide."
+)]
+mod session_resources;
+pub use self::session_resources::SessionResources;
 
-    /// 一次性提交 frozen：仅当该 identity 从未提交过；重复调用返回 typed 冲突，不覆盖。
-    async fn commit_frozen(&self, frozen: &FrozenSnapshotBytes) -> SessionResourceResult<()>;
+mod child_resume_claim;
+pub use child_resume_claim::ChildResumeClaim;
 
-    /// 撤销未发布的创建（幂等）；已提交后调用返回 typed 冲突，不删除。
-    async fn abandon(self: Arc<Self>) -> SessionResourceResult<()>;
-}
+mod session_initialization;
+pub use session_initialization::SessionInitialization;
 
-/// 子会话 resume 认领 handle。
-///
-/// 认领期间的 active/原状态/终态由资源内部保存，调用方只提交领域结果，不拼补偿
-/// 写入、不接触事务或重试令牌。
-#[async_trait]
-pub trait ChildResumeClaim: Send + Sync {
-    /// 认领成功并开始运行。
-    async fn mark_running(&self) -> SessionResourceResult<()>;
-    /// 移交后台执行（仍属本次认领）；完成后调用方才可放行后台执行。
-    async fn hand_off_to_background(&self) -> SessionResourceResult<()>;
-    /// 认领后准备失败：恢复到认领前的状态，不留 active 残留。
-    /// 移交失败或移交后启动被取消也可补偿，但调用方须确保后台执行尚未放行。
-    async fn mark_failed(&self) -> SessionResourceResult<()>;
-    /// 认领终止（取消/宿主退出）：恢复到认领前的状态。
-    async fn mark_terminated(&self) -> SessionResourceResult<()>;
-
-    /// 认领终止并提交领域终态，返回本次是否仍拥有该 child 的写入权。
-    ///
-    /// 实现必须把「恢复到认领前」与终态写入放在同一个归属校验内完成：返回
-    /// `Ok(false)` 表示新认领已接管该 child，调用方不得再写终态。
-    async fn finish_with_status(&self, status: AgentStatus) -> SessionResourceResult<bool>;
-}
-
-mod port;
-pub use port::SessionResources;
-
-mod lifecycle;
+mod session_store_shutdown_port;
 pub use lifecycle::SessionStoreShutdownPort;
+use session_store_shutdown_port as lifecycle;
 
-mod settlement;
+mod terminal_settlement_outcome;
 pub use settlement::TerminalSettlementOutcome;
+use terminal_settlement_outcome as settlement;
 
 #[cfg(test)]
 #[path = "session_resources_test.rs"]

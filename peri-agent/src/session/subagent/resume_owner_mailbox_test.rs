@@ -1,12 +1,26 @@
-use super::*;
-use crate::agent::async_tasks::delivery::terminal_delivery_id;
+use crate::agent::async_tasks::TaskManager;
 use crate::agent::events::BackgroundTaskResult;
+use crate::messages::BaseMessage;
+use crate::middleware::chain::MiddlewareChain;
 use crate::session::async_result_mailbox::AsyncResultState;
+
+use crate::session::subagent::tests::resume_owner_reuse::FailWithoutResidual;
+use crate::session::subagent::tests::EchoLLM;
+use crate::session::subagent::types::SubagentChainAssembler;
+use crate::session::subagent::types::SubagentChainContext;
+
+use crate::session::subagent::types::SubagentHost;
 use crate::session::subagent::ParkedChildOwner;
+use crate::session::subagent::SessionFactory;
+use crate::session::test_resources::mock::MockSessionResources;
 use crate::session::{FrozenContext, MessageQueue, Session};
+use crate::thread::ThreadMeta;
 use peri_acp_types::tasks::{BgTaskKind, BgTaskRegistration, TaskManager as _};
+use peri_acp_types::thread::AgentStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 const RESULT_A: &str = "RESULT_A_UNCOVERED_FACT";
 const RESULT_B: &str = "RESULT_B_LATE_FACT";
@@ -39,7 +53,7 @@ fn register_shell(
             pid: None,
             kill: Some(Box::new(|| {})),
         })
-        .unwrap();
+        .expect("the register fixture result is required for this assertion");
     // The synthetic task has no process; mailbox/result responsibility remains.
     manager.confirm_external_execution_stopped(&ticket);
     ticket
@@ -72,7 +86,7 @@ impl peri_model::Model for SummaryCapture {
         _cancellation: CancellationToken,
     ) -> peri_model::ModelResult<peri_model::ModelResponse> {
         self.0.lock().push(request);
-        peri_model::ModelResponse::new(
+        peri_model::ModelResponse::try_new(
             peri_model::ModelMessage::assistant_text("<summary>已压缩历史</summary>"),
             peri_model::StopReason::EndTurn,
             None,
@@ -133,29 +147,29 @@ impl SubagentChainAssembler for CaptureSessionAssembler {
             session.async_result_mailbox(),
             session
                 .subagent_host()
-                .unwrap()
+                .expect("the subagent host fixture result is required for this assertion")
                 .on_bg_complete
                 .clone()
-                .unwrap(),
+                .expect("the clone fixture result is required for this assertion"),
         ));
         tools
     }
 }
 
-async fn failed_child_resume_preserves_blocked_result_through_full_compact(
-    first_background: bool,
-    background: bool,
-) {
+async fn failed_child_resume_preserves_blocked_result_through_full_compact() {
     let store = MockSessionResources::new();
     let child_id = uuid::Uuid::now_v7().to_string();
     let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
     meta.id = child_id.clone();
     meta.parent_thread_id = Some("parent-thread".into());
-    store.create_resumable_thread(meta).await.unwrap();
+    store
+        .create_resumable_thread(meta)
+        .await
+        .expect("the create resumable thread fixture result is required for this assertion");
     store
         .update_thread_status(&child_id, "error")
         .await
-        .unwrap();
+        .expect("the update thread status fixture result is required for this assertion");
     let parent_manager = Arc::new(TaskManager::new());
     let child_manager = Arc::new(TaskManager::new());
     let ticket_a = register_shell(&child_manager, "task-A");
@@ -168,7 +182,9 @@ async fn failed_child_resume_preserves_blocked_result_through_full_compact(
         Some(store.clone()),
         None,
     );
-    parent_manager.register_child_owner(owner.clone()).unwrap();
+    parent_manager
+        .register_child_owner(owner.clone())
+        .expect("the register child owner fixture result is required for this assertion");
     let parent = Session::new(
         Arc::from("/tmp"),
         FrozenContext::builder().build(),
@@ -187,20 +203,16 @@ async fn failed_child_resume_preserves_blocked_result_through_full_compact(
             shell_result("task-A", RESULT_A),
             initial_delivery,
         )
-        .unwrap();
-    let result_a_id = terminal_delivery_id("task-A", "terminal");
-    let mut failed_config = resume_config_with(
+        .expect("the settle completed fixture result is required for this assertion");
+    let result_a_id =
+        crate::agent::async_tasks::delivery::terminal_delivery_id("task-A", "terminal");
+    let mut failed_config = crate::session::subagent::tests::resume_config_with(
         store.clone(),
         child_id.clone(),
         crate::session::test_resources::mock::model::fixture_source(
             Arc::new(FailWithoutResidual),
             "fixture-scripted",
         ),
-        if first_background {
-            SubagentRunMode::Background
-        } else {
-            SubagentRunMode::Sync
-        },
         Some(parent_manager.clone()),
         None,
     );
@@ -221,29 +233,21 @@ async fn failed_child_resume_preserves_blocked_result_through_full_compact(
             let _ = sender.send(());
         }
     }));
-    let failed = SessionFactory::resume_subagent(Some(&parent), failed_config).await;
-    if first_background {
-        let spawned = failed.expect("首次后台执行必须启动");
-        let result = tokio::time::timeout(Duration::from_secs(10), failed_rx)
-            .await
-            .expect("首次失败必须交付")
-            .unwrap();
-        assert!(!result.success);
-        drop(spawned);
-    } else {
-        let error = failed.err().expect("首次同步执行必须报告模型失败");
-        assert!(error
-            .downcast_ref::<crate::session::subagent::SubagentFailure>()
-            .unwrap()
-            .handoff()
-            .is_some());
-    }
+    let spawned = SessionFactory::resume_subagent(Some(&parent), failed_config)
+        .await
+        .expect("首次后台执行必须启动");
+    let result = tokio::time::timeout(Duration::from_secs(10), failed_rx)
+        .await
+        .expect("首次失败必须交付")
+        .expect("the expect fixture result is required for this assertion");
+    assert!(!result.success);
+    drop(spawned);
     let (old_session, old_mailbox, old_delivery) =
         captured.lock().take().expect("必须捕获原会话的资源路由");
     tokio::time::timeout(Duration::from_secs(10), finished_rx)
         .await
         .expect("首次执行必须排空并结算")
-        .unwrap();
+        .expect("the expect fixture result is required for this assertion");
     let blocked = old_mailbox.protected_snapshot();
     assert!(
         blocked.items.iter().any(|item| {
@@ -275,18 +279,13 @@ async fn failed_child_resume_preserves_blocked_result_through_full_compact(
         release: release.clone(),
         first: Arc::new(AtomicBool::new(true)),
     };
-    let mut resumed_config = resume_config_with(
+    let mut resumed_config = crate::session::subagent::tests::resume_config_with(
         store.clone(),
         child_id.clone(),
         crate::session::test_resources::mock::model::fixture_source(
             Arc::new(model),
             "fixture-scripted",
         ),
-        if background {
-            SubagentRunMode::Background
-        } else {
-            SubagentRunMode::Sync
-        },
         Some(parent_manager),
         None,
     );
@@ -319,7 +318,7 @@ async fn failed_child_resume_preserves_blocked_result_through_full_compact(
         let requests = summaries.lock();
         assert!(!requests.is_empty(), "新执行必须在 Reason 前实际执行 Full");
         serde_json::to_string(&requests[0])
-            .unwrap()
+            .expect("to_string must accept this test fixture representation")
             .contains(RESULT_A)
     };
     let excluded = store.flags(&result_a_id).excluded;
@@ -348,9 +347,11 @@ async fn failed_child_resume_preserves_blocked_result_through_full_compact(
     let result_b = shell_result("task-B", RESULT_B);
     child_manager
         .settle_completed(&ticket_b, result_b.clone(), old_delivery.clone())
-        .unwrap();
-    old_delivery(&result_b, BgTaskKind::Shell).unwrap();
-    let result_b_id = terminal_delivery_id("task-B", "terminal");
+        .expect("the settle completed fixture result is required for this assertion");
+    old_delivery(&result_b, BgTaskKind::Shell)
+        .expect("the old delivery fixture result is required for this assertion");
+    let result_b_id =
+        crate::agent::async_tasks::delivery::terminal_delivery_id("task-B", "terminal");
     assert_eq!(
         owner
             .queue
@@ -366,22 +367,18 @@ async fn failed_child_resume_preserves_blocked_result_through_full_compact(
     let resumed = tokio::time::timeout(Duration::from_secs(10), resumed_call)
         .await
         .expect("恢复调用必须结束")
-        .unwrap()
+        .expect("the expect fixture result is required for this assertion")
         .expect("可靠交接后必须允许 resume");
     assert_eq!(resumed.child_thread_id, child_id);
     assert!(Arc::ptr_eq(
         &old_mailbox,
         &resumed.session.async_result_mailbox()
     ));
-    if background {
-        let resumed_result = tokio::time::timeout(Duration::from_secs(10), resumed_rx)
-            .await
-            .expect("恢复执行必须处理 B 后完成")
-            .unwrap();
-        assert!(resumed_result.success);
-    } else {
-        assert!(resumed.task_id.is_none(), "同步恢复应直接完成");
-    }
+    let resumed_result = tokio::time::timeout(Duration::from_secs(10), resumed_rx)
+        .await
+        .expect("恢复执行必须处理 B 后完成")
+        .expect("the expect fixture result is required for this assertion");
+    assert!(resumed_result.success);
     let seen = messages.lock();
     assert!(seen
         .iter()
@@ -397,25 +394,7 @@ async fn failed_child_resume_preserves_blocked_result_through_full_compact(
 /// [回归测试] 模型失败交接后，后台 resume 的 Full 保留未覆盖结果。
 #[tokio::test(start_paused = true)]
 async fn test_failed_child_background_resume_preserves_blocked_result_through_full_compact() {
-    failed_child_resume_preserves_blocked_result_through_full_compact(true, true).await;
-}
-
-/// [回归测试] 后台失败交接后，同步 resume 的 Full 保留未覆盖结果。
-#[tokio::test(start_paused = true)]
-async fn test_failed_child_sync_resume_preserves_blocked_result_through_full_compact() {
-    failed_child_resume_preserves_blocked_result_through_full_compact(true, false).await;
-}
-
-/// [回归测试] 同步失败交接后，后台 resume 的 Full 保留未覆盖结果。
-#[tokio::test(start_paused = true)]
-async fn test_sync_failed_child_background_resume_preserves_blocked_result_through_full_compact() {
-    failed_child_resume_preserves_blocked_result_through_full_compact(false, true).await;
-}
-
-/// [回归测试] 同步失败交接后，同步 resume 的 Full 保留未覆盖结果。
-#[tokio::test(start_paused = true)]
-async fn test_sync_failed_child_sync_resume_preserves_blocked_result_through_full_compact() {
-    failed_child_resume_preserves_blocked_result_through_full_compact(false, false).await;
+    failed_child_resume_preserves_blocked_result_through_full_compact().await;
 }
 
 /// [回归测试] 没有进程内 owner 的冷恢复只加载历史，不重建任务或结果责任。
@@ -428,12 +407,15 @@ async fn test_cold_resume_does_not_reconstruct_mailbox_or_tasks() {
     let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
     meta.id = child_id.clone();
     meta.parent_thread_id = Some("parent-thread".into());
-    store.create_resumable_thread(meta).await.unwrap();
+    store
+        .create_resumable_thread(meta)
+        .await
+        .expect("the create resumable thread fixture result is required for this assertion");
     store
         .update_thread_status(&child_id, "error")
         .await
-        .unwrap();
-    let id = terminal_delivery_id("old-task", "terminal");
+        .expect("the update thread status fixture result is required for this assertion");
+    let id = crate::agent::async_tasks::delivery::terminal_delivery_id("old-task", "terminal");
     let reminder = crate::session::async_router::background_result_reminder(
         &shell_result("old-task", RESULT_A),
         BgTaskKind::Shell,
@@ -441,7 +423,7 @@ async fn test_cold_resume_does_not_reconstruct_mailbox_or_tasks() {
     store
         .append_reminder_if_absent(&child_id, id, &reminder)
         .await
-        .unwrap();
+        .expect("the append reminder if absent fixture result is required for this assertion");
     let parent_manager = Arc::new(TaskManager::new());
     let parent = Session::new(
         Arc::from("/tmp"),
@@ -452,36 +434,41 @@ async fn test_cold_resume_does_not_reconstruct_mailbox_or_tasks() {
         task_manager: Some(parent_manager),
         ..Default::default()
     });
-    let resumed =
-        SessionFactory::resume_subagent(Some(&parent), resume_config(store, child_id.clone()))
-            .await
-            .expect("冷恢复必须允许从历史开始新执行");
+    let resumed = SessionFactory::resume_subagent(
+        Some(&parent),
+        crate::session::subagent::tests::resume_config(store, child_id.clone()),
+    )
+    .await
+    .expect("冷恢复必须允许从历史开始新执行");
     assert_eq!(resumed.child_thread_id, child_id);
     assert!(resumed.session.transcript().read().get(id).is_some());
     assert_eq!(resumed.session.async_result_mailbox().pending_count(), 0);
     assert!(resumed
         .session
         .subagent_host()
-        .unwrap()
+        .expect("the subagent host fixture result is required for this assertion")
         .task_manager
         .as_ref()
-        .unwrap()
+        .expect("the as ref fixture result is required for this assertion")
         .registry()
         .list_tasks_full()
         .is_empty());
 }
 
-async fn confirmed_handoff_terminal_write_failure(background: bool) {
+async fn confirmed_handoff_terminal_write_failure() {
     let store = MockSessionResources::new();
     let child_id = uuid::Uuid::now_v7().to_string();
     let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
     meta.id = child_id.clone();
     meta.parent_thread_id = Some("parent-thread".into());
-    store.create_resumable_thread(meta).await.unwrap();
+    store
+        .create_resumable_thread(meta)
+        .await
+        .expect("the create resumable thread fixture result is required for this assertion");
     store
         .update_thread_status(&child_id, "error")
         .await
-        .unwrap();
+        .expect("the update thread status fixture result is required for this assertion");
     let parent_manager = Arc::new(TaskManager::new());
     let child_manager = Arc::new(TaskManager::new());
     register_shell(&child_manager, "status-shell");
@@ -493,7 +480,9 @@ async fn confirmed_handoff_terminal_write_failure(background: bool) {
         Some(store.clone()),
         None,
     );
-    parent_manager.register_child_owner(owner.clone()).unwrap();
+    parent_manager
+        .register_child_owner(owner.clone())
+        .expect("the register child owner fixture result is required for this assertion");
     let parent = Session::new(
         Arc::from("/tmp"),
         FrozenContext::builder().build(),
@@ -503,18 +492,13 @@ async fn confirmed_handoff_terminal_write_failure(background: bool) {
         task_manager: Some(parent_manager.clone()),
         ..Default::default()
     });
-    let mut config = resume_config_with(
+    let mut config = crate::session::subagent::tests::resume_config_with(
         store.clone(),
         child_id.clone(),
         crate::session::test_resources::mock::model::fixture_source(
             Arc::new(FailWithoutResidual),
             "fixture-scripted",
         ),
-        if background {
-            SubagentRunMode::Background
-        } else {
-            SubagentRunMode::Sync
-        },
         Some(parent_manager),
         None,
     );
@@ -537,34 +521,32 @@ async fn confirmed_handoff_terminal_write_failure(background: bool) {
             let _ = sender.send(());
         }
     }));
-    let first = SessionFactory::resume_subagent(Some(&parent), config).await;
-    if background {
-        first.expect("后台执行必须启动");
-        let result = tokio::time::timeout(Duration::from_secs(10), result_rx)
-            .await
-            .expect("终态写失败必须交付")
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.output.contains("terminal status write failed"));
-    } else {
-        let error = first.err().expect("终态写失败必须返回错误");
-        assert!(error.to_string().contains("terminal_status_persist_failed"));
-    }
+    SessionFactory::resume_subagent(Some(&parent), config)
+        .await
+        .expect("后台执行必须启动");
+    let result = tokio::time::timeout(Duration::from_secs(10), result_rx)
+        .await
+        .expect("终态写失败必须交付")
+        .expect("the expect fixture result is required for this assertion");
+    assert!(!result.success);
+    assert!(result.output.contains("terminal status write failed"));
     tokio::time::timeout(Duration::from_secs(10), finished_rx)
         .await
         .expect("旧执行必须完成")
-        .unwrap();
+        .expect("the expect fixture result is required for this assertion");
     assert!(owner.receipt().is_some(), "交接必须先成功提交");
     assert!(owner.pending_receipt().is_none());
     assert!(owner
         .failure()
-        .unwrap()
+        .expect("the failure fixture result is required for this assertion")
         .contains("terminal_status_persist_failed"));
-    let error = SessionFactory::resume_subagent(Some(&parent), resume_config(store, child_id))
-        .await
-        .err()
-        .expect("终态写入失败必须拒绝 resume")
-        .to_string();
+    let error = SessionFactory::resume_subagent(
+        Some(&parent),
+        crate::session::subagent::tests::resume_config(store, child_id),
+    )
+    .await
+    .expect_err("终态写入失败必须拒绝 resume")
+    .to_string();
     assert!(error.contains("settlement is unconfirmed"), "{error}");
 }
 
@@ -578,11 +560,14 @@ async fn test_failed_resume_registration_keeps_mailbox_blocked() {
     let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
     meta.id = child_id.clone();
     meta.parent_thread_id = Some("parent-thread".into());
-    store.create_resumable_thread(meta).await.unwrap();
+    store
+        .create_resumable_thread(meta)
+        .await
+        .expect("the create resumable thread fixture result is required for this assertion");
     store
         .update_thread_status(&child_id, "error")
         .await
-        .unwrap();
+        .expect("the update thread status fixture result is required for this assertion");
     let parent_manager = Arc::new(TaskManager::new());
     let owner = ParkedChildOwner::new(
         child_id.clone(),
@@ -592,7 +577,8 @@ async fn test_failed_resume_registration_keeps_mailbox_blocked() {
         Some(store.clone()),
         None,
     );
-    let id = terminal_delivery_id("preflight-task", "terminal");
+    let id =
+        crate::agent::async_tasks::delivery::terminal_delivery_id("preflight-task", "terminal");
     let reminder = crate::session::async_router::background_result_reminder(
         &shell_result("preflight-task", RESULT_A),
         BgTaskKind::Shell,
@@ -600,13 +586,15 @@ async fn test_failed_resume_registration_keeps_mailbox_blocked() {
     owner
         .mailbox
         .accept(id, &reminder, MessageSource::ShellComplete)
-        .unwrap();
+        .expect("the accept fixture result is required for this assertion");
     owner
         .mailbox
         .mark_canonical_ready(id, &reminder, MessageSource::ShellComplete, None)
-        .unwrap();
+        .expect("the mark canonical ready fixture result is required for this assertion");
     owner.mailbox.block_uncovered("reason", "模型失败");
-    parent_manager.register_child_owner(owner.clone()).unwrap();
+    parent_manager
+        .register_child_owner(owner.clone())
+        .expect("the register child owner fixture result is required for this assertion");
     let parent = Session::new(
         Arc::from("/tmp"),
         FrozenContext::builder().build(),
@@ -616,40 +604,36 @@ async fn test_failed_resume_registration_keeps_mailbox_blocked() {
         task_manager: Some(parent_manager),
         ..Default::default()
     });
-    let config = resume_config_with(
+    let config = crate::session::subagent::tests::resume_config_with(
         store.clone(),
         child_id.clone(),
         crate::session::test_resources::mock::model::fixture_source(
             Arc::new(EchoLLM),
             "fixture-scripted",
         ),
-        SubagentRunMode::Background,
         None,
         None,
     );
     let error = SessionFactory::resume_subagent(Some(&parent), config)
         .await
-        .err()
-        .expect("缺少后台任务 manager 必须拒绝注册")
+        .expect_err("缺少后台任务 manager 必须拒绝注册")
         .to_string();
     assert!(error.contains("no task manager configured"), "{error}");
     assert_eq!(owner.mailbox.state_of(&id), Some(AsyncResultState::Blocked));
     assert_eq!(
-        store.load_meta(&child_id).await.unwrap().agent_status,
+        store
+            .load_meta(&child_id)
+            .await
+            .expect("the load meta fixture result is required for this assertion")
+            .agent_status,
         AgentStatus::Error
     );
-}
-
-/// [回归测试] 已确认交接后，同步终态状态写入失败仍拒绝 resume。
-#[tokio::test(start_paused = true)]
-async fn test_sync_confirmed_handoff_terminal_write_failure_blocks_resume() {
-    confirmed_handoff_terminal_write_failure(false).await;
 }
 
 /// [回归测试] 已确认交接后，后台终态状态写入失败仍拒绝 resume。
 #[tokio::test(start_paused = true)]
 async fn test_background_confirmed_handoff_terminal_write_failure_blocks_resume() {
-    confirmed_handoff_terminal_write_failure(true).await;
+    confirmed_handoff_terminal_write_failure().await;
 }
 
 /// [回归测试] 后台 resume 已开始但未结算即被强制取消时，不得保留 Ready 责任。
@@ -662,11 +646,14 @@ async fn test_background_forced_abort_reblocks_unsettled_mailbox() {
     let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
     meta.id = child_id.clone();
     meta.parent_thread_id = Some("parent-thread".into());
-    store.create_resumable_thread(meta).await.unwrap();
+    store
+        .create_resumable_thread(meta)
+        .await
+        .expect("the create resumable thread fixture result is required for this assertion");
     store
         .update_thread_status(&child_id, "error")
         .await
-        .unwrap();
+        .expect("the update thread status fixture result is required for this assertion");
     let parent_manager = Arc::new(TaskManager::new());
     let owner = ParkedChildOwner::new(
         child_id.clone(),
@@ -676,7 +663,10 @@ async fn test_background_forced_abort_reblocks_unsettled_mailbox() {
         Some(store.clone()),
         None,
     );
-    let blocked_id = terminal_delivery_id("blocked-before-resume", "terminal");
+    let blocked_id = crate::agent::async_tasks::delivery::terminal_delivery_id(
+        "blocked-before-resume",
+        "terminal",
+    );
     let reminder = crate::session::async_router::background_result_reminder(
         &shell_result("blocked-before-resume", RESULT_A),
         BgTaskKind::Shell,
@@ -684,11 +674,11 @@ async fn test_background_forced_abort_reblocks_unsettled_mailbox() {
     owner
         .mailbox
         .accept(blocked_id, &reminder, MessageSource::ShellComplete)
-        .unwrap();
+        .expect("the accept fixture result is required for this assertion");
     owner
         .mailbox
         .mark_canonical_ready(blocked_id, &reminder, MessageSource::ShellComplete, None)
-        .unwrap();
+        .expect("the mark canonical ready fixture result is required for this assertion");
     owner.mailbox.block_uncovered("reason", "模型失败");
     let delivery = crate::session::bg_complete::task_bg_complete_callback(
         crate::session::bg_complete::queue_terminal_delivery_with_mailbox(
@@ -696,9 +686,13 @@ async fn test_background_forced_abort_reblocks_unsettled_mailbox() {
             owner.mailbox.clone(),
         ),
     );
-    delivery(&shell_result("receive-gate", RESULT_B), BgTaskKind::Shell).unwrap();
-    let queued_id = terminal_delivery_id("receive-gate", "terminal");
-    parent_manager.register_child_owner(owner.clone()).unwrap();
+    delivery(&shell_result("receive-gate", RESULT_B), BgTaskKind::Shell)
+        .expect("the delivery fixture result is required for this assertion");
+    let queued_id =
+        crate::agent::async_tasks::delivery::terminal_delivery_id("receive-gate", "terminal");
+    parent_manager
+        .register_child_owner(owner.clone())
+        .expect("the register child owner fixture result is required for this assertion");
     let parent = Session::new(
         Arc::from("/tmp"),
         FrozenContext::builder().build(),
@@ -709,14 +703,13 @@ async fn test_background_forced_abort_reblocks_unsettled_mailbox() {
         ..Default::default()
     });
     let (entered, release) = owner.queue.gate_next_receive();
-    let config = resume_config_with(
+    let config = crate::session::subagent::tests::resume_config_with(
         store,
         child_id,
         crate::session::test_resources::mock::model::fixture_source(
             Arc::new(EchoLLM),
             "fixture-scripted",
         ),
-        SubagentRunMode::Background,
         Some(parent_manager.clone()),
         None,
     );
@@ -726,7 +719,7 @@ async fn test_background_forced_abort_reblocks_unsettled_mailbox() {
     tokio::time::timeout(Duration::from_secs(10), entered)
         .await
         .expect("Receive 必须卡在规范提交")
-        .unwrap();
+        .expect("the expect fixture result is required for this assertion");
     assert_eq!(
         owner.mailbox.state_of(&blocked_id),
         Some(AsyncResultState::Ready)
@@ -736,8 +729,8 @@ async fn test_background_forced_abort_reblocks_unsettled_mailbox() {
         Some(AsyncResultState::Queued)
     );
     parent_manager
-        .cancel(spawned.task_id.as_deref().unwrap())
-        .unwrap();
+        .cancel(&spawned.task_id)
+        .expect("the cancel fixture result is required for this assertion");
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(4)).await;
     tokio::time::timeout(Duration::from_secs(10), async {

@@ -31,6 +31,7 @@ fn delivery() -> Delivery {
                     items: vec![ApprovalItem {
                         tool_call_id: "call".into(),
                         tool_name: "Bash".into(),
+                        mcp_origin: None,
                         tool_input: json!({"command":"Get-ChildItem"}),
                     }],
                 },

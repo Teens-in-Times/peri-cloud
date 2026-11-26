@@ -1,27 +1,32 @@
 //! The configuration entity: its sources, domain merge rules and consumer projections.
 //! Source adapters collect bytes; this module alone assembles their meaning.
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
 
 use peri_acp_types::plugin::{ConfigSource, McpServerConfig};
 use serde_json::Value;
 
-use crate::{
-    app::PeriConfig,
-    betas::{self, BetaFlags},
-    mcp::{self, McpConfigFile},
-    observability::{self, LangfuseConfig},
-    provider::{self, ResolvedProvider},
-    resources::{self, ResourceConfiguration},
-    system::{
-        ConfigurationError, ConfigurationField, ConfigurationInputs, ConfigurationRevision,
-        ConfigurationScope, FieldExplanation, SourceIdentity,
-    },
-    ui::TuiConfig,
-};
+use crate::app::PeriConfig;
+use crate::betas;
+use crate::betas::BetaFlags;
+use crate::mcp;
+use crate::mcp::McpConfigFile;
+use crate::observability;
+use crate::observability::LangfuseConfig;
+use crate::provider;
+use crate::provider::ResolvedProvider;
+use crate::resources;
+use crate::resources::ResourceConfiguration;
+use crate::system::ConfigurationError;
+use crate::system::ConfigurationField;
+use crate::system::ConfigurationInputs;
+use crate::system::ConfigurationRevision;
+use crate::system::ConfigurationScope;
+use crate::system::FieldExplanation;
+use crate::system::SourceIdentity;
+use crate::ui::TuiConfig;
 
 #[derive(Clone, Copy)]
 enum Source {
@@ -180,10 +185,18 @@ pub(crate) fn resolve(
 ) -> Result<ResolvedConfiguration, ConfigurationError> {
     let global = parse_document(inputs.global.as_deref(), SourceIdentity::GlobalFile)?;
     let workspace = parse_document(inputs.workspace.as_deref(), SourceIdentity::WorkspaceFile)?;
-    let global_settings = parse_settings(&global, SourceIdentity::GlobalFile)?;
+    let global_settings = parse_settings(
+        &global,
+        inputs.global.as_deref(),
+        SourceIdentity::GlobalFile,
+    )?;
     let mut settings = global_settings.clone();
     if inputs.workspace.is_some() {
-        let overrides = parse_settings(&workspace, SourceIdentity::WorkspaceFile)?;
+        let overrides = parse_settings(
+            &workspace,
+            inputs.workspace.as_deref(),
+            SourceIdentity::WorkspaceFile,
+        )?;
         settings.config.merge_overrides(overrides.config);
     }
     let mcp = resolve_mcp(scope, inputs, &HashMap::new())?;
@@ -312,10 +325,11 @@ pub(crate) fn parse_document(
 
 fn parse_settings(
     document: &Value,
+    raw: Option<&str>,
     source_identity: SourceIdentity,
 ) -> Result<PeriConfig, ConfigurationError> {
     crate::app::warn_legacy_compact_keys(document);
-    let mut config: PeriConfig = serde_json::from_value(document.clone()).map_err(|error| {
+    let mut config: PeriConfig = serde_json::from_str(raw.unwrap_or("{}")).map_err(|error| {
         ConfigurationError::InvalidInput {
             cause: Box::new(error),
             source_identity,

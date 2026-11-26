@@ -9,6 +9,7 @@
 //! 参照既有 `TaskManager`（`peri-acp-types::tasks`）/ `MiddlewareChainAssembler`
 //! （`crate::session::factory`）注入先例：本模块只声明端口，不持有实现。
 
+use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
 use peri_acp_types::agents::AgentOverrides;
@@ -16,7 +17,7 @@ use peri_acp_types::agents::AgentOverrides;
 use crate::middleware::r#trait::Middleware;
 use crate::tools::{BaseTool, ToolInvocationResolver};
 
-use super::WorkflowAgentContext;
+use crate::agent::workflow::agent::WorkflowAgentContext;
 
 /// Workflow agent 从 `agentType` 解析出的 subagent 定义投影。
 ///
@@ -71,6 +72,7 @@ pub trait WorkflowAgentFactory: Send + Sync {
     /// `mcp_skill_registry` = 会话级 MCP skill registry（W4b/F4）：workflow agent
     /// 的技能目录与正文只来自它（本地扫描已删除，J5）；None = 未装配技能面，
     /// 技能工具为空，不回落磁盘。
+    #[must_use]
     fn build_tools(
         &self,
         cwd: &str,
@@ -82,6 +84,7 @@ pub trait WorkflowAgentFactory: Send + Sync {
     /// 装配 workflow agent 中间件链（frozen CLAUDE.md / skills summary / HITL
     /// broker+permission_mode 语义自 `ctx` 读取；`model_name` 供
     /// GitAttribution 使用——alias 解析后的有效模型名）。
+    #[must_use]
     fn build_middlewares(
         &self,
         ctx: &WorkflowAgentContext,
@@ -92,6 +95,7 @@ pub trait WorkflowAgentFactory: Send + Sync {
 
     /// 构造 tool invocation resolver（迁移前语义 =
     /// `ExecuteExtraToolResolver::default()`）。
+    #[must_use]
     fn build_tool_resolver(&self) -> Arc<dyn ToolInvocationResolver>;
 }
 
@@ -117,12 +121,17 @@ pub type WorkflowModelFactory = Arc<
         + Sync,
 >;
 
+use peri_acp_types::skills::SkillToolAccess;
+
 /// Workflow agent 的 subagent prompt 渲染端口。
 ///
 /// agent type 指定时使用其 `agent.md` overrides 渲染；无 agent type 时继续使用
 /// session 冻结的默认 subagent prompt。
-pub type WorkflowAgentPromptBuilder =
-    Arc<dyn Fn(Option<&AgentOverrides>, &str, Option<&str>, Option<&str>) -> String + Send + Sync>;
+pub type WorkflowAgentPromptBuilder = Arc<
+    dyn Fn(Option<&AgentOverrides>, &str, Option<&str>, Option<&str>, SkillToolAccess) -> String
+        + Send
+        + Sync,
+>;
 
 /// Workflow agent system prompt fallback 渲染闭包（ACP 宿主构造：`PromptTemplate`
 /// 渲染面；参数 = cwd / frozen date / frozen language）。
@@ -130,7 +139,7 @@ pub type WorkflowAgentPromptBuilder =
 /// 仅 `WorkflowAgentContext.system_prompt = None` 时调用（workflow 链不注册
 /// WorkflowTool，fallback 渲染关闭 workflow section——P2-2026-08-02）。
 pub type WorkflowSystemPromptFallback =
-    Arc<dyn Fn(&str, Option<&str>, Option<&str>) -> String + Send + Sync>;
+    Arc<dyn Fn(&str, Option<&str>, Option<&str>, SkillToolAccess) -> String + Send + Sync>;
 
 /// Workflow agent 事件发射钩子（ACP 宿主构造：`Controller::publish_event` 适配；
 /// 事件三层化统一出口，与主 executor 同一发射路径）。
@@ -139,3 +148,13 @@ pub type WorkflowPublishHook = Arc<
         + Send
         + Sync,
 >;
+
+impl Debug for WorkflowModel {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkflowModel")
+            .field("model_name", &self.model_name)
+            .field("tier_present", &self.tier.is_some())
+            .finish_non_exhaustive()
+    }
+}

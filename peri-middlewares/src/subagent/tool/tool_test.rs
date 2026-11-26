@@ -8,20 +8,19 @@ use peri_acp_types::session_resources::{
 use peri_acp_types::store::PersistedPayload;
 use peri_acp_types::thread::AgentStatus;
 use peri_acp_types::workspace::{ResolvedWorkspace, SessionBinding, SESSION_BINDING_VERSION};
-use peri_agent::{
-    agent::{
-        events::ExecutorEvent,
-        events_v2::ObserveEvent,
-        react::{ReactLLM, Reasoning, StreamingContext},
-        AgentCancellationToken,
-    },
-    messages::BaseMessage,
-    thread::{ThreadId, ThreadMeta},
-    tools::BaseTool,
-};
-use tempfile::tempdir;
+use peri_agent::agent::events::ExecutorEvent;
+use peri_agent::agent::events_v2::ObserveEvent;
+use peri_agent::agent::react::ReactLLM;
+use peri_agent::agent::react::Reasoning;
+use peri_agent::agent::react::StreamingContext;
+use peri_agent::agent::AgentCancellationToken;
+use peri_agent::messages::BaseMessage;
+use peri_agent::thread::ThreadId;
+use peri_agent::thread::ThreadMeta;
+use peri_agent::tools::BaseTool;
+use tempfile;
 
-use super::*;
+use super::SubAgentTool;
 use peri_agent::session::subagent::SubagentLlmSource;
 
 // Mock LLM: returns final answer directly
@@ -34,14 +33,14 @@ impl EchoLLM {
         request: peri_model::ModelRequest,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Vec<peri_model::ModelResult<peri_model::ModelStreamEvent>> {
-        use crate::subagent::test_support::*;
+        use crate::subagent::test_support;
         let _ = &cancellation;
-        let messages = base_messages(&request);
-        let defined = defined_tools(&request);
+        let messages = test_support::base_messages(&request);
+        let defined = test_support::defined_tools(&request);
         let _tools: Vec<&dyn BaseTool> = defined.iter().map(|t| t as &dyn BaseTool).collect();
 
         let last = messages.last().map(|m| m.content()).unwrap_or_default();
-        text_events(format!("echo: {}", last))
+        test_support::text_events(format!("echo: {}", last))
     }
 }
 crate::subagent::test_support::fixture_model_impl!(EchoLLM);
@@ -268,12 +267,14 @@ pub(crate) fn with_agent_catalog(
     )],
 ) -> SubAgentTool {
     use peri_acp_types::plugin::ConfigSource;
-    use peri_acp_types::workspace_resources::{agent_uri, META_KEY_FRONTMATTER, META_KEY_SCOPE};
+    use peri_acp_types::workspace_resources;
+    use peri_acp_types::workspace_resources::META_KEY_FRONTMATTER;
+    use peri_acp_types::workspace_resources::META_KEY_SCOPE;
     use rmcp::model::{MetaObject, Resource};
 
     let mut resources = Vec::new();
     for (scope, id, frontmatter) in entries {
-        let uri = agent_uri(*scope, None, id).expect("agent uri");
+        let uri = workspace_resources::agent_uri(*scope, None, id).expect("agent uri");
         let mut meta = serde_json::Map::new();
         meta.insert(
             META_KEY_SCOPE.to_string(),
@@ -336,7 +337,7 @@ async fn agent_definition_without_a_resource_face_reports_a_gap() {
 async fn built_in_policy_is_enforced_by_the_registry_catalog() {
     use peri_acp_types::workspace_resources::ResourceScope;
     // 只有 builtin 来源的定义：关闭 built-in policy 时不可加载；resume 放开。
-    let dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_str().unwrap();
     let tool = with_agent_catalog(
         tool_with_built_ins_disabled(cwd),
@@ -377,7 +378,7 @@ async fn invoke_resolves_agent_from_argument_cwd_before_starting_factory() {
 
     // W5：Agent 定义来源是会话绑定的资源面；显式 cwd 只能是父目录的等价路径。
     // 本用例保留「失败不启动 factory」断言（锁 failed-before-spawn 顺序）。
-    let dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let agents_dir = dir.path().join(".claude").join("agents");
     std::fs::create_dir_all(&agents_dir).unwrap();
     std::fs::write(
@@ -420,12 +421,10 @@ async fn invoke_resolves_agent_from_argument_cwd_before_starting_factory() {
         )
         .await
         .unwrap();
-    assert!(result.text.contains("echo: from bound face"));
-    assert_eq!(
-        result.execution.as_ref().unwrap().status,
-        peri_agent::tools::ToolExecutionStatus::Completed
-    );
-    assert!(result.execution.as_ref().unwrap().task_id.is_none());
+    assert!(result.text.contains("Background task"), "{}", result.text);
+    let completed = host.wait_background_completion().await;
+    assert!(completed.success);
+    assert!(completed.output.contains("echo: from bound face"));
     assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
 
     // 2) 未命中：失败且**不启动 factory**（顺序契约不变）。
@@ -456,7 +455,7 @@ async fn background_invoke_uses_argument_cwd_for_loader_failure() {
     // W5：Agent 定义来源是**会话绑定的资源面**（builtin `workspace` 实例的
     // project agent 根 = 会话 cwd 的 `.claude/agents`）；`cwd` 参数不再决定
     // 定义来源。本用例锁「定义不可得时后台路径报错且不启动 factory」。
-    let dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let agents_dir = dir.path().join(".claude").join("agents");
     std::fs::create_dir_all(&agents_dir).unwrap();
     std::fs::write(
@@ -542,10 +541,11 @@ async fn background_invoke_uses_argument_cwd_for_loader_failure() {
 
 #[tokio::test]
 async fn mcp_agent_suggestions_require_activation_and_connection() {
-    use crate::mcp::{
-        client::{ClientStatus, McpClientHandle, OAuthStatus},
-        McpAgentRegistry, McpClientPool,
-    };
+    use crate::mcp::client::ClientStatus;
+    use crate::mcp::client::McpClientHandle;
+    use crate::mcp::client::OAuthStatus;
+    use crate::mcp::McpAgentRegistry;
+    use crate::mcp::McpClientPool;
     use rmcp::model::Resource;
 
     let empty_pool = Arc::new(McpClientPool::new_empty());
@@ -775,164 +775,79 @@ pub(crate) fn preset_child_ctx(
 ///
 /// 子链宿主来自 owning parent session（`parent.subagent_host()`），因此端口与
 /// 资源必须装在父 session 上；工具的 host 字段只在父 session 无 host 时生效。
+/// 后台完成捕获器：测试用 `on_bg_complete` 确认接纳并留存结果。
+///
+/// v5 起 Agent 调用恒后台；需要最终结果的用例用 [`Self::invoke_and_wait`] 发起
+/// 委派并等待完成，而不是读同步返回值。
+#[derive(Clone, Default)]
+pub(crate) struct BackgroundCapture {
+    completions: Arc<std::sync::Mutex<Vec<peri_acp_types::event::BackgroundTaskResult>>>,
+}
+
+impl BackgroundCapture {
+    /// 可挂到 `SubagentHost::on_bg_complete` 的捕获器（确认接纳，不投递父 MQ）。
+    pub(crate) fn logger(&self) -> peri_acp_types::tasks::OnBgCompleteFn {
+        let completions = Arc::clone(&self.completions);
+        Arc::new(move |result, _kind| {
+            completions.lock().unwrap().push(result.clone());
+            Ok(())
+        })
+    }
+
+    /// 等待下一次后台完成并返回结果；超时即判失败。
+    pub(crate) async fn wait(&self) -> peri_acp_types::event::BackgroundTaskResult {
+        self.wait_with_timeout(std::time::Duration::from_secs(10))
+            .await
+    }
+
+    async fn wait_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> peri_acp_types::event::BackgroundTaskResult {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if let Some(result) = self.completions.lock().unwrap().pop() {
+                    return result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("后台任务必须在超时内完成")
+    }
+
+    /// 发起后台委派并等待结果，返回与旧同步路径同形的文本
+    /// （`child_thread_id: ...` 前缀 + 子结果）。错误路径不回退等待。
+    pub(crate) async fn invoke_and_wait(
+        &self,
+        tool: &SubAgentTool,
+        input: serde_json::Value,
+        ctx: peri_agent::tools::ToolContext<'_>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let receipt = tool.invoke(input, ctx).await?;
+        assert!(
+            receipt.contains("Background task"),
+            "v5 起 Agent 调用必须后台启动：{receipt}"
+        );
+        let completed = self.wait().await;
+        assert!(
+            completed.success,
+            "后台委派必须成功完成：{}",
+            completed.output
+        );
+        let child = completed
+            .child_thread_id
+            .clone()
+            .unwrap_or_else(|| "<missing-child-id>".to_string());
+        Ok(format!("child_thread_id: {child}\n{}", completed.output))
+    }
+}
+
 pub(crate) fn install_parent_host(
     store: &SessionFixture,
     parent: &std::sync::Arc<peri_agent::session::Session>,
-) {
-    let mut host = parent
-        .subagent_host()
-        .as_deref()
-        .cloned()
-        .unwrap_or_default();
-    host.session_resources = Some(store.facade());
-    if host.task_manager.is_none() {
-        host.task_manager = Some(Arc::new(peri_agent::agent::async_tasks::TaskManager::new()));
-    }
-    host.parent_thread_id = parent.store().thread_id.clone();
-    parent.set_subagent_host(host);
+) -> BackgroundCapture {
+    install_parent_host_with_bridge(store, parent, None)
 }
 
-/// 让目录成为 git 工作区（工作区发现需要真实仓库证据）。
-pub(crate) fn git_init(directory: &std::path::Path) {
-    for args in [
-        vec!["init", "-q"],
-        vec![
-            "-c",
-            "user.name=fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--allow-empty",
-            "-qm",
-            "base",
-        ],
-    ] {
-        let output = std::process::Command::new("git")
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("HOME", directory)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .arg("-C")
-            .arg(directory)
-            .args(&args)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "git fixture failed");
-    }
-}
-
-/// 预置可恢复 thread：创建（title 决定工具集恢复路径）+ 写消息 + 置非 active。
-async fn preset_resumable_thread(
-    fixture: &SessionFixture,
-    id: &str,
-    title: &str,
-    parent_thread_id: Option<&str>,
-    msgs: Vec<BaseMessage>,
-) {
-    let id = id.to_string();
-    let mut meta = peri_agent::thread::ThreadMeta::new_at("/tmp/work", peri_time::now_wall());
-    meta.id = id.clone();
-    meta.title = Some(title.to_string());
-    meta.parent_thread_id = parent_thread_id.map(|s| s.to_string());
-    meta.hidden = true;
-    fixture.create_thread(meta).await.unwrap();
-    if !msgs.is_empty() {
-        fixture.append_messages(&id, &msgs).await.unwrap();
-    }
-    fixture.update_thread_status(&id, "done").await.unwrap();
-}
-
-// 本文件经 mod.rs 的 `#[path = "tool_test.rs"]` 挂载；此路径加载方式下，
-// rustc 不会为聚合根派生 `tool_test/` 子目录，子模块需显式 `#[path]` 指向。
-#[path = "tool_test/active_message_test.rs"]
-mod active_message_test;
-#[path = "tool_test/beta_default_test.rs"]
-mod beta_default_test;
-
-#[path = "tool_test/bg_register_cancel_test.rs"]
-mod bg_register_cancel_test;
-#[path = "tool_test/events_contract_test.rs"]
-mod events_contract_test;
-#[path = "tool_test/fork_test.rs"]
-mod fork_test;
-#[path = "tool_test/input_contract_test.rs"]
-mod input_contract_test;
-#[path = "tool_test/integration_modes_test.rs"]
-mod integration_modes_test;
-#[path = "tool_test/integration_v2_test.rs"]
-mod integration_v2_test;
-#[path = "tool_test/invoke_test.rs"]
-mod invoke_test;
-#[path = "tool_test/middleware_chain_test.rs"]
-mod middleware_chain_test;
-#[path = "tool_test/mock_model.rs"]
-mod mock_model;
-#[path = "tool_test/model_tier_test.rs"]
-mod model_tier_test;
-#[path = "tool_test/resume_failure_test.rs"]
-mod resume_failure_test;
-#[path = "tool_test/resume_identity_test.rs"]
-mod resume_identity_test;
-#[path = "tool_test/resume_integration_test.rs"]
-mod resume_integration_test;
-#[path = "tool_test/resume_test.rs"]
-mod resume_test;
-#[path = "tool_test/sections_parity_test.rs"]
-mod sections_parity_test;
-#[path = "tool_test/session_isolation_test.rs"]
-mod session_isolation_test;
-
-#[path = "tool_test/mcp_activation_owner_test.rs"]
-mod mcp_activation_owner_test;
-
-/// W5 关闭矩阵 E2E（生产链路）：agent 面关闭（`SubAgentMiddleware` 链槽关闭位 =
-/// `SUB_AGENT_FACE_CLOSED_KEY`）⇒ 本地来源**不可发现、不可激活**，且**零磁盘兜底**
-/// （定义文件仍在磁盘上也不得被读取）。
-#[tokio::test]
-async fn closed_agent_face_hides_and_blocks_activation_without_disk_fallback() {
-    use peri_acp_types::workspace_resources::ResourceScope;
-
-    let dir = tempdir().unwrap();
-    let agents_dir = dir.path().join(".claude").join("agents");
-    std::fs::create_dir_all(&agents_dir).unwrap();
-    std::fs::write(
-        agents_dir.join("matrix-agent.md"),
-        "---\nname: matrix-agent\ndescription: Matrix agent\n---\n\nMatrix.\n",
-    )
-    .unwrap();
-
-    // 默认（面开启）：资源面可见、可解析（定义文件存在即命中）。
-    let open_fixture = crate::mcp::agent_face_fixture::AgentFaceFixture::connect(dir.path()).await;
-    let open = open_fixture.registry.local_catalog(true);
-    assert!(
-        open.iter().any(|entry| entry.id == "matrix-agent"),
-        "面开启时候选可见: {open:?}"
-    );
-    drop(open_fixture);
-
-    // 关闭位（与 A24 关闭集同一份 `disabled_middlewares` 派生）：同一磁盘内容不可见。
-    let closed_fixture =
-        crate::mcp::agent_face_fixture::AgentFaceFixture::connect(dir.path()).await;
-    let closed_registry =
-        crate::mcp::McpAgentRegistry::new(std::sync::Arc::clone(&closed_fixture.pool))
-            .with_local_face_closed(true);
-    assert!(
-        closed_registry.local_catalog(true).is_empty(),
-        "关闭位下本地来源不可发现"
-    );
-    assert!(
-        closed_registry.resolve_local("matrix-agent", true).is_err(),
-        "关闭位下不可激活（零磁盘兜底）"
-    );
-    // 链槽关闭键是唯一事实源常量（不是散落字面量）。
-    assert_eq!(
-        crate::assembly::SUB_AGENT_FACE_CLOSED_KEY,
-        "SubAgentMiddleware"
-    );
-    let _ = ResourceScope::Project;
-}
-
-#[path = "tool_test/resume_archive_test.rs"]
-mod resume_archive_test;
+include!("tool_test_section_2.rs");

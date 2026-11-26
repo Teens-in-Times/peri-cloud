@@ -150,6 +150,7 @@ mod tests {
         let item = ApprovalItem {
             tool_call_id: "call".into(),
             tool_name: "Write".into(),
+            mcp_origin: None,
             tool_input: json!({"file_path":"notes.txt","content":"private draft".repeat(1000)}),
         };
         let card = card(vec![item; 5]);
@@ -169,6 +170,7 @@ mod tests {
         let item = ApprovalItem {
             tool_call_id: "call".into(),
             tool_name: "Bash".into(),
+            mcp_origin: None,
             tool_input: json!({"command":format!("[click](https://untrusted.test)\n{}", "界".repeat(4000))}),
         };
         let summary = text(&card(vec![item]), "https://agent.example.test", true);

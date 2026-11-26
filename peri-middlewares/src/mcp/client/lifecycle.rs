@@ -8,7 +8,17 @@ use crate::mcp::builtin::runtime::{
     BUILTIN_CONVERGE_TIMEOUT,
 };
 use peri_acp_types::ports::McpPoolShutdownReport;
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use futures::StreamExt;
+
+/// 单个 pool 内并行关闭的上限。
+///
+/// service / process 两张表互不共享锁，单项关闭都有 5s 上限；并行收口把「逐项累加」
+/// 压成「取最大」，同时避免一次拉起过多收尾任务。builtin 监督者不适用此闸门：每项
+/// 移交给独立 task（见 `close_builtin_tasks`），实例数由配置决定。
+pub(super) const MAX_PARALLEL_CLOSES: usize = 8;
 
 pub(super) enum ServiceShutdownState {
     Idle,
@@ -28,9 +38,18 @@ async fn close_services(
     mut settled_services: usize,
     mut failed_services: usize,
 ) -> (McpPoolShutdownReport, Vec<(String, McpServiceWrapper)>) {
+    // 各 service 的 close 互不依赖：并行收口，单项 5s 上限不再逐项累加。
+    let results: Vec<_> = futures::stream::iter(services)
+        .map(|(server_name, mut service)| async move {
+            let outcome = service.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+            (server_name, service, outcome)
+        })
+        .buffer_unordered(MAX_PARALLEL_CLOSES)
+        .collect()
+        .await;
     let mut remaining = Vec::new();
-    for (server_name, mut service) in services {
-        match service.close_with_timeout(SHUTDOWN_TIMEOUT).await {
+    for (server_name, service, outcome) in results {
+        match outcome {
             Ok(Some(_reason)) => settled_services += 1,
             Ok(None) => {
                 tracing::warn!(server = %server_name, "MCP service cleanup remained unfinished");
@@ -43,6 +62,8 @@ async fn close_services(
             }
         }
     }
+    // 并行完成的顺序不稳定：重试队列按 server 名排序，保持报告与重试顺序确定。
+    remaining.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     let unfinished_services = remaining.len();
     let report = if unfinished_services == 0 {
         McpPoolShutdownReport::Complete {
@@ -91,20 +112,60 @@ impl McpClientPool {
         owner
     }
 
+    /// 丢弃已经收口的失败/取消连接，避免重复加载让 service/process 保留表增长。
+    ///
+    /// 只移除已停止的 owner：关闭超时或仍可重试的 owner 继续由关闭事务持有。
+    pub(crate) fn release_stopped_resources(&self, server_name: &str) {
+        let _admission = self.lifecycle_registration.lock();
+        self.shared_services
+            .lock()
+            .retain(|service| !service.is_stopped());
+        #[cfg(not(target_os = "emscripten"))]
+        self.processes
+            .lock()
+            .retain(|process| !process.is_stopped());
+        if let Some(slot) = self.existing_server_slot(server_name) {
+            slot.services.lock().retain(|service| !service.is_stopped());
+            #[cfg(not(target_os = "emscripten"))]
+            slot.processes
+                .lock()
+                .retain(|process| !process.is_stopped());
+        }
+    }
+
     #[cfg(all(test, not(target_os = "emscripten")))]
     pub(crate) fn retained_service_count(&self) -> usize {
         self.shared_services.lock().len()
     }
 
+    #[cfg(all(test, not(target_os = "emscripten")))]
+    pub(crate) fn retained_process_count(&self) -> usize {
+        self.processes.lock().len()
+    }
+
+    /// 测试停点：持锁可把提交卡在「已过准入、尚未发布」之间。
+    #[cfg(test)]
+    pub(crate) fn pause_handle_generation(
+        &self,
+    ) -> parking_lot::MutexGuard<
+        '_,
+        std::collections::HashMap<String, Vec<(std::sync::Weak<McpClientHandle>, u64)>>,
+    > {
+        self.handle_generations.lock()
+    }
+
     async fn close_shared_services(&self) -> usize {
         let services = self.shared_services.lock().clone();
-        for service in services {
-            let _ = peri_time::timeout(
-                SHUTDOWN_TIMEOUT,
-                service.close_with_timeout(SHUTDOWN_TIMEOUT),
-            )
+        // 共享 service 彼此独立：并行收口，不把每项 5s 上限累加。
+        futures::stream::iter(services)
+            .for_each_concurrent(MAX_PARALLEL_CLOSES, |service| async move {
+                let _ = peri_time::timeout(
+                    SHUTDOWN_TIMEOUT,
+                    service.close_with_timeout(SHUTDOWN_TIMEOUT),
+                )
+                .await;
+            })
             .await;
-        }
         let mut services = self.shared_services.lock();
         services.retain(|service| !service.is_stopped());
         services.len()
@@ -137,6 +198,31 @@ impl McpClientPool {
     }
 
     pub async fn remove_server(self: &Arc<Self>, server_name: &str) {
+        // 准入锁下完成「不可再提交」与条目取走：已通过准入的提交要么先于此完成、
+        // 由这里收口，要么在此之后因 stopped/配置版本失效被拒绝。不可把 await 放进锁内。
+        #[cfg(test)]
+        self.removal_admission_hits.fetch_add(1, Ordering::SeqCst);
+        let (cancelled_attempt, service) = {
+            let _admission = self.lifecycle_registration.lock();
+            self.server_slot(server_name)
+                .stopped
+                .store(true, Ordering::Release);
+            // 卸载同时取消在建首次加载：不能只靠配置版本在连接完成后才拒绝。
+            let cancelled_attempt = self.cancel_load_attempt(server_name);
+            if let Some(handle) = self.clients.write().remove(server_name) {
+                handle.call_gate.revoke();
+            }
+            let service = { self.services.lock().remove(server_name) };
+            self.bump_catalog_generation();
+            self.configs.write().remove(server_name);
+            self.server_slot(server_name).note_config_revision();
+            // 会话级 ACP 声明身份随连接一并消失（M7）：此后该名不再有可证明的
+            // cache 身份，任何持久化 cache 准入都按 fail-closed 拒绝。
+            self.acp_connections.write().remove(server_name);
+            // 句柄与配置同时消失：本代发现证据一律失效，等待方立即重读事实。
+            self.system_readiness.clear_evidence(server_name);
+            (cancelled_attempt, service)
+        };
         self.stop_background(&crate::mcp::task_scope::McpTaskKey::Subscription(
             server_name.to_string(),
         ))
@@ -146,22 +232,17 @@ impl McpClientPool {
         self.task_spawner
             .stop_instance_resource_subscriptions(server_name)
             .await;
-        if let Some(handle) = self.clients.write().remove(server_name) {
-            handle.call_gate.revoke();
-        }
-        self.bump_catalog_generation();
-        let service = { self.services.lock().remove(server_name) };
         if let Some(mut svc) = service {
             let _ = svc.close_with_timeout(SHUTDOWN_TIMEOUT).await;
         }
         // builtin 实例的 server 半边是本进程 task：随 `services` 一并收口，不留 orphan。
         self.close_builtin_task(server_name).await;
-        self.configs.write().remove(server_name);
-        // 会话级 ACP 声明身份随连接一并消失（M7）：此后该名不再有可证明的
-        // cache 身份，任何持久化 cache 准入都按 fail-closed 拒绝。
-        self.acp_connections.write().remove(server_name);
-        // 句柄与配置同时消失：本代发现证据一律失效，等待方立即重读事实。
-        self.system_readiness.clear_evidence(server_name);
+        // 取消可能仍处于 connect 中的 attempt：任务被 abort 后不会执行自身清理，
+        // 由卸载路径收口它已登记的 service/process。
+        if cancelled_attempt {
+            self.task_spawner.stop_load_attempts(server_name).await;
+        }
+        self.discard_uncommitted_resources(server_name).await;
     }
 
     /// 会话级 ACP（MCP over ACP）连接的可见性过滤。
@@ -169,6 +250,7 @@ impl McpClientPool {
     /// 无归属条目的 server（配置来源、dynamic 投影）对所有会话可见；有归属的
     /// 仅对归属会话可见——同一 ACP 连接下不同会话各自声明 server 时，工具不得
     /// 跨会话泄漏。
+    #[must_use]
     pub fn is_visible_to_session(&self, server_name: &str, session_id: &str) -> bool {
         match self.acp_owners.read().get(server_name) {
             Some(owner) => owner == session_id,
@@ -336,6 +418,9 @@ impl McpClientPool {
         }
         self.lifecycle
             .store(1, std::sync::atomic::Ordering::Release);
+        // 关闭事务开始：未完成的首次加载 attempt 先取消并唤醒等待方；
+        // 受管任务随后由 task owner 统一终止，迟到结果无法提交。
+        self.control.cancel_load_attempts();
         // 关闭事务开始：全部发现证据失效并唤醒等待方（它们在重读时看到 PoolClosed）。
         self.system_readiness.clear_all_evidence();
         for handle in self.clients.read().values() {
@@ -380,8 +465,28 @@ impl McpClientPool {
         handle: Arc<McpClientHandle>,
         service: McpServiceWrapper,
     ) -> Result<(), McpServiceWrapper> {
+        self.try_commit_connection_guarded(name, handle, service, || true)
+    }
+
+    /// Commit a verified connection only if the caller's admission still holds.
+    ///
+    /// The admission check runs under the same lifecycle registration as the
+    /// pool/stopped checks, so a concurrent stop either observes the committed
+    /// handle (and cleans it) or makes this commit fail — a late load result
+    /// cannot revive a stopped server. The caller must not hold the lifecycle
+    /// gate or a `ServerSlot` attempt lock.
+    pub(crate) fn try_commit_connection_guarded<F>(
+        &self,
+        name: String,
+        handle: Arc<McpClientHandle>,
+        service: McpServiceWrapper,
+        admit: F,
+    ) -> Result<(), McpServiceWrapper>
+    where
+        F: FnOnce() -> bool,
+    {
         let _admission = self.lifecycle_registration.lock();
-        if !self.is_open() || self.server_slot(&name).stopped.load(Ordering::Acquire) {
+        if !self.is_open() || self.server_slot(&name).stopped.load(Ordering::Acquire) || !admit() {
             return Err(service);
         }
         self.advance_handle_generation(&handle);
@@ -484,10 +589,19 @@ impl McpClientPool {
         };
         // builtin 实例：client service 已关闭（上面的 transaction），server 半边 task
         // 随之按「有界等待 → 未收敛才 abort」收口。非 builtin pool 这里是空操作。
-        self.close_builtin_tasks().await;
-        let unfinished_shared = self.close_shared_services().await;
+        // 三张表（builtin supervisors / shared services / processes）互不共享锁，
+        // 收口并行进行；单项上限不再逐组逐项累加。
         #[cfg(not(target_os = "emscripten"))]
-        let unfinished_processes = self.close_processes().await + unfinished_shared;
+        let (_, unfinished_shared, process_unfinished) = tokio::join!(
+            self.close_builtin_tasks(),
+            self.close_shared_services(),
+            self.close_processes()
+        );
+        #[cfg(target_os = "emscripten")]
+        let (_, unfinished_shared) =
+            tokio::join!(self.close_builtin_tasks(), self.close_shared_services());
+        #[cfg(not(target_os = "emscripten"))]
+        let unfinished_processes = unfinished_shared + process_unfinished;
         #[cfg(target_os = "emscripten")]
         let unfinished_processes = unfinished_shared;
         let report = match (report, unfinished_processes) {
@@ -558,9 +672,30 @@ impl McpClientPool {
     pub(crate) async fn close_builtin_tasks(&self) -> Vec<String> {
         let supervisors: Vec<(String, BuiltinInstanceSupervisor)> =
             self.builtin_server_tasks.lock().drain().collect();
+        // 实例之间互不依赖：并行做「有界等待 → 未收敛才 abort」。
+        //
+        // 每项 close 先移交给独立 task：宿主墙钟预算到期会丢弃本 future，而 supervisor
+        // 已从表里摘除；若随 future 一起 drop，server task 只会被 detach（不 abort）。
+        // 所有权转移后，收尾仍会走完 `BUILTIN_CONVERGE_TIMEOUT` 内的「等待 → abort」。
+        // builtin 实例数由配置决定、量级很小，不需要额外的并发闸门。
+        let closes: Vec<(String, tokio::task::JoinHandle<BuiltinCloseOutcome>)> = supervisors
+            .into_iter()
+            .map(|(server_name, supervisor)| {
+                (
+                    server_name,
+                    tokio::spawn(supervisor.close(BUILTIN_CONVERGE_TIMEOUT)),
+                )
+            })
+            .collect();
         let mut aborted = Vec::new();
-        for (server_name, supervisor) in supervisors {
-            let outcome = supervisor.close(BUILTIN_CONVERGE_TIMEOUT).await;
+        for (server_name, handle) in closes {
+            let outcome = match handle.await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::warn!(server = %server_name, %error, "builtin close task failed");
+                    continue;
+                }
+            };
             if matches!(outcome.tick, TickCloseOutcome::AbortedAfterTimeout)
                 || matches!(outcome.server, BuiltinServerExit::AbortedAfterTimeout)
             {

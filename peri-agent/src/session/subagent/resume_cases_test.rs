@@ -1,12 +1,35 @@
 //! Subagent resume behavior cases.
 
-use super::*;
+use crate::agent::async_tasks::BackgroundTask;
+use crate::agent::async_tasks::BackgroundTaskStatus;
+use crate::agent::async_tasks::BgCancelHandle;
+use crate::agent::async_tasks::BgTaskKind;
+use crate::agent::async_tasks::TaskManager;
+use crate::messages::BaseMessage;
+use crate::messages::ToolCallRequest;
+use crate::session::subagent::tests::CancelGateLLM;
+use crate::session::subagent::tests::EchoLLM;
+use crate::session::subagent::tests::GateLLM;
+use crate::session::subagent::tests::RecordingLLM;
+use crate::session::subagent::types::SubagentHost;
+use crate::session::subagent::util::extract_last_ai_text;
+use crate::session::subagent::SessionFactory;
+use crate::session::test_resources::mock::MockSessionResources;
+use crate::session::FrozenContext;
+use crate::session::Session;
+use crate::thread::ThreadMeta;
+use peri_acp_types::thread::AgentStatus;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn test_resume_subagent_invalid_thread_id_rejected() {
     let store = MockSessionResources::new();
-    let config = resume_config(Arc::clone(&store), "not-a-uuid".to_string());
-    let err = resume_err(None, config).await;
+    let config = crate::session::subagent::tests::resume_config(
+        Arc::clone(&store),
+        "not-a-uuid".to_string(),
+    );
+    let err = crate::session::subagent::tests::resume_err(None, config).await;
     assert_eq!(err, "resume_subagent: invalid thread id: not-a-uuid");
 }
 
@@ -16,8 +39,8 @@ async fn test_resume_subagent_thread_not_found() {
     let store = MockSessionResources::new();
     // 合法 UUID 但未创建（low-1 后非 UUID 会先被格式校验拦截，测不到 not found）
     let id = uuid::Uuid::now_v7().to_string();
-    let config = resume_config(Arc::clone(&store), id.clone());
-    let err = resume_err(None, config).await;
+    let config = crate::session::subagent::tests::resume_config(Arc::clone(&store), id.clone());
+    let err = crate::session::subagent::tests::resume_err(None, config).await;
     assert_eq!(err, format!("resume_subagent: thread not found: {}", id));
 }
 
@@ -31,11 +54,14 @@ async fn test_resume_subagent_active_thread_rejected() {
     let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
     meta.id = id.clone();
     meta.parent_thread_id = Some("parent-thread-1".to_string());
-    store.create_resumable_thread(meta).await.unwrap();
+    store
+        .create_resumable_thread(meta)
+        .await
+        .expect("the create resumable thread fixture result is required for this assertion");
 
     // 预置 active（ThreadMeta 默认）→ 拒绝
-    let config = resume_config(Arc::clone(&store), id.clone());
-    let err = resume_err(None, config).await;
+    let config = crate::session::subagent::tests::resume_config(Arc::clone(&store), id.clone());
+    let err = crate::session::subagent::tests::resume_err(None, config).await;
     assert_eq!(
         err,
         format!(
@@ -47,17 +73,23 @@ async fn test_resume_subagent_active_thread_rejected() {
     );
 
     // update_thread_status → load_meta 读回新状态（R-L2：mock 同步 agent_status）
-    store.update_thread_status(&id, "done").await.unwrap();
-    let meta = store.load_meta(&id).await.unwrap();
+    store
+        .update_thread_status(&id, "done")
+        .await
+        .expect("the update thread status fixture result is required for this assertion");
+    let meta = store
+        .load_meta(&id)
+        .await
+        .expect("the load meta fixture result is required for this assertion");
     assert_eq!(meta.agent_status, AgentStatus::Done);
 
     // 非 active 后校验通过 → 完整执行（EchoLLM 完成 → 收尾 done）
-    let config = resume_config(Arc::clone(&store), id.clone());
+    let config = crate::session::subagent::tests::resume_config(Arc::clone(&store), id.clone());
     let spawned = SessionFactory::resume_subagent(None, config)
         .await
         .expect("非 active 后可恢复");
     assert_eq!(spawned.child_thread_id, id);
-    assert!(!spawned.interrupted);
+    crate::session::subagent::tests::wait_resume_settled(&store, &id).await;
     let statuses = store.statuses();
     assert_eq!(
         statuses.last().map(|(_, s)| s.as_str()),
@@ -73,12 +105,18 @@ async fn test_resume_subagent_legacy_history_starts_a_fresh_run_without_runtime_
     let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
     meta.id = id.clone();
     meta.parent_thread_id = Some("other-parent".to_string()); // 与父 session 不一致
-    store.create_legacy_thread(meta).await.unwrap();
-    store.update_thread_status(&id, "done").await.unwrap();
+    store
+        .create_legacy_thread(meta)
+        .await
+        .expect("the create legacy thread fixture result is required for this assertion");
+    store
+        .update_thread_status(&id, "done")
+        .await
+        .expect("the update thread status fixture result is required for this assertion");
     store
         .append_message(&id, BaseMessage::system("LEGACY_SYSTEM_NOT_CHILD_IDENTITY"))
         .await
-        .unwrap();
+        .expect("the append message fixture result is required for this assertion");
 
     let parent = Session::new(
         Arc::from("/tmp/work"),
@@ -87,22 +125,22 @@ async fn test_resume_subagent_legacy_history_starts_a_fresh_run_without_runtime_
     );
     let llm = RecordingLLM::new();
     let calls = llm.received.clone();
-    let config = resume_config_with(
+    let manager = Arc::new(TaskManager::new());
+    let config = crate::session::subagent::tests::resume_config_with(
         store.clone(),
         id.clone(),
         crate::session::test_resources::mock::model::fixture_source(
             std::sync::Arc::new(llm),
             "fixture-scripted",
         ),
-        SubagentRunMode::Sync,
-        None,
+        Some(manager.clone()),
         None,
     );
     let resumed = SessionFactory::resume_subagent(Some(&parent), config)
         .await
-        .unwrap();
+        .expect("the resume subagent fixture result is required for this assertion");
     assert_eq!(resumed.child_thread_id, id);
-    assert!(!resumed.interrupted);
+    crate::session::subagent::tests::wait_background_idle(&manager).await;
     assert!(
         resumed.session.store().frozen.system_prompt.is_empty(),
         "非 hidden legacy 历史的首条 System 不得升级为子身份"
@@ -123,7 +161,12 @@ async fn test_resume_subagent_legacy_history_starts_a_fresh_run_without_runtime_
 async fn test_resume_subagent_main_agent_via_host_parent_id() {
     let store = MockSessionResources::new();
     let id = uuid::Uuid::now_v7().to_string();
-    preset_resumable_thread(&store, &id, Some("main-context-thread")).await;
+    crate::session::subagent::tests::preset_resumable_thread(
+        &store,
+        &id,
+        Some("main-context-thread"),
+    )
+    .await;
 
     // 主 agent 样子：store().thread_id = None + host.parent_thread_id = ctx.thread_id
     let parent = Session::new(
@@ -136,11 +179,12 @@ async fn test_resume_subagent_main_agent_via_host_parent_id() {
         ..Default::default()
     });
 
-    let config = resume_config(Arc::clone(&store), id.clone());
+    let config = crate::session::subagent::tests::resume_config(Arc::clone(&store), id.clone());
     let spawned = SessionFactory::resume_subagent(Some(&parent), config)
         .await
         .expect("主 agent 场景恢复应成功");
     assert_eq!(spawned.child_thread_id, id, "thread_id 不变");
+    crate::session::subagent::tests::wait_resume_settled(&store, &id).await;
     let statuses = store.statuses();
     assert_eq!(
         statuses.last().map(|(_, s)| s.as_str()),
@@ -157,20 +201,26 @@ async fn test_resume_subagent_validation_passes_and_runs() {
     let mut meta = ThreadMeta::new_at("/tmp", peri_time::now_wall());
     meta.id = id.clone();
     meta.parent_thread_id = Some("parent-thread-3".to_string());
-    store.create_resumable_thread(meta).await.unwrap();
-    store.update_thread_status(&id, "done").await.unwrap();
+    store
+        .create_resumable_thread(meta)
+        .await
+        .expect("the create resumable thread fixture result is required for this assertion");
+    store
+        .update_thread_status(&id, "done")
+        .await
+        .expect("the update thread status fixture result is required for this assertion");
 
     let parent = Session::new(
         Arc::from("/tmp/work"),
         FrozenContext::builder().build(),
         Some("parent-thread-3".into()),
     );
-    let config = resume_config(store.clone(), id.clone());
+    let config = crate::session::subagent::tests::resume_config(store.clone(), id.clone());
     let spawned = SessionFactory::resume_subagent(Some(&parent), config)
         .await
         .expect("校验通过后恢复执行");
     assert_eq!(spawned.child_thread_id, id, "thread_id 不变");
-    assert!(!spawned.interrupted);
+    crate::session::subagent::tests::wait_resume_settled(&store, &id).await;
     let statuses = store.statuses();
     assert_eq!(
         statuses.last().map(|(_, s)| s.as_str()),
@@ -186,7 +236,8 @@ async fn test_resume_subagent_replays_transcript_and_preserves_thread_id() {
     let store = MockSessionResources::new();
     let thread_id = uuid::Uuid::now_v7().to_string();
     let parent_id = "parent-thread-r1";
-    preset_resumable_thread(&store, &thread_id, Some(parent_id)).await;
+    crate::session::subagent::tests::preset_resumable_thread(&store, &thread_id, Some(parent_id))
+        .await;
     let original_msgs = vec![
         BaseMessage::human("task-1"),
         BaseMessage::ai("answer-1"),
@@ -195,7 +246,7 @@ async fn test_resume_subagent_replays_transcript_and_preserves_thread_id() {
     store
         .append_messages(&thread_id, &original_msgs)
         .await
-        .unwrap();
+        .expect("the append messages fixture result is required for this assertion");
 
     let parent = Session::new(
         Arc::from("/tmp/work"),
@@ -206,10 +257,11 @@ async fn test_resume_subagent_replays_transcript_and_preserves_thread_id() {
             .build(),
         Some(parent_id.into()),
     );
-    let config = resume_config(store.clone(), thread_id.clone());
+    let config = crate::session::subagent::tests::resume_config(store.clone(), thread_id.clone());
     let spawned = SessionFactory::resume_subagent(Some(&parent), config)
         .await
         .expect("resume ok");
+    crate::session::subagent::tests::wait_resume_settled(&store, &thread_id).await;
 
     // transcript 完整重放（顺序断言：旧消息 → 隐式 continue prompt → AI echo）
     let tx = spawned.session.transcript();
@@ -257,7 +309,7 @@ async fn test_resume_subagent_replays_transcript_and_preserves_thread_id() {
 async fn test_resume_subagent_pops_unpaired_tool_call_ai() {
     let store = MockSessionResources::new();
     let thread_id = uuid::Uuid::now_v7().to_string();
-    preset_resumable_thread(&store, &thread_id, None).await;
+    crate::session::subagent::tests::preset_resumable_thread(&store, &thread_id, None).await;
 
     // 身份持久形态：spawn 在子会话 own history 起始写入身份 System（见 spawn
     // 6b），恢复路径读回该条、不再重注入。夹具按同一形态预置。
@@ -293,24 +345,24 @@ async fn test_resume_subagent_pops_unpaired_tool_call_ai() {
             ],
         )
         .await
-        .unwrap();
+        .expect("the append messages fixture result is required for this assertion");
 
     let llm = RecordingLLM::new();
-    let config = resume_config_with(
+    let manager = Arc::new(TaskManager::new());
+    let config = crate::session::subagent::tests::resume_config_with(
         store.clone(),
         thread_id.clone(),
         crate::session::test_resources::mock::model::fixture_source(
             std::sync::Arc::new(llm.clone()),
             "fixture-scripted",
         ),
-        SubagentRunMode::Sync,
-        None,
+        Some(manager.clone()),
         None,
     );
     let spawned = SessionFactory::resume_subagent(None, config)
         .await
         .expect("resume ok");
-    assert!(!spawned.interrupted);
+    crate::session::subagent::tests::wait_background_idle(&manager).await;
 
     // transcript 层面：末条未配对 AI 被 pop，已配对轮次保留
     let tx = spawned.session.transcript();
@@ -375,7 +427,7 @@ async fn test_resume_subagent_pops_unpaired_tool_call_ai() {
 async fn test_resume_subagent_keeps_complete_tool_round() {
     let store = MockSessionResources::new();
     let thread_id = uuid::Uuid::now_v7().to_string();
-    preset_resumable_thread(&store, &thread_id, None).await;
+    crate::session::subagent::tests::preset_resumable_thread(&store, &thread_id, None).await;
 
     let paired_ai = BaseMessage::ai_with_tool_calls(
         "paired-think",
@@ -396,12 +448,13 @@ async fn test_resume_subagent_keeps_complete_tool_round() {
             ],
         )
         .await
-        .unwrap();
+        .expect("the append messages fixture result is required for this assertion");
 
-    let config = resume_config(store.clone(), thread_id.clone());
+    let config = crate::session::subagent::tests::resume_config(store.clone(), thread_id.clone());
     let spawned = SessionFactory::resume_subagent(None, config)
         .await
         .expect("resume ok");
+    crate::session::subagent::tests::wait_resume_settled(&store, &thread_id).await;
 
     let tx = spawned.session.transcript();
     let guard = tx.read();
@@ -423,17 +476,19 @@ async fn test_resume_subagent_keeps_complete_tool_round() {
 async fn test_resume_subagent_new_prompt_appended() {
     let store = MockSessionResources::new();
     let thread_id = uuid::Uuid::now_v7().to_string();
-    preset_resumable_thread(&store, &thread_id, None).await;
+    crate::session::subagent::tests::preset_resumable_thread(&store, &thread_id, None).await;
     store
         .append_messages(&thread_id, &[BaseMessage::human("old-task")])
         .await
-        .unwrap();
+        .expect("the append messages fixture result is required for this assertion");
 
-    let mut config = resume_config(store.clone(), thread_id.clone());
+    let mut config =
+        crate::session::subagent::tests::resume_config(store.clone(), thread_id.clone());
     config.prompt = Some("do the new thing".to_string());
     let spawned = SessionFactory::resume_subagent(None, config)
         .await
         .expect("resume ok");
+    crate::session::subagent::tests::wait_resume_settled(&store, &thread_id).await;
 
     let tx = spawned.session.transcript();
     let guard = tx.read();
@@ -458,59 +513,63 @@ async fn test_resume_subagent_new_prompt_appended() {
 async fn test_resume_subagent_interrupted_then_manual_history_continue() {
     let store = MockSessionResources::new();
     let thread_id = uuid::Uuid::now_v7().to_string();
-    preset_resumable_thread(&store, &thread_id, None).await;
+    crate::session::subagent::tests::preset_resumable_thread(&store, &thread_id, None).await;
     store
         .append_messages(&thread_id, &[BaseMessage::human("task")])
         .await
-        .unwrap();
+        .expect("the append messages fixture result is required for this assertion");
 
     // 第一次恢复：进入 Reason 后取消，覆盖 stage-local Interrupted 规范化。
     let token = CancellationToken::new();
     let (gate, entered_rx) = CancelGateLLM::new();
-    let config = resume_config_with(
+    let manager = Arc::new(TaskManager::new());
+    let config = crate::session::subagent::tests::resume_config_with(
         store.clone(),
         thread_id.clone(),
         crate::session::test_resources::mock::model::fixture_source(
             std::sync::Arc::new(gate),
             "fixture-scripted",
         ),
-        SubagentRunMode::Sync,
-        None,
+        Some(manager.clone()),
         Some(token.clone()),
     );
-    let first_resume =
-        tokio::spawn(async move { SessionFactory::resume_subagent(None, config).await });
-    entered_rx.await.expect("sync subagent 必须进入 Reason");
-    token.cancel();
-    let spawned1 = first_resume
+    let spawned1 = SessionFactory::resume_subagent(None, config)
         .await
-        .expect("sync resume task 不得 panic")
         .expect("resume 1 ok（中断不是 Err）");
-    assert!(spawned1.interrupted, "Reason 内 cancel 必须是 Interrupted");
+    assert_eq!(spawned1.child_thread_id, thread_id);
+    entered_rx
+        .await
+        .expect("background subagent 必须进入 Reason");
+    token.cancel();
+    crate::session::subagent::tests::wait_resume_settled(&store, &thread_id).await;
+    crate::session::subagent::tests::wait_background_idle(&manager).await;
     {
         let statuses = store.statuses();
         assert_eq!(
             statuses.last().map(|(_, s)| s.as_str()),
             Some("cancelled"),
-            "A3：真实取消的 sync 中断收尾写 cancelled"
+            "A3：真实取消的中断收尾写 cancelled"
         );
     }
 
     let llm = RecordingLLM::new();
     let calls = llm.received.clone();
-    let config = resume_config_with(
+    let manager = Arc::new(TaskManager::new());
+    let config = crate::session::subagent::tests::resume_config_with(
         store.clone(),
         thread_id.clone(),
         crate::session::test_resources::mock::model::fixture_source(
             std::sync::Arc::new(llm),
             "fixture-scripted",
         ),
-        SubagentRunMode::Sync,
-        None,
+        Some(manager.clone()),
         None,
     );
-    let resumed = SessionFactory::resume_subagent(None, config).await.unwrap();
-    assert!(!resumed.interrupted);
+    let resumed = SessionFactory::resume_subagent(None, config)
+        .await
+        .expect("the resume subagent fixture result is required for this assertion");
+    assert_eq!(resumed.child_thread_id, thread_id);
+    crate::session::subagent::tests::wait_background_idle(&manager).await;
     assert_eq!(calls.read().len(), 1);
 }
 
@@ -520,22 +579,23 @@ async fn test_resume_subagent_interrupted_then_manual_history_continue() {
 async fn test_resume_subagent_concurrent_resume_mutex() {
     let store = MockSessionResources::new();
     let thread_id = uuid::Uuid::now_v7().to_string();
-    preset_resumable_thread(&store, &thread_id, None).await;
+    crate::session::subagent::tests::preset_resumable_thread(&store, &thread_id, None).await;
 
     let (gate, release_tx) = GateLLM::new();
+    let manager = Arc::new(TaskManager::new());
     let store1 = Arc::clone(&store);
     let thread_id1 = thread_id.clone();
     let gate1 = gate.clone();
+    let manager1 = manager.clone();
     let t1 = tokio::spawn(async move {
-        let config = resume_config_with(
+        let config = crate::session::subagent::tests::resume_config_with(
             store1.clone(),
             thread_id1,
             crate::session::test_resources::mock::model::fixture_source(
                 std::sync::Arc::new(gate1.clone()),
                 "fixture-scripted",
             ),
-            SubagentRunMode::Sync,
-            None,
+            Some(manager1),
             None,
         );
         SessionFactory::resume_subagent(None, config).await
@@ -552,12 +612,13 @@ async fn test_resume_subagent_concurrent_resume_mutex() {
     })
     .await
     .expect("t1 应完成置 active");
+    let spawned = t1.await.expect("t1 task ok").expect("t1 resume ok");
 
     // 第二个并发 resume：锁内看到 active → 拒绝
     let store2 = Arc::clone(&store);
     let thread_id2 = thread_id.clone();
     let t2 = tokio::spawn(async move {
-        let config = resume_config(store2.clone(), thread_id2);
+        let config = crate::session::subagent::tests::resume_config(store2.clone(), thread_id2);
         SessionFactory::resume_subagent(None, config).await
     });
     let t2_res = t2.await.expect("t2 task ok");
@@ -572,8 +633,7 @@ async fn test_resume_subagent_concurrent_resume_mutex() {
 
     // 放行 t1 → 完成（oneshot 有缓冲，send 先于 LLM await 也不丢）
     let _ = release_tx.send(());
-    let spawned = t1.await.expect("t1 task ok").expect("t1 resume ok");
-    assert!(!spawned.interrupted);
+    crate::session::subagent::tests::wait_background_idle(&manager).await;
     assert_eq!(spawned.child_thread_id, thread_id);
     let statuses = store.statuses();
     assert_eq!(
@@ -583,5 +643,126 @@ async fn test_resume_subagent_concurrent_resume_mutex() {
     );
 }
 
-#[path = "resume_background_cases_test.rs"]
-mod tail;
+/// 重建失败回滚（R-M1）：load_messages 失败 → status 回滚至原值
+/// （不被 active 卡死，可再次恢复）
+#[tokio::test]
+async fn test_resume_subagent_rolls_back_status_on_rebuild_failure() {
+    let store = MockSessionResources::new();
+    let thread_id = uuid::Uuid::now_v7().to_string();
+    crate::session::subagent::tests::preset_resumable_thread(&store, &thread_id, None).await;
+
+    // 注入「认领后 history 装载」失败：绑定预检只读 binding，不经过完整快照；
+    // 因此第 1 次完整快照读取就是 own history 装载。
+    store.fail_snapshot_load_at(1);
+    let config = crate::session::subagent::tests::resume_config(store.clone(), thread_id.clone());
+    let err = crate::session::subagent::tests::resume_err(None, config).await;
+    assert!(
+        err.contains("failed to load messages"),
+        "重建失败错误必须带原因，got: {}",
+        err
+    );
+
+    // status 回滚至原值（done），未被 active 卡死
+    let meta = store
+        .load_meta(&thread_id)
+        .await
+        .expect("the load meta fixture result is required for this assertion");
+    assert_eq!(
+        meta.agent_status,
+        AgentStatus::Done,
+        "重建失败必须回滚 status 至原值"
+    );
+    {
+        let statuses = store.statuses();
+        let seq: Vec<&str> = statuses.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(seq, vec!["done", "active", "done"], "active 后回滚原值");
+    }
+
+    // 回滚后可再次恢复成功（不残留互斥态）
+    let config = crate::session::subagent::tests::resume_config(store.clone(), thread_id.clone());
+    let spawned = SessionFactory::resume_subagent(None, config)
+        .await
+        .expect("回滚后可再次恢复");
+    assert_eq!(spawned.child_thread_id, thread_id);
+    crate::session::subagent::tests::wait_resume_settled(&store, &thread_id).await;
+}
+
+/// parent None 组合：meta.parent_thread_id = Some(x) 且调用方无 parent session
+/// （/bg 命令等路径）→ 恢复成功（无 parent 链校验，仅存在性 + status 校验）
+#[tokio::test]
+async fn test_resume_subagent_explicit_delegation_runs_without_parent_session_handle() {
+    let store = MockSessionResources::new();
+    let thread_id = uuid::Uuid::now_v7().to_string();
+    // meta 声明了父链，但调用方无 parent session（/bg 命令等路径）
+    crate::session::subagent::tests::preset_resumable_thread(
+        &store,
+        &thread_id,
+        Some("orphan-parent"),
+    )
+    .await;
+    store
+        .append_messages(&thread_id, &[BaseMessage::human("task")])
+        .await
+        .expect("the append messages fixture result is required for this assertion");
+
+    let config = crate::session::subagent::tests::resume_config(store.clone(), thread_id.clone());
+    let spawned = SessionFactory::resume_subagent(None, config)
+        .await
+        .expect("parent None 时无 parent 链校验，恢复成功");
+    assert_eq!(spawned.child_thread_id, thread_id);
+    crate::session::subagent::tests::wait_resume_settled(&store, &thread_id).await;
+    let statuses = store.statuses();
+    assert_eq!(
+        statuses.last().map(|(_, s)| s.as_str()),
+        Some("done"),
+        "恢复完成后收尾 done"
+    );
+}
+include!("resume_background_cases_test.rs");
+
+/// [回归测试] 绑定不匹配必须在 binding 预检阶段拒绝：不读取任何完整快照，
+/// 也不改变 child 的 agent_status。
+#[tokio::test]
+async fn test_resume_binding_mismatch_rejected_from_binding_only() {
+    let store = MockSessionResources::new();
+    let child_id = uuid::Uuid::now_v7().to_string();
+    store.register_bound_session(&child_id, "/tmp/child-workspace");
+    store
+        .update_thread_status(&child_id, "done")
+        .await
+        .expect("the update thread status fixture result is required for this assertion");
+    store
+        .append_message(&child_id, BaseMessage::human("task"))
+        .await
+        .expect("the append message fixture result is required for this assertion");
+
+    let parent_id = uuid::Uuid::now_v7().to_string();
+    // 两次登记各自生成独立 binding（project/workspace 不同）→ 必然 mismatch。
+    store.register_bound_session(&parent_id, "/tmp/parent-workspace");
+    let parent = Session::new(
+        Arc::from("/tmp/parent-workspace"),
+        FrozenContext::builder().build(),
+        Some(parent_id),
+    );
+
+    let config = crate::session::subagent::tests::resume_config(store.clone(), child_id.clone());
+    let err = crate::session::subagent::tests::resume_err(Some(&parent), config).await;
+    assert!(
+        err.contains("execution binding does not match"),
+        "binding mismatch 应在预检拒绝，got: {err}"
+    );
+    assert_eq!(
+        store.snapshot_reads(),
+        0,
+        "binding 预检不得为校验物化 child/parent 有效正文"
+    );
+    assert_eq!(
+        store
+            .load_meta(&child_id)
+            .await
+            .expect("the load meta fixture result is required for this assertion")
+            .agent_status,
+        AgentStatus::Done,
+        "预检拒绝不得认领或改写 child 状态"
+    );
+}

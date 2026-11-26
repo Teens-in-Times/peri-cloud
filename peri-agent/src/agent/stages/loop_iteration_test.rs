@@ -1,10 +1,26 @@
 //! 循环语义迭代预算、Receive 唤醒与 idle 重试。
-use super::super::*;
+use crate::agent::events::Stage;
+use crate::agent::events::StageStatus;
+
+use crate::agent::events_v2::ObserveEvent;
+use crate::agent::react::ReactLLM;
+
+use crate::agent::stages::context::StageContext;
+use crate::agent::stages::LoopResult;
+use crate::agent::stages::SharedToolMap;
+use crate::messages::BaseMessage;
 use crate::middleware::capabilities as hook_state;
+
 use crate::session::queue::MessageSource;
 use crate::session::store::FrozenContext;
+
+use crate::session::QueuedMessage;
 use crate::session::Session;
+
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 struct CountingFinalAnswerLLM {
     calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -97,7 +113,7 @@ async fn hook_stop_in_budget_boundary_batch_wins_without_followup_activation() {
         }))
         .build();
         assert!(matches!(
-            run_react_loop(context, 1).await,
+            crate::agent::stages::run_react_loop(context, 1).await,
             LoopResult::HookStopped { unprocessed_tool_calls } if unprocessed_tool_calls.is_empty()
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -201,7 +217,7 @@ async fn completion_during_reason_with_prefix(
         passive_prefix,
     }))
     .build();
-    let result = run_react_loop(context, max_iterations).await;
+    let result = crate::agent::stages::run_react_loop(context, max_iterations).await;
     (session, calls, result)
 }
 
@@ -216,7 +232,7 @@ async fn background_completion_at_budget_boundary_retains_followup_eligibility()
     let delivery_id =
         crate::agent::async_tasks::delivery::terminal_delivery_id("bg-budget-boundary", "terminal");
     assert!(session.transcript().read().get(delivery_id).is_none());
-    assert!(session.queue().has_ensure_processing_after_sync(&None));
+    assert!(session.queue().has_ensure_processing_after_sync(None));
     assert!(session
         .queue()
         .has_pending_defer_sync(&MessageSource::SubAgentComplete));
@@ -238,7 +254,7 @@ async fn background_completion_at_budget_boundary_retains_followup_eligibility()
     }))
     .build();
     assert!(matches!(
-        run_react_loop(context, 10).await,
+        crate::agent::stages::run_react_loop(context, 10).await,
         LoopResult::Completed
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -265,14 +281,16 @@ async fn deferred_result_that_reaches_failed_reason_is_not_requeued() {
     .with_llm(Arc::new(FailingFollowupLlm(calls.clone())))
     .build();
     assert!(matches!(
-        run_react_loop(context, 1).await,
+        crate::agent::stages::run_react_loop(context, 1).await,
         LoopResult::Error(crate::error::AgentError::Other(_))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(session.queue().is_empty_sync());
     // 队列已排空，水位随行消失；「没有新准入」由 after 判定保证。
     assert!(session.queue().admission_watermark_sync().is_none());
-    assert!(!session.queue().has_ensure_processing_after_sync(&watermark));
+    assert!(!session
+        .queue()
+        .has_ensure_processing_after_sync(watermark.as_ref()));
     let context = StageContext::builder(
         session.start_turn(),
         session.transcript(),
@@ -281,7 +299,7 @@ async fn deferred_result_that_reaches_failed_reason_is_not_requeued() {
     .with_llm(Arc::new(FailingFollowupLlm(calls.clone())))
     .build();
     assert!(matches!(
-        run_react_loop(context, 1).await,
+        crate::agent::stages::run_react_loop(context, 1).await,
         LoopResult::Completed
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -310,7 +328,7 @@ async fn background_completion_after_receive_batch_boundary_retains_original_adm
 async fn deferred_result_in_zero_budget_followup_does_not_reactivate_itself() {
     let (session, calls, _) = completion_during_reason_fixture(1).await;
     let watermark = session.queue().admission_watermark_sync();
-    assert!(session.queue().has_ensure_processing_after_sync(&None));
+    assert!(session.queue().has_ensure_processing_after_sync(None));
     let context = StageContext::builder(
         session.start_turn(),
         session.transcript(),
@@ -323,13 +341,15 @@ async fn deferred_result_in_zero_budget_followup_does_not_reactivate_itself() {
     }))
     .build();
     assert!(matches!(
-        run_react_loop(context, 0).await,
+        crate::agent::stages::run_react_loop(context, 0).await,
         LoopResult::Error(crate::error::AgentError::MaxIterationsExceeded(0))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     // 队列已排空，水位随行消失；「没有新准入」由 after 判定保证。
     assert!(session.queue().admission_watermark_sync().is_none());
-    assert!(!session.queue().has_ensure_processing_after_sync(&watermark));
+    assert!(!session
+        .queue()
+        .has_ensure_processing_after_sync(watermark.as_ref()));
     assert!(session.queue().is_empty_sync());
     let context = StageContext::builder(
         session.start_turn(),
@@ -343,7 +363,7 @@ async fn deferred_result_in_zero_budget_followup_does_not_reactivate_itself() {
     }))
     .build();
     assert!(matches!(
-        run_react_loop(context, 1).await,
+        crate::agent::stages::run_react_loop(context, 1).await,
         LoopResult::Completed
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -375,7 +395,7 @@ async fn exhausted_budget_idle_wake_retains_new_required_message() {
     .with_idle_should_wait(Arc::new(|| true))
     .with_idle_suspended_flag(Arc::clone(&suspended))
     .build();
-    let owner = tokio::spawn(run_react_loop(context, 1));
+    let owner = tokio::spawn(crate::agent::stages::run_react_loop(context, 1));
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while !suspended.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
@@ -392,15 +412,21 @@ async fn exhausted_budget_idle_wake_retains_new_required_message() {
     assert!(matches!(
         tokio::time::timeout(std::time::Duration::from_secs(2), owner)
             .await
-            .unwrap()
-            .unwrap(),
+            .expect("the from secs fixture result is required for this assertion")
+            .expect("exhausted budget idle wake retains new required message: the completed fixture operation must provide its result payload"),
         LoopResult::Error(crate::error::AgentError::MaxIterationsExceeded(1))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(session.transcript().read().get(message_id).is_none());
     let pending = session.queue().drain_all_sync();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].message().unwrap().id(), message_id);
+    assert_eq!(
+        pending[0]
+            .message()
+            .expect("the fixture entry must contain a message payload")
+            .id(),
+        message_id
+    );
 }
 
 #[tokio::test]
@@ -429,7 +455,7 @@ async fn loaded_history_never_replays_old_tools_and_new_input_starts_a_fresh_run
     }))
     .build();
     assert!(matches!(
-        run_react_loop(context, 10).await,
+        crate::agent::stages::run_react_loop(context, 10).await,
         LoopResult::Completed
     ));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -448,7 +474,7 @@ async fn loaded_history_never_replays_old_tools_and_new_input_starts_a_fresh_run
     }))
     .build();
     assert!(matches!(
-        run_react_loop(context, 10).await,
+        crate::agent::stages::run_react_loop(context, 10).await,
         LoopResult::Completed
     ));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -458,7 +484,7 @@ async fn loaded_history_never_replays_old_tools_and_new_input_starts_a_fresh_run
             .read()
             .visible_messages()
             .last()
-            .unwrap()
+            .expect("session transcript fixture must contain the expected element")
             .content(),
         "fresh answer"
     );
@@ -498,12 +524,15 @@ impl crate::middleware::Middleware for IterationBudgetProbe {
         state: &mut dyn hook_state::BeforeAgentState,
     ) -> crate::error::AgentResult<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.prompt_visible.lock().unwrap().push(
-            state
-                .messages()
-                .iter()
-                .any(|message| message.content().contains(self.prompt_marker)),
-        );
+        self.prompt_visible
+            .lock()
+            .expect("self prompt visible mutex must remain unpoisoned throughout the test")
+            .push(
+                state
+                    .messages()
+                    .iter()
+                    .any(|message| message.content().contains(self.prompt_marker)),
+            );
         state.push_recall(self.recall_marker.to_string());
         Ok(())
     }
@@ -605,5 +634,130 @@ fn assert_single_turn_completed(
         .collect();
     assert_eq!(completed_steps, vec![expected_steps]);
 }
+include!("loop_iteration_budget_cases_test.rs");
 
-include!("loop_iteration_budget_test.rs");
+fn async_result_reminder(task_id: &str) -> peri_acp_types::system_reminder::TrustedSystemReminder {
+    use peri_acp_types::system_reminder::{
+        ReminderAudience, ReminderAudiences, ReminderCategory, ReminderDelivery, ReminderSeverity,
+        ReminderSource as CanonicalSource, SystemReminder, TrustedSystemReminderFactory,
+        SYSTEM_REMINDER_VERSION,
+    };
+    TrustedSystemReminderFactory::for_producer()
+        .construct(SystemReminder {
+            version: SYSTEM_REMINDER_VERSION,
+            category: ReminderCategory::Task,
+            source: CanonicalSource("shell".into()),
+            kind: "terminal".into(),
+            severity: ReminderSeverity::Info,
+            delivery: ReminderDelivery::Configurable,
+            audiences: ReminderAudiences(vec![ReminderAudience::Model]),
+            body: format!("后台任务已结束\ntask_id: {task_id}\nstate: succeeded"),
+            summary: None,
+            metadata: serde_json::json!({"task_id": task_id}),
+        })
+        .expect("the construct fixture result is required for this assertion")
+}
+
+fn ready_result(context: &StageContext, task_id: &str) -> crate::messages::MessageId {
+    let id = crate::messages::MessageId::new();
+    let reminder = async_result_reminder(task_id);
+    let mailbox = &context.session.async_result_mailbox;
+    mailbox
+        .accept(
+            id,
+            &reminder,
+            peri_acp_types::session::MessageSource::ShellComplete,
+        )
+        .expect("the accept fixture result is required for this assertion");
+    mailbox
+        .mark_canonical_ready(
+            id,
+            &reminder,
+            peri_acp_types::session::MessageSource::ShellComplete,
+            None,
+        )
+        .expect("the mark canonical ready fixture result is required for this assertion");
+    id
+}
+
+/// 队列为空但 mailbox 仍有 Ready 结果时，循环必须进入本次请求处理，
+/// 不能以“没有可唤醒消息”为由退出并留下自动续跑候选。
+#[tokio::test]
+async fn async_result_ready_without_queue_work_runs_followup() {
+    let session = Session::new(
+        Arc::from("/tmp/async-ready-no-queue"),
+        FrozenContext::builder().build(),
+        None,
+    );
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let context = StageContext::builder(
+        session.start_turn(),
+        session.transcript(),
+        session.queue().clone(),
+    )
+    .with_llm(Arc::new(CountingFinalAnswerLLM {
+        calls: calls.clone(),
+        answer: "done",
+    }))
+    .build();
+
+    let _id = ready_result(&context, "shell-no-queue");
+    assert!(context.session.async_result_mailbox.has_ready());
+    assert!(session.queue().is_empty_sync());
+
+    let result = crate::agent::stages::run_react_loop(context.clone(), 5).await;
+    assert!(matches!(result, LoopResult::Completed));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "Ready 结果必须触发一次真实主模型请求"
+    );
+    assert_eq!(
+        context.session.async_result_mailbox.pending_count(),
+        0,
+        "处理完成后结果应 Covered"
+    );
+    assert!(!context.session.async_result_mailbox.has_ready());
+}
+
+/// [T12] Hook stop 必须在退出前挂起未处理结果：不能保持 Ready 触发自动续跑，
+/// 也不得伪造 Covered。
+#[tokio::test]
+async fn async_result_hook_stop_suspends_ready_result() {
+    let session = Session::new(
+        Arc::from("/tmp/async-result-hook-stop"),
+        FrozenContext::builder().build(),
+        None,
+    );
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let context = StageContext::builder(
+        session.start_turn(),
+        session.transcript(),
+        session.queue().clone(),
+    )
+    .with_llm(Arc::new(CountingFinalAnswerLLM {
+        calls: calls.clone(),
+        answer: "done",
+    }))
+    .build();
+
+    let id = ready_result(&context, "shell-stop");
+    session.queue().push_sync(QueuedMessage::info(
+        MessageSource::HookStopIntent,
+        BaseMessage::human("stop"),
+    ));
+
+    let result = crate::agent::stages::run_react_loop(context.clone(), 5).await;
+    assert!(
+        matches!(result, LoopResult::HookStopped { .. }),
+        "Hook stop 必须经唯一退出口返回 HookStopped，实际 {result:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "Stop 之后不得发起模型请求");
+    assert_eq!(
+        context.session.async_result_mailbox.state_of(&id),
+        Some(crate::session::async_result_mailbox::AsyncResultState::Suspended),
+        "未处理结果必须挂起，而不是保持 Ready 或伪装 Covered"
+    );
+    assert!(!context.session.async_result_mailbox.has_ready());
+    assert_eq!(context.session.async_result_mailbox.pending_count(), 1);
+}

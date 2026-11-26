@@ -1,25 +1,26 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    fmt,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::fmt;
+use std::fmt::{Debug, Formatter};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{
-    app::PeriConfig,
-    assembly::{self, parse_document},
-    betas::BetaFlags,
-    mcp::{McpCachePolicy, McpConfigFile},
-    observability::LangfuseConfig,
-    provider::ResolvedProvider,
-    resources::ResourceConfiguration,
-    source::{ConfigurationSource, McpConfigurationSource},
-    ui::TuiConfig,
-};
+use crate::app::PeriConfig;
+use crate::assembly;
+use crate::betas::BetaFlags;
+use crate::mcp::McpCachePolicy;
+use crate::mcp::McpConfigFile;
+use crate::observability::LangfuseConfig;
+use crate::provider::ResolvedProvider;
+use crate::resources::ResourceConfiguration;
+use crate::source::ConfigurationSource;
+use crate::source::McpConfigurationSource;
+use crate::ui::TuiConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigurationScope {
@@ -28,7 +29,10 @@ pub struct ConfigurationScope {
 }
 
 impl ConfigurationScope {
-    pub fn new(cwd: PathBuf, global_settings: PathBuf) -> Result<Self, ConfigurationError> {
+    /// Binds configuration lookup to absolute workspace and global settings paths.
+    /// Relative paths return `InvalidScope`, so later resolution cannot depend on
+    /// the process working directory changing.
+    pub fn try_new(cwd: PathBuf, global_settings: PathBuf) -> Result<Self, ConfigurationError> {
         let scope = Self {
             cwd,
             global_settings,
@@ -186,14 +190,17 @@ impl ConfigurationSnapshot {
         })
     }
 
+    #[must_use]
     pub fn scope(&self) -> &ConfigurationScope {
         &self.scope
     }
 
+    #[must_use]
     pub fn revision(&self) -> ConfigurationRevision {
         self.revision
     }
 
+    #[must_use]
     pub fn settings(&self) -> &PeriConfig {
         &self.settings
     }
@@ -206,6 +213,7 @@ impl ConfigurationSnapshot {
         &self.inputs
     }
 
+    #[must_use]
     pub fn mcp(&self) -> &McpConfigFile {
         &self.mcp
     }
@@ -231,6 +239,7 @@ impl ConfigurationSnapshot {
         })
     }
 
+    #[must_use]
     pub fn cache_policy(&self) -> McpCachePolicy {
         McpCachePolicy::from_setting(self.mcp.mcp_cache)
     }
@@ -239,27 +248,38 @@ impl ConfigurationSnapshot {
         self.effective_provider.as_ref()
     }
 
+    #[must_use]
     pub fn observability(&self) -> &LangfuseConfig {
         &self.observability
     }
 
+    #[must_use]
     pub fn ui(&self) -> &TuiConfig {
         &self.ui
     }
 
+    #[must_use]
     pub fn resources(&self) -> &ResourceConfiguration {
         &self.resources
     }
 
     /// Beta flag 有效值投影（由合并后 settings 派生；未覆盖与未知 id 按 false）。
+    #[must_use]
     pub fn flags(&self) -> &BetaFlags {
         &self.betas
     }
 
+    #[must_use]
     pub fn builtin_mcp_enabled(&self) -> bool {
         crate::mcp::builtin_enabled(&self.inputs.environment)
     }
 
+    #[must_use]
+    pub fn builtin_assembly_mode(&self) -> peri_acp_types::builtin_mcp::BuiltinAssemblyMode {
+        crate::mcp::builtin_assembly_mode(&self.inputs.environment)
+    }
+
+    #[must_use]
     pub fn explain(&self, field: ConfigurationField) -> FieldExplanation {
         assembly::explain(field, self.revision, &self.inputs)
     }
@@ -268,6 +288,18 @@ impl ConfigurationSnapshot {
 pub struct ConfigurationSystem {
     source: Arc<dyn ConfigurationSource>,
     snapshots: Mutex<HashMap<ConfigurationScope, Arc<ConfigurationSnapshot>>>,
+    /// 串行化配置源 I/O 与发布，避免并发写互相覆盖；读路径不经过此锁。
+    ///
+    /// `snapshots` 只在读取或替换映射项的瞬间持有，不得跨越 `source` 调用。
+    write_gate: Mutex<()>,
+}
+
+impl Debug for ConfigurationSystem {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigurationSystem")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for ConfigurationSystem {
@@ -277,10 +309,12 @@ impl Default for ConfigurationSystem {
 }
 
 impl ConfigurationSystem {
+    #[must_use]
     pub fn new(source: Arc<dyn ConfigurationSource>) -> Self {
         Self {
             source,
             snapshots: Mutex::new(HashMap::new()),
+            write_gate: Mutex::new(()),
         }
     }
 
@@ -289,23 +323,26 @@ impl ConfigurationSystem {
         scope: ConfigurationScope,
     ) -> Result<Arc<ConfigurationSnapshot>, ConfigurationError> {
         scope.validate()?;
-        let mut snapshots = self
-            .snapshots
+        let _writer = self
+            .write_gate
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .expect("configuration writes must be serialized");
         let inputs = self
             .source
             .collect(&scope)
             .map_err(ConfigurationError::InputUnavailable)?;
         let snapshot = Arc::new(ConfigurationSnapshot::resolve(scope.clone(), inputs)?);
-        snapshots.insert(scope, snapshot.clone());
+        self.snapshots
+            .lock()
+            .expect("configuration snapshots must not expose a partially completed update")
+            .insert(scope, snapshot.clone());
         Ok(snapshot)
     }
 
     pub fn current(&self, scope: &ConfigurationScope) -> Option<Arc<ConfigurationSnapshot>> {
         self.snapshots
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .expect("configuration snapshots must not expose a partially completed update")
             .get(scope)
             .cloned()
     }
@@ -343,12 +380,16 @@ impl ConfigurationSystem {
         expected_revision: ConfigurationRevision,
         settings: &PeriConfig,
     ) -> Result<Arc<ConfigurationSnapshot>, ConfigurationError> {
-        let snapshots = self
+        let _writer = self
+            .write_gate
+            .lock()
+            .expect("configuration writes must be serialized");
+        let current = self
             .snapshots
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let current = snapshots
+            .expect("configuration snapshots must not expose a partially completed update")
             .get(scope)
+            .cloned()
             .ok_or(ConfigurationError::UnresolvedScope)?;
         if current.revision != expected_revision {
             return Err(ConfigurationError::Conflict);
@@ -360,7 +401,7 @@ impl ConfigurationSystem {
         if revision_of(scope, &inputs)? != expected_revision {
             return Err(ConfigurationError::Conflict);
         }
-        settings_update_document(scope, current, &mut inputs, settings)?;
+        settings_update_document(scope, &current, &mut inputs, settings)?;
         Ok(Arc::new(ConfigurationSnapshot::resolve(
             scope.clone(),
             inputs,
@@ -392,8 +433,10 @@ impl ConfigurationSystem {
                     }
                 }
             }
-            let mut document =
-                parse_document(inputs.project.as_deref(), SourceIdentity::ProjectMcpFile)?;
+            let mut document = assembly::parse_document(
+                inputs.project.as_deref(),
+                SourceIdentity::ProjectMcpFile,
+            )?;
             let encoded =
                 serde_json::to_value(config).map_err(ConfigurationError::Serialization)?;
             document["mcpServers"] = encoded["mcpServers"].clone();
@@ -419,12 +462,16 @@ impl ConfigurationSystem {
             &mut ConfigurationInputs,
         ) -> Result<(PathBuf, Option<String>, String), ConfigurationError>,
     ) -> Result<Arc<ConfigurationSnapshot>, ConfigurationError> {
-        let mut snapshots = self
+        let _writer = self
+            .write_gate
+            .lock()
+            .expect("configuration writes must be serialized");
+        let current = self
             .snapshots
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let current = snapshots
+            .expect("configuration snapshots must not expose a partially completed update")
             .get(scope)
+            .cloned()
             .ok_or(ConfigurationError::UnresolvedScope)?;
         if current.revision != expected_revision {
             return Err(ConfigurationError::Conflict);
@@ -436,7 +483,7 @@ impl ConfigurationSystem {
         if revision_of(scope, &inputs)? != expected_revision {
             return Err(ConfigurationError::Conflict);
         }
-        let (path, expected, content) = changes(current, &mut inputs)?;
+        let (path, expected, content) = changes(&current, &mut inputs)?;
         let next = Arc::new(ConfigurationSnapshot::resolve(scope.clone(), inputs)?);
         if !self
             .source
@@ -445,6 +492,10 @@ impl ConfigurationSystem {
         {
             return Err(ConfigurationError::Conflict);
         }
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .expect("configuration snapshots must not expose a partially completed update");
         snapshots.retain(|other_scope, _| {
             other_scope.global_settings != scope.global_settings || other_scope == scope
         });
@@ -479,7 +530,7 @@ fn settings_update_document(
     } else {
         &mut inputs.global
     };
-    let mut document = parse_document(
+    let mut document = assembly::parse_document(
         content.as_deref(),
         if workspace {
             SourceIdentity::WorkspaceFile

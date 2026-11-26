@@ -1,25 +1,46 @@
-use super::*;
+use crate::journal::git::GitBaseline;
+use crate::journal::git::GitObservation;
+use crate::journal::AttemptTracker;
+use crate::journal::RunState;
+use crate::journal::WorkflowJournalStore;
+use crate::protocol::JournalEntry;
 use crate::protocol::{AgentRunResult, Usage};
+use peri_acp_types::workflow::AcceptanceStatus;
+use peri_acp_types::workflow::AttemptDisposition;
+use peri_acp_types::workflow::DeliveryStatus;
+use peri_acp_types::workflow::ExecutionStatus;
+use peri_acp_types::workflow::PostProcessingStatus;
+use peri_acp_types::workflow::WorkflowAttempt;
+
 use tempfile::TempDir;
 
 fn make_store() -> (TempDir, WorkflowJournalStore) {
-    let tmp = TempDir::new().unwrap();
-    let store = WorkflowJournalStore::new(tmp.path().to_str().unwrap());
+    let tmp = TempDir::new().expect("the new fixture result is required for this assertion");
+    let store = WorkflowJournalStore::new(
+        tmp.path()
+            .to_str()
+            .expect("the fixture text must be valid UTF-8"),
+    );
     (tmp, store)
 }
 
 #[test]
 fn test_init_run_creates_dir_and_script() {
     let (_tmp, store) = make_store();
-    store.init_run("run-1", "export const meta = {}").unwrap();
-    let script = std::fs::read_to_string(store.run_dir("run-1").join("script.js")).unwrap();
+    store
+        .init_run("run-1", "export const meta = {}")
+        .expect("the init run fixture result is required for this assertion");
+    let script = std::fs::read_to_string(store.run_dir("run-1").join("script.js"))
+        .expect("the test fixture text file must be readable");
     assert_eq!(script, "export const meta = {}");
 }
 
 #[test]
 fn test_append_and_read_all_journal() {
     let (_tmp, store) = make_store();
-    store.init_run("run-1", "script").unwrap();
+    store
+        .init_run("run-1", "script")
+        .expect("the init run fixture result is required for this assertion");
     let entry = JournalEntry {
         key: "abc123".into(),
         seq: 0,
@@ -34,8 +55,12 @@ fn test_append_and_read_all_journal() {
         },
         attempt: None,
     };
-    store.append("run-1", &entry).unwrap();
-    let entries = store.read_all("run-1").unwrap();
+    store
+        .append("run-1", &entry)
+        .expect("the append fixture result is required for this assertion");
+    let entries = store
+        .read_all("run-1")
+        .expect("the read all fixture result is required for this assertion");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].key, "abc123");
     assert_eq!(entries[0].seq, 0);
@@ -44,60 +69,204 @@ fn test_append_and_read_all_journal() {
 #[test]
 fn strict_resume_read_rejects_missing_and_malformed_journal() {
     let (_tmp, store) = make_store();
-    store.init_run("missing", "script").unwrap();
+    store
+        .init_run("empty", "script")
+        .expect("the init run fixture result is required for this assertion");
+    assert!(
+        store
+            .read_all_strict("empty")
+            .expect("init_run 建出的空 journal 必须可读")
+            .is_empty(),
+        "零 agent run 的空 journal 是合法空前缀"
+    );
+
+    std::fs::create_dir_all(store.run_dir("missing"))
+        .expect("the missing-run fixture directory must be creatable");
     assert!(store.read_all_strict("missing").is_err());
 
-    store.init_run("malformed", "script").unwrap();
+    store
+        .init_run("malformed", "script")
+        .expect("the init run fixture result is required for this assertion");
     std::fs::write(
         store.run_dir("malformed").join("journal.jsonl"),
         "{\"key\":\"ok\",\"seq\":0,\"result\":{\"kind\":\"ok\",\"output\":\"ok\",\"usage\":{\"outputTokens\":1}}}\nnot-json\n",
     )
-    .unwrap();
+    .expect("the test fixture file must be writable");
     let error = store.read_all_strict("malformed").unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("line 2"));
 
-    store.init_run("gap", "script").unwrap();
+    store
+        .init_run("gap", "script")
+        .expect("the init run fixture result is required for this assertion");
     std::fs::write(
         store.run_dir("gap").join("journal.jsonl"),
         "{\"key\":\"later\",\"seq\":1,\"result\":{\"kind\":\"ok\",\"output\":\"later\",\"usage\":{\"outputTokens\":1}}}\n",
     )
-    .unwrap();
+    .expect("the test fixture file must be writable");
     let error = store.read_all_strict("gap").unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("expected seq 0"));
 
-    store.init_run("duplicate", "script").unwrap();
+    store
+        .init_run("duplicate", "script")
+        .expect("the init run fixture result is required for this assertion");
     std::fs::write(
         store.run_dir("duplicate").join("journal.jsonl"),
         "{\"key\":\"a\",\"seq\":0,\"result\":{\"kind\":\"ok\",\"output\":\"a\",\"usage\":{\"outputTokens\":1}}}\n{\"key\":\"b\",\"seq\":0,\"result\":{\"kind\":\"ok\",\"output\":\"b\",\"usage\":{\"outputTokens\":1}}}\n",
     )
-    .unwrap();
+    .expect("the test fixture file must be writable");
     let error = store.read_all_strict("duplicate").unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("expected seq 1"));
 }
 
+// ─── tools.jsonl（issue #407 阶段 2）：append-only 工具调用记录 ───────────────
+
+fn tool_entry(seq: u64, agent_seq: u64, task: &str) -> crate::protocol::ToolJournalEntry {
+    crate::protocol::ToolJournalEntry {
+        tool_seq: seq,
+        agent_seq,
+        task_id: task.into(),
+        tool_name: "Read".into(),
+        arguments: serde_json::Map::new(),
+        outcome: peri_acp_types::workflow::WorkflowToolOutcome::Ok {
+            structured_content: None,
+            content: format!("result-{seq}"),
+        },
+    }
+}
+
+#[test]
+fn tool_journal_appends_and_reads_back_in_sorted_order() {
+    let (_tmp, store) = make_store();
+    store
+        .init_run("run-1", "script")
+        .expect("the init run fixture result is required for this assertion");
+    store
+        .append_tool("run-1", &tool_entry(0, 1, "tool-1"))
+        .expect("append_tool must write the fixture");
+    store
+        .append_tool("run-1", &tool_entry(1, 2, "tool-2"))
+        .expect("append_tool must write the fixture");
+
+    let entries = store
+        .read_tools_strict("run-1")
+        .expect("read_tools_strict must accept the written fixture");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].task_id, "tool-1");
+    assert_eq!(entries[0].tool_seq, 0);
+    assert_eq!(entries[0].agent_seq, 1);
+    assert_eq!(entries[1].task_id, "tool-2");
+    assert_eq!(entries[1].tool_seq, 1);
+    assert_eq!(entries[1].agent_seq, 2);
+}
+
+#[test]
+fn missing_tool_journal_reads_as_empty() {
+    let (_tmp, store) = make_store();
+    store
+        .init_run("run-1", "script")
+        .expect("the init run fixture result is required for this assertion");
+    assert!(store
+        .read_tools_strict("run-1")
+        .expect("缺失 tools.jsonl 不是错误")
+        .is_empty());
+}
+
+#[test]
+fn tool_journal_reads_out_of_order_writes_by_tool_seq() {
+    let (_tmp, store) = make_store();
+    store
+        .init_run("run-1", "script")
+        .expect("the init run fixture result is required for this assertion");
+    // 并发工具调用按完成顺序追加：文件顺序可以不是脚本调用顺序。
+    store
+        .append_tool("run-1", &tool_entry(1, 0, "tool-2"))
+        .expect("append_tool must write the fixture");
+    store
+        .append_tool("run-1", &tool_entry(0, 0, "tool-1"))
+        .expect("append_tool must write the fixture");
+
+    let entries = store
+        .read_tools_strict("run-1")
+        .expect("read_tools_strict must accept the written fixture");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].tool_seq, 0);
+    assert_eq!(entries[0].task_id, "tool-1");
+    assert_eq!(entries[1].tool_seq, 1);
+    assert_eq!(entries[1].task_id, "tool-2");
+}
+
+#[test]
+fn malformed_tool_journal_fails_closed() {
+    let (_tmp, store) = make_store();
+    store
+        .init_run("run-1", "script")
+        .expect("the init run fixture result is required for this assertion");
+    std::fs::write(
+        store.run_dir("run-1").join("tools.jsonl"),
+        "{\"toolSeq\":0,\"agentSeq\":0,\"taskId\":\"tool-1\",\"toolName\":\"Read\",\"arguments\":{},\"outcome\":{\"kind\":\"ok\",\"content\":\"ok\"}}\nnot-json\n",
+    )
+    .expect("the test fixture file must be writable");
+
+    let error = store.read_tools_strict("run-1").unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("line 2"));
+}
+
+#[test]
+fn truncate_does_not_clear_the_tool_journal() {
+    let (_tmp, store) = make_store();
+    store
+        .init_run("run-1", "script")
+        .expect("the init run fixture result is required for this assertion");
+    store
+        .append_tool("run-1", &tool_entry(0, 0, "tool-1"))
+        .expect("append_tool must write the fixture");
+    store
+        .truncate("run-1")
+        .expect("truncate must clear only journal.jsonl");
+    assert_eq!(
+        store
+            .read_tools_strict("run-1")
+            .expect("read_tools_strict must accept the fixture")
+            .len(),
+        1,
+        "tools.jsonl 是 append-only：journal/truncate 不得清空"
+    );
+}
+
 #[test]
 fn test_truncate_clears_journal() {
     let (_tmp, store) = make_store();
-    store.init_run("run-1", "script").unwrap();
+    store
+        .init_run("run-1", "script")
+        .expect("the init run fixture result is required for this assertion");
     let entry = JournalEntry {
         key: "k".into(),
         seq: 0,
         result: AgentRunResult::Skipped,
         attempt: None,
     };
-    store.append("run-1", &entry).unwrap();
-    store.truncate("run-1").unwrap();
-    let entries = store.read_all("run-1").unwrap();
+    store
+        .append("run-1", &entry)
+        .expect("the append fixture result is required for this assertion");
+    store
+        .truncate("run-1")
+        .expect("the truncate fixture result is required for this assertion");
+    let entries = store
+        .read_all("run-1")
+        .expect("the read all fixture result is required for this assertion");
     assert!(entries.is_empty());
 }
 
 #[test]
 fn test_write_and_read_state() {
     let (_tmp, store) = make_store();
-    store.init_run("run-1", "script").unwrap();
+    store
+        .init_run("run-1", "script")
+        .expect("the init run fixture result is required for this assertion");
     let state = RunState {
         run_id: "run-1".into(),
         workflow_name: "test".into(),
@@ -106,8 +275,15 @@ fn test_write_and_read_state() {
         acceptance_status: AcceptanceStatus::Unknown,
         post_processing_status: PostProcessingStatus::Blocked,
         delivery_status: DeliveryStatus::Blocked,
+        delivery_reason: None,
+        postcondition_observation: None,
+        git_observation_scope: None,
+        outcome: peri_acp_types::workflow::WorkflowOutcome::Blocked,
+        unknown_side_effects: false,
         write_intent: None,
         limits: crate::protocol::WorkflowLimits::default(),
+        limit_breaches: Vec::new(),
+        token_usage: None,
         budget_total: Some(9_007_199_254_740_991),
         args: Some(serde_json::json!({"task": "round-trip"})),
         max_concurrency: 7,
@@ -118,13 +294,22 @@ fn test_write_and_read_state() {
         finished_at: Some("2026-06-22T00:01:00Z".into()),
         error: None,
     };
-    store.write_state("run-1", &state).unwrap();
-    let read = store.read_state("run-1").unwrap();
+    store
+        .write_state("run-1", &state)
+        .expect("the write state fixture result is required for this assertion");
+    let read = store
+        .read_state("run-1")
+        .expect("the read state fixture result is required for this assertion");
     assert_eq!(read.run_id, "run-1");
     assert_eq!(read.status, "completed");
     assert_eq!(read.budget_total, Some(9_007_199_254_740_991));
     assert_eq!(read.args, Some(serde_json::json!({"task": "round-trip"})));
     assert_eq!(read.max_concurrency, 7);
+    assert_eq!(
+        read.outcome,
+        peri_acp_types::workflow::WorkflowOutcome::Blocked,
+        "state.json 必须保留独立的引擎级 outcome"
+    );
 }
 
 #[test]
@@ -136,7 +321,7 @@ fn test_legacy_state_defaults_budget_total_to_none() {
         "script": "script",
         "started_at": "2026-06-22T00:00:00Z"
     }))
-    .unwrap();
+    .expect("from_value must accept this test fixture representation");
 
     assert_eq!(state.budget_total, None);
     assert_eq!(state.args, None);
@@ -147,7 +332,9 @@ fn test_legacy_state_defaults_budget_total_to_none() {
 fn test_state_error_field_round_trip() {
     // failed 的 state.json 必须能保存并读回 error 字段
     let (_tmp, store) = make_store();
-    store.init_run("run-err", "script").unwrap();
+    store
+        .init_run("run-err", "script")
+        .expect("the init run fixture result is required for this assertion");
     let state = RunState {
         run_id: "run-err".into(),
         workflow_name: "test".into(),
@@ -156,8 +343,15 @@ fn test_state_error_field_round_trip() {
         acceptance_status: AcceptanceStatus::Unknown,
         post_processing_status: PostProcessingStatus::Failed,
         delivery_status: DeliveryStatus::Blocked,
+        delivery_reason: None,
+        postcondition_observation: None,
+        git_observation_scope: None,
+        outcome: peri_acp_types::workflow::WorkflowOutcome::Blocked,
+        unknown_side_effects: false,
         write_intent: None,
         limits: crate::protocol::WorkflowLimits::default(),
+        limit_breaches: Vec::new(),
+        token_usage: None,
         budget_total: None,
         args: None,
         max_concurrency: 3,
@@ -168,8 +362,12 @@ fn test_state_error_field_round_trip() {
         finished_at: Some("2026-06-22T00:00:01Z".into()),
         error: Some("parallel thunk #0 failed: t is not a function".into()),
     };
-    store.write_state("run-err", &state).unwrap();
-    let read = store.read_state("run-err").unwrap();
+    store
+        .write_state("run-err", &state)
+        .expect("the write state fixture result is required for this assertion");
+    let read = store
+        .read_state("run-err")
+        .expect("the read state fixture result is required for this assertion");
     assert_eq!(read.status, "failed");
     assert_eq!(
         read.error.as_deref(),
@@ -181,7 +379,9 @@ fn test_state_error_field_round_trip() {
 fn test_state_error_skipped_when_none() {
     // error 为 None 时序列化应省略该字段（向后兼容旧 state.json）
     let (_tmp, store) = make_store();
-    store.init_run("run-ok", "script").unwrap();
+    store
+        .init_run("run-ok", "script")
+        .expect("the init run fixture result is required for this assertion");
     let state = RunState {
         run_id: "run-ok".into(),
         workflow_name: "test".into(),
@@ -190,8 +390,15 @@ fn test_state_error_skipped_when_none() {
         acceptance_status: AcceptanceStatus::Passed,
         post_processing_status: PostProcessingStatus::NotRequired,
         delivery_status: DeliveryStatus::Unknown,
+        delivery_reason: None,
+        postcondition_observation: None,
+        git_observation_scope: None,
+        outcome: peri_acp_types::workflow::WorkflowOutcome::Completed,
+        unknown_side_effects: false,
         write_intent: None,
         limits: crate::protocol::WorkflowLimits::default(),
+        limit_breaches: Vec::new(),
+        token_usage: None,
         budget_total: None,
         args: None,
         max_concurrency: 3,
@@ -202,8 +409,11 @@ fn test_state_error_skipped_when_none() {
         finished_at: None,
         error: None,
     };
-    store.write_state("run-ok", &state).unwrap();
-    let raw = std::fs::read_to_string(store.run_dir("run-ok").join("state.json")).unwrap();
+    store
+        .write_state("run-ok", &state)
+        .expect("the write state fixture result is required for this assertion");
+    let raw = std::fs::read_to_string(store.run_dir("run-ok").join("state.json"))
+        .expect("the test fixture text file must be readable");
     assert!(!raw.contains("error"), "None 时不应序列化 error 字段");
 }
 
@@ -217,7 +427,7 @@ fn test_legacy_deliverable_state_reads_as_unknown() {
         "script": "script",
         "started_at": "2026-06-22T00:00:00Z"
     }))
-    .unwrap();
+    .expect("from_value must accept this test fixture representation");
 
     assert_eq!(
         state.delivery_status,
@@ -236,33 +446,82 @@ fn test_legacy_completed_defaults_do_not_claim_delivery() {
         "started_at": "2026-06-22T00:00:00Z",
         "future_field": {"ignored": true}
     }))
-    .unwrap();
+    .expect("from_value must accept this test fixture representation");
 
     assert_eq!(state.status, "completed");
     assert_eq!(state.execution_status, ExecutionStatus::Unknown);
     assert_eq!(state.acceptance_status, AcceptanceStatus::Unknown);
     assert_eq!(state.post_processing_status, PostProcessingStatus::Unknown);
     assert_eq!(state.delivery_status, DeliveryStatus::Unknown);
+    assert_eq!(
+        state.delivery_reason, None,
+        "旧 state.json 缺原因字段：不得据此推断“未请求交付”或“无变化”"
+    );
+    assert_eq!(state.postcondition_observation, None);
 }
 
 #[test]
-fn test_non_git_baseline_is_optional_for_legacy_and_read_only() {
-    let tmp = TempDir::new().unwrap();
+fn postcondition_reason_fields_round_trip_and_stay_optional() {
+    let tmp = TempDir::new().expect("the temporary test directory must be available");
+    let store = WorkflowJournalStore::new(
+        tmp.path()
+            .to_str()
+            .expect("the fixture text must be valid UTF-8"),
+    );
+    store
+        .init_run("run-reason", "script")
+        .expect("the init run fixture result is required for this assertion");
+    let state: RunState = serde_json::from_value(serde_json::json!({
+        "run_id": "run-reason",
+        "workflow_name": "reason",
+        "status": "completed",
+        "script": "script",
+        "started_at": "2026-06-22T00:00:00Z"
+    }))
+    .expect("legacy payload must deserialize");
+    let mut state = state;
+    state.delivery_reason = Some(peri_acp_types::workflow::DeliveryReason::NotRequested);
+    state.postcondition_observation =
+        Some(peri_acp_types::workflow::PostconditionObservation::Complete);
+    store
+        .write_state("run-reason", &state)
+        .expect("the write state fixture result is required for this assertion");
 
-    assert!(GitBaseline::capture_for_intent(tmp.path(), None)
-        .unwrap()
-        .is_none());
-    assert!(GitBaseline::capture_for_intent(
-        tmp.path(),
-        Some(&peri_acp_types::workflow::WorkflowWriteIntent::ReadOnly),
-    )
-    .unwrap()
-    .is_none());
+    let read = store
+        .read_state("run-reason")
+        .expect("the read state fixture result is required for this assertion");
+    assert_eq!(
+        read.delivery_reason,
+        Some(peri_acp_types::workflow::DeliveryReason::NotRequested)
+    );
+    assert_eq!(
+        read.postcondition_observation,
+        Some(peri_acp_types::workflow::PostconditionObservation::Complete)
+    );
+}
+
+#[test]
+fn test_non_git_directory_reports_not_applicable_without_intent() {
+    let tmp = TempDir::new().expect("the new fixture result is required for this assertion");
+
+    assert!(matches!(
+        GitBaseline::capture_for_intent(tmp.path(), None)
+            .expect("sampling failure must not fail start"),
+        GitObservation::NotApplicable
+    ));
+    assert!(matches!(
+        GitBaseline::capture_for_intent(
+            tmp.path(),
+            Some(&peri_acp_types::workflow::WorkflowWriteIntent::ReadOnly),
+        )
+        .expect("read-only sampling failure must not fail start"),
+        GitObservation::NotApplicable
+    ));
 }
 
 #[test]
 fn test_non_git_baseline_is_required_for_write_intent() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = TempDir::new().expect("the new fixture result is required for this assertion");
     let intent = peri_acp_types::workflow::WorkflowWriteIntent::Write {
         repo_root: tmp.path().to_string_lossy().into_owned(),
         cwd: tmp.path().to_string_lossy().into_owned(),
@@ -272,22 +531,34 @@ fn test_non_git_baseline_is_required_for_write_intent() {
     };
 
     let error = GitBaseline::capture_for_intent(tmp.path(), Some(&intent)).unwrap_err();
-    assert!(error.contains("git pre/postcondition command failed"));
+    // 采样失败必须保留 git 自身 stderr 摘要，不能退化成统一文本。
+    let detail = error
+        .strip_prefix("git rev-parse --show-toplevel failed: ")
+        .unwrap_or_else(|| panic!("错误必须带失败命令: {error}"));
+    assert!(
+        !detail.trim().is_empty() && detail != "no stderr output",
+        "错误必须保留 git 诊断: {error}"
+    );
+    assert!(
+        detail.chars().count() <= 501,
+        "stderr 摘要必须有界: {error}"
+    );
 }
 
 #[test]
 fn test_git_baseline_preserves_dirty_staged_and_untracked_bytes() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = TempDir::new().expect("the new fixture result is required for this assertion");
     let run_git = |args: &[&str]| {
         let status = std::process::Command::new("git")
             .args(args)
             .current_dir(tmp.path())
             .status()
-            .unwrap();
+            .expect("the status fixture result is required for this assertion");
         assert!(status.success());
     };
     run_git(&["init", "-q"]);
-    std::fs::write(tmp.path().join("tracked.txt"), b"base\n").unwrap();
+    std::fs::write(tmp.path().join("tracked.txt"), b"base\n")
+        .expect("the test fixture file must be writable");
     run_git(&["add", "tracked.txt"]);
     run_git(&[
         "-c",
@@ -299,39 +570,50 @@ fn test_git_baseline_preserves_dirty_staged_and_untracked_bytes() {
         "baseline",
     ]);
 
-    std::fs::write(tmp.path().join("tracked.txt"), b"staged\n").unwrap();
+    std::fs::write(tmp.path().join("tracked.txt"), b"staged\n")
+        .expect("the test fixture file must be writable");
     run_git(&["add", "tracked.txt"]);
-    std::fs::write(tmp.path().join("tracked.txt"), b"dirty\n").unwrap();
-    std::fs::write(tmp.path().join("untracked.bin"), [0_u8, 1, 2, 255]).unwrap();
-    let tracked_before = std::fs::read(tmp.path().join("tracked.txt")).unwrap();
-    let untracked_before = std::fs::read(tmp.path().join("untracked.bin")).unwrap();
+    std::fs::write(tmp.path().join("tracked.txt"), b"dirty\n")
+        .expect("the test fixture file must be writable");
+    std::fs::write(tmp.path().join("untracked.bin"), [0_u8, 1, 2, 255])
+        .expect("the test fixture file must be writable");
+    let tracked_before = std::fs::read(tmp.path().join("tracked.txt"))
+        .expect("the test fixture file must be readable");
+    let untracked_before = std::fs::read(tmp.path().join("untracked.bin"))
+        .expect("the test fixture file must be readable");
 
-    let baseline = GitBaseline::capture(tmp.path()).unwrap();
-    baseline.verify_unchanged().unwrap();
+    let baseline = GitBaseline::capture(tmp.path())
+        .expect("the capture fixture result is required for this assertion");
+    baseline
+        .verify_unchanged()
+        .expect("the verify unchanged fixture result is required for this assertion");
 
     assert_eq!(
-        std::fs::read(tmp.path().join("tracked.txt")).unwrap(),
+        std::fs::read(tmp.path().join("tracked.txt"))
+            .expect("the test fixture file must be readable"),
         tracked_before
     );
     assert_eq!(
-        std::fs::read(tmp.path().join("untracked.bin")).unwrap(),
+        std::fs::read(tmp.path().join("untracked.bin"))
+            .expect("the test fixture file must be readable"),
         untracked_before
     );
 }
 
 #[test]
 fn test_git_baseline_detects_unattributed_change_without_restoring_it() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = TempDir::new().expect("the new fixture result is required for this assertion");
     let run_git = |args: &[&str]| {
         let status = std::process::Command::new("git")
             .args(args)
             .current_dir(tmp.path())
             .status()
-            .unwrap();
+            .expect("the status fixture result is required for this assertion");
         assert!(status.success());
     };
     run_git(&["init", "-q"]);
-    std::fs::write(tmp.path().join("tracked.txt"), "base\n").unwrap();
+    std::fs::write(tmp.path().join("tracked.txt"), "base\n")
+        .expect("the test fixture file must be writable");
     run_git(&["add", "tracked.txt"]);
     run_git(&[
         "-c",
@@ -343,36 +625,56 @@ fn test_git_baseline_detects_unattributed_change_without_restoring_it() {
         "baseline",
     ]);
 
-    let baseline = GitBaseline::capture(tmp.path()).unwrap();
+    let baseline = GitBaseline::capture(tmp.path())
+        .expect("the capture fixture result is required for this assertion");
     std::fs::write(
         tmp.path().join("tracked.txt"),
         "agent claim without ownership\n",
     )
-    .unwrap();
+    .expect("the test fixture file must be writable");
 
     let error = baseline.verify_unchanged().unwrap_err();
-    assert!(error.contains("changed without an attributable"));
+    assert!(
+        !error.is_violation(),
+        "无 write footprint 时变化只能判为未归因"
+    );
+    let message = error.to_string();
+    assert!(message.contains("outside the run's write footprint"));
+    assert!(
+        message.contains("tracked.txt"),
+        "报告必须带可定位路径: {message}"
+    );
     assert_eq!(
-        std::fs::read_to_string(tmp.path().join("tracked.txt")).unwrap(),
+        std::fs::read_to_string(tmp.path().join("tracked.txt"))
+            .expect("the test fixture text file must be readable"),
         "agent claim without ownership\n"
     );
 }
 
+/// 未合并条目（`u`）也要能被解析：始终比较 map（而非原始字节）后，
+/// 冲突中的仓库不能因为解析失败被读成观测不完整。
 #[test]
-fn test_write_postcondition_ignores_unchanged_preexisting_dirty_path() {
-    let tmp = TempDir::new().unwrap();
+fn unmerged_porcelain_entries_do_not_claim_a_change() {
+    let tmp = TempDir::new().expect("the new fixture result is required for this assertion");
     let run_git = |args: &[&str]| {
         assert!(std::process::Command::new("git")
             .args(args)
             .current_dir(tmp.path())
             .status()
-            .unwrap()
+            .expect("the status fixture result is required for this assertion")
             .success());
     };
-    run_git(&["init", "-q"]);
-    std::fs::write(tmp.path().join("allowed.txt"), "base\n").unwrap();
-    std::fs::write(tmp.path().join("outside.txt"), "base\n").unwrap();
-    run_git(&["add", "."]);
+    run_git(&[
+        "-c",
+        "user.name=Peri Test",
+        "-c",
+        "user.email=peri-test@example.invalid",
+        "init",
+        "-q",
+    ]);
+    std::fs::write(tmp.path().join("tracked.txt"), "base\n")
+        .expect("the test fixture file must be writable");
+    run_git(&["add", "tracked.txt"]);
     run_git(&[
         "-c",
         "user.name=Peri Test",
@@ -382,276 +684,117 @@ fn test_write_postcondition_ignores_unchanged_preexisting_dirty_path() {
         "-qm",
         "baseline",
     ]);
-    std::fs::write(tmp.path().join("outside.txt"), "pre-existing dirty\n").unwrap();
-
-    let baseline = GitBaseline::capture(tmp.path()).unwrap();
-    let intent = peri_acp_types::workflow::WorkflowWriteIntent::Write {
-        repo_root: tmp.path().to_string_lossy().into_owned(),
-        cwd: tmp.path().to_string_lossy().into_owned(),
-        path_allowlist: vec!["allowed.txt".into()],
-        head_may_change: false,
-        commit_required: None,
-    };
-    std::fs::write(tmp.path().join("allowed.txt"), "changed\n").unwrap();
-
-    baseline.verify_postcondition(Some(&intent)).unwrap();
-}
-
-#[test]
-fn test_write_postcondition_allows_only_allowlisted_change() {
-    let tmp = TempDir::new().unwrap();
-    let run_git = |args: &[&str]| {
-        assert!(std::process::Command::new("git")
-            .args(args)
-            .current_dir(tmp.path())
-            .status()
-            .unwrap()
-            .success());
-    };
-    run_git(&["init", "-q"]);
-    std::fs::write(tmp.path().join("allowed.txt"), "base\n").unwrap();
-    std::fs::write(tmp.path().join("outside.txt"), "base\n").unwrap();
-    run_git(&["add", "."]);
+    run_git(&["checkout", "-q", "-b", "side"]);
+    std::fs::write(tmp.path().join("tracked.txt"), "side\n")
+        .expect("the test fixture file must be writable");
     run_git(&[
         "-c",
         "user.name=Peri Test",
         "-c",
         "user.email=peri-test@example.invalid",
         "commit",
-        "-qm",
-        "baseline",
+        "-qam",
+        "side",
     ]);
-
-    let baseline = GitBaseline::capture(tmp.path()).unwrap();
-    let intent = peri_acp_types::workflow::WorkflowWriteIntent::Write {
-        repo_root: tmp.path().to_string_lossy().into_owned(),
-        cwd: tmp.path().to_string_lossy().into_owned(),
-        path_allowlist: vec!["allowed.txt".into()],
-        head_may_change: false,
-        commit_required: None,
-    };
-    baseline.validate_write_intent(&intent).unwrap();
-    std::fs::write(tmp.path().join("allowed.txt"), "changed\n").unwrap();
-    baseline.verify_postcondition(Some(&intent)).unwrap();
-    std::fs::write(tmp.path().join("outside.txt"), "escaped\n").unwrap();
-    assert!(baseline
-        .verify_postcondition(Some(&intent))
-        .unwrap_err()
-        .contains("escaped"));
-}
-
-#[test]
-fn test_write_intent_rejects_parent_traversal() {
-    let tmp = TempDir::new().unwrap();
-    assert!(std::process::Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(tmp.path())
-        .status()
-        .unwrap()
-        .success());
-    std::fs::write(tmp.path().join("tracked.txt"), "base\n").unwrap();
-    assert!(std::process::Command::new("git")
-        .args(["add", "tracked.txt"])
-        .current_dir(tmp.path())
-        .status()
-        .unwrap()
-        .success());
-    assert!(std::process::Command::new("git")
+    run_git(&["checkout", "-q", "-"]);
+    std::fs::write(tmp.path().join("tracked.txt"), "main\n")
+        .expect("the test fixture file must be writable");
+    run_git(&[
+        "-c",
+        "user.name=Peri Test",
+        "-c",
+        "user.email=peri-test@example.invalid",
+        "commit",
+        "-qam",
+        "main",
+    ]);
+    let merge = std::process::Command::new("git")
         .args([
             "-c",
             "user.name=Peri Test",
             "-c",
             "user.email=peri-test@example.invalid",
-            "commit",
-            "-qm",
-            "baseline"
+            "merge",
+            "--no-ff",
+            "side",
         ])
         .current_dir(tmp.path())
         .status()
-        .unwrap()
-        .success());
-    let baseline = GitBaseline::capture(tmp.path()).unwrap();
-    let intent = peri_acp_types::workflow::WorkflowWriteIntent::Write {
-        repo_root: tmp.path().to_string_lossy().into_owned(),
-        cwd: tmp.path().to_string_lossy().into_owned(),
-        path_allowlist: vec!["../outside".into()],
-        head_may_change: false,
-        commit_required: None,
+        .expect("the merge fixture result is required for this assertion");
+    assert!(!merge.success(), "fixture 必须进入未合并状态");
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain=v2", "-z", "--untracked-files=all"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("the status fixture result is required for this assertion");
+    let status =
+        String::from_utf8(status.stdout).expect("the status fixture output must be valid UTF-8");
+    assert!(
+        status.split('\0').any(|field| field.starts_with("u ")),
+        "fixture 必须产生未合并记录: {status}"
+    );
+
+    let baseline = GitBaseline::capture(tmp.path())
+        .expect("the capture fixture result is required for this assertion");
+    baseline
+        .verify_unchanged()
+        .expect("未合并条目本身不是运行带来的变化");
+}
+
+#[test]
+fn workflow_journal_is_excluded_but_unrelated_untracked_files_are_not() {
+    let tmp = TempDir::new().expect("the new fixture result is required for this assertion");
+    let run_git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(tmp.path())
+            .status()
+            .expect("the status fixture result is required for this assertion")
+            .success());
     };
-    assert!(baseline.validate_write_intent(&intent).is_err());
-}
+    run_git(&["init", "-q"]);
+    std::fs::write(tmp.path().join("tracked.txt"), "base\n")
+        .expect("the test fixture file must be writable");
+    // 刻意不忽略 `.claude/`：宿主自己的运行产物不得被当成外部变化。
+    run_git(&["add", "tracked.txt"]);
+    run_git(&[
+        "-c",
+        "user.name=Peri Test",
+        "-c",
+        "user.email=peri-test@example.invalid",
+        "commit",
+        "-qm",
+        "baseline",
+    ]);
 
-// ─── extract_long_texts / write_output 测试 ────────────────────
+    let baseline = GitBaseline::capture(tmp.path())
+        .expect("the capture fixture result is required for this assertion");
+    let run_dir = tmp
+        .path()
+        .join(".claude")
+        .join("workflow-runs")
+        .join("run-1");
+    std::fs::create_dir_all(&run_dir).expect("the run directory must be creatable");
+    std::fs::write(run_dir.join("script.js"), "return null")
+        .expect("the test fixture file must be writable");
+    baseline
+        .verify_unchanged()
+        .expect("本 run 自己的 journal 不构成外部变化");
 
-/// [回归测试] label 归一：分隔符/控制字符替换、连续点折叠、空 label 回落、
-/// 重名去重（同一 label 不得覆盖）。
-#[test]
-fn test_output_label_sanitizes_and_dedups() {
-    let mut used = std::collections::HashSet::new();
-    assert_eq!(output_label("a.b[0]", &mut used), "a.b[0]");
-    assert_eq!(output_label("raw/crates", &mut used), "raw_crates");
-    assert_eq!(output_label("raw\\crates", &mut used), "raw_crates-2");
-    assert_eq!(output_label("..", &mut used), "._");
-    assert_eq!(output_label("", &mut used), "unnamed");
-}
-
-/// [回归测试] 占位符与文件名同源：label 含 `/`（非法路径字符）时，state.json 写入的
-/// `${label}` 必须指向真实存在的 `outputs/<label>.txt`；两个会归一到同一名字的
-/// label 不得互相覆盖（2026-10-11 issue：引用断裂 / 内容被覆盖）。
-#[test]
-fn test_extract_long_texts_label_matches_output_file() {
-    let (_tmp, store) = make_store();
-    store.init_run("r1", "script").unwrap();
-    let first = "a".repeat(250);
-    let second = "b".repeat(260);
-    let mut value = serde_json::json!({"raw/crates": first.clone(), "raw_crates": second.clone()});
-    let extracted = extract_long_texts(&mut value, "r1", &store, 200);
-    let mut labels = extracted.clone();
-    labels.sort();
-    assert_eq!(labels, vec!["raw_crates", "raw_crates-2"]);
-
-    // 每个占位符都必须解析到真实文件，两份内容都不丢。
-    let outputs = store.run_dir("r1").join("outputs");
-    let mut resolved: Vec<(String, String)> = ["raw/crates", "raw_crates"]
-        .into_iter()
-        .map(|key| {
-            let placeholder = value[key].as_str().expect("长文本应替换为占位符");
-            let name = placeholder
-                .strip_prefix("${")
-                .and_then(|rest| rest.strip_suffix('}'))
-                .expect("占位符形态必须为 ${label}");
-            let content = std::fs::read_to_string(outputs.join(format!("{name}.txt")))
-                .unwrap_or_else(|error| panic!("占位符 {placeholder} 未指向真实文件: {error}"));
-            (name.to_string(), content)
-        })
-        .collect();
-    resolved.sort();
-    assert_eq!(
-        resolved,
-        vec![
-            ("raw_crates".to_string(), first),
-            ("raw_crates-2".to_string(), second),
-        ]
+    std::fs::write(tmp.path().join("notes.txt"), "external\n")
+        .expect("the test fixture file must be writable");
+    let failure = baseline
+        .verify_unchanged()
+        .expect_err("journal 之外的未跟踪文件仍必须报告");
+    assert!(
+        matches!(
+            failure,
+            crate::journal::PostconditionFailure::Unattributed(_)
+        ),
+        "无 write footprint 时变化只能判为未归因: {failure}"
     );
+    assert!(failure.to_string().contains("notes.txt"));
 }
 
-#[test]
-fn test_extract_long_texts_empty() {
-    let (_tmp, store) = make_store();
-    store.init_run("r1", "script").unwrap();
-    let mut value = serde_json::json!({});
-    let extracted = extract_long_texts(&mut value, "r1", &store, 200);
-    assert!(extracted.is_empty());
-    assert_eq!(value, serde_json::json!({}));
-}
-
-#[test]
-fn test_extract_long_texts_short_strings() {
-    let (_tmp, store) = make_store();
-    store.init_run("r1", "script").unwrap();
-    let mut value = serde_json::json!({"k": "short"});
-    let extracted = extract_long_texts(&mut value, "r1", &store, 200);
-    assert!(extracted.is_empty());
-    assert_eq!(value, serde_json::json!({"k": "short"}));
-}
-
-#[test]
-fn test_extract_long_texts_top_level() {
-    let (_tmp, store) = make_store();
-    store.init_run("r1", "script").unwrap();
-    let long_str = "a".repeat(250);
-    let mut value = serde_json::json!({"result": long_str.clone()});
-    let extracted = extract_long_texts(&mut value, "r1", &store, 200);
-    assert_eq!(extracted.len(), 1);
-    assert_eq!(extracted[0], "result");
-    // 原位置替换为 ${label}
-    assert_eq!(value["result"].as_str().unwrap(), "${result}");
-    // 验证文件写入
-    let content =
-        std::fs::read_to_string(store.run_dir("r1").join("outputs").join("result.txt")).unwrap();
-    assert_eq!(content, long_str);
-}
-
-#[test]
-fn test_extract_long_texts_array() {
-    let (_tmp, store) = make_store();
-    store.init_run("r1", "script").unwrap();
-    let long1 = "b".repeat(300);
-    let long2 = "c".repeat(300);
-    let mut value = serde_json::json!({"items": [
-        {"result": long1.clone()},
-        {"result": long2.clone()}
-    ]});
-    let extracted = extract_long_texts(&mut value, "r1", &store, 200);
-    assert_eq!(extracted.len(), 2);
-    // 使用索引标签，无覆盖
-    assert_eq!(extracted[0], "items[0].result");
-    assert_eq!(extracted[1], "items[1].result");
-    // 原位置替换
-    assert_eq!(
-        value["items"][0]["result"].as_str().unwrap(),
-        "${items[0].result}"
-    );
-    assert_eq!(
-        value["items"][1]["result"].as_str().unwrap(),
-        "${items[1].result}"
-    );
-    // 验证两个文件均正确写入，无覆盖
-    let content0 = std::fs::read_to_string(
-        store
-            .run_dir("r1")
-            .join("outputs")
-            .join("items[0].result.txt"),
-    )
-    .unwrap();
-    assert_eq!(content0, long1);
-    let content1 = std::fs::read_to_string(
-        store
-            .run_dir("r1")
-            .join("outputs")
-            .join("items[1].result.txt"),
-    )
-    .unwrap();
-    assert_eq!(content1, long2);
-}
-
-#[test]
-fn test_extract_long_texts_nested() {
-    let (_tmp, store) = make_store();
-    store.init_run("r1", "script").unwrap();
-    let inner_long = "d".repeat(250);
-    let mut value = serde_json::json!({
-        "outer": {
-            "inner": inner_long.clone()
-        }
-    });
-    let extracted = extract_long_texts(&mut value, "r1", &store, 200);
-    assert_eq!(extracted.len(), 1);
-    // 点号分隔标签
-    assert_eq!(extracted[0], "outer.inner");
-    assert_eq!(value["outer"]["inner"].as_str().unwrap(), "${outer.inner}");
-    let content =
-        std::fs::read_to_string(store.run_dir("r1").join("outputs").join("outer.inner.txt"))
-            .unwrap();
-    assert_eq!(content, inner_long);
-}
-
-/// [回归测试] 文件写失败时不能把仍未持久化的原文替换成不可读取的引用。
-#[test]
-fn test_extract_long_texts_preserves_content_when_output_write_fails() {
-    let (_tmp, store) = make_store();
-    store.init_run("failed-output", "script").unwrap();
-    let outputs = store.run_dir("failed-output").join("outputs");
-    std::fs::create_dir_all(outputs.join("blocked.txt")).unwrap();
-    let original = "retained".repeat(40);
-    let saved = "persisted".repeat(40);
-    let mut value = serde_json::json!({"blocked": original, "saved": saved});
-    let extracted = extract_long_texts(&mut value, "failed-output", &store, 200);
-    assert_eq!(extracted, vec!["saved"]);
-    assert_eq!(value["blocked"], original, "失败分支必须保留可用正文");
-    assert_eq!(value["saved"], "${saved}");
-    assert_eq!(
-        std::fs::read_to_string(outputs.join("saved.txt")).unwrap(),
-        saved
-    );
-}
+include!("journal_test_section_2.rs");
+include!("journal_test_section_3.rs");

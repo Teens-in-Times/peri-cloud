@@ -12,8 +12,21 @@
 //! `LateChildContribution` 是 Agent 层的模拟中间件，只证明请求时读取与组合
 //! 语义，不代表真实生产链已验收。
 
-use super::*;
+use crate::agent::async_tasks::TaskManager;
+use crate::messages::BaseMessage;
+use crate::middleware::chain::MiddlewareChain;
+use crate::session::subagent::types::SubagentChainAssembler;
+use crate::session::subagent::types::SubagentChainContext;
+use crate::session::subagent::types::SubagentLlmSource;
+use crate::session::subagent::ForkDirectiveKind;
+use crate::session::subagent::SessionFactory;
+use crate::session::subagent::SubagentCancelPolicy;
+use crate::session::subagent::SubagentSpawnConfig;
+use crate::session::FrozenContext;
+use crate::session::Session;
+use std::sync::Arc;
 use std::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// 捕获请求的 mock Model（生产 bridge 直接消费它）。
 struct CaptureModel {
@@ -30,7 +43,10 @@ impl CaptureModel {
     }
 
     fn last_system(&self) -> String {
-        let requests = self.requests.lock().unwrap();
+        let requests = self
+            .requests
+            .lock()
+            .expect("self requests mutex must remain unpoisoned throughout the test");
         let Some(request) = requests.last() else {
             return String::new();
         };
@@ -54,7 +70,10 @@ impl CaptureModel {
     }
 
     fn conversation_text(&self) -> String {
-        let requests = self.requests.lock().unwrap();
+        let requests = self
+            .requests
+            .lock()
+            .expect("self requests mutex must remain unpoisoned throughout the test");
         let Some(request) = requests.last() else {
             return String::new();
         };
@@ -76,6 +95,27 @@ impl CaptureModel {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    /// 后台执行在独立任务内发请求；断言前先等到预期请求数（超时即失败）。
+    async fn wait_for_requests(&self, count: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if self
+                .requests
+                .lock()
+                .expect("self requests mutex must remain unpoisoned throughout the test")
+                .len()
+                >= count
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "model did not receive {count} requests before timeout"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -95,7 +135,10 @@ impl peri_model::Model for CaptureModel {
         &self,
         request: peri_model::ModelRequest,
     ) -> peri_model::ModelResult<peri_model::PreparedModelCall> {
-        self.requests.lock().unwrap().push(request.clone());
+        self.requests
+            .lock()
+            .expect("self requests mutex must remain unpoisoned throughout the test")
+            .push(request.clone());
         let answer = self.answer.clone();
         let checkpoint = serde_json::json!({
             "provider": "fixture-capture",
@@ -107,7 +150,7 @@ impl peri_model::Model for CaptureModel {
         Ok(peri_model::PreparedModelCall::new(
             checkpoint,
             move |cancellation| {
-                let response = peri_model::ModelResponse::new(
+                let response = peri_model::ModelResponse::try_new(
                     peri_model::ModelMessage::assistant_text(answer),
                     peri_model::StopReason::EndTurn,
                     None,
@@ -128,8 +171,11 @@ impl peri_model::Model for CaptureModel {
         request: peri_model::ModelRequest,
         cancellation: CancellationToken,
     ) -> peri_model::ModelResult<peri_model::ModelStream> {
-        self.requests.lock().unwrap().push(request);
-        let response = peri_model::ModelResponse::new(
+        self.requests
+            .lock()
+            .expect("self requests mutex must remain unpoisoned throughout the test")
+            .push(request);
+        let response = peri_model::ModelResponse::try_new(
             peri_model::ModelMessage::assistant_text(self.answer.clone()),
             peri_model::StopReason::EndTurn,
             None,
@@ -155,14 +201,20 @@ impl crate::middleware::r#trait::Middleware for LateChildContribution {
     }
 
     fn prompt_contribution(&self) -> Option<String> {
-        self.contribution.lock().unwrap().clone()
+        self.contribution
+            .lock()
+            .expect("self contribution mutex must remain unpoisoned throughout the test")
+            .clone()
     }
 
     async fn before_agent(
         &self,
         _state: &mut dyn crate::middleware::capabilities::BeforeAgentState,
     ) -> crate::error::AgentResult<()> {
-        let mut slot = self.contribution.lock().unwrap();
+        let mut slot = self
+            .contribution
+            .lock()
+            .expect("self contribution mutex must remain unpoisoned throughout the test");
         if slot.is_none() {
             *slot = Some("CHILD_SKILLS_AND_DEFERRED".to_string());
         }
@@ -203,7 +255,6 @@ fn child_config(
         cancel_policy: SubagentCancelPolicy::Independent,
         max_iterations: 3,
         fork_directive_kind: fork.then_some(ForkDirectiveKind::Fork),
-        run_mode: SubagentRunMode::Sync,
         skill_names: vec![],
         // H1：生产模型来源（bridge 在子链装配点构造）。
         llm: SubagentLlmSource::model(
@@ -221,7 +272,7 @@ fn child_config(
         session_resources: Some(store),
         event_handler: None,
         bg_event_sender: None,
-        task_manager: None,
+        task_manager: Some(Arc::new(TaskManager::new())),
         on_bg_complete: None,
         langfuse_bridge: None,
         on_subagent_start: None,
@@ -250,14 +301,18 @@ async fn bound_parent(
     tempfile::TempDir,
 ) {
     let repo = crate::session::test_resources::git_repository();
-    let db = tempfile::tempdir().unwrap();
+    let db = tempfile::tempdir().expect("the temporary test directory must be available");
     let resources = peri_resources::Resources::open_with(Some(db.path().join(db_name)))
         .await
-        .unwrap();
+        .expect("the temporary session store fixture must open successfully");
     let (store, _shutdown) = resources.into_parts();
-    let workspace = store.resolve_workspace(repo.path()).await.unwrap();
+    let workspace = store
+        .resolve_workspace(repo.path())
+        .await
+        .expect("the resolve workspace fixture result is required for this assertion");
     let cwd = workspace.cwd.to_string_lossy().into_owned();
-    let parent_id = create_bound_root(&store, &workspace, None).await;
+    let parent_id =
+        crate::session::subagent::tests::create_bound_root(&store, &workspace, None).await;
     let parent = Session::new(
         Arc::from(cwd.as_str()),
         FrozenContext::builder().build(),
@@ -270,13 +325,17 @@ async fn bound_parent(
 /// concurrently and share a provider. Resume keeps the owner but starts a new real execution.
 #[tokio::test]
 async fn concurrent_child_requests_keep_parent_tool_causality_across_resume() {
-    use crate::agent::model_call::scope_tool_parent;
+    use crate::agent::model_call;
 
     let (store, parent, cwd, _repo, _db) = bound_parent("child-call-context.db").await;
     let model = CaptureModel::new("child done");
     let turn = parent.start_turn();
     let make_parent = |tool_call: &str| peri_model::ModelCallParent {
-        owner: parent.store().thread_id.clone().unwrap(),
+        owner: parent
+            .store()
+            .thread_id
+            .clone()
+            .expect("the clone fixture result is required for this assertion"),
         execution: turn.execution_binding().attempt_id.to_string(),
         call: "reason:0".into(),
         tool_call: tool_call.into(),
@@ -298,33 +357,41 @@ async fn concurrent_child_requests_keep_parent_tool_causality_across_resume() {
     let first_parent = make_parent("spawn-first");
     let second_parent = make_parent("spawn-second");
     let (first, second) = tokio::join!(
-        scope_tool_parent(
+        model_call::scope_tool_parent(
             Some(first_parent.clone()),
             SessionFactory::spawn_subagent(Some(&parent), make_config("spawn-first")),
         ),
-        scope_tool_parent(
+        model_call::scope_tool_parent(
             Some(second_parent.clone()),
             SessionFactory::spawn_subagent(Some(&parent), make_config("spawn-second")),
         ),
     );
-    let first = first.unwrap();
-    let second = second.unwrap();
+    let first = first.expect("first fixture must contain the expected element");
+    let second = second.expect("the second fixture result is required for this assertion");
+    model.wait_for_requests(2).await;
+    crate::session::subagent::tests::wait_status_settled(&*store, &first.child_thread_id).await;
+    crate::session::subagent::tests::wait_status_settled(&*store, &second.child_thread_id).await;
     let contexts: Vec<_> = model
         .requests
         .lock()
-        .unwrap()
+        .expect("model requests mutex must remain unpoisoned throughout the test")
         .iter()
-        .map(|request| request.call_context.clone().unwrap())
+        .map(|request| {
+            request
+                .call_context
+                .clone()
+                .expect("the clone fixture result is required for this assertion")
+        })
         .collect();
     assert_eq!(contexts.len(), 2);
     let first_context = contexts
         .iter()
         .find(|context| context.owner == first.child_thread_id)
-        .unwrap();
+        .expect("the find fixture result is required for this assertion");
     let second_context = contexts
         .iter()
         .find(|context| context.owner == second.child_thread_id)
-        .unwrap();
+        .expect("the find fixture result is required for this assertion");
     assert_eq!(first_context.parent, Some(first_parent));
     assert_eq!(second_context.parent, Some(second_parent));
     assert_ne!(first_context.execution, second_context.execution);
@@ -332,26 +399,34 @@ async fn concurrent_child_requests_keep_parent_tool_causality_across_resume() {
     assert_eq!(second_context.call, "reason:1");
 
     let resume_parent = make_parent("resume-first");
-    let mut resume = resume_config_with(
+    let mut resume = crate::session::subagent::tests::resume_config_with(
         Arc::clone(&store),
         first.child_thread_id.clone(),
         SubagentLlmSource::model(
             Arc::clone(&model) as Arc<dyn peri_model::Model>,
             "capture-model",
         ),
-        SubagentRunMode::Sync,
-        None,
+        Some(Arc::new(TaskManager::new())),
         None,
     );
     resume.parent_tool_call_id = Some("resume-first".into());
-    scope_tool_parent(
+    model_call::scope_tool_parent(
         Some(resume_parent.clone()),
         SessionFactory::resume_subagent(Some(&parent), resume),
     )
     .await
-    .unwrap();
-    let requests = model.requests.lock().unwrap();
-    let resumed = requests.last().unwrap().call_context.as_ref().unwrap();
+    .expect("the scope tool parent fixture result is required for this assertion");
+    model.wait_for_requests(3).await;
+    let requests = model
+        .requests
+        .lock()
+        .expect("model requests mutex must remain unpoisoned throughout the test");
+    let resumed = requests
+        .last()
+        .expect("requests last fixture must contain the expected element")
+        .call_context
+        .as_ref()
+        .expect("the as ref fixture result is required for this assertion");
     assert_eq!(resumed.owner, first_context.owner);
     assert_ne!(resumed.execution, first_context.execution);
     assert_eq!(resumed.parent, Some(resume_parent));
@@ -384,7 +459,9 @@ async fn child_external_instructions_are_wire_only_across_resume_and_nested_fork
         ),
     )
     .await
-    .unwrap();
+    .expect("the spawn subagent fixture result is required for this assertion");
+    model.wait_for_requests(1).await;
+    crate::session::subagent::tests::wait_status_settled(&*store, &first.child_thread_id).await;
     assert!(model.last_system().ends_with(&format!(
         "<env>\nWorking directory: /frozen-child-env\nSession ID: {}\n</env>",
         first.child_thread_id
@@ -401,24 +478,24 @@ async fn child_external_instructions_are_wire_only_across_resume_and_nested_fork
         .transcript()
         .read()
         .visible_model_messages()
-        .unwrap()
+        .expect("the visible model messages fixture result is required for this assertion")
         .iter()
         .any(|m| m.content().contains("EXTERNAL_ONLY_SENTINEL")));
     let resumed_model = CaptureModel::new("resumed done");
-    let resume = resume_config_with(
+    let resume = crate::session::subagent::tests::resume_config_with(
         Arc::clone(&store),
         first.child_thread_id.clone(),
         SubagentLlmSource::model(
             Arc::clone(&resumed_model) as Arc<dyn peri_model::Model>,
             "capture-model",
         ),
-        SubagentRunMode::Sync,
-        None,
+        Some(Arc::new(TaskManager::new())),
         None,
     );
     let resumed = SessionFactory::resume_subagent(Some(&parent), resume)
         .await
-        .unwrap();
+        .expect("the resume subagent fixture result is required for this assertion");
+    resumed_model.wait_for_requests(1).await;
     assert!(resumed_model.last_system().ends_with(&format!(
         "<env>\nWorking directory: /frozen-child-env\nSession ID: {}\n</env>",
         first.child_thread_id
@@ -435,7 +512,7 @@ async fn child_external_instructions_are_wire_only_across_resume_and_nested_fork
         .transcript()
         .read()
         .visible_model_messages()
-        .unwrap()
+        .expect("the visible model messages fixture result is required for this assertion")
         .iter()
         .any(|m| m.content().contains("EXTERNAL_ONLY_SENTINEL")));
     let grandchild_model = CaptureModel::new("grandchild done");
@@ -444,7 +521,7 @@ async fn child_external_instructions_are_wire_only_across_resume_and_nested_fork
         .transcript()
         .read()
         .visible_model_messages()
-        .unwrap();
+        .expect("the visible model messages fixture result is required for this assertion");
     let mut grandchild = child_config(
         store,
         Arc::clone(&grandchild_model),
@@ -458,7 +535,8 @@ async fn child_external_instructions_are_wire_only_across_resume_and_nested_fork
     grandchild.system_prompt = Some("GRANDCHILD_IDENTITY_SENTINEL".into());
     let second = SessionFactory::spawn_subagent(Some(&resumed.session), grandchild)
         .await
-        .unwrap();
+        .expect("the spawn subagent fixture result is required for this assertion");
+    grandchild_model.wait_for_requests(1).await;
     assert!(grandchild_model.last_system().ends_with(&format!(
         "<env>\nWorking directory: /frozen-child-env\nSession ID: {}\n</env>",
         second.child_thread_id
@@ -478,7 +556,7 @@ async fn child_external_instructions_are_wire_only_across_resume_and_nested_fork
         .transcript()
         .read()
         .visible_model_messages()
-        .unwrap()
+        .expect("the visible model messages fixture result is required for this assertion")
         .iter()
         .any(|m| m.content().contains("EXTERNAL_ONLY_SENTINEL")));
 }
@@ -499,10 +577,10 @@ async fn defined_child_request_carries_identity_and_contributions_exactly_once()
         false,
         &cwd,
     );
-    let spawned = SessionFactory::spawn_subagent(Some(&parent), config)
+    let _spawned = SessionFactory::spawn_subagent(Some(&parent), config)
         .await
-        .unwrap();
-    assert!(!spawned.interrupted);
+        .expect("the spawn subagent fixture result is required for this assertion");
+    model.wait_for_requests(1).await;
 
     let system = model.last_system();
     let expected = format!(
@@ -552,10 +630,10 @@ async fn fork_child_request_keeps_single_identity_with_parent_ancestors() {
         true,
         &cwd,
     );
-    let spawned = SessionFactory::spawn_subagent(Some(&parent), config)
+    let _spawned = SessionFactory::spawn_subagent(Some(&parent), config)
         .await
-        .unwrap();
-    assert!(!spawned.interrupted);
+        .expect("the spawn subagent fixture result is required for this assertion");
+    model.wait_for_requests(1).await;
 
     let system = model.last_system();
     assert_eq!(
@@ -598,29 +676,30 @@ async fn resumed_child_request_reads_persisted_identity_and_fresh_contributions(
     );
     let spawned = SessionFactory::spawn_subagent(Some(&parent), config)
         .await
-        .unwrap();
+        .expect("the spawn subagent fixture result is required for this assertion");
+    first.wait_for_requests(1).await;
+    crate::session::subagent::tests::wait_status_settled(&*store, &spawned.child_thread_id).await;
 
     let second = CaptureModel::new("resumed run");
     let resume_contribution = Arc::new(Mutex::new(None));
     // 夹具在 resume 路径内部完成委派登记（与生产“当前可信 invocation”同源）。
-    let mut resume = resume_config_with(
+    let mut resume = crate::session::subagent::tests::resume_config_with(
         Arc::clone(&store),
         spawned.child_thread_id.clone(),
         SubagentLlmSource::model(
             Arc::clone(&second) as Arc<dyn peri_model::Model>,
             "capture-model",
         ),
-        SubagentRunMode::Sync,
-        None,
+        Some(Arc::new(TaskManager::new())),
         None,
     );
     resume.chain_assembler = Arc::new(ContributionAssembler {
         contribution: Arc::clone(&resume_contribution),
     });
-    let resumed = SessionFactory::resume_subagent(Some(&parent), resume)
+    let _resumed = SessionFactory::resume_subagent(Some(&parent), resume)
         .await
-        .unwrap();
-    assert!(!resumed.interrupted);
+        .expect("the resume subagent fixture result is required for this assertion");
+    second.wait_for_requests(1).await;
 
     let system = second.last_system();
     assert_eq!(
@@ -654,7 +733,7 @@ async fn nested_fork_request_excludes_parent_child_identity() {
         Some(&root),
         child_config(
             Arc::clone(&store),
-            first_model,
+            Arc::clone(&first_model),
             Arc::new(ContributionAssembler {
                 contribution: Arc::new(Mutex::new(None)),
             }),
@@ -663,13 +742,14 @@ async fn nested_fork_request_excludes_parent_child_identity() {
         ),
     )
     .await
-    .unwrap();
+    .expect("the spawn subagent fixture result is required for this assertion");
+    first_model.wait_for_requests(1).await;
     let inherited = first
         .session
         .transcript()
         .read()
         .visible_model_messages()
-        .unwrap();
+        .expect("the visible model messages fixture result is required for this assertion");
     assert!(inherited.iter().any(|message| {
         matches!(message, BaseMessage::System { .. })
             && message.content() == "CHILD_IDENTITY_SENTINEL"
@@ -686,10 +766,10 @@ async fn nested_fork_request_excludes_parent_child_identity() {
     );
     config.parent_messages = inherited;
     config.system_prompt = Some("GRANDCHILD_IDENTITY_SENTINEL".into());
-    let second = SessionFactory::spawn_subagent(Some(&first.session), config)
+    let _second = SessionFactory::spawn_subagent(Some(&first.session), config)
         .await
-        .unwrap();
-    assert!(!second.interrupted);
+        .expect("the spawn subagent fixture result is required for this assertion");
+    second_model.wait_for_requests(1).await;
     let system = second_model.last_system();
     assert_eq!(
         system,
@@ -698,10 +778,13 @@ async fn nested_fork_request_excludes_parent_child_identity() {
             peri_model::prompt_cache::SYSTEM_PROMPT_DYNAMIC_BOUNDARY
         )
     );
-    let request = second_model.requests.lock().unwrap();
+    let request = second_model
+        .requests
+        .lock()
+        .expect("second model requests mutex must remain unpoisoned throughout the test");
     let systems: Vec<_> = request
         .last()
-        .unwrap()
+        .expect("request last fixture must contain the expected element")
         .messages
         .iter()
         .filter(|message| matches!(message, peri_model::ModelMessage::System { .. }))
@@ -733,18 +816,21 @@ async fn fork_from_root_preserves_own_system_even_when_it_matches_frozen_prompt(
         &cwd,
     );
     config.parent_messages = vec![root_system, BaseMessage::human("root task")];
-    let spawned = SessionFactory::spawn_subagent(Some(&root), config)
+    let _spawned = SessionFactory::spawn_subagent(Some(&root), config)
         .await
-        .unwrap();
-    assert!(!spawned.interrupted);
+        .expect("the spawn subagent fixture result is required for this assertion");
+    model.wait_for_requests(1).await;
     let system = model.last_system();
     assert!(system.contains("ROOT_SYSTEM_SENTINEL"));
     assert!(system.contains("CHILD_IDENTITY_SENTINEL"));
-    let request = model.requests.lock().unwrap();
+    let request = model
+        .requests
+        .lock()
+        .expect("model requests mutex must remain unpoisoned throughout the test");
     assert_eq!(
         request
             .last()
-            .unwrap()
+            .expect("request last fixture must contain the expected element")
             .messages
             .iter()
             .filter(|message| matches!(message, peri_model::ModelMessage::System { .. }))
@@ -770,21 +856,29 @@ async fn background_child_request_carries_single_identity_and_contributions() {
         false,
         &cwd,
     );
-    config.run_mode = SubagentRunMode::Background;
-    config.task_manager = Some(Arc::new(crate::agent::async_tasks::TaskManager::new()));
     let (bg_tx, _bg_rx) = tokio::sync::mpsc::unbounded_channel();
     config.bg_event_sender = Some(bg_tx);
     let spawned = SessionFactory::spawn_subagent(Some(&parent), config)
         .await
-        .unwrap();
-    assert!(spawned.task_id.is_some());
+        .expect("the spawn subagent fixture result is required for this assertion");
+    assert!(spawned.task_id.starts_with("bg-"));
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while model.requests.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+    while model
+        .requests
+        .lock()
+        .expect("model requests mutex must remain unpoisoned throughout the test")
+        .is_empty()
+        && std::time::Instant::now() < deadline
+    {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(
-        !model.requests.lock().unwrap().is_empty(),
+        !model
+            .requests
+            .lock()
+            .expect("model requests mutex must remain unpoisoned throughout the test")
+            .is_empty(),
         "后台子会话必须发出模型请求"
     );
     let system = model.last_system();

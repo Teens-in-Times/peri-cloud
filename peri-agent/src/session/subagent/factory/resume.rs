@@ -1,22 +1,17 @@
 //! Existing child-thread claim, history reconstruction and pre-run rollback.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use peri_acp_types::store::PersistedPayload;
 
-use super::super::background::spawn_background_subagent;
-use super::super::run_sync::{
-    handoff_event_handler, new_sync_task_id, run_sync_subagent, run_sync_with_registered_handoff,
-    SyncCompletion,
-};
-use super::super::types::{
-    ChildRunOutcome, SubagentFailure, SubagentResumeConfig, SubagentRunMode, SubagentSpawned,
-};
-use super::super::v2_bridge::agent_id_from_child_thread;
-use super::claim::ResumeClaim;
-use super::context::{build_subagent_session_v2, derive_cancel_token, inherited_frozen_context};
 use crate::messages::BaseMessage;
 use crate::session::queue::{MessageKind, MessageSource, QueuedMessage};
+
+use crate::session::subagent::factory::claim::ResumeClaim;
+
+use crate::session::subagent::types::{SubagentResumeConfig, SubagentSpawned};
+
 use crate::session::Session;
 
 // ─── 恢复（统一入口 resume_subagent） ───────────────────────────────────────
@@ -43,13 +38,13 @@ use crate::session::Session;
 ///   旧 transcript 已含首轮注入内容，重复注入会重复）
 /// - prompt 入队：`Some(p)` 原样追加（不套 fork directive）；`None` 注入隐式
 ///   continue 常量（issue 决策 9）
-/// - run mode 由本次调用决定（issue 决策 8）：Sync → `run_sync_subagent`；
-///   Background → 新 task_id + `spawn_background_subagent`
+/// - 执行恒为后台（Issue #450）：新 task_id + `spawn_background_subagent`
 ///
 /// 重建/装配失败（load_messages 失败）时回滚 status 至原值（R-M1），防 thread
-/// 永久停留 active（R-M4 崩溃遗留的镜像问题）。执行开始后的失败走
-/// `run_sync_subagent` / bg 各自的收尾路径（error / cancelled），不回滚。
-/// 准备阶段调用被 drop 时，由 claim worker 在 active 写完成后异步回滚。
+/// 永久停留 active（R-M4 崩溃遗留的镜像问题）。执行开始后的失败走后台收尾路径
+/// （error / cancelled），不回滚。
+/// 准备阶段调用被 drop 时，由 claim worker 在 active 写完成后异步回滚，并撤回
+/// 本次已登记的 prompt；两条补偿同属一个 owned worker，不会被调用方取消拆开。
 pub(super) async fn resume_subagent_impl(
     parent: Option<&Arc<Session>>,
     config: SubagentResumeConfig,
@@ -62,7 +57,6 @@ pub(super) async fn resume_subagent_impl(
         thread_id,
         prompt,
         agent_name: agent_name_cfg,
-        run_mode,
         max_iterations,
         llm,
         chain_assembler,
@@ -73,7 +67,7 @@ pub(super) async fn resume_subagent_impl(
         context_budget,
         compact_llm,
         session_resources,
-        event_handler,
+        event_handler: _,
         bg_event_sender,
         task_manager,
         on_bg_complete,
@@ -109,13 +103,13 @@ pub(super) async fn resume_subagent_impl(
             ) =>
         {
             // 先判格式再判存在：非 UUID 不是「不存在」，与 `validate_thread` 同判据。
-            super::validate_thread_id_format(&thread_id)?;
+            crate::session::subagent::factory::validate_thread_id_format(&thread_id)?;
             return Err(format!("resume_subagent: thread not found: {thread_id}").into());
         }
         Err(error) => return Err(error.into()),
     };
     if binding.is_some() {
-        let parent_id = super::spawn::parent_thread_id_of(parent)
+        let parent_id = crate::session::subagent::factory::spawn::parent_thread_id_of(parent)
             .ok_or("bound child resume requires its owning parent session")?;
         let parent_binding = match session_resources.load_session_binding(&parent_id).await? {
             peri_acp_types::session_resources::BindingState::Bound(binding) => binding,
@@ -124,8 +118,13 @@ pub(super) async fn resume_subagent_impl(
         if binding.as_ref() != Some(&parent_binding) {
             return Err(peri_acp_types::workspace::WorkspaceError::ExecutionBindingMismatch.into());
         }
-        if super::execution_root(session_resources.as_ref(), &thread_id).await?
-            != super::execution_root(session_resources.as_ref(), &parent_id).await?
+        if crate::session::subagent::factory::execution_root(session_resources.as_ref(), &thread_id)
+            .await?
+            != crate::session::subagent::factory::execution_root(
+                session_resources.as_ref(),
+                &parent_id,
+            )
+            .await?
         {
             return Err("bound subagent belongs to another root session execution owner".into());
         }
@@ -148,7 +147,9 @@ pub(super) async fn resume_subagent_impl(
             )
         })
         .transpose()?;
-    let cluster_root = super::execution_root(session_resources.as_ref(), &thread_id).await?;
+    let cluster_root =
+        crate::session::subagent::factory::execution_root(session_resources.as_ref(), &thread_id)
+            .await?;
     let (meta, mut claim) = ResumeClaim::acquire(
         Arc::clone(&session_resources),
         thread_id.clone(),
@@ -157,16 +158,16 @@ pub(super) async fn resume_subagent_impl(
     )
     .await?;
 
-    let completion_target = super::completion_target(
+    let completion_target = crate::session::subagent::factory::completion_target(
         parent,
         on_bg_complete.as_ref(),
-        super::spawn::parent_thread_id_of(parent),
+        crate::session::subagent::factory::spawn::parent_thread_id_of(parent),
     );
     // The claim remains owned across history I/O and session construction. A
     // dropped caller closes its decision channel, leaving ordered rollback to
     // the worker that performed the active write.
     let restored = async {
-        super::persist_completion_target(
+        crate::session::subagent::factory::persist_completion_target(
             session_resources.as_ref(),
             &thread_id,
             completion_target.as_deref(),
@@ -245,22 +246,45 @@ pub(super) async fn resume_subagent_impl(
     let identity = (meta.hidden && meta.parent_thread_id.is_some())
         .then(|| loaded.first().and_then(PersistedPayload::as_message))
         .flatten()
-        .and_then(|message| {
-            matches!(message, BaseMessage::System { .. }).then(|| message.content().to_owned())
-        });
-    let frozen = inherited_frozen_context(
+        .filter(|message| matches!(message, BaseMessage::System { .. }));
+    let persisted_identity = identity.map(BaseMessage::id);
+    let (effective_identity, tool_filter) = match identity {
+        Some(original) => match chain_assembler.project_resumed_identity(
+            &original.content(),
+            &cwd,
+            original.child_skill_ceiling(),
+            parent.map(|session| &session.store().frozen.meta_harness),
+            tool_filter,
+        ) {
+            Ok((projected, filter)) => (Some(projected), filter),
+            Err(detail) => {
+                let rollback = claim.rollback().await;
+                let suffix = rollback
+                    .err()
+                    .map(|error| format!("; {error}"))
+                    .unwrap_or_default();
+                return Err(format!("resume_subagent: {detail}{suffix}").into());
+            }
+        },
+        None => (None, tool_filter),
+    };
+    let frozen = crate::session::subagent::factory::context::inherited_frozen_context(
         parent,
-        identity.as_deref(),
-        &frozen_claude_md,
-        &frozen_skill_summary,
-        &frozen_date,
+        effective_identity.as_deref(),
+        frozen_claude_md.as_deref(),
+        frozen_skill_summary.as_deref(),
+        frozen_date.as_deref(),
     );
 
     // 4. cancel token：Cascade = 父 cancel 传播（parent 优先，回退 config 注入的
     //    父 token；均缺失时新建——与 spawn 的 :466-472 完全对齐，review low-2），
     //    Independent = 恒新建（忽略 config 注入的 token——复用会让父 cancel
     //    波及 Independent 子任务，与 spawn :471 对齐，review low-1）
-    let cancel_token = derive_cancel_token(parent, cancel_token_cfg, meta.cancel_policy);
+    let cancel_token = crate::session::subagent::factory::context::derive_cancel_token(
+        parent,
+        cancel_token_cfg,
+        meta.cancel_policy,
+    );
 
     // 5. agent_name：config 优先，回退 meta.title，最后兜底 "subagent"
     let agent_name = agent_name_cfg
@@ -270,56 +294,39 @@ pub(super) async fn resume_subagent_impl(
     // 6. 重建 session（thread_id 固定 = config.thread_id；ancestor/own 显式分区，
     //    两区 flags 均恢复后绑定持久化——helper 内）
     //    不注入 parent_messages / identity System / skill_names（F4 / R-H1）
-    let (session, mut v2_ctx) = build_subagent_session_v2(
-        cwd.clone(),
-        frozen,
-        cancel_token.clone(),
-        thread_id.clone(),
-        parent.and_then(|session| session.subagent_host()),
-        Some(Arc::clone(&session_resources)),
-        inherited,
-        loaded,
-        llm,
-        chain_assembler,
-        tools,
-        tool_filter,
-        parent
-            .and_then(|session| session.subagent_host())
-            .and_then(|host| host.session_mcp_catalog.clone()),
-        Vec::new(), // skill_names 恒空（R-H1：恢复不重复注入 SkillPreload）
-        frozen_claude_md,
-        frozen_claude_local_md_cfg,
-        frozen_skill_summary,
-        tool_invocation_resolver,
-        compact_config,
-        context_budget,
-        compact_llm,
-        Some(agent_id_from_child_thread(&thread_id)),
-        identity.is_some(),
-    )
-    .await?;
-    let parent_thread = super::spawn::parent_thread_id_of(parent);
+    let (session, mut v2_ctx) =
+        crate::session::subagent::factory::context::build_subagent_session_v2(
+            cwd.clone(),
+            frozen,
+            cancel_token.clone(),
+            thread_id.clone(),
+            parent.and_then(|session| session.subagent_host()),
+            Some(Arc::clone(&session_resources)),
+            inherited,
+            loaded,
+            llm,
+            chain_assembler,
+            tools,
+            tool_filter,
+            parent
+                .and_then(|session| session.subagent_host())
+                .and_then(|host| host.session_mcp_catalog.clone()),
+            Vec::new(), // skill_names 恒空（R-H1：恢复不重复注入 SkillPreload）
+            frozen_claude_md,
+            frozen_claude_local_md_cfg,
+            frozen_skill_summary,
+            tool_invocation_resolver,
+            compact_config,
+            context_budget,
+            compact_llm,
+            Some(crate::session::subagent::v2_bridge::agent_id_from_child_thread(&thread_id)),
+            persisted_identity,
+        )
+        .await?;
+    let parent_thread = crate::session::subagent::factory::spawn::parent_thread_id_of(parent);
     v2_ctx.context.session.model_parent =
         crate::agent::model_call::capture_tool_parent(parent_tool_call_id.as_deref())
             .filter(|parent| Some(parent.owner.as_str()) == parent_thread.as_deref());
-
-    // Assembly is synchronous but can observe cancellation from another task
-    // (or a callback). Sync callers still receive the established interrupted
-    // result with this thread/session identity, without publishing Start.
-    // Background must pass through real registration and asynchronous completion;
-    // returning a task-less success here would violate its launch contract.
-    if matches!(run_mode, SubagentRunMode::Sync) && cancel_token.is_cancelled() {
-        claim.rollback().await?;
-        return Ok(SubagentSpawned {
-            child_thread_id: thread_id,
-            task_id: None,
-            session,
-            cancel_token,
-            interrupted: true,
-            pending_tasks: Vec::new(),
-            handoff: None,
-        });
-    }
 
     // 7. prompt 入队：Some(p) 原样追加（不套 fork directive——恢复目标仍是原
     //    任务，直接追加指令）；None 注入隐式 continue 常量（issue 决策 9）
@@ -329,177 +336,98 @@ pub(super) async fn resume_subagent_impl(
         MessageSource::UserInput,
         BaseMessage::human(prompt_text.clone()),
     );
-    if let Err(error) = v2_ctx
-        .context
-        .session
-        .queue
-        .enqueue_sent(prompt_message)
+    // 注册失败时要撤回的就是这一行；稳定 ID 必须在入队移动前取出。
+    let prompt_message_id = prompt_message.id();
+    let prompt_queue = v2_ctx.context.session.queue.clone();
+    // 入队写必须活过调用方 future：`DetachedEnqueue` 随写入方 drop，而存储提交可能
+    // 在取消之后才落库，撤回若只看队列会漏掉这一行。写由独立任务持有，认领 worker
+    // 在撤回前等它结清（见 `ResumeClaim::track_prompt`）。
+    let (enqueue_tx, enqueue_rx) = tokio::sync::oneshot::channel();
+    let enqueue_queue = prompt_queue.clone();
+    let enqueue = tokio::spawn(async move {
+        let result = enqueue_queue
+            .enqueue_sent(prompt_message)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = enqueue_tx.send(result.clone());
+    });
+    claim.track_prompt(prompt_queue, prompt_message_id, enqueue);
+    let enqueued = enqueue_rx
         .await
-    {
-        // 没有接纳到初始指令的恢复不得继续跑：先撤销本次认领，再把失败交给调用方。
+        .unwrap_or_else(|_| Err("enqueue task stopped before reporting".to_string()));
+    if let Err(error) = enqueued {
+        // 没有接纳到初始指令的恢复不得继续跑：先撤销本次认领与 prompt，再把失败交给调用方。
         let detail = format!("resume prompt enqueue failed: {error}");
-        if let Err(rollback) = claim.rollback().await {
-            return Err(format!("{detail}; resume claim rollback failed: {rollback}").into());
-        }
-        return Err(detail.into());
+        let suffix = rollback_resume_claim(claim).await;
+        return Err(format!("{detail}{suffix}").into());
     }
 
-    // 8. 执行（run mode 由本次调用决定，issue 决策 8）
+    // 8. 执行（恒后台，Issue #450）
     // 认领已写入 Active；准备门在进入执行前释放，避免与本次 run 的
     // 执行 permit 互斥（并发的第二次 resume 由 claim/status 拒绝）。
     drop(preparation);
     // 终态结果投递到父会话的 MQ（无父 thread 时不做跨会话投递）。
-    let terminal_route =
-        completion_target.map(
-            |target| super::super::terminal_settlement::TerminalMqRoute {
-                store: Arc::clone(&session_resources),
-                target: peri_acp_types::thread::ThreadId::from(target.as_str()),
-                mailbox: parent
-                    .filter(|_| super::spawn::parent_thread_id_of(parent).as_ref() == Some(&target))
-                    .map(|parent| parent.async_result_mailbox()),
-            },
-        );
-    match run_mode {
-        SubagentRunMode::Sync => {
-            let run_thread_id = thread_id.clone();
-            let run_agent_name = agent_name.clone();
-            let run_cwd = cwd.clone();
-            let run_session = session.clone();
-            let sync_task_id = new_sync_task_id();
-            let completion = run_sync_with_registered_handoff(
-                session.clone(),
-                thread_id.clone(),
-                agent_name.clone(),
-                parent
-                    .and_then(|session| session.subagent_host())
-                    .and_then(|host| host.task_manager.clone()),
-                Some(sync_task_id.clone()),
-                super::completion_delivery(parent, on_bg_complete),
-                terminal_route,
-                move |handoff_start, handed_off| async move {
-                    run_sync_subagent(
-                        &run_thread_id,
-                        &run_agent_name,
-                        &run_cwd,
-                        max_iterations,
-                        handoff_event_handler(event_handler, bg_event_sender, handed_off),
-                        on_subagent_start,
-                        on_subagent_stop,
-                        Some(session_resources),
-                        register_runtime,
-                        deregister_runtime,
-                        langfuse_bridge,
-                        parent_agent_id,
-                        parent_tool_call_id,
-                        v2_ctx,
-                        run_session,
-                        Some(claim),
-                        Some(handoff_start),
-                    )
-                    .await
-                },
-            )
-            .await?;
-            let (interrupted, pending_tasks, pending_task_id, handoff) = match completion {
-                SyncCompletion::Finished(ChildRunOutcome::Settled) => {
-                    (false, Vec::new(), None, None)
-                }
-                SyncCompletion::Finished(ChildRunOutcome::Interrupted) => {
-                    (true, Vec::new(), None, None)
-                }
-                SyncCompletion::Finished(ChildRunOutcome::HandedOff { receipt }) => {
-                    let tasks = receipt
-                        .tasks
-                        .iter()
-                        .map(|task| task.task_id.clone())
-                        .collect();
-                    (false, tasks, None, Some(receipt))
-                }
-                SyncCompletion::Finished(ChildRunOutcome::Failed { error, .. }) => {
-                    return Err(Box::new(SubagentFailure::new(
-                        thread_id.clone(),
-                        agent_name.clone(),
-                        error,
-                    )))
-                }
-                SyncCompletion::Finished(ChildRunOutcome::HandoffFailed { cause, failure }) => {
-                    return Err(Box::new(SubagentFailure::handoff_failed(
-                        thread_id.clone(),
-                        agent_name.clone(),
-                        cause,
-                        &failure,
-                    )))
-                }
-                SyncCompletion::Pending(pending) => (
-                    false,
-                    pending.pending_tasks,
-                    Some(sync_task_id),
-                    Some(pending.receipt),
-                ),
-            };
-            Ok(SubagentSpawned {
-                child_thread_id: thread_id,
-                task_id: pending_task_id,
-                session,
-                cancel_token,
-                interrupted,
-                pending_tasks,
-                handoff,
-            })
+    let terminal_route = completion_target.map(|target| {
+        crate::session::subagent::terminal_settlement::TerminalMqRoute {
+            store: Arc::clone(&session_resources),
+            target: peri_acp_types::thread::ThreadId::from(target.as_str()),
         }
-        SubagentRunMode::Background => {
-            // slice 5：后台恢复——生成新 task_id、TaskManager 注册（参数与 spawn
-            // 调用点对齐；prompt 传实际注入文本——用户 prompt 或 continue 常量，
-            // 仅用于 prompt_summary 展示，R2-LOW-3）
-            let task_id = format!("bg-{}", uuid::Uuid::now_v7());
-            match spawn_background_subagent(
-                task_id.clone(),
-                thread_id.clone(),
-                agent_name.clone(),
-                prompt_text,
-                cwd,
-                max_iterations,
-                bg_event_sender,
-                task_manager,
-                super::completion_delivery(parent, on_bg_complete),
-                langfuse_bridge,
-                Some(Arc::clone(&session_resources)),
-                terminal_route,
-                deregister_runtime,
-                on_subagent_start,
-                on_subagent_stop,
-                register_runtime,
-                parent_agent_id,
-                parent_tool_call_id,
-                cancel_token.clone(),
-                v2_ctx,
-                Some(&mut claim),
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    // review MEDIUM-1 回滚：注册失败（task_manager 缺失 /
-                    // register_with_kind 撞 per-kind 上限）时任务未执行——status
-                    // 回滚至原值，防 thread 永久停留 active（R-M1 执行前失败回滚
-                    // 契约，与 load_messages 失败回滚同款）；错误携带 thread_id
-                    let rollback = claim.rollback().await;
-                    let suffix = rollback.err().map(|e| format!("; {e}")).unwrap_or_default();
-                    return Err(
-                        format!("resume_subagent: thread {}: {}{}", thread_id, e, suffix).into(),
-                    );
-                }
-            }
-            Ok(SubagentSpawned {
-                child_thread_id: thread_id,
-                task_id: Some(task_id),
-                session,
-                cancel_token,
-                interrupted: false,
-                pending_tasks: Vec::new(),
-                handoff: None,
-            })
+    });
+    // slice 5：后台恢复——生成新 task_id、TaskManager 注册（参数与 spawn
+    // 调用点对齐；prompt 传实际注入文本——用户 prompt 或 continue 常量，
+    // 仅用于 prompt_summary 展示，R2-LOW-3）
+    let task_id = format!("bg-{}", uuid::Uuid::now_v7());
+    match crate::session::subagent::background::spawn_background_subagent(
+        task_id.clone(),
+        thread_id.clone(),
+        agent_name.clone(),
+        prompt_text,
+        cwd,
+        max_iterations,
+        bg_event_sender,
+        task_manager,
+        crate::session::subagent::factory::completion_delivery(parent, on_bg_complete),
+        langfuse_bridge,
+        Some(Arc::clone(&session_resources)),
+        terminal_route,
+        deregister_runtime,
+        on_subagent_start,
+        on_subagent_stop,
+        register_runtime,
+        parent_agent_id,
+        parent_tool_call_id,
+        cancel_token.clone(),
+        v2_ctx,
+        Some(&mut claim),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(e) => {
+            // 失败补偿由认领 worker 持有：先撤回本次 prompt，再回滚认领。调用方
+            // 取消只丢弃等待，不会留下「状态已回滚、prompt 仍在队列」的窗口。
+            let suffix = rollback_resume_claim(claim).await;
+            return Err(format!("resume_subagent: thread {}: {}{}", thread_id, e, suffix).into());
         }
+    }
+    Ok(SubagentSpawned {
+        child_thread_id: thread_id,
+        task_id,
+        session,
+        cancel_token,
+    })
+}
+
+/// 失败补偿的调用方等待上限；超时后 owned worker 继续持有认领并完成撤回与回滚。
+const RESUME_COMPENSATION_WAIT: Duration = Duration::from_secs(10);
+
+/// 有界等待认领 worker 结清；超时只影响调用方报告，不取消 worker。
+async fn rollback_resume_claim(claim: ResumeClaim) -> String {
+    match tokio::time::timeout(RESUME_COMPENSATION_WAIT, claim.rollback()).await {
+        Ok(Ok(())) => String::new(),
+        Ok(Err(rollback)) => format!("; {rollback}"),
+        // 补偿仍由 owned worker 持有认领并在后台重试；调用方只报告未结清。
+        Err(_) => "; resume compensation is still running".to_string(),
     }
 }
 

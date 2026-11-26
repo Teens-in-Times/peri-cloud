@@ -2,14 +2,13 @@
 //!
 //! 语义（issue 决策）：主 agent 凭中断/错误/bg 通知文本携带的 `child_thread_id`
 //! 恢复被中断 subagent——从磁盘 thread 恢复现场继续执行，不创建新 subagent。
-//! - 工具集：`meta.title == "fork"` → 父工具集 clone（execute_fork.rs 同款，无过滤）；
+//! - 工具集：`meta.title == "fork"` → 父工具集 clone（无过滤）；
 //!   否则 `load_agent_def(title)` 重新应用 tools/disallowed 过滤（权限漂移防护，
 //!   issue 决策 11）
 //! - skill_names 恒不注入（R-H1：旧 transcript 已含首轮 SkillPreload 内容，
 //!   重复注入会随多次恢复无界增长；`SubagentResumeConfig` 无该字段，结构性禁止）
 //! - 不传 system_prompt（F4：identity System 已在旧 transcript 中，重复注入会重复）
-//! - run mode 由本次调用决定（issue 决策 8）：`run_in_background: true` →
-//!   Background（新 task_id + TaskManager 注册）
+//! - 执行：非 active 恢复恒为后台（Issue #450：没有同步唤醒路径）。
 //!
 //! L3：校验/重建/运行/收尾统一经
 //! `peri_agent::session::subagent::resume_subagent`（Agent 层统一入口），
@@ -18,9 +17,6 @@
 use std::sync::Arc;
 
 use peri_acp_types::session_resources::SessionResourceErrorKind;
-use peri_agent::session::subagent::{
-    extract_last_ai_text, format_subagent_result, SubagentRunMode,
-};
 use peri_agent::tools::{BaseTool, EffectiveToolError, EffectiveToolErrorCode};
 
 fn preflight_rejected(
@@ -116,7 +112,6 @@ impl super::SubAgentTool {
         thread_id: String,
         prompt: Option<String>,
         cwd: String,
-        run_in_background: bool,
         parent_tool_call_id: Option<String>,
         approval_owner: Option<peri_agent::interaction::TrustedInteractionOwner>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -134,18 +129,6 @@ impl super::SubAgentTool {
             &thread_id, "resources", EffectiveToolErrorCode::ApplicationFailed,
             "resume_subagent: session resources required (resume_thread_id needs a persisted thread)",
         ))?;
-
-        // 双保险（review MEDIUM-1）：bg resume 在 agent 层注册失败会回滚 status，
-        // 但无 task_manager 时先在此预检，避免「置 active → 注册失败 → 回滚」的
-        // 无效往返（execute_bg.rs:29-32 同款文本）
-        if run_in_background && host.task_manager.is_none() {
-            return Err(preflight_rejected(
-                &thread_id,
-                "background_manager",
-                EffectiveToolErrorCode::ApplicationFailed,
-                "Background tasks not available: no task manager configured",
-            ));
-        }
 
         // 0. thread_id 格式校验（review low-2）：FilesystemThreadStore 按 id 拼路径，
         //    非 UUID 在 load_meta 之前统一拒绝（agent 层同文本，双保险）
@@ -192,8 +175,19 @@ impl super::SubAgentTool {
         }
         let title = meta.title.clone().unwrap_or_default();
 
+        // v5 起 resume 恒后台：身份 / active 预检通过后再要求后台能力，
+        // 避免错误分类被能力缺失掩盖（无效 id 仍是 InvalidInput）。
+        if host.task_manager.is_none() {
+            return Err(preflight_rejected(
+                &thread_id,
+                "background_manager",
+                EffectiveToolErrorCode::ApplicationFailed,
+                "Background tasks not available: no task manager configured",
+            ));
+        }
+
         // 2. 按 title 恢复工具集 / LLM / 迭代上限：
-        //    - "fork" → 父工具集 clone（execute_fork.rs 同款，无过滤）+
+        //    - "fork" → 父工具集 clone，沿用 fork spawn 的子链继承策略 +
         //      DEFAULT_SUBAGENT_MAX_ITERATIONS
         //    - 其他 → load_agent_def(title) 重新应用过滤（tools/disallowed，
         //      权限漂移防护）+ agent_def 声明的 max_turns
@@ -204,7 +198,7 @@ impl super::SubAgentTool {
             (
                 llm,
                 tools,
-                Arc::new(|_: &dyn BaseTool| true) as peri_agent::session::tool_catalog::ToolFilter,
+                crate::subagent::fork::child_inheritance_filter(),
                 crate::subagent::DEFAULT_SUBAGENT_MAX_ITERATIONS,
             )
         } else {
@@ -251,11 +245,6 @@ impl super::SubAgentTool {
         let config = self.resume_config_base(
             thread_id.clone(),
             prompt,
-            if run_in_background {
-                SubagentRunMode::Background
-            } else {
-                SubagentRunMode::Sync
-            },
             max_iterations,
             llm,
             tools,
@@ -268,41 +257,15 @@ impl super::SubAgentTool {
         // 4. 统一恢复入口（Agent 层完成校验 / 重建 / 执行 / 收尾）
         let spawned = self.resume(config).await?;
 
-        if let Some(pending) = spawned.pending_message() {
-            return Ok(format!("action: resume\n{pending}"));
-        }
-
-        // 5. 返回文本（见方法注释格式约定）
-        if let Some(task_id) = &spawned.task_id {
-            // 与 execute_bg.rs 同形：新 task 身份 + 可直接复用的线程身份规范句
-            // （与 bg 完成通知逐字同形），不保留无指引的 `(thread: …)` 标注。
-            return Ok(format!(
-                "action: resume\nBackground task {} started. You will be notified when it completes. \
-                 You can continue with other tasks in the meantime.\n\
-                 child_thread_id: {} (resume with Agent(resume_thread_id: {}))\n\
-                 While active, include a non-empty prompt to send supplemental instructions; \
-                 omit prompt only when resuming a non-active thread.",
-                task_id, spawned.child_thread_id, spawned.child_thread_id
-            ));
-        }
-
-        if spawned.interrupted {
-            return Ok(format!(
-                "child_thread_id: {}\naction: resume\nSub-agent execution was interrupted, resume with Agent(resume_thread_id: {})",
-                spawned.child_thread_id, spawned.child_thread_id
-            ));
-        }
-
+        // 5. 返回文本（见方法注释格式约定）：恢复恒为后台，无条件返回任务回执。
+        //    与 execute_bg.rs 同形：新 task 身份 + 可直接复用的线程身份规范句。
         Ok(format!(
-            "child_thread_id: {}\naction: resume\n{}",
-            spawned.child_thread_id,
-            format_subagent_result(&peri_agent::agent::react::AgentOutput {
-                text: extract_last_ai_text(&spawned.session),
-                steps: 0,
-                tool_calls: Vec::new(),
-                stop_reason: None,
-                block_continue: None,
-            })
+            "action: resume\nBackground task {} started. You will be notified when it completes. \
+             You can continue with other tasks in the meantime.\n\
+             child_thread_id: {} (resume with Agent(resume_thread_id: {}))\n\
+             While active, include a non-empty prompt to send supplemental instructions; \
+             omit prompt only when resuming a non-active thread.",
+            spawned.task_id, spawned.child_thread_id, spawned.child_thread_id
         ))
     }
 }

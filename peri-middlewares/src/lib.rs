@@ -87,41 +87,11 @@ pub use subagent::{
     SubAgentTool,
 };
 pub use tool_search::{
-    resolve_effective_tool_name, ExecuteExtraToolResolver, ToolSearchMiddleware,
-    EXECUTE_EXTRA_TOOL_NAME, EXTRA_TOOL_NAME_FIELD, EXTRA_TOOL_PARAMS_FIELD,
-    SEARCH_EXTRA_TOOLS_NAME,
+    parse_proxy_call, resolve_effective_tool_name, ExecuteExtraToolResolver, ProxyCall,
+    ToolSearchMiddleware, EXECUTE_EXTRA_TOOL_NAME, EXTRA_TOOL_NAME_FIELD, EXTRA_TOOL_PARAMS_FIELD,
+    SEARCH_EXTRA_TOOLS_NAME, TOOL_INVOKE_NAME, TOOL_SEARCH_NAME,
 };
 pub use tools::{ArcToolWrapper, AskUserTool, BoxToolWrapper};
 
 /// Prelude - 常用类型一次性导入
-pub mod prelude {
-    // 重导出 peri-agent 核心类型
-    pub use peri_agent::prelude::*;
-
-    pub use crate::{
-        agents_md::AgentsMdMiddleware,
-        ask_user::{
-            ask_user_tool_definition, parse_ask_user, InteractionContext, QuestionItem,
-            QuestionOption,
-        },
-        attribution::GitAttributionMiddleware,
-        hitl::HumanInTheLoopMiddleware,
-        hooks::{HookMiddleware, RegisteredHook},
-        middleware::TodoMiddleware,
-        permission::{
-            default_requires_approval, AutoClassifier, BatchItem, Classification, HitlDecision,
-            LlmAutoClassifier, PermissionMiddleware, PermissionMode, SharedPermissionMode,
-        },
-        plugin::{
-            AvailablePlugin, ClaudeSettings, CommandEntry, CommandProvider, CommandSource,
-            InstallScope, InstalledPlugin, InstalledPlugins, KnownMarketplace, LoadedPlugin,
-            LoaderError, MarketplaceEntry, MarketplaceError, MarketplaceManager,
-            MarketplaceManifest, MarketplacePlugin, MarketplaceRefreshEvent, MarketplaceSource,
-            PluginAgent, PluginAuthor, PluginCommand, PluginCommandProvider, PluginConfigError,
-            PluginManifest, PluginMiddleware, PluginOption,
-        },
-        skills::{SkillMetadata, SkillsMiddleware},
-        subagent::{SkillPreloadMiddleware, SubAgentMiddleware, SubAgentTool},
-        tools::{ArcToolWrapper, AskUserTool, BoxToolWrapper, TodoItem, TodoStatus, TodoWriteTool},
-    };
-}
+pub mod prelude;

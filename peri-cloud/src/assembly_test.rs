@@ -9,6 +9,9 @@ use peri_acp_types::interaction::{
     InteractionContext, InteractionResponse, TrustedInteractionOwner, UserInteractionBroker,
 };
 use peri_acp_types::permission::{PermissionMode, SharedPermissionMode};
+use peri_acp_types::tool_proxy::{
+    EXECUTE_EXTRA_TOOL_NAME, SEARCH_EXTRA_TOOLS_NAME, TOOL_INVOKE_NAME, TOOL_SEARCH_NAME,
+};
 use peri_agent::session::factory::build_middleware_chain;
 use peri_agent::tools::BaseTool;
 use peri_middlewares::tool_search::ToolSearchIndex;
@@ -143,12 +146,11 @@ fn goal_is_a_deferred_tool_reachable_through_tool_search() {
         tools: shared,
     });
 
-    let names = tool_names(&context);
-    assert!(names.iter().any(|name| name == "goal"));
-    assert!(names.iter().any(|name| name == "SearchExtraTools"));
-    assert!(names.iter().any(|name| name == "ExecuteExtraTool"));
-
     let map = tools(&context);
+    assert!(map[TOOL_SEARCH_NAME].is_direct());
+    assert!(map[TOOL_INVOKE_NAME].is_direct());
+    assert!(!map.contains_key(SEARCH_EXTRA_TOOLS_NAME));
+    assert!(!map.contains_key(EXECUTE_EXTRA_TOOL_NAME));
     // Deferred tools are intentionally absent from the direct model catalog.
     assert!(!map["goal"].is_direct());
     assert!(map["goal"].visible_to_model());
@@ -158,8 +160,8 @@ fn goal_is_a_deferred_tool_reachable_through_tool_search() {
 fn goal_and_tool_search_are_off_without_an_account_scope() {
     let names = tool_names(&context(CloudWebTools::default()));
     assert!(!names.iter().any(|name| name == "goal"));
-    assert!(!names.iter().any(|name| name == "SearchExtraTools"));
-    assert!(!names.iter().any(|name| name == "ExecuteExtraTool"));
+    assert!(!names.iter().any(|name| name == TOOL_SEARCH_NAME));
+    assert!(!names.iter().any(|name| name == TOOL_INVOKE_NAME));
 }
 
 #[test]

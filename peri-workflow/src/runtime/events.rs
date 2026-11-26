@@ -20,8 +20,8 @@ use tokio::sync::broadcast;
 use crate::progress::ProgressObserver;
 use crate::protocol::ProgressEvent;
 
-use super::event_log::{BoundedEventLog, EventLogPage};
-use super::WorkflowResourceUpdate;
+use crate::runtime::event_log::{BoundedEventLog, EventLogPage};
+use crate::runtime::{ProgressExpirySweeper, WorkflowResourceUpdate, WorkflowTaskTable};
 
 /// run 事件类型（`ProgressEvent` 的粗分类，便于过滤与展示）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -70,12 +70,14 @@ pub struct WorkflowRunEvent {
 /// （锁序恒为「水位 → 有界日志」，无反向路径）。读取方用
 /// [`Self::committed_watermark`] 作为补读游标：水位单调不减，事件被淘汰后仍保持
 /// 已提交值；可读缺口由事件页的 `truncatedBefore` 表达。
+#[derive(Debug)]
 pub struct WorkflowRunEventLog {
     log: BoundedEventLog<WorkflowRunEvent>,
     watermarks: Mutex<HashMap<String, u64>>,
 }
 
 impl WorkflowRunEventLog {
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
             log: BoundedEventLog::new(capacity),
@@ -105,11 +107,21 @@ impl WorkflowRunEventLog {
     }
 
     /// 该 run 的已提交水位（最后一条已提交事件的 sequence；无提交时为 0）。
+    #[must_use]
     pub fn committed_watermark(&self, run_id: &str) -> u64 {
         self.watermarks.lock().get(run_id).copied().unwrap_or(0)
     }
 
+    /// 回收该 run 的已提交水位。
+    ///
+    /// 仅在 run 退役且生产者结束时调用（此后不会再有该 run 的追加）：可见 run 的
+    /// 水位不受清理影响，仍按已提交值单调（#468）。
+    pub fn forget_run(&self, run_id: &str) {
+        self.watermarks.lock().remove(run_id);
+    }
+
     /// 带谓词的过滤分页（跨 run 聚合日志的单 run 视图）。
+    #[must_use]
     pub fn page_where(
         &self,
         after: Option<u64>,
@@ -124,14 +136,23 @@ impl WorkflowRunEventLog {
 pub(crate) struct RuntimeProgressObserver {
     events: Arc<WorkflowRunEventLog>,
     updates: broadcast::Sender<WorkflowResourceUpdate>,
+    tasks: Arc<WorkflowTaskTable>,
+    expiry: Arc<ProgressExpirySweeper>,
 }
 
 impl RuntimeProgressObserver {
     pub(crate) fn new(
         events: Arc<WorkflowRunEventLog>,
         updates: broadcast::Sender<WorkflowResourceUpdate>,
+        tasks: Arc<WorkflowTaskTable>,
+        expiry: Arc<ProgressExpirySweeper>,
     ) -> Self {
-        Self { events, updates }
+        Self {
+            events,
+            updates,
+            tasks,
+            expiry,
+        }
     }
 }
 
@@ -144,7 +165,7 @@ impl ProgressObserver for RuntimeProgressObserver {
             sequence,
             run_id: run_id.clone(),
             kind,
-            at_ms: super::tasks::now_ms(),
+            at_ms: crate::runtime::tasks::now_ms(),
             payload,
         });
         let _ = self.updates.send(WorkflowResourceUpdate::RunEvents {
@@ -158,11 +179,27 @@ impl ProgressObserver for RuntimeProgressObserver {
         if kind != WorkflowRunEventKind::Log {
             let _ = self.updates.send(WorkflowResourceUpdate::RunsIndex);
         }
+        // 终态开窗或新 run 到达：让实例级清扫按当前快照重新计算最近的到期时刻
+        // （最后一个 run 结束后即使没有后续 workflow 工作也按期释放，P1-B）。
+        if matches!(
+            kind,
+            WorkflowRunEventKind::RunStarted | WorkflowRunEventKind::RunDone
+        ) {
+            self.expiry.arm();
+        }
     }
 
     fn on_runs_changed(&self) {
         // 清理淘汰改变了 `workflow://runs` 的正文（且被清理 run 的 scoped 资源
         // 转为 not-found）：提交后唤醒索引订阅者。
         let _ = self.updates.send(WorkflowResourceUpdate::RunsIndex);
+    }
+
+    fn on_runs_reclaimable(&self, run_ids: &[String]) {
+        // run 退役且生产者结束：逐 run 簿记不再有读取方或迟到发布依赖它。
+        for run_id in run_ids {
+            self.tasks.forget_run_fences(run_id);
+            self.events.forget_run(run_id);
+        }
     }
 }

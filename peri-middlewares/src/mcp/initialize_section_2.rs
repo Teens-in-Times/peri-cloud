@@ -1,0 +1,826 @@
+impl McpClientPool {
+    /// Deployment capabilities must be fixed before configuration loading starts.
+    pub fn set_builtin_available(&self, available: bool) -> std::io::Result<()> {
+        let context = self.builtin_context.lock();
+        if context.initialize_started || !self.is_open() {
+            return Err(std::io::Error::other(
+                "MCP capability injection window is closed",
+            ));
+        }
+        self.builtin_available
+            .store(available, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    pub fn set_stdio_available(&self, available: bool) -> std::io::Result<()> {
+        let context = self.builtin_context.lock();
+        if context.initialize_started || !self.is_open() {
+            return Err(std::io::Error::other(
+                "MCP capability injection window is closed",
+            ));
+        }
+        self.stdio_available
+            .store(available, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// 宿主显式声明 lazy workspace（默认 `false`）。
+    ///
+    /// `true` 且本会话 workspace 是远端（`WorkspaceRemote`）时，启动期的资源
+    /// 探测、指令/覆盖读取、Git 分支观察与 shell 任务扫描延后到首个真实
+    /// `tools/call`（Bun cold 代理只宣告 tools，任何启动期探测都会拉起真实后端）。
+    /// `false` 保持既有语义：普通远端 workspace 的资源发现失败仍拒绝初连。
+    ///
+    /// 与其余能力位同一注入窗口：必须在 MCP 初始化开始前。
+    pub fn set_lazy_workspace(&self, lazy: bool) -> std::io::Result<()> {
+        let context = self.builtin_context.lock();
+        if context.initialize_started || !self.is_open() {
+            return Err(std::io::Error::other(
+                "MCP capability injection window is closed",
+            ));
+        }
+        self.lazy_workspace
+            .store(lazy, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    pub fn set_plugin_discovery_available(&self, available: bool) -> std::io::Result<()> {
+        let context = self.builtin_context.lock();
+        if context.initialize_started || !self.is_open() {
+            return Err(std::io::Error::other(
+                "MCP capability injection window is closed",
+            ));
+        }
+        self.plugin_discovery_available
+            .store(available, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// 会话级准备失败与部署能力、冻结关闭策略分开记录；MCP 不重试该来源。
+    pub fn set_plugin_source_failed(&self, failed: bool) -> std::io::Result<()> {
+        let context = self.builtin_context.lock();
+        if context.initialize_started || !self.is_open() {
+            self.plugin_source_failed
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(std::io::Error::other(
+                "MCP capability injection window is closed",
+            ));
+        }
+        self.plugin_source_failed
+            .store(failed, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn plugin_sources_available(&self) -> bool {
+        self.plugin_discovery_available
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !self
+                .plugin_source_failed
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 绑定插件来源闭合位（M6）：会话装配从**冻结/session-local** 的
+    /// `meta_harness` 派生后在这里注入，必须早于 MCP 初始化（注入窗口与其余
+    /// 能力位同一条规则）。
+    ///
+    /// `true` ⇒ 本会话不合并插件 MCP 配置，且**不读插件目录**——关闭位的判定
+    /// 必须先于任何插件来源读取（含严格路径的清单解析）。
+    pub fn set_plugin_face_closed(&self, closed: bool) -> std::io::Result<()> {
+        let context = self.builtin_context.lock();
+        if context.initialize_started || !self.is_open() {
+            // fail-closed：注入窗口已关闭（池关闭或已开始初始化）时不得按「开」继续
+            // ——先把位强制置为关闭，再报错给调用方（调用方记录错误；此后本池也不会
+            // 再合并插件来源）。装配路径的绑定早于 `run_initialize`，正常不可达。
+            self.plugin_face_closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(std::io::Error::other(
+                "MCP capability injection window is closed",
+            ));
+        }
+        self.plugin_face_closed
+            .store(closed, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn plugin_face_closed(&self) -> bool {
+        self.plugin_face_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Initialize only builtin workspace tools, without loading user integrations.
+    /// Uses the normal discovery, readiness and owned shutdown lifecycle.
+    pub async fn run_initialize_bare(
+        pool: Arc<Self>,
+        cwd: &Path,
+        status_tx: tokio::sync::watch::Sender<McpInitStatus>,
+    ) {
+        pool.seal_builtin_context();
+        let loaded = match pool.configuration_snapshot.get() {
+            Some(snapshot) => super::config::load_bare_config_from_snapshot_with_mode(
+                snapshot,
+                pool.frozen_builtin_mode.get().copied(),
+            ),
+            None => {
+                super::config::load_bare_config_with_mode(pool.frozen_builtin_mode.get().copied())
+            }
+        };
+        let mut config = match loaded {
+            Ok(config) => config,
+            Err(error) => {
+                publish_config_failure(&pool, &status_tx, &error.to_string());
+                return;
+            }
+        };
+        if !pool
+            .builtin_available
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            config
+                .mcp_servers
+                .retain(|_, server| !matches!(server.source, Some(ConfigSource::Builtin { .. })));
+        }
+        // Bare keeps only Workspace, but an explicit session Workspace must still
+        // replace the builtin before discovery and readiness are published.
+        if let Some(workspace) = pool
+            .session_servers
+            .get()
+            .and_then(|servers| servers.get("workspace"))
+        {
+            config
+                .mcp_servers
+                .insert("workspace".to_owned(), workspace.clone());
+        }
+        Self::initialize_config(pool, cwd, config, Default::default(), status_tx, None).await;
+    }
+
+    /// Initialize only session-declared servers, without reading host config
+    /// files or builtin instances. Account-scoped deployments use this so a
+    /// session's MCP surface is exactly what its authenticated owner supplied.
+    pub async fn run_initialize_session_only(
+        pool: Arc<Self>,
+        cwd: &Path,
+        status_tx: tokio::sync::watch::Sender<McpInitStatus>,
+    ) {
+        pool.seal_builtin_context();
+        let config = super::config::McpConfigFile {
+            mcp_servers: pool.session_servers.get().cloned().unwrap_or_default(),
+            mcp_cache: None,
+        };
+        Self::initialize_config(pool, cwd, config, Default::default(), status_tx, None).await;
+    }
+
+    pub async fn run_initialize(
+        pool: Arc<Self>,
+        cwd: &Path,
+        claude_home: &Path,
+        status_tx: tokio::sync::watch::Sender<McpInitStatus>,
+        oauth_event_callback: Option<Box<dyn Fn(OAuthFlowEvent) + Send + Sync>>,
+    ) {
+        // 封口（A33 晚注入拒绝）①：本函数是 `run_initialize` 里**配置加载窗口**的起点——
+        // 一旦配置加载开始，宿主就不再有机会在「initialize 尚未开始」的语义下注入上下文，
+        // 因此在这里置真，覆盖 `load_merged_config_full` 失败等提前返回路径。
+        pool.seal_builtin_context();
+        // 配置加载失败必须是可见的 Failed：不发布 Ready、不标记 initialized、
+        // 不注册任何 server（因而也不会开始 transport）。B 在 1R 消费该失败。
+        let loaded = match pool.configuration_snapshot.get() {
+            Some(snapshot) => super::config::load_merged_config_from_snapshot_with_policy(
+                cwd,
+                claude_home,
+                snapshot,
+                pool.builtin_available
+                    .load(std::sync::atomic::Ordering::Acquire),
+                pool.plugin_sources_available(),
+                pool.plugin_face_closed(),
+                pool.frozen_builtin_mode.get().copied(),
+            ),
+            None => super::config::load_merged_config_full_with_policy(
+                cwd,
+                claude_home,
+                pool.builtin_available
+                    .load(std::sync::atomic::Ordering::Acquire),
+                pool.plugin_sources_available(),
+                pool.plugin_face_closed(),
+                pool.frozen_builtin_mode.get().copied(),
+            ),
+        };
+        let (mut config, plugin_sources) = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                publish_config_failure(&pool, &status_tx, &error.to_string());
+                return;
+            }
+        };
+        if let Some(servers) = pool.session_servers.get() {
+            config.mcp_servers.extend(servers.clone());
+        }
+        Self::initialize_config(
+            pool,
+            cwd,
+            config,
+            plugin_sources,
+            status_tx,
+            oauth_event_callback,
+        )
+        .await;
+    }
+
+    async fn initialize_config(
+        pool: Arc<Self>,
+        cwd: &Path,
+        mut config: super::config::McpConfigFile,
+        plugin_sources: std::collections::HashMap<String, String>,
+        status_tx: tokio::sync::watch::Sender<McpInitStatus>,
+        oauth_event_callback: Option<Box<dyn Fn(OAuthFlowEvent) + Send + Sync>>,
+    ) {
+        // 封口（A33 晚注入拒绝）②：`initialize_config` 也接受直接调用（不经
+        // `run_initialize`），配置校验与目录绑定都已越过「注入窗口」的边界；两处封口都是
+        // 幂等的，任一路径进入都会让此后的首次注入被 typed 拒绝。
+        pool.seal_builtin_context();
+        // P5（用户裁决 2026-10-11）：命中关闭集的 builtin 实例**不 spawn**。
+        //
+        // ARC-CAPABILITY-CLOSURE-001 的既有语义是「非物理投影关闭」（实例照常
+        // 连接，只关本 turn 的工具投影）；workflow 是**经裁决的唯一特例**——
+        // 关闭集命中时实例（含宿主消费者）不得装配。实现点选在这里：把该条目
+        // 从本会话的 server 集合中移除，使它既不连接、也不进入 System 依赖
+        // 清单（readiness 的 `await_system_connections` 按 pool 级配置判定，
+        // 留下条目但跳过连接会造成启动 fatal）。特例仅按实例名精确匹配，
+        // 不改变共享关闭机制本身（见 docs/design/workflow-mcp.md §4.4）。
+        if let Some(context) = pool.builtin_instance_context() {
+            if context.closed.contains("workflow") {
+                config.mcp_servers.remove("workflow");
+            }
+        }
+        // typed 配置（含手工构造）在任何 empty / disabled / ready 分支之前校验：
+        // 非法组合必须暴露为 Failed，不能因为「空配置」或「全部 disabled」被跳过。
+        if let Err(error) = super::config::validate_config(&config) {
+            publish_config_failure(&pool, &status_tx, &error.to_string());
+            return;
+        }
+        if let Err(error) = pool.bind_cache_policy(super::config::McpCachePolicy::from_setting(
+            config.mcp_cache,
+        )) {
+            publish_config_failure(&pool, &status_tx, &error.to_string());
+            return;
+        }
+        #[allow(unused_variables)] // Emscripten cannot spawn stdio transports.
+        let cwd = match pool.bind_execution_cwd(cwd) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                // 执行目录绑定失败后本 pool 不可能再发布配置清单：等待方必须立刻
+                // 拿到终态，而不是把「不可用」睡成 bootstrap 超时。
+                pool.publish_system_manifest(SystemMcpManifest::Failed);
+                pool.mark_system_settled();
+                let status = McpInitStatus::Failed(error.to_string());
+                *pool.init_status.write() = status.clone();
+                let _ = status_tx.send(status);
+                return;
+            }
+        };
+        // 启动分母只统计实际需要首次连接的服务器：disabled 不连接；dynamic
+        // 只登记配置，首次连接由 Loader 触发（plan 4.2）。
+        let connectable = config
+            .mcp_servers
+            .iter()
+            .filter(|(_, sc)| !sc.disabled.unwrap_or(false) && !sc.dynamic)
+            .count();
+        if config.mcp_servers.is_empty() {
+            // 空集合也是**完整**清单：此后 system 依赖（零个）是可信事实。
+            pool.publish_system_manifest(SystemMcpManifest::Loaded);
+            pool.mark_system_settled();
+            let _ = status_tx.send(McpInitStatus::Ready { total: 0 });
+            *pool.init_status.write() = McpInitStatus::Ready { total: 0 };
+            pool.mark_initialized();
+            return;
+        }
+
+        *pool.plugin_sources.write() = plugin_sources;
+
+        // OAuth 事件回调注入 pool（spawn_oauth_flow / start_oauth_flow 读取；
+        // 无回调时授权不自动触发——由 host pool 统一执行，本 pool 仅标记
+        // NeedsAuthorization，授权完成后经共享凭据服务恢复）。
+        if let Some(cb) = oauth_event_callback {
+            pool.set_oauth_event_callback(cb);
+        }
+
+        for (name, server_config) in &config.mcp_servers {
+            pool.configs
+                .write()
+                .insert(name.clone(), server_config.clone());
+        }
+        // 完整 configs（含全部 disabled）已一次性写入：此刻起配置清单是可信的
+        // System 依赖事实源，等待方可以按 server 逐个判定发现证据。
+        pool.publish_system_manifest(SystemMcpManifest::Loaded);
+        let _ = status_tx.send(McpInitStatus::Initializing {
+            connected: 0,
+            total: connectable,
+        });
+        *pool.init_status.write() = McpInitStatus::Initializing {
+            connected: 0,
+            total: connectable,
+        };
+
+        // 启动依赖优先推进：System MCP 是本轮启动的阻塞条件，普通 MCP 的慢
+        // transport / 慢握手不得把它排在后面（原实现按 HashMap 顺序串行连接）。
+        // 同优先级内按 server 名排序，使连接顺序确定、可复现。
+        let mut ordered: Vec<(&String, &McpServerConfig)> = config.mcp_servers.iter().collect();
+        ordered.sort_by(|(left_name, left), (right_name, right)| {
+            let left_system = left.system_mcp == Some(true);
+            let right_system = right.system_mcp == Some(true);
+            right_system
+                .cmp(&left_system)
+                .then_with(|| left_name.cmp(right_name))
+        });
+
+        let system_total = ordered
+            .iter()
+            .filter(|(_, server)| server.system_mcp == Some(true))
+            .count();
+        let mut connected = 0usize;
+        {
+            let indexed_ordered = ordered.into_iter().enumerate();
+            for (index, (name, server_config)) in indexed_ordered {
+                // System MCP 是本轮启动的阻塞条件，普通 MCP 不是：System 批次处理
+                // 完即向等待方收口。后续普通 transport 即使每个都等满超时，也只
+                // 影响它们自己的工具可用时间，不再拖住会话创建。
+                if index == system_total {
+                    pool.mark_system_settled();
+                }
+                // Dynamic 只登记配置：不构建 transport、不启动进程、不做 OAuth
+                // 首次连接或远端发现；首次连接延迟到 Loader（plan 4.2）。
+                // disabled 仍走下面的既有分支（面板显示 Disabled、不连接）。
+                if server_config.dynamic {
+                    tracing::info!(server = %name, "MCP 服务器为 dynamic：延迟首次连接");
+                    continue;
+                }
+                let slot = pool.server_slot(name);
+                let Ok(_operation) = slot.operation.clone().try_lock_owned() else {
+                    continue;
+                };
+                if slot.stopped.load(std::sync::atomic::Ordering::Acquire)
+                    || pool
+                        .client(name)
+                        .is_some_and(|h| h.status == ClientStatus::Connected)
+                {
+                    continue;
+                }
+
+                // 跳过已禁用的服务器，注册为 Disabled 状态
+                if server_config.disabled.unwrap_or(false) {
+                    tracing::info!(server = %name, "MCP 服务器已禁用，跳过连接");
+                    pool.clients.write().insert(
+                        name.clone(),
+                        Arc::new(McpClientHandle {
+                            call_gate: Default::default(),
+                            name: name.clone(),
+                            version: None,
+                            connected_at: None,
+                            protocol_version: None,
+                            cache_version: None,
+                            peer: None,
+                            tools: vec![],
+                            resources: vec![],
+                            status: ClientStatus::Disabled,
+                            oauth_status: OAuthStatus::default(),
+                            source: server_config.source.clone(),
+                            url: server_config.url.clone(),
+                            skills_capable: false,
+                        }),
+                    );
+                    continue;
+                }
+                if matches!(server_config.source, Some(ConfigSource::Builtin { .. }))
+                    && !pool
+                        .builtin_available
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    Self::insert_failed(
+                        &pool,
+                        name,
+                        "builtin handler is unavailable in this deployment".into(),
+                    );
+                    commit_discovery_failure(&pool, name, false);
+                    continue;
+                }
+                // 本次发现尝试开始：旧代证据立即作废，等待方按「仍在进行」重新判定，
+                // 不会把上一次尝试的成功当成这一次的证据。
+                pool.clear_discovery_evidence(name);
+                let transport_config = match TransportConfig::try_from(server_config) {
+                    Ok(tc) => tc,
+                    Err(e) => {
+                        tracing::warn!(server = %name, error = %e, "传输层构建失败");
+                        Self::insert_failed(&pool, name, format!("传输层构建失败: {e}"));
+                        commit_discovery_failure(&pool, name, false);
+                        continue;
+                    }
+                };
+                // 三分类（IF-D1）：超时与日志字段来自同一结果；`is_http` 仅用于
+                // 「是否 AuthRequired」判定（HTTP 专属，builtin 无 URL / 无凭据恒 false）。
+                let kind = transport_config.kind();
+                let timeout = connect_timeout(kind);
+                let is_http = matches!(kind, TransportKind::Http);
+                // lifecycle 统一自动协商；subscriptions 只负责连接后订阅。
+                // v5：订阅按会话关闭集过滤（workspace 关闭时不再订阅 git ref）。
+                let subscriptions = server_config
+                    .subscriptions
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|subscriptions| pool.filter_subscriptions(name, subscriptions));
+
+                let connect_result = match transport_config {
+                    // builtin 分支：同进程链路（duplex + 真实 `rmcp::serve_server`）。它与 stdio
+                    // 分支走**同一条**处理链（同参的 `serve_client_auto_for_server` → 发现 → 句柄 → 提交），
+                    // 不为 builtin 另起一套 spawn / readiness / 面板语义。
+                    TransportConfig::Builtin { ref instance } => {
+                        // 实例解析与上下文读取都在 pool 方法内统一收口：未注册 / 上下文缺失 /
+                        // 输入缺失 / handler 未接线各得 typed 原因 + 失败证据 + continue。
+                        let transport = match pool.spawn_builtin_transport_with_environment(
+                            instance,
+                            server_config.env.as_ref().unwrap_or(&Default::default()),
+                        ) {
+                            Ok(transport) => transport,
+                            Err(error) => {
+                                let reason = format!("builtin 启动失败: {error}");
+                                tracing::warn!(server = %name, error = %reason, "MCP builtin 启动失败");
+                                Self::insert_failed(&pool, name, reason);
+                                commit_discovery_failure(&pool, name, false);
+                                continue;
+                            }
+                        };
+                        let (io, supervisor) = transport.into_parts();
+                        // task 归属：server 半边是同进程 task，必须与 `services` 同期登记，
+                        // 否则重连 / 关闭会留下 orphan（IF-D12）。同名旧代监督者先按冻结顺序
+                        // 有界收敛（先停 tick 再收敛 server task）。
+                        if let Some(previous) = pool.register_builtin_task(name.clone(), supervisor)
+                        {
+                            let _ = previous.close(BUILTIN_CONVERGE_TIMEOUT).await;
+                        }
+                        let connected =
+                            client::serve_client_auto_for_server(io, &pool, name, timeout).await;
+                        // 握手失败 / 超时：本实例的 server task 当场收口（不含糊到 pool 关闭）；
+                        // 成功则由重连 / 关闭 / 移除时的有界关闭负责。
+                        if !matches!(connected, Ok(Ok(_))) {
+                            pool.close_builtin_task(name).await;
+                        }
+                        connected
+                    }
+                    #[allow(unused_variables)]
+                    TransportConfig::Stdio {
+                        ref command,
+                        ref args,
+                        ref env,
+                    } => match pool
+                        .stdio_available
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        false => {
+                            Self::insert_failed(
+                                &pool,
+                                name,
+                                crate::platform::STDIO_UNAVAILABLE.into(),
+                            );
+                            commit_discovery_failure(&pool, name, false);
+                            continue;
+                        }
+                        #[cfg(target_os = "emscripten")]
+                        true => {
+                            Self::insert_failed(
+                                &pool,
+                                name,
+                                crate::platform::STDIO_UNAVAILABLE.into(),
+                            );
+                            commit_discovery_failure(&pool, name, false);
+                            continue;
+                        }
+                        #[cfg(not(target_os = "emscripten"))]
+                        true => match pool.spawn_stdio_transport(name, command, args, env, cwd) {
+                            Ok(transport) => {
+                                client::serve_client_auto_for_server(
+                                    transport, &pool, name, timeout,
+                                )
+                                .await
+                            }
+                            Err(e) => {
+                                let err_str = e.to_string();
+                                tracing::warn!(server = %name, error = %err_str, "MCP stdio 启动失败");
+                                Self::insert_failed(
+                                    &pool,
+                                    name,
+                                    format!("stdio 启动失败: {err_str}"),
+                                );
+                                commit_discovery_failure(&pool, name, false);
+                                continue;
+                            }
+                        },
+                    },
+                    TransportConfig::StreamableHttp {
+                        ref url,
+                        ref headers,
+                        ref oauth,
+                    } => {
+                        let token_store = pool.oauth_credentials().ok();
+                        if oauth.is_some() && token_store.is_none() {
+                            Self::insert_failed(
+                                &pool,
+                                name,
+                                "OAuth credentials were not injected".into(),
+                            );
+                            commit_discovery_failure(&pool, name, false);
+                            continue;
+                        }
+                        let oauth_cfg = if let Some(config) = oauth.as_ref() {
+                            Some(config.clone())
+                        } else if let Some(token_store) = token_store.as_ref() {
+                            let default_oauth = OAuthConfig::default();
+                            let key = auth_store::static_credential_key(name, url, &default_oauth);
+                            match token_store.load_server(&key).await {
+                                Ok(Some(_)) => Some(default_oauth),
+                                Ok(None) => None,
+                                Err(error) => {
+                                    Self::insert_failed(&pool, name, error.to_string());
+                                    commit_discovery_failure(&pool, name, false);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if oauth_cfg.is_some() {
+                            if pool.oauth_event_callback().is_some() {
+                                // host pool：不主动触发授权（避免启动即弹 popup
+                                // 打扰），统一标记 NeedsAuthorization，由用户经
+                                // MCP 面板显式发起（mcp/oauth_start RPC →
+                                // spawn_oauth_flow → popup）。
+                                Self::insert_needs_auth(
+                                    &pool,
+                                    name,
+                                    "OAuth 授权待完成".to_string(),
+                                );
+                                continue;
+                            }
+                            // TUI 面板池：无 UI 交互通道，走快速路径——尝试恢复
+                            // 存储凭证直接连接（不弹窗）；凭据缺失/失效时保持
+                            // NeedsAuthorization，由 host pool 授权后共享凭据服务
+                            // 恢复。异步执行不阻塞初始化。
+                            pool.spawn_oauth_flow(name);
+                            continue;
+                        } else {
+                            client::serve_client_auto_for_server(
+                                client::build_http_transport(url, headers),
+                                &pool,
+                                name,
+                                timeout,
+                            )
+                            .await
+                        }
+                    }
+                };
+
+                match connect_result {
+                    Ok(Ok(rs)) => {
+                        let rs = pool.track_server_service(name, rs);
+                        // 订阅配置存在：建立 subscriptions/listen 长流（2026-07-28）。
+                        // 失败仅告警——server 可能不支持，连接本身仍可用。
+                        // A24 关闭门：关闭集命中的 builtin 实例不建立订阅（订阅是能力的外部
+                        // 副作用；`WorkspaceMiddleware: false` ⇒ 零 git 调用）。
+                        if let Some(sub) = subscriptions {
+                            if pool.subscription_allowed(name) {
+                                client::setup_subscription(&pool, &rs, name, &sub).await;
+                            } else {
+                                tracing::info!(
+                                    server = %name,
+                                    "builtin 实例在关闭集内，跳过 subscriptions/listen"
+                                );
+                            }
+                        }
+                        let peer = rs.peer().clone();
+                        pool.configure_peer_cache(&peer).await;
+                        let cache_version = pool.install_peer_cache_version(name, &peer);
+                        let startup =
+                            match pool.capture_startup_cache_connection(name, &peer, server_config)
+                            {
+                                Ok(startup) => startup,
+                                Err(error) => {
+                                    let mut service = rs;
+                                    let _ = service.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+                                    fail_tool_discovery(&pool, name, &error.to_string());
+                                    continue;
+                                }
+                            };
+                        // 严格发现（契约 2 / 主 plan IF-M3）：`tools/list` 的 `Err` 既不是
+                        // 「服务器没有工具」，也不是 ready 证据。只有真实成功的 round-trip
+                        // 才允许提交 `Connected`；失败必须显式失败并释放已建立的 service，
+                        // 否则 `Connected + tools=[]` 会被下游误判为 discovery 完成。
+                        let tools =
+                            match list_discovered_tools(&pool, name, &peer, server_config).await {
+                                Ok(tools) => tools,
+                                Err(error) => {
+                                    let mut service = rs;
+                                    let _ = service.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+                                    fail_tool_discovery(&pool, name, &error.to_string());
+                                    continue;
+                                }
+                            };
+                        // 只有宿主显式 opt-in 的 lazy workspace 才延后资源探测：
+                        // cold 面只宣告 tools，启动期 `resources/list` 会穿透 cold
+                        // 代理启动真实后端。普通远端 workspace 按既有策略在启动期
+                        // 探测，失败拒绝初连（`fail_workspace_resource_discovery`）。
+                        let resources = if pool.lazy_workspace()
+                            && matches!(server_config.source, Some(ConfigSource::WorkspaceRemote))
+                        {
+                            tracing::info!(
+                                server = %name,
+                                "lazy 远端 workspace 资源探测延后到首个真实调用（cold 面只宣告 tools）"
+                            );
+                            Vec::new()
+                        } else {
+                            match pool
+                                .list_all_resources_cached_for_startup(name, &peer, server_config)
+                                .await
+                            {
+                                Ok(resources) => resources,
+                                Err(error) => {
+                                    if matches!(
+                                        server_config.source,
+                                        Some(ConfigSource::WorkspaceRemote)
+                                    ) {
+                                        let mut service = rs;
+                                        let _ = service.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+                                        fail_workspace_resource_discovery(
+                                            &pool,
+                                            name,
+                                            &error.to_string(),
+                                        );
+                                        continue;
+                                    }
+                                    downgrade_resource_listing(name, &error.to_string());
+                                    Vec::new()
+                                }
+                            }
+                        };
+                        tracing::info!(server = %name, tools = tools.len(), resources = resources.len(), "MCP 连接成功");
+                        let peer = rs.peer().clone();
+                        let oauth_status = OAuthStatus::default();
+                        let skills_capable = super::client::peer_declares_skills(&peer);
+                        let handle = Arc::new(McpClientHandle {
+                            call_gate: Default::default(),
+                            name: name.clone(),
+                            version: peer.peer_info().and_then(|info| {
+                                info.server_info.as_ref().map(|si| si.version.clone())
+                            }),
+                            cache_version: cache_version.clone(),
+                            connected_at: Some(peri_time::now_utc_rfc3339()),
+                            protocol_version: peer
+                                .peer_info()
+                                .map(|info| info.protocol_version.as_str().to_string()),
+                            peer: Some(peer),
+                            tools,
+                            resources,
+                            status: ClientStatus::Connected,
+                            oauth_status,
+                            source: server_config.source.clone(),
+                            url: server_config.url.clone(),
+                            skills_capable,
+                        });
+                        let committed = Arc::clone(&handle);
+                        if pool.require_cache_connection_current(&startup).is_err() {
+                            let mut service = rs;
+                            let _ = service.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+                            continue;
+                        }
+                        if let Err(mut service) =
+                            pool.try_commit_connection(name.clone(), handle, rs)
+                        {
+                            let _ = service.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+                            // 提交被拒（pool 关闭）：不留任何可被读成成功的证据。
+                            pool.clear_discovery_evidence(name);
+                            break;
+                        }
+                        // 唯一能提交「本代完整发现证据」的位置：transport + initialize +
+                        // 能力协商 + 真实成功的 live `tools/list` 全部完成，且句柄已登记代际。
+                        commit_discovery_success(&pool, name, &committed);
+                        connected += 1;
+                        let _ = status_tx.send(McpInitStatus::Initializing {
+                            connected,
+                            total: connectable,
+                        });
+                        *pool.init_status.write() = McpInitStatus::Initializing {
+                            connected,
+                            total: connectable,
+                        };
+                    }
+                    Ok(Err(e)) => {
+                        let err_str = e.to_string();
+                        tracing::warn!(server = %name, error = %err_str, "MCP 连接失败");
+                        if Self::is_auth_required_error(&err_str, is_http) {
+                            // 服务器要求授权（如 sentry 401）：标记待授权，不主动
+                            // 触发——用户经 MCP 面板显式发起授权（mcp/oauth_start）。
+                            Self::insert_needs_auth(&pool, name, err_str);
+                        } else {
+                            Self::insert_failed(&pool, name, err_str);
+                        }
+                        // initialize 未完成：证据必须明确记为「本代 initialize 失败」，
+                        // 不能靠「没有证据」让等待方一直等到 deadline。
+                        commit_discovery_failure(&pool, name, false);
+                    }
+                    Err(_) => {
+                        // 超时是面板上可见、日志里必须可查的失败：首次启动需装依赖的
+                        // stdio 服务器会在连接超时内完不成握手。
+                        tracing::warn!(
+                            server = %name,
+                            transport = transport_label(kind),
+                            timeout_secs = timeout.as_secs(),
+                            "MCP 连接超时"
+                        );
+                        Self::insert_failed(&pool, name, "连接超时".to_string());
+                        commit_discovery_failure(&pool, name, false);
+                    }
+                }
+            }
+        }
+
+        // 全部是 System，或在 System 批次内因池关闭 break：同样要对等待方收口。
+        pool.mark_system_settled();
+
+        if connectable > 0 && connected == 0 {
+            let all_need_auth = pool
+                .clients
+                .read()
+                .values()
+                .all(|h| h.oauth_status == OAuthStatus::NeedsAuthorization);
+            if all_need_auth {
+                let _ = status_tx.send(McpInitStatus::Ready { total: 0 });
+                *pool.init_status.write() = McpInitStatus::Ready { total: 0 };
+            } else {
+                let failed: Vec<String> = pool
+                    .clients
+                    .read()
+                    .iter()
+                    .filter(|(_, h)| matches!(h.status, ClientStatus::Failed(_)))
+                    .map(|(n, h)| {
+                        if let ClientStatus::Failed(r) = &h.status {
+                            format!("{}: {}", n, r)
+                        } else {
+                            n.clone()
+                        }
+                    })
+                    .collect();
+                let _ = status_tx.send(McpInitStatus::Failed(format!(
+                    "{} 个服务器连接失败: {}",
+                    connectable,
+                    failed.join("; ")
+                )));
+                *pool.init_status.write() = McpInitStatus::Failed(format!(
+                    "{} 个服务器连接失败: {}",
+                    connectable,
+                    failed.join("; ")
+                ));
+            }
+        } else {
+            let _ = status_tx.send(McpInitStatus::Ready { total: connected });
+            *pool.init_status.write() = McpInitStatus::Ready { total: connected };
+        }
+        // 初始化收口：此后状态变化才产生上下线通知（初始连接结果由
+        // 会话首 turn 的 first_turn_reminder 概览覆盖，不逐条推送）。
+        pool.mark_initialized();
+        // 初始连接补发（决策 B 扩展）：mark_initialized 之后为每个已连接
+        // server 补发一次连接通知——`run_initialize` 直接插入 Connected
+        // handle，初始化期间的连接事件不产生 record_status_change，挂载
+        // 的连接事件 notifier（装配面 / session 预热）收不到初始连接。
+        // 补发使「刚进入、未说话」场景下连接完成的 server 立即驱动
+        // skill 发现（notifier 未挂载时零操作，由 session/new 预热发现
+        // 兜底——get_all_clients 已非空）。
+        pool.notify_initial_connections();
+    }
+
+    /// 测试用构造：直接复用生产初始化路径。
+    ///
+    /// 不保留第二套宽松的发现/提交逻辑——两条路径分叉时，测试会在与生产不同的
+    /// 语义上变绿（`tools/list` 失败必须是显式 `Failed`，不是 `Connected` 空工具）。
+    #[cfg(test)]
+    pub async fn initialize(
+        cwd: &Path,
+        claude_home: &Path,
+        oauth_event_callback: Option<Box<dyn Fn(OAuthFlowEvent) + Send + Sync>>,
+    ) -> Arc<Self> {
+        let pool = Arc::new(Self::new_pending());
+        let (config, plugin_sources) =
+            match super::config::load_merged_config_full(cwd, claude_home) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    *pool.init_status.write() = McpInitStatus::Failed(error.to_string());
+                    return pool;
+                }
+            };
+        let (status_tx, _status_rx) = tokio::sync::watch::channel(McpInitStatus::Pending);
+        Self::initialize_config(
+            pool.clone(),
+            cwd,
+            config,
+            plugin_sources,
+            status_tx,
+            oauth_event_callback,
+        )
+        .await;
+        pool
+    }
+}
