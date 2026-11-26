@@ -52,7 +52,7 @@ impl Model for ModelGate {
             .push(serde_json::to_string(&request).unwrap());
         self.calls.fetch_add(1, Ordering::SeqCst);
         tokio::select! { _=cancel.cancelled() => return Err(ModelError::cancelled()), permit=self.release.acquire() => permit.unwrap().forget() }
-        let response = ModelResponse::new(
+        let response = ModelResponse::try_new(
             ModelMessage::assistant_text("done"),
             StopReason::EndTurn,
             None,

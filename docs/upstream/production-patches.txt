@@ -119,3 +119,7 @@ peri-workflow/src/runtime_test.rs
 
 # Regression for the relocated Cloud summary-only entry.
 peri-agent/src/agent/compact_v2/full_test.rs
+
+# Shared scanner cancellation-token regression wiring.
+mcp-packages/workspace/src/filesystem/folder_test.rs
+mcp-packages/workspace/src/filesystem/grep_guard_test.rs

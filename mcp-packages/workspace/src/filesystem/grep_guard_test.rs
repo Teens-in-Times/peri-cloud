@@ -6,8 +6,6 @@ use crate::filesystem::grep::SEARCH_TIMEOUT;
 use crate::filesystem::grep_args::OutputMode;
 use crate::filesystem::grep_args::ParsedArgs;
 use peri_agent::tools::BaseTool;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use std::time::Duration;
 
 // ─── Grep 防护移植（glob.rs 蓝本：协作取消 / 线程 cap / 预算）───────────────
@@ -44,7 +42,8 @@ fn test_grep_cancelled_skips_walk() {
         fixed_strings: false,
         max_depth: None,
     };
-    let cancelled = Arc::new(AtomicBool::new(true));
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    cancelled.cancel();
     let result = crate::filesystem::grep::execute_search(
         &parsed,
         &[],
