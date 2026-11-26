@@ -65,8 +65,7 @@ the instructions above and close the summary within the reduced target. Do not c
 ///
 /// 排除与取代关系必须在**同一次原子提交**里落地：只写排除会让 rewind 失去逐条依据，
 /// 只写取代关系则原文仍然可见。
-#[cfg(test)]
-pub(in crate::agent::compact_v2) async fn full_compact_inner(
+pub async fn full_compact_inner(
     transcript: &mut MessageTranscript,
     llm: Option<&dyn peri_model::Model>,
     config: &CompactConfig,
@@ -86,8 +85,7 @@ pub(in crate::agent::compact_v2) async fn full_compact_inner(
 ///
 /// 受保护结果不进入摘要请求，也不被归档；它们由派生模型视图在摘要之后按接收
 /// 顺序重新投影。只有会话路径传入非空保护集合。
-#[cfg(test)]
-pub(in crate::agent::compact_v2) async fn full_compact_inner_with_protected(
+pub async fn full_compact_inner_with_protected(
     transcript: &mut MessageTranscript,
     llm: Option<&dyn peri_model::Model>,
     config: &CompactConfig,
@@ -144,7 +142,11 @@ pub(in crate::agent::compact_v2) async fn full_compact_inner_with_hard_memory(
     let summary_id = MessageId::new();
     let mut archive_receipt_budget_tokens = None;
     let mut archive_roots = Vec::<peri_acp_types::context_archive::ArchiveRoot>::new();
-    for entry in transcript.entries() {
+    for entry in transcript
+        .entries()
+        .iter()
+        .filter(|entry| !transcript.is_excluded(entry.id()))
+    {
         if let Some(directive) = transcript.projection_ref(entry.id()) {
             if directive.archive_receipt_budget_tokens.is_some() {
                 archive_receipt_budget_tokens = directive.archive_receipt_budget_tokens;
